@@ -1169,6 +1169,96 @@ const Comet_01wbtc = Comet(<const>{
 
 const market01wbtc = <const>[BTC_USD_priceFeed, Comet_01wbtc];
 
+/*
+ * Test-only deployment: "Compound TEST Svc Patch USDC" (ctestUSDCv3).
+ *
+ * This market is governed by an EOA (0x4c894222653870C5e5a346E2c293a75DAC8d77a8),
+ * not the mainnet Timelock, holds no liquidity, and prices its collateral with
+ * feeds whose description() is "PriceFeedLiveTest (TEST ONLY)".
+ *
+ * !! WARNING: NOTHING IN THE CODE HIDES THIS MARKET. !!
+ *
+ * getCometContractsForNetwork() returns every Comet declared for a network, so
+ * this market appears in every `all-contracts` aggregate response -- including
+ * the market list the v3 frontend reads. Isolation is entirely a matter of
+ * deployment: this declaration is expected to live on a branch deployed only to
+ * stage. Merging it to main and deploying to production WILL surface a market
+ * named "Compound TEST Svc Patch USDC" with $0 TVL in the production app.
+ *
+ * NOTE: this deployment has its OWN CometRewards, unlike every other
+ * ethereum-mainnet market, and it MUST NOT claim the 'default' CometRewards
+ * alias -- StaticWellKnownContracts merges aliases into one map per canonical
+ * name, so 'default' would overwrite the production CometRewards.
+ *
+ * Because this market IS aggregated, it also enters the batch in
+ * get-reward-configs-sleuth.ts, which queries every comet on a network against
+ * cometMarkets[0].rewards.contract and so assumes one CometRewards per network.
+ * market01testusdc MUST therefore stay last among the comet groups in
+ * contractData, so that cometMarkets[0] remains a production market using the
+ * canonical CometRewards. If this market ever sorted first, every production
+ * market's reward config would be read from the test rewards contract and
+ * silently return zero.
+ */
+const CometRewards_testSvcPatch = UntypedContract("CometRewards", <const>{
+  aliases: ["test-svc-patch"],
+  displayName: "CometRewardsTestSvcPatch",
+  network: "ethereum-mainnet",
+  address: "0x3c2b39375f8b3813842b6c59CA8afD0fe3b4b0d7",
+  block: {
+    number: 25602754,
+    timestamp: 1784897963,
+  },
+});
+
+const WETH_LiveTest_priceFeed = PriceFeed(<const>{
+  aliases: ["WETH-USD-livetest"],
+  decimals: 8,
+  network: "ethereum-mainnet",
+  address: "0x36012dD3aD298aA3e657057De5682A40b7e9DF0C",
+  block: {
+    number: 25644931,
+    timestamp: 1785405575,
+  },
+});
+
+const wstETH_LiveTest_priceFeed = PriceFeed(<const>{
+  aliases: ["wstETH-USD-livetest"],
+  decimals: 8,
+  network: "ethereum-mainnet",
+  address: "0x0584722682d0915E7ff75D0B2ecFF4333bd750F4",
+  block: {
+    number: 25644933,
+    timestamp: 1785405599,
+  },
+});
+
+const Comet_01testusdc = Comet(<const>{
+  displayName: "ctestUSDCv3",
+  aliases: ["01-testusdc", "ctestUSDCv3"],
+  base: {
+    asset: USDC,
+    priceFeed: USDC_USD_priceFeed,
+  },
+  rewards: {
+    asset: COMP,
+    contract: CometRewards_testSvcPatch,
+    priceFeed: COMP_USD_priceFeed,
+  },
+  network: "ethereum-mainnet",
+  address: "0xf5a628D53c47fBA2C062cd6F5B6D255cb05645Eb",
+  block: {
+    number: 25602729,
+    timestamp: 1784897663,
+  },
+});
+
+const market01testusdc = <const>[
+  CometRewards_testSvcPatch,
+  WETH_LiveTest_priceFeed,
+  wstETH_LiveTest_priceFeed,
+  Comet_01testusdc,
+];
+
 // governance
 const Timelock = UntypedContract("Timelock", <const>{
   aliases: ["default"],
@@ -1946,6 +2036,8 @@ const contractData = [
   ...market01wstETH,
   ...market01usds,
   ...market01wbtc,
+  // MUST remain last among the comet groups: see market01testusdc's note above
+  ...market01testusdc,
   // everything else...
   ...misc,
 ] as const;
