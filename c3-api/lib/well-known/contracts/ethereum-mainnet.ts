@@ -1198,6 +1198,11 @@ const market01wbtc = <const>[BTC_USD_priceFeed, Comet_01wbtc];
  * canonical CometRewards. If this market ever sorted first, every production
  * market's reward config would be read from the test rewards contract and
  * silently return zero.
+ *
+ * This market is also listed in GetAllStreamEvents() in
+ * src/transaction-history-handler/transaction-history-items-handler.ts, which
+ * is what makes its transaction history reachable at all -- declaring a Comet
+ * here is not sufficient for that endpoint.
  */
 const CometRewards_testSvcPatch = UntypedContract("CometRewards", <const>{
   aliases: ["test-svc-patch"],
