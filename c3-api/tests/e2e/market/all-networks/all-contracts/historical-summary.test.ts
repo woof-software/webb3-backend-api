@@ -70,10 +70,13 @@ const testBlocks: { [key in string]: Eth.Block.WithTimestamp } = {
     timestamp: 1_746_139_928,
     date: "2025-02-18",
   },
+  // Ronin's replacement USD price feeds (post Chainlink proxy deprecation on
+  // 2026-08-26) only exist from block 55_577_500, so the pinned block must be
+  // at or after that.
   "ronin-mainnet": {
-    number: 44_084_652,
-    timestamp: 1_744_106_923,
-    date: "2025-04-08",
+    number: 58_000_000,
+    timestamp: 1_783_468_787,
+    date: "2026-07-07",
   },
 };
 const mainnetBlockNumber = testBlocks["ethereum-mainnet"].number;
