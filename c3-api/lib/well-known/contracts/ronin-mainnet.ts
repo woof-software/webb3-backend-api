@@ -68,14 +68,18 @@ const Comet_Rewards = UntypedContract('CometRewards', <const>{
   },
 });
 
+// The original Chainlink ETH/USD proxy (0x662Fdb0E...) was deprecated on
+// 2026-08-26 (aggregator zeroed, all reads revert). This is the ETH/USD feed
+// cWRONv3 registers on-chain for its WETH collateral; it did not exist before
+// block 55577500, so computations at earlier blocks cannot use it.
 const WETH_USD_priceFeed = PriceFeed(<const>{
   aliases: ['WETH-USD'],
   decimals: 8,
   network: 'ronin-mainnet',
-  address: '0x662Fdb0E7D95d89CD3458E4A3506296E48BB1F44',
+  address: '0x5D173813B4505701e79E654b36A95E6c1FAD4448',
   block: {
-    number: 41700642,
-    timestamp: 1736952996,
+    number: 55577500,
+    timestamp: 1778623787,
   },
 });
 
@@ -94,21 +98,25 @@ const COMP_USD_priceFeed = PriceFeed(<const>{
   aliases: ['COMP-USD'],
   decimals: 8,
   network: 'ronin-mainnet',
-  address: '0x662fdb0e7d95d89cd3458e4a3506296e48bb1f44',
+  address: '0x5D173813B4505701e79E654b36A95E6c1FAD4448',
   block: {
-    number: 41700642,
-    timestamp: 1736952996
+    number: 55577500,
+    timestamp: 1778623787
   },
 });
 
+// The original Chainlink RON/USD proxy (0x0b6074f2...) was deprecated on
+// 2026-08-26 along with the other Ronin proxies. This is the RON/USD feed
+// cWRONv3 registers on-chain as its base token feed; same block-55577500
+// deployment caveat as WETH_USD_priceFeed above.
 const RON_USD_priceFeed = PriceFeed(<const>{
   aliases: ['RON-USD', 'WRON-USD'],
   decimals: 8,
   network: 'ronin-mainnet',
-  address: '0x0b6074f21488b95945989e513efea070096d931d',
+  address: '0xB88e4078AAc88F10C0Ca71086ddCF512Ec54498a',
   block: {
-    number: 41701029,
-    timestamp: 1736954157,
+    number: 55577500,
+    timestamp: 1778623787,
   },
 });
 
