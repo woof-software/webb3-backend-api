@@ -18,94 +18,73 @@ import { getCometContractsForNetwork } from '../../../../lib/well-known/contract
 import '../../../../shim/node-self.js';
 
 const network = 'ethereum-mainnet' as const;
-const testMarketAddress = '0xf5a628D53c47fBA2C062cd6F5B6D255cb05645Eb';
-const testRewardsAddress = '0x3c2b39375f8b3813842b6c59CA8afD0fe3b4b0d7';
-const prodRewardsAddress = '0x1b0e765f6224c21223aea2af16c1c46e38885a40';
+const iusdcAddress = '0x207158a267CBD2598BB3d611D8CBdEE2709F2F8C';
+const cometRewardsAddress = '0x1b0e765f6224c21223aea2af16c1c46e38885a40';
 
-/*
- * ctestUSDCv3 is a test deployment on a production network and NOTHING filters
- * it out: it is returned by getCometContractsForNetwork() like any other
- * market, so it appears in every `all-contracts` aggregate response. Isolation
- * is a deployment concern -- this declaration is meant to ship only to stage.
- *
- * This test pins that reality rather than asserting a filter that does not
- * exist, so that the day someone adds filtering the test fails loudly and gets
- * updated deliberately.
- */
-t.test('ctestUSDCv3 is aggregated like any other market', async t => {
+t.test('ciUSDCv3 is aggregated alongside the other ethereum-mainnet markets', async t => {
   const contracts = getCometContractsForNetwork(network);
 
   t.ok(
-    contracts.some(({ address }) => address === testMarketAddress),
-    'ctestUSDCv3 IS present in ethereum-mainnet aggregation (nothing hides it)'
+    contracts.some(({ address }) => address === iusdcAddress),
+    'ciUSDCv3 is returned by getCometContractsForNetwork'
   );
   t.ok(
     contracts.some(({ displayName }) => displayName === 'cUSDCv3'),
-    'production markets are present alongside it'
+    'the other markets are still present'
   );
 });
 
 /*
- * This is the load-bearing assertion.
+ * get-reward-configs-sleuth.ts batches every comet returned for a network into
+ * a single Sleuth query issued against cometMarkets[0].rewards.contract -- it
+ * assumes one CometRewards per network, and flags that assumption in a comment
+ * at line 78. That assumption is only true as long as every declared comet
+ * points at the same CometRewards.
  *
- * get-reward-configs-sleuth.ts batches every comet returned here into a single
- * Sleuth query against cometMarkets[0].rewards.contract, assuming one
- * CometRewards per network. ctestUSDCv3 brings a second CometRewards to
- * ethereum-mainnet, and since it is NOT filtered out it enters that batch. The
- * only thing keeping production markets correct is that ctestUSDCv3 is declared
- * last in contractData, so cometMarkets[0] is still cUSDCv3 with the canonical
- * CometRewards.
- *
- * If this test fails, production reward configs are being read from the test
- * rewards contract and will silently come back zero.
+ * If this test fails, some market's reward config is being read from the wrong
+ * rewards contract and will silently come back zero. The fix is not to reorder
+ * contractData -- it is to teach get-reward-configs-sleuth.ts to batch per
+ * rewards contract.
  */
-t.test('cometMarkets[0] still uses the production CometRewards', async t => {
+t.test('every ethereum-mainnet market shares one CometRewards', async t => {
   const contracts = getCometContractsForNetwork(network);
 
-  t.equal(contracts[0].displayName, 'cUSDCv3', 'cometMarkets[0] is cUSDCv3');
-  t.equal(
-    contracts[0].rewards.contract.address,
-    prodRewardsAddress,
-    'cometMarkets[0] uses the production CometRewards'
-  );
-  t.not(
-    contracts[0].rewards.contract.address,
-    testRewardsAddress,
-    'cometMarkets[0] does not use the test rewards contract'
-  );
-  t.equal(
-    contracts[contracts.length - 1].address,
-    testMarketAddress,
-    'ctestUSDCv3 is last, so it can never become cometMarkets[0]'
-  );
+  t.ok(contracts.length > 1, 'there is more than one market to compare');
+  for (const comet of contracts) {
+    t.equal(
+      comet.rewards.contract.address.toLowerCase(),
+      cometRewardsAddress,
+      `${comet.displayName ?? comet.address} uses the canonical CometRewards`
+    );
+  }
 });
 
-t.test('registry lookups resolve the test market and its contracts', async t => {
+t.test('registry lookups resolve ciUSDCv3', async t => {
   const wellKnown = wellKnownContractsByNetwork[network];
 
   t.equal(
-    (wellKnown as any)[testMarketAddress].displayName,
-    'ctestUSDCv3',
+    (wellKnown as any)[iusdcAddress].displayName,
+    'ciUSDCv3',
     'resolves by address'
   );
   t.equal(
-    (wellKnown as any)['Comet']['ctestUSDCv3'].address,
-    testMarketAddress,
+    (wellKnown as any)[iusdcAddress.toLowerCase()].displayName,
+    'ciUSDCv3',
+    'resolves by lowercased address'
+  );
+  t.equal(
+    (wellKnown as any)['Comet']['ciUSDCv3'].address,
+    iusdcAddress,
     'resolves by displayName alias'
   );
   t.equal(
-    (wellKnown as any)['Comet']['01-testusdc'].address,
-    testMarketAddress,
-    'resolves by 01-testusdc alias'
+    (wellKnown as any)['Comet']['01-iusdc'].address,
+    iusdcAddress,
+    'resolves by 01-iusdc alias'
   );
   t.equal(
     (wellKnown as any)['CometRewards']['default'].address,
-    prodRewardsAddress,
-    'the production CometRewards still owns the default alias'
-  );
-  t.equal(
-    (wellKnown as any)['CometRewards']['test-svc-patch'].address,
-    testRewardsAddress,
-    'the test CometRewards is reachable under its own alias'
+    cometRewardsAddress,
+    'the canonical CometRewards still owns the default alias'
   );
 });

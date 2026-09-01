@@ -139,19 +139,18 @@ function GetAllStreamEvents(): { network: KnownNetwork.Name, marketContractAddre
       Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cWETHv3'].address,
       Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cUSDTv3'].address,
       /*
-       * Test-only market; see ethereum-mainnet.ts. It must be listed HERE, not
-       * just declared in the registry: this list decides which contracts' logs
-       * are fetched, while the `markets[]` query parameter only filters items
-       * already fetched from these streams. A market absent from this list has
-       * no transaction history reachable by any query.
+       * ciUSDCv3 must be listed HERE, not just declared in the registry: this
+       * list decides which contracts' logs are fetched, while the `markets[]`
+       * query parameter only filters items already fetched from these streams.
+       * A market absent from this list has no transaction history reachable by
+       * any query, and the empty response is indistinguishable from a market
+       * with no activity.
        *
-       * NOTE: this entry only streams the Comet's own events. This market has
-       * its own CometRewards (0x3c2b3937...), but rewardsContractAddress below
-       * is a single per-network value, so RewardClaimed events from the test
-       * rewards contract are not streamed. Harmless while its rewardConfig is
-       * unset; revisit if rewards are ever configured on it.
+       * NOTE: cwstETHv3, cUSDSv3 and cWBTCv3 are absent for exactly that
+       * reason and so currently have no reachable history. Pre-existing; not
+       * addressed here.
        */
-      Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['ctestUSDCv3'].address,
+      Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['ciUSDCv3'].address,
     ],
     rewardsContractAddress: Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cUSDCv3'].rewards.contract.address,
   });
