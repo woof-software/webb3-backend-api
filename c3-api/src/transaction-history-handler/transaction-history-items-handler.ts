@@ -138,6 +138,19 @@ function GetAllStreamEvents(): { network: KnownNetwork.Name, marketContractAddre
       Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cUSDCv3'].address,
       Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cWETHv3'].address,
       Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cUSDTv3'].address,
+      /*
+       * ciUSDCv3 must be listed HERE, not just declared in the registry: this
+       * list decides which contracts' logs are fetched, while the `markets[]`
+       * query parameter only filters items already fetched from these streams.
+       * A market absent from this list has no transaction history reachable by
+       * any query, and the empty response is indistinguishable from a market
+       * with no activity.
+       *
+       * NOTE: cwstETHv3, cUSDSv3 and cWBTCv3 are absent for exactly that
+       * reason and so currently have no reachable history. Pre-existing; not
+       * addressed here.
+       */
+      Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['ciUSDCv3'].address,
     ],
     rewardsContractAddress: Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cUSDCv3'].rewards.contract.address,
   });

@@ -1169,6 +1169,59 @@ const Comet_01wbtc = Comet(<const>{
 
 const market01wbtc = <const>[BTC_USD_priceFeed, Comet_01wbtc];
 
+/*
+ * "Compound Institutional USDC" (ciUSDCv3).
+ *
+ * A separately-operated USDC market: WETH, wstETH, cbBTC and WBTC collateral,
+ * priced by production feeds ("ETH / USD", "wstETH / USD CAPO SVR",
+ * "CBBTC / USD", "Custom price feed for WBTC / USD").
+ *
+ * Two things about it differ from the other ethereum-mainnet markets, neither
+ * of which the API needs to special-case, but both of which are worth knowing
+ * when its numbers look surprising:
+ *
+ *   - governor() is a Gnosis Safe (0x4f05F11ca5DE8946958d58AD765F16755F23b113)
+ *     and the proxy admin is 0x362739f84FFE4e5f06395301617a90f62Ee1f4cf, not
+ *     the mainnet Timelock / CometProxyAdmin. Its parameters and price feeds
+ *     can therefore change without a governance proposal; the summary endpoint
+ *     reports whatever it is currently set to.
+ *
+ *   - it has no rewards configured: rewardConfig(ciUSDCv3) on the canonical
+ *     CometRewards returns rewardToken == 0x0, so /account/{address}/rewards
+ *     skips it via the NullAddress guard in src/account-handlers/rewards.ts.
+ *     It is declared against the canonical CometRewards anyway, which keeps the
+ *     one-CometRewards-per-network assumption in get-reward-configs-sleuth.ts
+ *     true and means RewardClaimed events are already covered by the existing
+ *     per-network rewardsContractAddress in the transaction-history handler.
+ *     If rewards are ever configured on a *different* CometRewards, both of
+ *     those assumptions need revisiting.
+ *
+ * Transaction history additionally requires an entry in GetAllStreamEvents()
+ * in src/transaction-history-handler/transaction-history-items-handler.ts --
+ * declaring a Comet here is not sufficient for that endpoint.
+ */
+const Comet_01iusdc = Comet(<const>{
+  displayName: "ciUSDCv3",
+  aliases: ["01-iusdc", "ciUSDCv3"],
+  base: {
+    asset: USDC,
+    priceFeed: USDC_USD_priceFeed,
+  },
+  rewards: {
+    asset: COMP,
+    contract: CometRewards,
+    priceFeed: COMP_USD_priceFeed,
+  },
+  network: "ethereum-mainnet",
+  address: "0x207158a267CBD2598BB3d611D8CBdEE2709F2F8C",
+  block: {
+    number: 25881203,
+    timestamp: 1788250907,
+  },
+});
+
+const market01iusdc = <const>[Comet_01iusdc];
+
 // governance
 const Timelock = UntypedContract("Timelock", <const>{
   aliases: ["default"],
@@ -1946,6 +1999,7 @@ const contractData = [
   ...market01wstETH,
   ...market01usds,
   ...market01wbtc,
+  ...market01iusdc,
   // everything else...
   ...misc,
 ] as const;
