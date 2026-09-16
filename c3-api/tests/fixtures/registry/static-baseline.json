@@ -1,0 +1,2784 @@
+{
+  "description": "Statically declared Comet markets in c3-api and webb3-frontend before the D1 registry (S0 baseline for shadow comparison). Generated, do not edit by hand.",
+  "capturedFrom": {
+    "backendCommit": "35389f33d54a82445fc82fbede7095feb6c83bb2",
+    "frontendCommit": "5e556e553f223d37842fd91c2eed2f21efb98a6d",
+    "frontendCometPackage": {
+      "repository": "compound-finance/comet",
+      "commit": "cbe77c1ba4430266c781a251d25c8326573a33da"
+    }
+  },
+  "summary": {
+    "backend": {
+      "total": 37,
+      "mainnet": 29,
+      "testnet": 8,
+      "byNetwork": {
+        "arbitrum-goerli": 1,
+        "arbitrum-mainnet": 4,
+        "base-goerli": 2,
+        "base-mainnet": 5,
+        "ethereum-mainnet": 7,
+        "ethereum-sepolia": 2,
+        "linea-goerli": 1,
+        "linea-mainnet": 2,
+        "mantle-mainnet": 1,
+        "optimism-goerli": 1,
+        "optimism-mainnet": 3,
+        "polygon-mainnet": 2,
+        "polygon-mumbai": 1,
+        "ronin-mainnet": 2,
+        "scroll-mainnet": 1,
+        "unichain-mainnet": 2
+      }
+    },
+    "frontend": {
+      "total": 30,
+      "byChainId": {
+        "1": 6,
+        "10": 3,
+        "130": 2,
+        "137": 2,
+        "2020": 2,
+        "5000": 1,
+        "8453": 5,
+        "42161": 4,
+        "59144": 2,
+        "534352": 1,
+        "11155111": 2
+      }
+    },
+    "onlyInBackend": [
+      {
+        "network": "ethereum-mainnet",
+        "address": "0x207158a267cbd2598bb3d611d8cbdee2709f2f8c",
+        "contractName": "ciUSDCv3"
+      },
+      {
+        "network": "polygon-mumbai",
+        "address": "0xf09f0369ab0a875254fb565e52226c88f10bc839",
+        "contractName": "cUSDCv3"
+      },
+      {
+        "network": "arbitrum-goerli",
+        "address": "0x1d573274e19174260c5ace3f2251598959d24456",
+        "contractName": "cUSDCv3"
+      },
+      {
+        "network": "optimism-goerli",
+        "address": "0xb8f2f9c84ced7bbccc1db6fb7bb1f19a9a4adff4",
+        "contractName": "cUSDCv3"
+      },
+      {
+        "network": "base-goerli",
+        "address": "0xe78fc55c884704f9485eda042fb91bfe16fd55c1",
+        "contractName": "cUSDCv3"
+      },
+      {
+        "network": "base-goerli",
+        "address": "0xed94f3052638620fe226a9661ead6a39c2a265be",
+        "contractName": "cWETHv3"
+      },
+      {
+        "network": "linea-goerli",
+        "address": "0xa84b24a43ba1890a165f94ad13d0196e5fd1023a",
+        "contractName": "cUSDCv3"
+      }
+    ],
+    "onlyInFrontend": []
+  },
+  "backend": {
+    "comets": [
+      {
+        "network": "ethereum-mainnet",
+        "chainId": 1,
+        "testnet": false,
+        "address": "0xc3d688b66703497daa19211eedff47f25384cdc3",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 15331586,
+        "base": {
+          "token": {
+            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x8fffffd4afb6115b954bd326cbe7b4ba576818f6",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x1b0e765f6224c21223aea2af16c1c46e38885a40",
+          "token": {
+            "address": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xdbd020caef83efd542f4de03e3cf0c28a4428bd5",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "ethereum-mainnet",
+        "chainId": 1,
+        "testnet": false,
+        "address": "0xa17581a9e3356d9a858b789d68b4d866e593ae94",
+        "displayName": null,
+        "aliases": [
+          "01-weth",
+          "cWETHv3"
+        ],
+        "creationBlock": 16400710,
+        "base": {
+          "token": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xd72ac1bce9177cfe7aeb5d0516a38c88a64ce0ab",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x1b0e765f6224c21223aea2af16c1c46e38885a40",
+          "token": {
+            "address": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x1b39ee86ec5979ba5c322b826b3ecb8c79991699",
+            "decimals": 18
+          }
+        }
+      },
+      {
+        "network": "ethereum-mainnet",
+        "chainId": 1,
+        "testnet": false,
+        "address": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840",
+        "displayName": "cUSDTv3",
+        "aliases": [
+          "01-usdt",
+          "cUSDTv3"
+        ],
+        "creationBlock": 20190637,
+        "base": {
+          "token": {
+            "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "symbol": "USDT",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x3e7d1eab13ad0104d2750b8863b489d65364e32d",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x1b0e765f6224c21223aea2af16c1c46e38885a40",
+          "token": {
+            "address": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xdbd020caef83efd542f4de03e3cf0c28a4428bd5",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "ethereum-mainnet",
+        "chainId": 1,
+        "testnet": false,
+        "address": "0x3d0bb1ccab520a66e607822fc55bc921738fafe3",
+        "displayName": "cwstETHv3",
+        "aliases": [
+          "01-wstETH",
+          "cwstETHv3"
+        ],
+        "creationBlock": 20683535,
+        "base": {
+          "token": {
+            "address": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+            "symbol": "wstETH",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x72e9b6f907365d76c6192ad49c0c5ba356b7fa48",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0x164b276057258d81941e97b0a900d4c7b358bce0",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x1b0e765f6224c21223aea2af16c1c46e38885a40",
+          "token": {
+            "address": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xdbd020caef83efd542f4de03e3cf0c28a4428bd5",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "ethereum-mainnet",
+        "chainId": 1,
+        "testnet": false,
+        "address": "0x5d409e56d886231adaf00c8775665ad0f9897b56",
+        "displayName": "cUSDSv3",
+        "aliases": [
+          "01-usds",
+          "cUSDSv3"
+        ],
+        "creationBlock": 20987551,
+        "base": {
+          "token": {
+            "address": "0xdc035d45d973e3ec169d2276ddab16f1e407384f",
+            "symbol": "USDS",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xff30586cd0f29ed462364c7e81375fc0c71219b1",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x1b0e765f6224c21223aea2af16c1c46e38885a40",
+          "token": {
+            "address": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xdbd020caef83efd542f4de03e3cf0c28a4428bd5",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "ethereum-mainnet",
+        "chainId": 1,
+        "testnet": false,
+        "address": "0xe85dc543813b8c2cfeaac371517b925a166a9293",
+        "displayName": "cWBTCv3",
+        "aliases": [
+          "01-wbtc",
+          "cWBTCv3"
+        ],
+        "creationBlock": 21820087,
+        "base": {
+          "token": {
+            "address": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+            "symbol": "WBTC",
+            "decimals": 8
+          },
+          "priceFeed": {
+            "address": "0xf4030086522a5beea4988f8ca5b36dbc97bee88c",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x1b0e765f6224c21223aea2af16c1c46e38885a40",
+          "token": {
+            "address": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xdbd020caef83efd542f4de03e3cf0c28a4428bd5",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "ethereum-mainnet",
+        "chainId": 1,
+        "testnet": false,
+        "address": "0x207158a267cbd2598bb3d611d8cbdee2709f2f8c",
+        "displayName": "ciUSDCv3",
+        "aliases": [
+          "01-iusdc",
+          "ciUSDCv3"
+        ],
+        "creationBlock": 25881203,
+        "base": {
+          "token": {
+            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x8fffffd4afb6115b954bd326cbe7b4ba576818f6",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x1b0e765f6224c21223aea2af16c1c46e38885a40",
+          "token": {
+            "address": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xdbd020caef83efd542f4de03e3cf0c28a4428bd5",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "ethereum-sepolia",
+        "chainId": 11155111,
+        "testnet": true,
+        "address": "0xaec1f48e02cfb822be958b68c7957156eb3f0b6e",
+        "displayName": null,
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 5343452,
+        "base": {
+          "token": {
+            "address": "0x1c7d4b196cb0c7b01d743fbc6116a902379c7238",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0xa2f78ab2355fe2f984d808b5cee7fd0a93d5270e",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x8bf5b658bdf0388e8b482ed51b14aef58f90abfd",
+          "token": {
+            "address": "0xa6c8d1c55951e8ac44a0eaa959be5fd21cc07531",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x619db7f74c0061e2917d1d57f834d9d24c5529da",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "ethereum-sepolia",
+        "chainId": 11155111,
+        "testnet": true,
+        "address": "0x2943ac1216979ad8db76d9147f64e61adc126e96",
+        "displayName": null,
+        "aliases": [
+          "01-weth",
+          "cWETHv3"
+        ],
+        "creationBlock": 5397323,
+        "base": {
+          "token": {
+            "address": "0x2d5ee574e710219a521449679a4a7f2b43f046ad",
+            "symbol": "WETH",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x7c4d60297f1c460567b84cecacd8ad3ba0292667",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0x694aa1769357215de4fac081bf1f309adc325306",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x8bf5b658bdf0388e8b482ed51b14aef58f90abfd",
+          "token": {
+            "address": "0xa6c8d1c55951e8ac44a0eaa959be5fd21cc07531",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x1b39ee86ec5979ba5c322b826b3ecb8c79991699",
+            "decimals": 18
+          }
+        }
+      },
+      {
+        "network": "polygon-mainnet",
+        "chainId": 137,
+        "testnet": false,
+        "address": "0xf25212e676d1f7f89cd72ffee66158f541246445",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 39412367,
+        "base": {
+          "token": {
+            "address": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0xfe4a8cc5b5b2366c1b58bea3858e81843581b2f7",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x45939657d1ca34a8fa39a924b71d28fe8431e581",
+          "token": {
+            "address": "0x8505b9d2254a7ae468c0e9dd10ccea3a837aef5c",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x2a8758b7257102461bc958279054e372c2b1bde6",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "polygon-mainnet",
+        "chainId": 137,
+        "testnet": false,
+        "address": "0xaeb318360f27748acb200ce616e389a6c9409a07",
+        "displayName": "cUSDTv3",
+        "aliases": [
+          "01-usdt",
+          "cUSDTv3"
+        ],
+        "creationBlock": 58479907,
+        "base": {
+          "token": {
+            "address": "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+            "symbol": "USDT",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x0a6513e40db6eb1b165753ad52e80663aea50545",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x45939657d1ca34a8fa39a924b71d28fe8431e581",
+          "token": {
+            "address": "0x8505b9d2254a7ae468c0e9dd10ccea3a837aef5c",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x2a8758b7257102461bc958279054e372c2b1bde6",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "polygon-mumbai",
+        "chainId": 80001,
+        "testnet": true,
+        "address": "0xf09f0369ab0a875254fb565e52226c88f10bc839",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 31855537,
+        "base": {
+          "token": {
+            "address": "0xdb3cb4f2688daab3bff59c24cc42d4b6285828e9",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x572ddec9087154dc5dfbb1546bb62713147e0ab0",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x0785f2ac0dcbedee4b8d62c25a34098e9a0df4bb",
+          "token": {
+            "address": "0xdb3cb4f2688daab3bff59c24cc42d4b6285828e9",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x572ddec9087154dc5dfbb1546bb62713147e0ab0",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "arbitrum-mainnet",
+        "chainId": 42161,
+        "testnet": false,
+        "address": "0xa5edbdd9646f8dff606d7448e414884c7d905dca",
+        "displayName": "cUSDC.ev3",
+        "aliases": [
+          "01-usdc",
+          "cUSDC.ev3"
+        ],
+        "creationBlock": 87335214,
+        "base": {
+          "token": {
+            "address": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+            "symbol": "USDC.e",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x50834f3163758fcc1df9973b6e91f0f0f0434ad3",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x88730d254a2f7e6ac8388c3198afd694ba9f7fae",
+          "token": {
+            "address": "0x354a6da3fcde098f8389cad84b0182725c6c91de",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xe7c53ffd03eb6cef7d208bc4c13446c76d1e5884",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "arbitrum-mainnet",
+        "chainId": 42161,
+        "testnet": false,
+        "address": "0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "02-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 122080500,
+        "base": {
+          "token": {
+            "address": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x50834f3163758fcc1df9973b6e91f0f0f0434ad3",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x88730d254a2f7e6ac8388c3198afd694ba9f7fae",
+          "token": {
+            "address": "0x354a6da3fcde098f8389cad84b0182725c6c91de",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xe7c53ffd03eb6cef7d208bc4c13446c76d1e5884",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "arbitrum-mainnet",
+        "chainId": 42161,
+        "testnet": false,
+        "address": "0x6f7d514bbd4aff3bcd1140b7344b32f063dee486",
+        "displayName": "cWETHv3",
+        "aliases": [
+          "01-weth",
+          "cWETHv3"
+        ],
+        "creationBlock": 219386101,
+        "base": {
+          "token": {
+            "address": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            "symbol": "WETH",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xdb7edfa090061d9367cbeaf6be16ecbde596676c",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0x639fe6ab55c921f74e7fac1ee960c0b6293ba612",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x88730d254a2f7e6ac8388c3198afd694ba9f7fae",
+          "token": {
+            "address": "0x354a6da3fcde098f8389cad84b0182725c6c91de",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xe7c53ffd03eb6cef7d208bc4c13446c76d1e5884",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "arbitrum-mainnet",
+        "chainId": 42161,
+        "testnet": false,
+        "address": "0xd98be00b5d27fc98112bde293e487f8d4ca57d07",
+        "displayName": "cUSDTv3",
+        "aliases": [
+          "01-usdt",
+          "cUSDTv3"
+        ],
+        "creationBlock": 223796350,
+        "base": {
+          "token": {
+            "address": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+            "symbol": "USDT",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x3f3f5df88dc9f13eac63df89ec16ef6e7e25dde7",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x88730d254a2f7e6ac8388c3198afd694ba9f7fae",
+          "token": {
+            "address": "0x354a6da3fcde098f8389cad84b0182725c6c91de",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xe7c53ffd03eb6cef7d208bc4c13446c76d1e5884",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "arbitrum-goerli",
+        "chainId": 421613,
+        "testnet": true,
+        "address": "0x1d573274e19174260c5ace3f2251598959d24456",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 17712850,
+        "base": {
+          "token": {
+            "address": "0x8fb1e3fc51f3b789ded7557e680551d93ea9d892",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x1692bdd32f31b831caac1b0c9faf68613682813b",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x8da65f8e3aa22a498211fc4204c498ae9050dae4",
+          "token": {
+            "address": "0xf03370d2acf26dde26389b66498b7c293038f5af",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x1692bdd32f31b831caac1b0c9faf68613682813b",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "optimism-mainnet",
+        "chainId": 10,
+        "testnet": false,
+        "address": "0x2e44e174f7d53f0212823acc11c01a11d58c5bcb",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 118406276,
+        "base": {
+          "token": {
+            "address": "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x16a9fa2fda030272ce99b29cf780dfa30361e0f3",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x443ea0340cb75a160f31a440722dec7b5bc3c2e9",
+          "token": {
+            "address": "0x7e7d4467112689329f7e06571ed0e8cbad4910ee",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xe1011160d78a80e2eebd60c228eef7af4dfcd4d7",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "optimism-mainnet",
+        "chainId": 10,
+        "testnet": false,
+        "address": "0x995e394b8b2437ac8ce61ee0bc610d617962b214",
+        "displayName": "cUSDTv3",
+        "aliases": [
+          "01-usdt",
+          "cUSDTv3"
+        ],
+        "creationBlock": 120295564,
+        "base": {
+          "token": {
+            "address": "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58",
+            "symbol": "USDT",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0xecef79e109e997bca29c1c0897ec9d7b03647f5e",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x443ea0340cb75a160f31a440722dec7b5bc3c2e9",
+          "token": {
+            "address": "0x7e7d4467112689329f7e06571ed0e8cbad4910ee",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xe1011160d78a80e2eebd60c228eef7af4dfcd4d7",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "optimism-mainnet",
+        "chainId": 10,
+        "testnet": false,
+        "address": "0xe36a30d249f7761327fd973001a32010b521b6fd",
+        "displayName": "cWETHv3",
+        "aliases": [
+          "01-weth",
+          "cWETHv3"
+        ],
+        "creationBlock": 122730232,
+        "base": {
+          "token": {
+            "address": "0x4200000000000000000000000000000000000006",
+            "symbol": "WETH",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x0be923b1716115d742e35fa359d415598c50510f",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0x13e3ee699d1909e989722e753853ae30b17e08c5",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x443ea0340cb75a160f31a440722dec7b5bc3c2e9",
+          "token": {
+            "address": "0x7e7d4467112689329f7e06571ed0e8cbad4910ee",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xe1011160d78a80e2eebd60c228eef7af4dfcd4d7",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "optimism-goerli",
+        "chainId": 420,
+        "testnet": true,
+        "address": "0xb8f2f9c84ced7bbccc1db6fb7bb1f19a9a4adff4",
+        "displayName": null,
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 7612463,
+        "base": {
+          "token": {
+            "address": "0x7e07e15d2a87a24492740d16f5bdf58c16db0c4e",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x2636b223652d388721a0ed2861792da9062d8c73",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0xbe60803049ca4aea3b75e4238d664aebcddd0773",
+          "token": {
+            "address": "0x6af3cb766d6cd37449bfd321d961a61b0515c1bc",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x2636b223652d388721a0ed2861792da9062d8c73",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "base-goerli",
+        "chainId": 84531,
+        "testnet": true,
+        "address": "0xe78fc55c884704f9485eda042fb91bfe16fd55c1",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 5225816,
+        "base": {
+          "token": {
+            "address": "0x31d3a7711a74b4ec970f50c3eaf1ee47ba803a95",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0xb85765935b4d9ab6f841c9a00690da5f34368bc0",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x0818165c053d325985d87f4b8646b3062c72c385",
+          "token": {
+            "address": "0xa29b548056c3fd0f68bad9d4829ec4e66f22f796",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xb85765935b4d9ab6f841c9a00690da5f34368bc0",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "base-goerli",
+        "chainId": 84531,
+        "testnet": true,
+        "address": "0xed94f3052638620fe226a9661ead6a39c2a265be",
+        "displayName": null,
+        "aliases": [
+          "01-weth",
+          "cWETHv3"
+        ],
+        "creationBlock": 5394626,
+        "base": {
+          "token": {
+            "address": "0x4200000000000000000000000000000000000006",
+            "symbol": "WETH",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x22738a450dda849beddfca219739a5d72dfb3ec6",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0xcd2a119bd1f7df95d706de6f2057fdd45a0503e2",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x0818165c053d325985d87f4b8646b3062c72c385",
+          "token": {
+            "address": "0xa29b548056c3fd0f68bad9d4829ec4e66f22f796",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xb85765935b4d9ab6f841c9a00690da5f34368bc0",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "base-mainnet",
+        "chainId": 8453,
+        "testnet": false,
+        "address": "0x46e6b214b524310239732d51387075e0e70970bf",
+        "displayName": "cWETHv3",
+        "aliases": [
+          "default",
+          "cWETHv3"
+        ],
+        "creationBlock": 2495303,
+        "base": {
+          "token": {
+            "address": "0x4200000000000000000000000000000000000006",
+            "symbol": "WETH",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x9f485610e26b9c0140439f88dc0c7742903bd1cf",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1",
+          "token": {
+            "address": "0x9e1028f5f1d5ede59748ffcee5532509976840e0",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x9dda783de64a9d1a60c49ca761ebe528c35ba428",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "base-mainnet",
+        "chainId": 8453,
+        "testnet": false,
+        "address": "0xb125e6687d4313864e53df431d5425969c15eb2f",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "default",
+          "cUSDCv3"
+        ],
+        "creationBlock": 11699480,
+        "base": {
+          "token": {
+            "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1",
+          "token": {
+            "address": "0x9e1028f5f1d5ede59748ffcee5532509976840e0",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x9dda783de64a9d1a60c49ca761ebe528c35ba428",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "base-mainnet",
+        "chainId": 8453,
+        "testnet": false,
+        "address": "0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf",
+        "displayName": "cUSDbCv3",
+        "aliases": [
+          "default",
+          "cUSDbCv3"
+        ],
+        "creationBlock": 2197588,
+        "base": {
+          "token": {
+            "address": "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
+            "symbol": "USDbC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1",
+          "token": {
+            "address": "0x9e1028f5f1d5ede59748ffcee5532509976840e0",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x9dda783de64a9d1a60c49ca761ebe528c35ba428",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "base-mainnet",
+        "chainId": 8453,
+        "testnet": false,
+        "address": "0x784efeb622244d2348d4f2522f8860b96fbece89",
+        "displayName": "cAEROv3",
+        "aliases": [
+          "cAEROv3"
+        ],
+        "creationBlock": 20852405,
+        "base": {
+          "token": {
+            "address": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+            "symbol": "AERO",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0x4ec5970fc728c5f65ba413992cd5ff6fd70fcff0",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1",
+          "token": {
+            "address": "0x9e1028f5f1d5ede59748ffcee5532509976840e0",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x9dda783de64a9d1a60c49ca761ebe528c35ba428",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "base-mainnet",
+        "chainId": 8453,
+        "testnet": false,
+        "address": "0x2c776041ccfe903071af44aa147368a9c8eea518",
+        "displayName": "cUSDSv3",
+        "aliases": [
+          "01-usds",
+          "cUSDSv3"
+        ],
+        "creationBlock": 26046502,
+        "base": {
+          "token": {
+            "address": "0x820c137fa70c8691f0e44dc420a5e53c168921dc",
+            "symbol": "USDS",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x2330aae3bca5f05169d5f4597964d44522f62930",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1",
+          "token": {
+            "address": "0x9e1028f5f1d5ede59748ffcee5532509976840e0",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x9dda783de64a9d1a60c49ca761ebe528c35ba428",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "linea-goerli",
+        "chainId": 59140,
+        "testnet": true,
+        "address": "0xa84b24a43ba1890a165f94ad13d0196e5fd1023a",
+        "displayName": null,
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 928259,
+        "base": {
+          "token": {
+            "address": "0xf56dc6695cf1f5c364edebc7dc7077ac9b586068",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0xcb81fffa91cd5f3436318d25057c1d5df8e23f95",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x44411c605eb7e009cad03f3847cfbbfcf8895130",
+          "token": {
+            "address": "0xab3134fa5edfb3dc64aa790e8bb6448117d18fe9",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x68169ed3fbea61ee3c1631b5c696cac10c147232",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "scroll-mainnet",
+        "chainId": 534352,
+        "testnet": false,
+        "address": "0xb2f97c1bd3bf02f5e74d13f02e3e26f93d77ce44",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 3397674,
+        "base": {
+          "token": {
+            "address": "0x06efdbff2a14a7c8e15944d1f4a48f9f95f663a4",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x43d12fb3afcad5347fa764eeab105478337b7200",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x70167d30964cbfdc315ecae02441af747be0c5ee",
+          "token": {
+            "address": "0x643e160a3c3e2b7eae198f0beb1bfd2441450e86",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x43d12fb3afcad5347fa764eeab105478337b7200",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "mantle-mainnet",
+        "chainId": 5000,
+        "testnet": false,
+        "address": "0x606174f62cd968d8e684c645080fa694c1d7786e",
+        "displayName": "cUSDev3",
+        "aliases": [
+          "01-usde",
+          "cUSDev3"
+        ],
+        "creationBlock": 70789050,
+        "base": {
+          "token": {
+            "address": "0x5d3a1ff2b6bab83b63cd9ad0787074081a52ef34",
+            "symbol": "USDe",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xc49e06b50fca57751155da78803dca691afcdb22",
+            "decimals": 18
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0xcd83cbbfce149d141a5171c3d6a0f0fccee225ab",
+          "token": {
+            "address": "0x52b7d8851d6ccbc6342ba0855be65f7b82a3f17f",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x0cd478875450bcdc75e16ff6084af3a4782610b9",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "linea-mainnet",
+        "chainId": 59144,
+        "testnet": false,
+        "address": "0x8d38a3d6b3c3b7d96d6536da7eef94a9d7dbc991",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 15197719,
+        "base": {
+          "token": {
+            "address": "0x176211869ca2b568f2a7d4ee941e073a821ee1ff",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0xaadaa473c1bdf7317ec07c915680af29debfdcb5",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x2c7118c4c88b9841fcf839074c26ae8f035f2921",
+          "token": {
+            "address": "0x0ece76334fb560f2b1a49a60e38cf726b02203f0",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xc0068a2f7e4847df9c3a34b27ccc07b7e15e0458",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "linea-mainnet",
+        "chainId": 59144,
+        "testnet": false,
+        "address": "0x60f2058379716a64a7a5d29219397e79bc552194",
+        "displayName": "cWETHv3",
+        "aliases": [
+          "01-weth",
+          "cWETHv3"
+        ],
+        "creationBlock": 20601032,
+        "base": {
+          "token": {
+            "address": "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f",
+            "symbol": "WETH",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xc4a9fff2152fe11fbb40f059100ce1271a330c51",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0x3c6cd9cc7c7a4c2cf5a82734cd249d7d593354da",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x2c7118c4c88b9841fcf839074c26ae8f035f2921",
+          "token": {
+            "address": "0x0ece76334fb560f2b1a49a60e38cf726b02203f0",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x6af327313876ef9a5d342105747ebf3aa2543547",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "unichain-mainnet",
+        "chainId": 130,
+        "testnet": false,
+        "address": "0x2c7118c4c88b9841fcf839074c26ae8f035f2921",
+        "displayName": "cUSDCv3",
+        "aliases": [
+          "01-usdc",
+          "cUSDCv3"
+        ],
+        "creationBlock": 9170496,
+        "base": {
+          "token": {
+            "address": "0x078d782b760474a361dda0af3839290b0ef57ad6",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x1f71901daf98d70b4baf40de080321e5c2676856",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x6f7d514bbd4aff3bcd1140b7344b32f063dee486",
+          "token": {
+            "address": "0xdf78e4f0a8279942ca68046476919a90f2288656",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xb81131b6368b3f0a83af09db4e39ac23da96c2db",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "unichain-mainnet",
+        "chainId": 130,
+        "testnet": false,
+        "address": "0x6c987dde50db1dcdd32cd4175778c2a291978e2a",
+        "displayName": "cWETHv3",
+        "aliases": [
+          "01-weth",
+          "cWETHv3"
+        ],
+        "creationBlock": 15416769,
+        "base": {
+          "token": {
+            "address": "0x4200000000000000000000000000000000000006",
+            "symbol": "WETH",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x3c30b5a5a04656565686f800481580ac4e7ed178",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0xe8d9fbc10e00ecc9f0694617075fdaf657a76fb2",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x6f7d514bbd4aff3bcd1140b7344b32f063dee486",
+          "token": {
+            "address": "0xdf78e4f0a8279942ca68046476919a90f2288656",
+            "symbol": "COMP",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xb81131b6368b3f0a83af09db4e39ac23da96c2db",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "ronin-mainnet",
+        "chainId": 2020,
+        "testnet": false,
+        "address": "0x4006ed4097ee51c09a04c3b0951d28ccf19e6dfe",
+        "displayName": "cWETHv3",
+        "aliases": [
+          "01-weth",
+          "cWETHv3"
+        ],
+        "creationBlock": 43343876,
+        "base": {
+          "token": {
+            "address": "0xc99a6a985ed2cac1ef41640596c5a5f9f4e19ef5",
+            "symbol": "WETH",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0x8ac2b57d15c84755a3333ad68025d2496ae3bebd",
+            "decimals": 8
+          },
+          "usdPriceFeed": {
+            "address": "0x5d173813b4505701e79e654b36a95e6c1fad4448",
+            "decimals": 8
+          }
+        },
+        "rewards": {
+          "contract": "0x31cdee8609bc15fd33cc525f101b70a81b2b1e59",
+          "token": {
+            "address": "0x0b7007c13325c48911f73a2dad5fa5dcbf808adc",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x5d173813b4505701e79e654b36a95e6c1fad4448",
+            "decimals": 8
+          }
+        }
+      },
+      {
+        "network": "ronin-mainnet",
+        "chainId": 2020,
+        "testnet": false,
+        "address": "0xc0afdbd1ceb621ef576ba969ce9d4cef78dbc0c0",
+        "displayName": "cWRONv3",
+        "aliases": [
+          "01-wron",
+          "cWRONv3"
+        ],
+        "creationBlock": 44084652,
+        "base": {
+          "token": {
+            "address": "0xe514d9deb7966c8be0ca922de8a064264ea6bcd4",
+            "symbol": "WRON",
+            "decimals": 18
+          },
+          "priceFeed": {
+            "address": "0xb88e4078aac88f10c0ca71086ddcf512ec54498a",
+            "decimals": 8
+          },
+          "usdPriceFeed": null
+        },
+        "rewards": {
+          "contract": "0x31cdee8609bc15fd33cc525f101b70a81b2b1e59",
+          "token": {
+            "address": "0x0b7007c13325c48911f73a2dad5fa5dcbf808adc",
+            "symbol": "USDC",
+            "decimals": 6
+          },
+          "priceFeed": {
+            "address": "0x5d173813b4505701e79e654b36a95e6c1fad4448",
+            "decimals": 8
+          }
+        }
+      }
+    ],
+    "rules": {
+      "assetPriceOverrides": {
+        "source": "c3-api/lib/computations/comet/asset-price.ts",
+        "defaultFeedDecimalsAssumption": 8,
+        "entries": [
+          {
+            "network": "ethereum-mainnet",
+            "priceFeed": "0xe3a409ed15cd53afdefdd191ad945cec528a2496",
+            "behavior": "zero",
+            "note": "deprecated wUSDM feed"
+          },
+          {
+            "network": "ethereum-mainnet",
+            "priceFeed": "0x351a133fd850ea81ed8a782016e308acbaddec91",
+            "behavior": "fixed",
+            "value": "102447384",
+            "decimals": 8,
+            "note": "deprecated pumpBTC/BTC feed, cWBTCv3 collateral; last answer 2026-09-03"
+          },
+          {
+            "network": "arbitrum-mainnet",
+            "priceFeed": "0x13cdfb7db5e2f58e122b2e789b59de13645349c4",
+            "behavior": "zero",
+            "note": "deprecated wUSDM feed"
+          },
+          {
+            "network": "optimism-mainnet",
+            "priceFeed": "0x66228d797eb83ecf3465297751f6b1d4d42b7627",
+            "behavior": "zero",
+            "note": "deprecated wUSDM feed"
+          },
+          {
+            "network": "*",
+            "priceFeed": "0x7e86318cc4bc539043f204b39ce0ebed9f0050dc",
+            "behavior": "zero",
+            "note": "intended optimism-mainnet only; operator precedence makes it match any network"
+          }
+        ]
+      },
+      "rewardsBaseUsdFeedBranches": {
+        "source": "c3-api/lib/computations/rewards/{supply,borrow}-rewards-apr.ts",
+        "entries": [
+          {
+            "network": "base-mainnet",
+            "displayName": "cWETHv3",
+            "priceFeedKey": "WETH-USD",
+            "comet": "0x46e6b214b524310239732d51387075e0e70970bf",
+            "priceFeed": "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70"
+          },
+          {
+            "network": "arbitrum-mainnet",
+            "displayName": "cWETHv3",
+            "priceFeedKey": "WETH-USD",
+            "comet": "0x6f7d514bbd4aff3bcd1140b7344b32f063dee486",
+            "priceFeed": "0x639fe6ab55c921f74e7fac1ee960c0b6293ba612"
+          },
+          {
+            "network": "optimism-mainnet",
+            "displayName": "cWETHv3",
+            "priceFeedKey": "WETH-USD",
+            "comet": "0xe36a30d249f7761327fd973001a32010b521b6fd",
+            "priceFeed": "0x13e3ee699d1909e989722e753853ae30b17e08c5"
+          },
+          {
+            "network": "unichain-mainnet",
+            "displayName": "cWETHv3",
+            "priceFeedKey": "WETH-USD",
+            "comet": "0x6c987dde50db1dcdd32cd4175778c2a291978e2a",
+            "priceFeed": "0xe8d9fbc10e00ecc9f0694617075fdaf657a76fb2"
+          },
+          {
+            "network": "ethereum-mainnet",
+            "displayName": "cwstETHv3",
+            "priceFeedKey": "wstETH-USD",
+            "comet": "0x3d0bb1ccab520a66e607822fc55bc921738fafe3",
+            "priceFeed": "0x164b276057258d81941e97b0a900d4c7b358bce0"
+          },
+          {
+            "network": "mantle-mainnet",
+            "displayName": "cUSDev3",
+            "priceFeedKey": "cUSDev3-USD",
+            "comet": "0x606174f62cd968d8e684c645080fa694c1d7786e",
+            "priceFeed": "0xc49e06b50fca57751155da78803dca691afcdb22"
+          },
+          {
+            "network": "ethereum-mainnet",
+            "displayName": "cWBTCv3",
+            "priceFeedKey": "WBTC-USD",
+            "comet": "0xe85dc543813b8c2cfeaac371517b925a166a9293",
+            "priceFeed": "0xf4030086522a5beea4988f8ca5b36dbc97bee88c"
+          }
+        ]
+      },
+      "transactionHistoryStreams": {
+        "source": "c3-api/src/transaction-history-handler/transaction-history-items-handler.ts",
+        "entries": [
+          {
+            "network": "ethereum-mainnet",
+            "markets": [
+              {
+                "displayName": "cUSDCv3",
+                "comet": "0xc3d688b66703497daa19211eedff47f25384cdc3"
+              },
+              {
+                "displayName": "cWETHv3",
+                "comet": "0xa17581a9e3356d9a858b789d68b4d866e593ae94"
+              },
+              {
+                "displayName": "cUSDTv3",
+                "comet": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840"
+              },
+              {
+                "displayName": "ciUSDCv3",
+                "comet": "0x207158a267cbd2598bb3d611d8cbdee2709f2f8c"
+              }
+            ],
+            "rewardsContract": "0x1b0e765f6224c21223aea2af16c1c46e38885a40"
+          },
+          {
+            "network": "polygon-mainnet",
+            "markets": [
+              {
+                "displayName": "cUSDCv3",
+                "comet": "0xf25212e676d1f7f89cd72ffee66158f541246445"
+              }
+            ],
+            "rewardsContract": "0x45939657d1ca34a8fa39a924b71d28fe8431e581"
+          },
+          {
+            "network": "arbitrum-mainnet",
+            "markets": [
+              {
+                "displayName": "cUSDCv3",
+                "comet": "0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf"
+              },
+              {
+                "displayName": "cUSDC.ev3",
+                "comet": "0xa5edbdd9646f8dff606d7448e414884c7d905dca"
+              }
+            ],
+            "rewardsContract": "0x88730d254a2f7e6ac8388c3198afd694ba9f7fae"
+          },
+          {
+            "network": "base-mainnet",
+            "markets": [
+              {
+                "displayName": "cUSDCv3",
+                "comet": "0xb125e6687d4313864e53df431d5425969c15eb2f"
+              },
+              {
+                "displayName": "cUSDbCv3",
+                "comet": "0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf"
+              },
+              {
+                "displayName": "cWETHv3",
+                "comet": "0x46e6b214b524310239732d51387075e0e70970bf"
+              }
+            ],
+            "rewardsContract": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1"
+          },
+          {
+            "network": "optimism-mainnet",
+            "markets": [
+              {
+                "displayName": "cUSDCv3",
+                "comet": "0x2e44e174f7d53f0212823acc11c01a11d58c5bcb"
+              },
+              {
+                "displayName": "cUSDTv3",
+                "comet": "0x995e394b8b2437ac8ce61ee0bc610d617962b214"
+              },
+              {
+                "displayName": "cWETHv3",
+                "comet": "0xe36a30d249f7761327fd973001a32010b521b6fd"
+              }
+            ],
+            "rewardsContract": "0x443ea0340cb75a160f31a440722dec7b5bc3c2e9"
+          },
+          {
+            "network": "ethereum-sepolia",
+            "markets": [
+              {
+                "displayName": "cUSDCv3",
+                "comet": "0xaec1f48e02cfb822be958b68c7957156eb3f0b6e"
+              },
+              {
+                "displayName": "cWETHv3",
+                "comet": "0x2943ac1216979ad8db76d9147f64e61adc126e96"
+              }
+            ],
+            "rewardsContract": "0x8bf5b658bdf0388e8b482ed51b14aef58f90abfd"
+          }
+        ]
+      },
+      "accountRewardsExcludedNetworks": {
+        "source": "c3-api/src/account-handlers/rewards.ts",
+        "networks": [
+          "ronin-mainnet",
+          "scroll-mainnet"
+        ]
+      },
+      "marketRewardsSpecialCase": {
+        "source": "c3-api/lib/computations/market/market-rewards.ts",
+        "networks": [
+          "scroll-mainnet"
+        ],
+        "note": "scroll-mainnet does not have a real rewards contract"
+      }
+    }
+  },
+  "frontend": {
+    "networks": [
+      {
+        "chainId": 1,
+        "key": "mainnet",
+        "name": "Ethereum",
+        "testnet": false,
+        "v3ApiNetworkKey": "mainnet",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Ether",
+          "symbol": "ETH"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0x4c9edd5852cd905f086c759e8383e09bff1e68b3",
+            "address": "0x4c9edd5852cd905f086c759e8383e09bff1e68b3",
+            "symbol": "USDe",
+            "name": "Ethena USDe"
+          },
+          {
+            "tokenAddress": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+            "address": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+            "symbol": "wstETH",
+            "name": "Lido Wrapped Staked ETH"
+          },
+          {
+            "tokenAddress": "0xa1290d69c65a6fe4df752f95823fae25cb99e5a7",
+            "address": "0xa1290d69c65a6fe4df752f95823fae25cb99e5a7",
+            "symbol": "rsETH",
+            "name": "KelpDao Restaked ETH"
+          },
+          {
+            "tokenAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "address": "0x0000000000000000000000000000000000000000",
+            "symbol": "ETH",
+            "name": "Ether"
+          },
+          {
+            "tokenAddress": "0xf1c9acdc66974dfb6decb12aa385b9cd01190e38",
+            "address": "0xf1c9acdc66974dfb6decb12aa385b9cd01190e38",
+            "symbol": "osETH",
+            "name": "StakeWise Staked ETH"
+          },
+          {
+            "tokenAddress": "0xfae103dc9cf190ed75350761e95403b7b8afa6c0",
+            "address": "0xfae103dc9cf190ed75350761e95403b7b8afa6c0",
+            "symbol": "rswETH",
+            "name": "Restaked Swell ETH"
+          }
+        ],
+        "unwrappedCollateralAssets": [
+          {
+            "tokenAddress": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+            "address": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+            "symbol": "stETH",
+            "name": "Lido Staked ETH"
+          }
+        ],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+          "rewards": {
+            "COMP": "0x619db7f74c0061e2917d1d57f834d9d24c5529da"
+          },
+          "otherBaseTokensToUsd": {
+            "wstETH": "0x164b276057258d81941e97b0a900d4c7b358bce0",
+            "WBTC": "0xf4030086522a5beea4988f8ca5b36dbc97bee88c"
+          }
+        }
+      },
+      {
+        "chainId": 10,
+        "key": "op",
+        "name": "Optimism",
+        "testnet": false,
+        "v3ApiNetworkKey": "optimism-mainnet",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Ether",
+          "symbol": "ETH"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0x4200000000000000000000000000000000000006",
+            "address": "0x0000000000000000000000000000000000000000",
+            "symbol": "ETH",
+            "name": "Ether"
+          },
+          {
+            "tokenAddress": "0x87eee96d50fb761ad85b1c982d28a042169d61b1",
+            "address": "0x87eee96d50fb761ad85b1c982d28a042169d61b1",
+            "symbol": "wrsETH",
+            "name": "Wrapped rsETH"
+          }
+        ],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0x13e3ee699d1909e989722e753853ae30b17e08c5",
+          "rewards": {
+            "COMP": "0xa6c8d1c55951e8ac44a0eaa959be5fd21cc07531"
+          },
+          "otherBaseTokensToUsd": {}
+        }
+      },
+      {
+        "chainId": 130,
+        "key": "unichain",
+        "name": "Unichain",
+        "testnet": false,
+        "v3ApiNetworkKey": "unichain-mainnet",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Ether",
+          "symbol": "ETH"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0x4200000000000000000000000000000000000006",
+            "address": "0x0000000000000000000000000000000000000000",
+            "symbol": "ETH",
+            "name": "Ether"
+          }
+        ],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0xe8d9fbc10e00ecc9f0694617075fdaf657a76fb2",
+          "rewards": {
+            "COMP": "0xdf78e4f0a8279942ca68046476919a90f2288656"
+          },
+          "otherBaseTokensToUsd": {}
+        }
+      },
+      {
+        "chainId": 137,
+        "key": "polygon",
+        "name": "Polygon",
+        "testnet": false,
+        "v3ApiNetworkKey": "polygon-mainnet",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Polygon",
+          "symbol": "POL"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270",
+            "address": "0x0000000000000000000000000000000000000000",
+            "symbol": "POL",
+            "name": "Polygon"
+          },
+          {
+            "tokenAddress": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6",
+            "address": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6",
+            "symbol": "WBTC",
+            "name": "Wrapped Bitcoin"
+          },
+          {
+            "tokenAddress": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+            "address": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+            "symbol": "USDC.e",
+            "name": "Bridged USDC"
+          },
+          {
+            "tokenAddress": "0xfa68fb4628dff1028cfec22b4162fccd0d45efb6",
+            "address": "0xfa68fb4628dff1028cfec22b4162fccd0d45efb6",
+            "symbol": "MaticX",
+            "name": "Stader MaticX"
+          }
+        ],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0xab594600376ec9fd91f8e885dadf0ce036862de0",
+          "rewards": {
+            "COMP": "0x2a8758b7257102461bc958279054e372c2b1bde6"
+          },
+          "otherBaseTokensToUsd": {}
+        }
+      },
+      {
+        "chainId": 2020,
+        "key": "ronin",
+        "name": "Ronin",
+        "testnet": false,
+        "v3ApiNetworkKey": "ronin-mainnet",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Ronin",
+          "symbol": "RON"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0xe514d9deb7966c8be0ca922de8a064264ea6bcd4",
+            "address": "0xe514d9deb7966c8be0ca922de8a064264ea6bcd4",
+            "symbol": "RON",
+            "name": "Ronin"
+          }
+        ],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0x0b6074f21488b95945989e513efea070096d931d",
+          "rewards": {
+            "COMP": "0x0b6074f21488b95945989e513efea070096d931d"
+          },
+          "otherBaseTokensToUsd": {
+            "WETH": "0x662fdb0e7d95d89cd3458e4a3506296e48bb1f44"
+          }
+        }
+      },
+      {
+        "chainId": 5000,
+        "key": "mantle",
+        "name": "Mantle",
+        "testnet": false,
+        "v3ApiNetworkKey": "mantle-mainnet",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Mantle",
+          "symbol": "MNT"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0xc96de26018a54d51c097160568752c4e3bd6c364",
+            "address": "0xc96de26018a54d51c097160568752c4e3bd6c364",
+            "symbol": "FBTC",
+            "name": "FunctionBTC"
+          },
+          {
+            "tokenAddress": "0xdeaddeaddeaddeaddeaddeaddeaddeaddead1111",
+            "address": "0x0000000000000000000000000000000000000000",
+            "symbol": "ETH",
+            "name": "Ether"
+          }
+        ],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0xc49e06b50fca57751155da78803dca691afcdb22",
+          "rewards": {
+            "COMP": "0x0cd478875450bcdc75e16ff6084af3a4782610b9"
+          },
+          "otherBaseTokensToUsd": {}
+        }
+      },
+      {
+        "chainId": 8453,
+        "key": "basemainnet",
+        "name": "Base",
+        "testnet": false,
+        "v3ApiNetworkKey": "base-mainnet",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Ether",
+          "symbol": "ETH"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0x4200000000000000000000000000000000000006",
+            "address": "0x0000000000000000000000000000000000000000",
+            "symbol": "ETH",
+            "name": "Ether"
+          },
+          {
+            "tokenAddress": "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
+            "address": "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
+            "symbol": "USDbC",
+            "name": "Bridged USDC"
+          },
+          {
+            "tokenAddress": "0xedfa23602d0ec14714057867a78d01e94176bea0",
+            "address": "0xedfa23602d0ec14714057867a78d01e94176bea0",
+            "symbol": "wrsETH",
+            "name": "Wrapped rsETH"
+          }
+        ],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70",
+          "rewards": {
+            "COMP": "0x9dda783de64a9d1a60c49ca761ebe528c35ba428"
+          },
+          "otherBaseTokensToUsd": {}
+        }
+      },
+      {
+        "chainId": 42161,
+        "key": "arb",
+        "name": "Arbitrum",
+        "testnet": false,
+        "v3ApiNetworkKey": "arbitrum-mainnet",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Ether",
+          "symbol": "ETH"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f",
+            "address": "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f",
+            "symbol": "WBTC",
+            "name": "Wrapped Bitcoin"
+          },
+          {
+            "tokenAddress": "0x5979d7b546e38e414f7e9822514be443a4800529",
+            "address": "0x5979d7b546e38e414f7e9822514be443a4800529",
+            "symbol": "wstETH",
+            "name": "Lido Wrapped Staked ETH"
+          },
+          {
+            "tokenAddress": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            "address": "0x0000000000000000000000000000000000000000",
+            "symbol": "ETH",
+            "name": "Ether"
+          },
+          {
+            "tokenAddress": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+            "address": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+            "symbol": "USDC.e",
+            "name": "Bridged USDC"
+          }
+        ],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0x639fe6ab55c921f74e7fac1ee960c0b6293ba612",
+          "rewards": {
+            "COMP": "0xe7c53ffd03eb6cef7d208bc4c13446c76d1e5884"
+          },
+          "otherBaseTokensToUsd": {}
+        }
+      },
+      {
+        "chainId": 43113,
+        "key": "fuji",
+        "name": "Avalanche Fuji",
+        "testnet": true,
+        "v3ApiNetworkKey": "fuji",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Avax",
+          "symbol": "AVAX"
+        },
+        "assetOverrides": [],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": null,
+          "rewards": {},
+          "otherBaseTokensToUsd": {}
+        }
+      },
+      {
+        "chainId": 43114,
+        "key": "Avax",
+        "name": "Avalanche",
+        "testnet": true,
+        "v3ApiNetworkKey": "Avax",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Avax",
+          "symbol": "AVAX"
+        },
+        "assetOverrides": [],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": null,
+          "rewards": {},
+          "otherBaseTokensToUsd": {}
+        }
+      },
+      {
+        "chainId": 59144,
+        "key": "linea",
+        "name": "Linea",
+        "testnet": false,
+        "v3ApiNetworkKey": "linea-mainnet",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Ether",
+          "symbol": "ETH"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f",
+            "address": "0x0000000000000000000000000000000000000000",
+            "symbol": "ETH",
+            "name": "Ether"
+          }
+        ],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0x3c6cd9cc7c7a4c2cf5a82734cd249d7d593354da",
+          "rewards": {
+            "COMP": "0x0ece76334fb560f2b1a49a60e38cf726b02203f0"
+          },
+          "otherBaseTokensToUsd": {}
+        }
+      },
+      {
+        "chainId": 534352,
+        "key": "scroll",
+        "name": "Scroll",
+        "testnet": false,
+        "v3ApiNetworkKey": "scroll-mainnet",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Ether",
+          "symbol": "ETH"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0x06efdbff2a14a7c8e15944d1f4a48f9f95f663a4",
+            "address": "0x06efdbff2a14a7c8e15944d1f4a48f9f95f663a4",
+            "symbol": "USDC",
+            "name": "USDC"
+          },
+          {
+            "tokenAddress": "0x5300000000000000000000000000000000000004",
+            "address": "0x0000000000000000000000000000000000000000",
+            "symbol": "ETH",
+            "name": "Ether"
+          },
+          {
+            "tokenAddress": "0xf610a9dfb7c89644979b4a0f27063e9e7d7cda32",
+            "address": "0xf610a9dfb7c89644979b4a0f27063e9e7d7cda32",
+            "symbol": "wstETH",
+            "name": "Lido Wrapped Staked ETH"
+          }
+        ],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0x43d12fb3afcad5347fa764eeab105478337b7200",
+          "rewards": {
+            "COMP": "0x643e160a3c3e2b7eae198f0beb1bfd2441450e86"
+          },
+          "otherBaseTokensToUsd": {}
+        }
+      },
+      {
+        "chainId": 11155111,
+        "key": "sepolia",
+        "name": "Sepolia",
+        "testnet": true,
+        "v3ApiNetworkKey": "sepolia",
+        "nativeToken": {
+          "decimals": 18,
+          "name": "Ether",
+          "symbol": "ETH"
+        },
+        "assetOverrides": [
+          {
+            "tokenAddress": "0x7b79995e5f793a07bc00c21412e50ecae098e7f9",
+            "address": "0x0000000000000000000000000000000000000000",
+            "symbol": "ETH",
+            "name": "Ether"
+          },
+          {
+            "tokenAddress": "0xb82381a3fbd3fafa77b3a7be693342618240067b",
+            "address": "0xb82381a3fbd3fafa77b3a7be693342618240067b",
+            "symbol": "wstETH",
+            "name": "Lido Wrapped Staked ETH"
+          }
+        ],
+        "unwrappedCollateralAssets": [],
+        "extraPriceFeeds": {
+          "nativeTokenToUsd": "0x694aa1769357215de4fac081bf1f309adc325306",
+          "rewards": {
+            "COMP": "0x619db7f74c0061e2917d1d57f834d9d24c5529da"
+          },
+          "otherBaseTokensToUsd": {}
+        }
+      }
+    ],
+    "markets": [
+      {
+        "sortOrder": 0,
+        "chainId": 1,
+        "upstreamNetworkKey": "mainnet",
+        "deploymentKey": "usdc",
+        "displaySymbol": "USDC",
+        "displayName": "USD Coin",
+        "isWrapped": false,
+        "isDefault": true,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "arbitrumInbox": "0x4dbd4fc535ac27206064b68ffcf827b0a60bab3f",
+          "arbitrumL1GatewayRouter": "0x72ce9c846789fdb6fc1f34ac4ad25dd9ef7031ef",
+          "baseL1CrossDomainMessenger": "0x866e82a600a1414e583f7f13623f1ac5d58b0afa",
+          "baseL1StandardBridge": "0x3154cf16ccdb4c6d922629664174b904d80f2c35",
+          "baseL1USDSBridge": "0xa5874756416fa632257eea380cabd2e87ced352a",
+          "bulker": "0xa397a8c2086c554b531c02e29f3291c9704b00c7",
+          "CCTPMessageTransmitter": "0x0a992d191deec32afe36203ad87d7d289a738f81",
+          "CCTPTokenMessenger": "0xbd3fa81b58ba92a82136038b25adec7066af3155",
+          "comet": "0xc3d688b66703497daa19211eedff47f25384cdc3",
+          "comptrollerV2": "0x3d9819210a31b4961b30ef54be2aed79b9c9cd3b",
+          "configurator": "0x316f9708bb98af7da9c68c1c3b5e79039cd336e3",
+          "fxRoot": "0xfe5e5d361b2ad62c541bab87c45a0b9b018389a2",
+          "l1CCIPRouter": "0x80226fc0ee2b096224eeac085bb9a8cba1146f7d",
+          "l1TokenAdminRegistry": "0xb22764f98dd05c789929716d677382df22c05cb6",
+          "lineaL1TokenBridge": "0x051f1d88f0af5763fb888ec4378b4d8b29ea3319",
+          "lineaL1USDCBridge": "0x504a330327a089d8364c4ab3811ee26976d388ce",
+          "lineaMessageService": "0xd19d4b5d358258f05d7b411e21a1460d11b0876f",
+          "mantleL1CrossDomainMessenger": "0x676a795fe6e43c17c668de16730c3f690feb7120",
+          "mantleL1StandardBridge": "0x95fc37a27a2f68e3a647cdc081f0a89bb47c3012",
+          "opL1CrossDomainMessenger": "0x25ace71c97b33cc4729cf772ae268934f7ab5fa1",
+          "opL1StandardBridge": "0x99c9fc46f92e8a1c0dec1b1747d010903e884be1",
+          "rewards": "0x1b0e765f6224c21223aea2af16c1c46e38885a40",
+          "roninl1CCIPOnRamp": "0xdc5b578ff3afcc4a4a6e149892b9472390b50844",
+          "roninl1NativeBridge": "0x64192819ac13ef72bf6b5ae239ac672b43a9af08",
+          "scrollL1USDCGateway": "0xf1af3b23de0a5ca3cab7261cb0061c0d779a5c7b",
+          "scrollMessenger": "0x6774bcbd5cecef1336b5300fb5186a12ddd8b367",
+          "unichainL1CrossDomainMessenger": "0x9a3d64e386c18cb1d6d5179a9596a4b5736e98a6",
+          "unichainL1StandardBridge": "0x81014f44b0a345033bb2b3b21c7a1a308b35feea"
+        }
+      },
+      {
+        "sortOrder": 1,
+        "chainId": 1,
+        "upstreamNetworkKey": "mainnet",
+        "deploymentKey": "weth",
+        "displaySymbol": "ETH",
+        "displayName": "Ether",
+        "isWrapped": true,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bulker": "0xa397a8c2086c554b531c02e29f3291c9704b00c7",
+          "comet": "0xa17581a9e3356d9a858b789d68b4d866e593ae94",
+          "configurator": "0x316f9708bb98af7da9c68c1c3b5e79039cd336e3",
+          "rewards": "0x1b0e765f6224c21223aea2af16c1c46e38885a40"
+        }
+      },
+      {
+        "sortOrder": 2,
+        "chainId": 1,
+        "upstreamNetworkKey": "mainnet",
+        "deploymentKey": "usdt",
+        "displaySymbol": "USDT",
+        "displayName": "Tether",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": true,
+        "roots": {
+          "bulker": "0xa397a8c2086c554b531c02e29f3291c9704b00c7",
+          "comet": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840",
+          "COMP": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+          "configurator": "0x316f9708bb98af7da9c68c1c3b5e79039cd336e3",
+          "rewards": "0x1b0e765f6224c21223aea2af16c1c46e38885a40"
+        }
+      },
+      {
+        "sortOrder": 3,
+        "chainId": 1,
+        "upstreamNetworkKey": "mainnet",
+        "deploymentKey": "wsteth",
+        "displaySymbol": "wstETH",
+        "displayName": "Lido Wrapped Staked ETH",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bulker": "0x2c776041ccfe903071af44aa147368a9c8eea518",
+          "comet": "0x3d0bb1ccab520a66e607822fc55bc921738fafe3",
+          "configurator": "0x316f9708bb98af7da9c68c1c3b5e79039cd336e3",
+          "rewards": "0x1b0e765f6224c21223aea2af16c1c46e38885a40"
+        }
+      },
+      {
+        "sortOrder": 4,
+        "chainId": 1,
+        "upstreamNetworkKey": "mainnet",
+        "deploymentKey": "usds",
+        "displaySymbol": "USDS",
+        "displayName": "USDS",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bulker": "0xa397a8c2086c554b531c02e29f3291c9704b00c7",
+          "comet": "0x5d409e56d886231adaf00c8775665ad0f9897b56",
+          "COMP": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+          "configurator": "0x316f9708bb98af7da9c68c1c3b5e79039cd336e3",
+          "rewards": "0x1b0e765f6224c21223aea2af16c1c46e38885a40"
+        }
+      },
+      {
+        "sortOrder": 5,
+        "chainId": 1,
+        "upstreamNetworkKey": "mainnet",
+        "deploymentKey": "wbtc",
+        "displaySymbol": "WBTC",
+        "displayName": "Wrapped BTC",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bulker": "0xa397a8c2086c554b531c02e29f3291c9704b00c7",
+          "comet": "0xe85dc543813b8c2cfeaac371517b925a166a9293",
+          "cometFactory": "0x1fa408992e74a42d1787e28b880c451452e8c958",
+          "COMP": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+          "configurator": "0x316f9708bb98af7da9c68c1c3b5e79039cd336e3",
+          "rewards": "0x1b0e765f6224c21223aea2af16c1c46e38885a40"
+        }
+      },
+      {
+        "sortOrder": 6,
+        "chainId": 137,
+        "upstreamNetworkKey": "polygon",
+        "deploymentKey": "usdc",
+        "displaySymbol": "USDC.e",
+        "displayName": "USD Coin (Bridged)",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x18281dfc4d00905da1aaa6731414eaba843c468a",
+          "bulker": "0x59e242d352ae13166b4987ae5c990c232f7f7cd6",
+          "comet": "0xf25212e676d1f7f89cd72ffee66158f541246445",
+          "configurator": "0x83e0f742cacbe66349e3701b171ee2487a26e738",
+          "fxChild": "0x8397259c983751daf40400790063935a11afa28a",
+          "rewards": "0x45939657d1ca34a8fa39a924b71d28fe8431e581"
+        }
+      },
+      {
+        "sortOrder": 7,
+        "chainId": 137,
+        "upstreamNetworkKey": "polygon",
+        "deploymentKey": "usdt",
+        "displaySymbol": "USDT0",
+        "displayName": "Tether",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x18281dfc4d00905da1aaa6731414eaba843c468a",
+          "bulker": "0x59e242d352ae13166b4987ae5c990c232f7f7cd6",
+          "comet": "0xaeb318360f27748acb200ce616e389a6c9409a07",
+          "COMP": "0x8505b9d2254a7ae468c0e9dd10ccea3a837aef5c",
+          "configurator": "0x83e0f742cacbe66349e3701b171ee2487a26e738",
+          "fxChild": "0x8397259c983751daf40400790063935a11afa28a",
+          "rewards": "0x45939657d1ca34a8fa39a924b71d28fe8431e581"
+        }
+      },
+      {
+        "sortOrder": 8,
+        "chainId": 42161,
+        "upstreamNetworkKey": "arbitrum",
+        "deploymentKey": "usdc",
+        "displaySymbol": "USDC",
+        "displayName": "USD Coin",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": true,
+        "roots": {
+          "bridgeReceiver": "0x42480c37b249e33aabaf4c22b20235656bd38068",
+          "bulker": "0xbde8f31d2ddda895264e27dd990fab3dc87b372d",
+          "CCTPMessageTransmitter": "0xc30362313fbba5cf9163f0bb16a0e01f01a896ca",
+          "comet": "0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf",
+          "configurator": "0xb21b06d71c75973babde35b49ffdac3f82ad3775",
+          "rewards": "0x88730d254a2f7e6ac8388c3198afd694ba9f7fae"
+        }
+      },
+      {
+        "sortOrder": 9,
+        "chainId": 42161,
+        "upstreamNetworkKey": "arbitrum",
+        "deploymentKey": "usdc.e",
+        "displaySymbol": "USDC.e",
+        "displayName": "USD Coin (Bridged)",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x42480c37b249e33aabaf4c22b20235656bd38068",
+          "bulker": "0xbde8f31d2ddda895264e27dd990fab3dc87b372d",
+          "comet": "0xa5edbdd9646f8dff606d7448e414884c7d905dca",
+          "configurator": "0xb21b06d71c75973babde35b49ffdac3f82ad3775",
+          "rewards": "0x88730d254a2f7e6ac8388c3198afd694ba9f7fae"
+        }
+      },
+      {
+        "sortOrder": 10,
+        "chainId": 42161,
+        "upstreamNetworkKey": "arbitrum",
+        "deploymentKey": "weth",
+        "displaySymbol": "ETH",
+        "displayName": "Ether",
+        "isWrapped": true,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x42480c37b249e33aabaf4c22b20235656bd38068",
+          "bulker": "0xbde8f31d2ddda895264e27dd990fab3dc87b372d",
+          "comet": "0x6f7d514bbd4aff3bcd1140b7344b32f063dee486",
+          "COMP": "0x354a6da3fcde098f8389cad84b0182725c6c91de",
+          "configurator": "0xb21b06d71c75973babde35b49ffdac3f82ad3775",
+          "rewards": "0x88730d254a2f7e6ac8388c3198afd694ba9f7fae"
+        }
+      },
+      {
+        "sortOrder": 11,
+        "chainId": 42161,
+        "upstreamNetworkKey": "arbitrum",
+        "deploymentKey": "usdt",
+        "displaySymbol": "USD₮0",
+        "displayName": "Tether",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x42480c37b249e33aabaf4c22b20235656bd38068",
+          "bulker": "0xbde8f31d2ddda895264e27dd990fab3dc87b372d",
+          "comet": "0xd98be00b5d27fc98112bde293e487f8d4ca57d07",
+          "COMP": "0x354a6da3fcde098f8389cad84b0182725c6c91de",
+          "configurator": "0xb21b06d71c75973babde35b49ffdac3f82ad3775",
+          "rewards": "0x88730d254a2f7e6ac8388c3198afd694ba9f7fae"
+        }
+      },
+      {
+        "sortOrder": 12,
+        "chainId": 11155111,
+        "upstreamNetworkKey": "sepolia",
+        "deploymentKey": "usdc",
+        "displaySymbol": "USDC",
+        "displayName": "USD Coin",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bulker": "0x157c001bb1f8b33743b14483be111c961d8e11de",
+          "comet": "0xaec1f48e02cfb822be958b68c7957156eb3f0b6e",
+          "configurator": "0xc28ad44975c614eabe0ed090207314549e1c6624",
+          "fauceteer": "0x68793ea49297eb75dfb4610b68e076d2a5c7646c",
+          "rewards": "0x8bf5b658bdf0388e8b482ed51b14aef58f90abfd"
+        }
+      },
+      {
+        "sortOrder": 13,
+        "chainId": 11155111,
+        "upstreamNetworkKey": "sepolia",
+        "deploymentKey": "weth",
+        "displaySymbol": "ETH",
+        "displayName": "Ether",
+        "isWrapped": true,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bulker": "0xad0c044425d81a2e223f4ce699156900fead2aaa",
+          "comet": "0x2943ac1216979ad8db76d9147f64e61adc126e96",
+          "configurator": "0xc28ad44975c614eabe0ed090207314549e1c6624",
+          "fauceteer": "0x68793ea49297eb75dfb4610b68e076d2a5c7646c",
+          "rewards": "0x8bf5b658bdf0388e8b482ed51b14aef58f90abfd"
+        }
+      },
+      {
+        "sortOrder": 14,
+        "chainId": 10,
+        "upstreamNetworkKey": "optimism",
+        "deploymentKey": "usdc",
+        "displaySymbol": "USDC",
+        "displayName": "USD Coin",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": true,
+        "roots": {
+          "bridgeReceiver": "0xc3a73a70d1577cd5b02da0ba91c0afc8fa434daf",
+          "bulker": "0xcb3643cc8294b23171272845473dec49739d4ba3",
+          "CCTPMessageTransmitter": "0x4d41f22c5a0e5c74090899e5a8fb597a8842b3e8",
+          "comet": "0x2e44e174f7d53f0212823acc11c01a11d58c5bcb",
+          "configurator": "0x84e93ec6170ed630f5ebd89a1aae72d4f63f2713",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "rewards": "0x443ea0340cb75a160f31a440722dec7b5bc3c2e9"
+        }
+      },
+      {
+        "sortOrder": 15,
+        "chainId": 10,
+        "upstreamNetworkKey": "optimism",
+        "deploymentKey": "usdt",
+        "displaySymbol": "USDT",
+        "displayName": "Tether",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": true,
+        "roots": {
+          "bridgeReceiver": "0xc3a73a70d1577cd5b02da0ba91c0afc8fa434daf",
+          "bulker": "0xcb3643cc8294b23171272845473dec49739d4ba3",
+          "CCTPMessageTransmitter": "0x4d41f22c5a0e5c74090899e5a8fb597a8842b3e8",
+          "comet": "0x995e394b8b2437ac8ce61ee0bc610d617962b214",
+          "COMP": "0x7e7d4467112689329f7e06571ed0e8cbad4910ee",
+          "configurator": "0x84e93ec6170ed630f5ebd89a1aae72d4f63f2713",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "rewards": "0x443ea0340cb75a160f31a440722dec7b5bc3c2e9"
+        }
+      },
+      {
+        "sortOrder": 16,
+        "chainId": 10,
+        "upstreamNetworkKey": "optimism",
+        "deploymentKey": "weth",
+        "displaySymbol": "ETH",
+        "displayName": "Ether",
+        "isWrapped": true,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0xc3a73a70d1577cd5b02da0ba91c0afc8fa434daf",
+          "bulker": "0xcb3643cc8294b23171272845473dec49739d4ba3",
+          "comet": "0xe36a30d249f7761327fd973001a32010b521b6fd",
+          "COMP": "0x7e7d4467112689329f7e06571ed0e8cbad4910ee",
+          "configurator": "0x84e93ec6170ed630f5ebd89a1aae72d4f63f2713",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "rewards": "0x443ea0340cb75a160f31a440722dec7b5bc3c2e9"
+        }
+      },
+      {
+        "sortOrder": 17,
+        "chainId": 8453,
+        "upstreamNetworkKey": "base",
+        "deploymentKey": "usdc",
+        "displaySymbol": "USDC",
+        "displayName": "USD Coin",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x18281dfc4d00905da1aaa6731414eaba843c468a",
+          "bulker": "0x78d0677032a35c63d142a48a2037048871212a8c",
+          "comet": "0xb125e6687d4313864e53df431d5425969c15eb2f",
+          "configurator": "0x45939657d1ca34a8fa39a924b71d28fe8431e581",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "rewards": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1"
+        }
+      },
+      {
+        "sortOrder": 18,
+        "chainId": 8453,
+        "upstreamNetworkKey": "base",
+        "deploymentKey": "usdbc",
+        "displaySymbol": "USDbC",
+        "displayName": "USD Coin (Bridged)",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x18281dfc4d00905da1aaa6731414eaba843c468a",
+          "bulker": "0x78d0677032a35c63d142a48a2037048871212a8c",
+          "comet": "0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf",
+          "configurator": "0x45939657d1ca34a8fa39a924b71d28fe8431e581",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "rewards": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1"
+        }
+      },
+      {
+        "sortOrder": 19,
+        "chainId": 8453,
+        "upstreamNetworkKey": "base",
+        "deploymentKey": "usds",
+        "displaySymbol": "USDS",
+        "displayName": "USDS",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x18281dfc4d00905da1aaa6731414eaba843c468a",
+          "bulker": "0x78d0677032a35c63d142a48a2037048871212a8c",
+          "comet": "0x2c776041ccfe903071af44aa147368a9c8eea518",
+          "COMP": "0x9e1028f5f1d5ede59748ffcee5532509976840e0",
+          "configurator": "0x45939657d1ca34a8fa39a924b71d28fe8431e581",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "l2USDSBridge": "0xee44cdb68d618d58f75d9fe0818b640bd7b8a7b7",
+          "rewards": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1"
+        }
+      },
+      {
+        "sortOrder": 20,
+        "chainId": 8453,
+        "upstreamNetworkKey": "base",
+        "deploymentKey": "weth",
+        "displaySymbol": "ETH",
+        "displayName": "Ether",
+        "isWrapped": true,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x18281dfc4d00905da1aaa6731414eaba843c468a",
+          "bulker": "0x78d0677032a35c63d142a48a2037048871212a8c",
+          "comet": "0x46e6b214b524310239732d51387075e0e70970bf",
+          "configurator": "0x45939657d1ca34a8fa39a924b71d28fe8431e581",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "rewards": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1"
+        }
+      },
+      {
+        "sortOrder": 21,
+        "chainId": 8453,
+        "upstreamNetworkKey": "base",
+        "deploymentKey": "aero",
+        "displaySymbol": "AERO",
+        "displayName": "Aero",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x18281dfc4d00905da1aaa6731414eaba843c468a",
+          "bulker": "0x78d0677032a35c63d142a48a2037048871212a8c",
+          "comet": "0x784efeb622244d2348d4f2522f8860b96fbece89",
+          "COMP": "0x9e1028f5f1d5ede59748ffcee5532509976840e0",
+          "configurator": "0x45939657d1ca34a8fa39a924b71d28fe8431e581",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "rewards": "0x123964802e6ababbe1bc9547d72ef1b69b00a6b1"
+        }
+      },
+      {
+        "sortOrder": 22,
+        "chainId": 534352,
+        "upstreamNetworkKey": "scroll",
+        "deploymentKey": "usdc",
+        "displaySymbol": "USDC",
+        "displayName": "USD Coin",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0xc6bf5a64896d679cf89843dbec6c0f5d3c9b610d",
+          "bulker": "0x53c6d04e3ec7031105baea05b36cbc3c987c56fa",
+          "comet": "0xb2f97c1bd3bf02f5e74d13f02e3e26f93d77ce44",
+          "configurator": "0xecab0beea3e5dea0c35d3e69468eac20098032d7",
+          "l2ERC20Gateway": "0xe2b4795039517653c5ae8c2a9bfdd783b48f447a",
+          "l2ETHGateway": "0x6ea73e05adc79974b931123675ea8f78ffdacdf0",
+          "l2Messenger": "0x781e90f1c8fc4611c9b7497c3b47f99ef6969cbc",
+          "l2WETHGateway": "0x7003e7b7186f0e6601203b99f7b8decbfa391cf9",
+          "l2WstETHGateway": "0x8ae8f22226b9d789a36ac81474e633f8be2856c9",
+          "rewards": "0x70167d30964cbfdc315ecae02441af747be0c5ee"
+        }
+      },
+      {
+        "sortOrder": 23,
+        "chainId": 5000,
+        "upstreamNetworkKey": "mantle",
+        "deploymentKey": "usde",
+        "displaySymbol": "USDe",
+        "displayName": "Ethena USDe",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0xc91eca15747e73d6dd7f616c49daff37b9f1b604",
+          "bulker": "0x67dfca85cceefa2c5b1db4dee3bea716a28b9baa",
+          "comet": "0x606174f62cd968d8e684c645080fa694c1d7786e",
+          "COMP": "0x52b7d8851d6ccbc6342ba0855be65f7b82a3f17f",
+          "configurator": "0xb77cd4cd000957283d8baf53cd782ecf029cf7db",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "rewards": "0xcd83cbbfce149d141a5171c3d6a0f0fccee225ab"
+        }
+      },
+      {
+        "sortOrder": 24,
+        "chainId": 59144,
+        "upstreamNetworkKey": "linea",
+        "deploymentKey": "usdc",
+        "displaySymbol": "USDC",
+        "displayName": "USD Coin",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x1f71901daf98d70b4baf40de080321e5c2676856",
+          "bulker": "0x023ee795361b28cdbb94e302983578486a0a5f1b",
+          "comet": "0x8d38a3d6b3c3b7d96d6536da7eef94a9d7dbc991",
+          "configurator": "0x970ffd8e335b8fa4cd5c869c7cac3a90671d5dc3",
+          "l2MessageService": "0x508ca82df566dcd1b0de8296e70a96332cd644ec",
+          "l2StandardBridge": "0x353012dc4a9a6cf55c941badc267f82004a8ceb9",
+          "l2TokenBridge": "0x353012dc4a9a6cf55c941badc267f82004a8ceb9",
+          "l2USDCBridge": "0xa2ee6fce4acb62d95448729cdb781e3beb62504a",
+          "rewards": "0x2c7118c4c88b9841fcf839074c26ae8f035f2921"
+        }
+      },
+      {
+        "sortOrder": 25,
+        "chainId": 130,
+        "upstreamNetworkKey": "unichain",
+        "deploymentKey": "usdc",
+        "displaySymbol": "USDC",
+        "displayName": "USD Coin",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x4b5dee60531a72c1264319ec6a22678a4d0c8118",
+          "bulker": "0x58ebb8db8b4fdf2dcbbb16e04c2f5b952963b514",
+          "comet": "0x2c7118c4c88b9841fcf839074c26ae8f035f2921",
+          "cometFactory": "0xdb7edfa090061d9367cbeaf6be16ecbde596676c",
+          "COMP": "0xdf78e4f0a8279942ca68046476919a90f2288656",
+          "configurator": "0x8df378453ff9deffa513367cdf9b3b53726303e9",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "rewards": "0x6f7d514bbd4aff3bcd1140b7344b32f063dee486",
+          "TokenMinter": "0x726bfef3cbb3f8af7d8cb141e78f86ae43c34163"
+        }
+      },
+      {
+        "sortOrder": 26,
+        "chainId": 130,
+        "upstreamNetworkKey": "unichain",
+        "deploymentKey": "weth",
+        "displaySymbol": "ETH",
+        "displayName": "Ether",
+        "isWrapped": true,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x4b5dee60531a72c1264319ec6a22678a4d0c8118",
+          "bulker": "0x58ebb8db8b4fdf2dcbbb16e04c2f5b952963b514",
+          "comet": "0x6c987dde50db1dcdd32cd4175778c2a291978e2a",
+          "cometFactory": "0xdb7edfa090061d9367cbeaf6be16ecbde596676c",
+          "COMP": "0xdf78e4f0a8279942ca68046476919a90f2288656",
+          "configurator": "0x8df378453ff9deffa513367cdf9b3b53726303e9",
+          "l2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+          "l2StandardBridge": "0x4200000000000000000000000000000000000010",
+          "rewards": "0x6f7d514bbd4aff3bcd1140b7344b32f063dee486",
+          "TokenMinter": "0x726bfef3cbb3f8af7d8cb141e78f86ae43c34163"
+        }
+      },
+      {
+        "sortOrder": 27,
+        "chainId": 2020,
+        "upstreamNetworkKey": "ronin",
+        "deploymentKey": "weth",
+        "displaySymbol": "WETH",
+        "displayName": "Wrapped Ether",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x2c7efa766338d33b9192db1fb5d170bdc03ef3f9",
+          "bulker": "0x840281fad56dd88afba052b7f18be2a65796ecc6",
+          "comet": "0x4006ed4097ee51c09a04c3b0951d28ccf19e6dfe",
+          "cometFactory": "0x4df9e0f8e94a7a8a9aea6010cd9d341f8ecfe4c6",
+          "configurator": "0x966c72f456fc248d458784ef3e0b6d042be115f2",
+          "l2CCIPOffRamp": "0x320a10449556388503fd71d74a16ab52e0bd1deb",
+          "l2CCIPRouter": "0x46527571d5d1b68ee7eb60b18a32e6c60dceaf99",
+          "l2TokenAdminRegistry": "0x90e83d532a4ad13940139c8ace0b93b0ddbd323a",
+          "rewards": "0x31cdee8609bc15fd33cc525f101b70a81b2b1e59",
+          "roninl2NativeBridge": "0x0cf8ff40a508bdbc39fbe1bb679dcba64e65c7df"
+        }
+      },
+      {
+        "sortOrder": 28,
+        "chainId": 2020,
+        "upstreamNetworkKey": "ronin",
+        "deploymentKey": "wron",
+        "displaySymbol": "RON",
+        "displayName": "Ronin",
+        "isWrapped": false,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x2c7efa766338d33b9192db1fb5d170bdc03ef3f9",
+          "bulker": "0x840281fad56dd88afba052b7f18be2a65796ecc6",
+          "comet": "0xc0afdbd1ceb621ef576ba969ce9d4cef78dbc0c0",
+          "cometFactory": "0x4df9e0f8e94a7a8a9aea6010cd9d341f8ecfe4c6",
+          "configurator": "0x966c72f456fc248d458784ef3e0b6d042be115f2",
+          "l2CCIPOffRamp": "0x320a10449556388503fd71d74a16ab52e0bd1deb",
+          "l2CCIPRouter": "0x46527571d5d1b68ee7eb60b18a32e6c60dceaf99",
+          "l2TokenAdminRegistry": "0x90e83d532a4ad13940139c8ace0b93b0ddbd323a",
+          "rewards": "0x31cdee8609bc15fd33cc525f101b70a81b2b1e59",
+          "roninl2NativeBridge": "0x0cf8ff40a508bdbc39fbe1bb679dcba64e65c7df"
+        }
+      },
+      {
+        "sortOrder": 29,
+        "chainId": 59144,
+        "upstreamNetworkKey": "linea",
+        "deploymentKey": "weth",
+        "displaySymbol": "ETH",
+        "displayName": "Ether",
+        "isWrapped": true,
+        "isDefault": false,
+        "deprecatedwUSDMMarket": false,
+        "roots": {
+          "bridgeReceiver": "0x1f71901daf98d70b4baf40de080321e5c2676856",
+          "bulker": "0x023ee795361b28cdbb94e302983578486a0a5f1b",
+          "comet": "0x60f2058379716a64a7a5d29219397e79bc552194",
+          "cometFactory": "0xaeb318360f27748acb200ce616e389a6c9409a07",
+          "configurator": "0x970ffd8e335b8fa4cd5c869c7cac3a90671d5dc3",
+          "l2MessageService": "0x508ca82df566dcd1b0de8296e70a96332cd644ec",
+          "l2StandardBridge": "0x353012dc4a9a6cf55c941badc267f82004a8ceb9",
+          "l2USDCBridge": "0xa2ee6fce4acb62d95448729cdb781e3beb62504a",
+          "rewards": "0x2c7118c4c88b9841fcf839074c26ae8f035f2921"
+        }
+      }
+    ],
+    "deprecatedPriceRemaps": [
+      {
+        "from": "0xe3a409ed15cd53afdefdd191ad945cec528a2496",
+        "to": "0xdbd020caef83efd542f4de03e3cf0c28a4428bd5"
+      },
+      {
+        "from": "0x13cdfb7db5e2f58e122b2e789b59de13645349c4",
+        "to": "0xb2a824043730fe05f3da2efafa1cbbe83fa548d6"
+      },
+      {
+        "from": "0x66228d797eb83ecf3465297751f6b1d4d42b7627",
+        "to": "0x0d276fc14719f9292d5c1ea2198673d1f4269246"
+      },
+      {
+        "from": "0x7e86318cc4bc539043f204b39ce0ebed9f0050dc",
+        "to": "0x0d276fc14719f9292d5c1ea2198673d1f4269246"
+      }
+    ]
+  }
+}

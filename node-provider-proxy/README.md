@@ -8,7 +8,7 @@ CloudFlare worker to proxy JSON-RPC requests needed for the v3 App.
 
 ## Getting Started
 
-First, install any dependencies:
+First, install dependencies with Node.js 22 or newer:
 
 ```sh
 npm install

@@ -12,7 +12,7 @@
     "../c3-api/tests/util/mock"
   ],
   "engines": {
-    "node": ">=19.4.0"
+    "node": ">=22.0.0"
   },
   "dependencies": {
     "@compound-finance/well-known-networks": "1.0.0-alpha.1",
@@ -30,7 +30,7 @@
   },
   "overrides": {
     "elliptic": "^6.6.1",
-    "sharp": "^0.35.3",
+    "sharp": "^0.35.4",
     "undici": "^6.24.0",
     "node-forge": "^1.4.0",
     "ws": "^8.21.0",

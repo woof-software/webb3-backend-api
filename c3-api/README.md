@@ -8,7 +8,7 @@ used by the Compound III frontend. See [./API.md](./API.md).
 
 # Getting Started
 
-Install dependencies:
+Install dependencies with Node.js 22 or newer:
 ```sh
 npm install
 ```
