@@ -1,5 +1,5 @@
 import t, { Test } from 'tap';
-import { MemoryKv } from '../util/kv.js';
+import { makeTestEnv } from '../util/test-env.js';
 import C3Api, { Env } from '../../entrypoint.js';
 import '../../shim/node-self.js';
 
@@ -17,16 +17,9 @@ const EXPECTED_SECURITY_HEADERS: Record<string, string> = {
   'Cross-Origin-Resource-Policy': 'cross-origin',
 };
 
-const testEnv: Env = {
-  'TALLY_API_KEY': 'test',
-  'V3_API_HOST': 'test',
-  'NODE_PROXY_HOST': 'test',
-  'NODE_PROXY_KEY': 'test',
-  'ENVIRONMENT': 'test',
+const testEnv: Env = makeTestEnv({
   'MEMORY_CACHE_SEED': 'security-headers',
-  'kv_testnet':  MemoryKv({}),
-  'kv_mainnet': MemoryKv({}),
-};
+});
 
 function assertSecurityHeaders(t: Test, response: Response) {
   for (const [ name, value ] of Object.entries(EXPECTED_SECURITY_HEADERS)) {

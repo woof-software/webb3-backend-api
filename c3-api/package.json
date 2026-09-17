@@ -60,8 +60,14 @@
     "pretest": "tsc",
     "test": "npm run test:tap",
     "test:tap": "npx tap --disable-coverage --timeout=900 'dist/tests/**/*.test.js'",
+    "pretest:worker": "tsc",
+    "test:worker": "npx tap --disable-coverage --timeout=300 'dist/tests/e2e/registry/**/*.test.js'",
     "build": "npx tsc",
     "start": "wrangler dev --local entrypoint.ts",
+    "start:scheduled": "wrangler dev --local --test-scheduled entrypoint.ts",
+    "d1:migrate:local": "npx wrangler d1 migrations apply APP_DB --local",
+    "d1:migrate:stage": "npx wrangler d1 migrations apply APP_DB --env stage --remote",
+    "d1:migrate:production": "npx wrangler d1 migrations apply APP_DB --env production --remote",
     "deploy:stage": "npx wrangler deploy --env stage",
     "deploy:production": "npx wrangler deploy --env production"
   }
