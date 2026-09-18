@@ -265,8 +265,21 @@ t.test('the worker boots in workerd with the registry bindings', async t => {
   t.equal(preflight.status, 204, 'legacy preflight still answers');
   t.equal(preflight.headers.get('x-content-type-options'), 'nosniff', 'security headers still apply');
 
+  /*
+   * Discovery only asks upstream once per interval, so recording a check
+   * first keeps this test off the network while still running the real cron
+   * handler.
+   */
+  await env.APP_DB.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
+    .bind(new Date().toISOString()).run();
+
   const scheduled = await server.getWorker<Env>().scheduled({ cron: '0 * * * *', scheduledTime: new Date() });
-  t.equal(scheduled.outcome, 'ok', 'the scheduled stub runs');
+  t.equal(scheduled.outcome, 'ok', 'the cron handler runs');
+  t.equal(
+    await env.APP_DB.prepare(`SELECT COUNT(*) AS n FROM sync_runs`).first<number>('n'),
+    0,
+    'and starts no import while upstream was checked recently',
+  );
 
   t.same(
     {
@@ -346,19 +359,26 @@ t.test('the fixture snapshot seeds, validates, activates, and rolls back', async
   );
 
   const order = await db.prepare(
-    `SELECT market.id
+    `SELECT network.chain_id AS chain_id, market.deployment_key AS deployment_key
      FROM markets AS market
      JOIN registry_networks AS network ON network.id = market.network_id
      WHERE market.registry_version_id = ?1
      ORDER BY network.chain_id, market.creation_block, market.deployment_key`
-  ).bind(first.versionId).all<{ id: string }>();
-  t.same((order.results ?? []).map(row => row.id), markets.map(market => market.id), 'columns reproduce the snapshot order');
+  ).bind(first.versionId).all<{ chain_id: number, deployment_key: string }>();
+  t.same(
+    (order.results ?? []).map(row => `${row.chain_id}/${row.deployment_key}`),
+    snapshot.networks.flatMap(network => network.markets.map(market => `${network.chainId}/${market.deploymentKey}`)),
+    'columns reproduce the snapshot order',
+  );
 
   const weth = markets.find(market => market.deploymentKey === 'weth' && market.contractName === 'cWETHv3')!;
   t.same(
     await db.prepare(
-      `SELECT display_name, is_wrapped_native, usd_price_feed_address FROM market_assets WHERE market_id = ?1 AND role = 'base'`
-    ).bind(weth.id).first(),
+      `SELECT asset.display_name, asset.is_wrapped_native, asset.usd_price_feed_address
+       FROM market_assets AS asset
+       JOIN markets AS market ON market.id = asset.market_id
+       WHERE asset.role = 'base' AND market.registry_version_id = ?1 AND market.deployment_key = 'weth'`
+    ).bind(first.versionId).first(),
     { display_name: 'Ether', is_wrapped_native: 1, usd_price_feed_address: weth.baseAsset.usdPriceFeed!.address },
     'the base row stores the base display fields and USD conversion',
   );

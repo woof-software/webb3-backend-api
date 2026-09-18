@@ -6,6 +6,8 @@ import * as Debug from './lib/debug-log.js';
 import { route }      from './src/router.js';
 import * as Evaluator from './src/evaluator.js';
 
+import { runRegistrySync } from './src/registry/scheduled.js';
+
 import * as v2           from './lib/computations/v2.js';
 import * as evm          from './lib/computations/evm.js';
 import * as comet        from './lib/computations/comet.js';
@@ -160,9 +162,16 @@ export default {
   },
 
   /*
-   * cron entry point for the resumable comet registry sync; the sync
-   * orchestrator is not implemented yet, so an invocation does nothing
+   * cron entry point for the resumable comet registry sync: one invocation
+   * imports a bounded number of markets and leaves the rest to the next one,
+   * resuming from the checkpoints it finds in APP_DB
    */
-  async scheduled(): Promise<void> {
+  async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext): Promise<void> {
+    /*
+     * The import brings its own fetch rather than configuring the shared
+     * request-counting one: it runs past the end of this handler, and a
+     * request arriving meanwhile would reset that counter and quota.
+     */
+    context.waitUntil(runRegistrySync(env));
   },
 };

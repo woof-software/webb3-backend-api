@@ -53,7 +53,10 @@ npm run d1:migrate:production
 
 The Comet registry also binds `kv_registry` for its snapshot cache,
 `REGISTRY_ADMIN_RATE_LIMITER` for admin writes, and an hourly Cron trigger
-for its resumable sync.
+for its resumable sync. One invocation imports
+`COMET_SYNC_MARKETS_PER_INVOCATION` markets and leaves the rest to the next
+one, resuming from the checkpoints in `APP_DB`; upstream is checked for a new
+commit once per `COMET_UPSTREAM_CHECK_INTERVAL_S`.
 
 Secrets and per-environment values, including the registry secrets, are
 listed in [./.dev.vars.example](./.dev.vars.example). Copy it to
