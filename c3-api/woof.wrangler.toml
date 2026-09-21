@@ -26,14 +26,7 @@ database_id = "5164b55f-1a05-464e-97ae-db93f217bfb0"
 migrations_dir = "migrations"
 
 ratelimits = [
-  {
-    name = "REGISTRY_ADMIN_RATE_LIMITER",
-    namespace_id = "4001",
-    simple = {
-      limit = 30,
-      period = 60
-    }
-  },
+  { name = "REGISTRY_ADMIN_RATE_LIMITER", namespace_id = "4001", simple = { limit = 30, period = 60 } },
 ]
 
 [[services]]
