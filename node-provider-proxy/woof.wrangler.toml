@@ -5,7 +5,7 @@ name = 'woof-node-provider-proxy'
 compatibility_date = "2026-06-25"
 compatibility_flags = ["nodejs_compat"]
 
-workers_dev = false
+workers_dev = true
 
 keep_vars = true
 
