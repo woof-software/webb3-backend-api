@@ -34,13 +34,14 @@ limit = 30
 period = 60
 
 [[services]]
-binding = "NODE_PROXY_HOST"
+binding = "node_provider_proxy"
 service = "woof-node-provider-proxy"
 
 [vars]
 DEBUG = ""
 ENVIRONMENT = "woof"
 MEMORY_CACHE_SEED = "woof"
+NODE_PROXY_HOST = "woof-node-provider-proxy.internal"
 V3_API_HOST = "woof-c3-api.dmitriy-a19.workers.dev"
 FLAGS_ETH_COMPUTATION_INDEX_BIAS = "default"
 COMET_SOURCE_REPOSITORY = "Compound-Foundation/comet"
