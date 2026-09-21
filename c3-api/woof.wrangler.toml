@@ -41,9 +41,14 @@ service = "woof-node-provider-proxy"
 DEBUG = ""
 ENVIRONMENT = "woof"
 MEMORY_CACHE_SEED = "woof"
-NODE_PROXY_HOST = "woof-node-provider-proxy.internal"
+
 V3_API_HOST = "woof-c3-api.dmitriy-a19.workers.dev"
+
+NODE_PROXY_HOST = "woof-node-provider-proxy.internal"
+NODE_PROXY_KEY = ""
+
 FLAGS_ETH_COMPUTATION_INDEX_BIAS = "default"
+
 COMET_SOURCE_REPOSITORY = "Compound-Foundation/comet"
 COMET_SOURCE_REF = "main"
 COMET_UPSTREAM_CHECK_INTERVAL_S = "86400"
