@@ -11,7 +11,7 @@ keep_vars = true
 
 [[kv_namespaces]]
 binding = "kv"
-id = "ТВОЙ_KV_ID"
+id = "57d2fa5ee37346169a2b585f1b66206e"
 
 [vars]
 allowedAppKey = ""
