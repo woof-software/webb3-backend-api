@@ -1,15 +1,4 @@
--- Comet registry schema for the shared APP_DB database.
---
--- Registry versions are immutable snapshots of Comet markets built from one
--- pinned commit of the Comet repository. A version stays mutable only while
--- it is importing, becomes validated or invalid exactly once, and a singleton
--- pointer selects the active validated version.
---
--- Conventions this file follows (the test migration helper relies on them):
--- every statement ends with a semicolon at the end of a line, and every
--- trigger body ends with a line containing only END followed by a semicolon.
--- D1 always enforces foreign keys, so no PRAGMA is needed.
-
+-- Migration number: 0001    2026-09-21T18:26:34.867Z
 CREATE TABLE registry_versions (
   id                 TEXT PRIMARY KEY,
   source_repository  TEXT NOT NULL CHECK (

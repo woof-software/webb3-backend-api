@@ -21,8 +21,8 @@ id = "caee22653f7f4baf999a1f8facb4bc7c"
 
 [[d1_databases]]
 binding = "APP_DB"
-database_name = "compound-db"
 database_id = "5164b55f-1a05-464e-97ae-db93f217bfb0"
+database_name = "compound-db"
 migrations_dir = "migrations"
 
 [[ratelimits]]
