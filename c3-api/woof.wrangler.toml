@@ -34,7 +34,7 @@ limit = 30
 period = 60
 
 [[services]]
-binding = "node_provider_proxy"
+binding = "NODE_PROXY_HOST"
 service = "woof-node-provider-proxy"
 
 [vars]
