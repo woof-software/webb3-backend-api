@@ -1,6 +1,6 @@
 main = "src/index.ts"
 
-name = "woof-node-provider-proxy"
+name = 'woof-node-provider-proxy'
 
 compatibility_date = "2026-06-25"
 compatibility_flags = ["nodejs_compat"]
