@@ -8,7 +8,7 @@ used by the Compound III frontend. See [./API.md](./API.md).
 
 # Getting Started
 
-Install dependencies:
+Install dependencies with Node.js 22 or newer:
 ```sh
 npm install
 ```
@@ -30,6 +30,44 @@ market contract for `{contract}` and a network (e.g. mainnet) for
 
 See [API.md](./API.md) for documentation of routes with examples.
 
+# Application Database (D1)
+
+The worker binds one Cloudflare D1 database as `APP_DB`, shared by every
+D1-backed feature. Each environment in `wrangler.toml` points `APP_DB` at
+its own physical database, and all of them apply the single ordered
+migration stream in [./migrations](./migrations). Never renumber a
+migration that has been applied anywhere.
+
+Apply migrations to the local Miniflare database under `.wrangler/state`:
+```sh
+npm run d1:migrate:local
+npx wrangler d1 execute APP_DB --local --command "PRAGMA foreign_key_check;"
+```
+
+Remote migrations always name the environment and must run before the
+worker release that needs them:
+```sh
+npm run d1:migrate:stage
+npm run d1:migrate:production
+```
+
+The Comet registry also binds `kv_registry` for its snapshot cache,
+`REGISTRY_ADMIN_RATE_LIMITER` for admin writes, and an hourly Cron trigger
+for its resumable sync.
+
+Secrets and per-environment values, including the registry secrets, are
+listed in [./.dev.vars.example](./.dev.vars.example). Copy it to
+`.dev.vars` for local runs; deployed environments set them with
+`npx wrangler secret put <NAME> --env <environment>`, never in
+`wrangler.toml`.
+
+Run the worker with the scheduled-event test route and trigger the Cron
+handler locally:
+```sh
+npm run start:scheduled
+curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=0+*+*+*+*"
+```
+
 # Testing
 
 Run unit and e2e dump tests with:
@@ -49,6 +87,20 @@ npm test tests/lib/computations/market/historical-market-day-summaries.test.ts
 # ✅ this is good
 npm test dist/tests/lib/computations/market/historical-market-day-summaries.test.js
 ```
+
+Tests that need real Workers bindings run the worker in workerd with local
+D1, KV, and rate-limit bindings through Wrangler's test harness, applying
+the migrations to fresh storage for every test. They need no Cloudflare
+account or network access:
+
+```sh
+npm run test:worker
+```
+
+Node-side tests build their worker environment with
+[`makeTestEnv`](./tests/util/test-env.ts). Its D1 and rate-limit bindings
+throw when used, so code that needs them must be tested through the
+harness.
 
 ## How to Update E2E test dumps
 The E2E tests have been configured with dumps in order to significantly cut down on requests to

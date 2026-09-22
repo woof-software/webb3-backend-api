@@ -1,0 +1,29 @@
+# Local values for `wrangler dev`. Copy to .dev.vars, which Git ignores, and
+# uncomment only the values you set: a value here overrides wrangler.toml
+# [vars], and an empty value overrides it with an empty string.
+#
+# Deployed environments do not define these in wrangler.toml; set them with:
+#   npx wrangler secret put <NAME> --env <environment>
+
+# Tally API key for the governance routes
+# TALLY_API_KEY=
+
+# node-provider-proxy used for every JSON-RPC call, as
+# https://<NODE_PROXY_HOST>/<network>/<NODE_PROXY_KEY>; the host has no scheme
+# and the key may be empty
+# NODE_PROXY_HOST=
+# NODE_PROXY_KEY=
+
+# Public host of this API
+# V3_API_HOST=
+
+# Optional Blocknative API key for /legacy/mainnet/gas-price
+# BLOCK_NATIVE_API_KEY=
+
+# Comet registry admin API: lowercase hex SHA-256 of the admin bearer token,
+# never the token itself
+# COMET_REGISTRY_ADMIN_TOKEN_HASH=
+
+# Optional GitHub token for reading the Comet repository with a higher API
+# rate limit
+# COMET_GITHUB_TOKEN=

@@ -25,9 +25,24 @@ interface ServiceBindings {
   node_provider_proxy?: { fetch: (typeof self.fetch) }
 }
 
+/*
+ * Workers rate limiting binding (`ratelimits` in wrangler.toml). Declared
+ * here because installs through the workspace preinstall resolve
+ * @cloudflare/workers-types 3.x, which has no rate limit type.
+ */
+interface RateLimiter {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+}
+
 interface Env extends Flags.Env, ServiceBindings {
   kv_mainnet:   KVNamespace,
   kv_testnet:   KVNamespace,
+  // versioned comet registry snapshot cache and last-valid fallback
+  kv_registry:  KVNamespace,
+  // application database shared by all D1-backed features
+  APP_DB:       D1Database,
+  // registry admin writes, keyed per authenticated actor and route family
+  REGISTRY_ADMIN_RATE_LIMITER: RateLimiter,
   ENVIRONMENT:  string,
   /*
    * seed for memory cache, useful for testing where we need independent
@@ -39,6 +54,21 @@ interface Env extends Flags.Env, ServiceBindings {
   V3_API_HOST: string,
   NODE_PROXY_HOST: string,
   NODE_PROXY_KEY: string,
+
+  /*
+   * comet registry source, sync, and cache settings; numeric values are
+   * strings, as in wrangler.toml
+   */
+  COMET_SOURCE_REPOSITORY: string,
+  COMET_SOURCE_REF: string,
+  COMET_UPSTREAM_CHECK_INTERVAL_S: string,
+  COMET_SYNC_MARKETS_PER_INVOCATION: string,
+  COMET_SYNC_LEASE_SECONDS: string,
+  REGISTRY_SNAPSHOT_CACHE_TTL_S: string,
+  REGISTRY_STALE_FALLBACK_MAX_S: string,
+  // comet registry secrets, never set in wrangler.toml
+  COMET_REGISTRY_ADMIN_TOKEN_HASH?: string,
+  COMET_GITHUB_TOKEN?: string,
 
   /*
    * for worker-to-worker requests we need to override fetch() requests to
@@ -127,5 +157,12 @@ export default {
       response.headers.set(name, value);
     }
     return response;
+  },
+
+  /*
+   * cron entry point for the resumable comet registry sync; the sync
+   * orchestrator is not implemented yet, so an invocation does nothing
+   */
+  async scheduled(): Promise<void> {
   },
 };
