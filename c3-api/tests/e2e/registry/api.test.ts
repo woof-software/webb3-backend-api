@@ -602,6 +602,70 @@ t.test('a market overlay carries the reviewed decisions', async t => {
   t.equal(terminal.status, 409, 'a validated version can no longer be changed');
 });
 
+/*
+ * Everything else about a version is read by its id, so an operator who has
+ * run a few imports needs something that says which ids exist.
+ */
+t.test('the versions there are can be listed, newest first', async t => {
+  const db = await freshDatabase();
+
+  const empty = await (await server.fetch('/registry/v1/admin/versions', { headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` } })).json() as {
+    activeVersionId: string | null, versions: unknown[],
+  };
+  t.same(empty, { activeVersionId: null, versions: [] }, 'an environment with no versions lists none');
+
+  const active = await seedValidated(db);
+  await server.fetch(...admin(`/registry/v1/admin/versions/${active}/activate`, { reason: 'bringing it up' }));
+
+  const candidate = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+
+  const listed = await (await server.fetch('/registry/v1/admin/versions', { headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` } })).json() as {
+    activeVersionId: string,
+    versions: Array<{
+      id: string, status: string, attempt: number, isActive: boolean, snapshotChecksum: string | null,
+      createdAt: string, validatedAt: string | null,
+    }>,
+  };
+  t.equal(listed.activeVersionId, active, 'the listing names the version that is on');
+  t.same(listed.versions.map(version => version.id).sort(), [ active, candidate.versionId ].sort(),
+    'and every version there is');
+  t.same(
+    listed.versions.find(version => version.id === active),
+    {
+      id:               active,
+      status:           'validated',
+      attempt:          1,
+      isActive:         true,
+      sourceRepository: snapshot.registryVersion.sourceRepository.toLowerCase(),
+      sourceCommitSha:  snapshot.registryVersion.sourceCommitSha,
+      snapshotChecksum: snapshot.registryVersion.checksum,
+      createdAt:        listed.versions.find(version => version.id === active)!.createdAt,
+      validatedAt:      listed.versions.find(version => version.id === active)!.validatedAt,
+      createdBy:        'test-seed',
+    } as never,
+    'with what each version was built from and what became of it',
+  );
+
+  const importing = await (await server.fetch('/registry/v1/admin/versions?status=importing', {
+    headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` },
+  })).json() as { versions: Array<{ id: string }> };
+  t.same(importing.versions.map(version => version.id), [ candidate.versionId ], 'the listing filters by status');
+
+  const one = await (await server.fetch('/registry/v1/admin/versions?limit=1', {
+    headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` },
+  })).json() as { versions: unknown[] };
+  t.equal(one.versions.length, 1, 'and is bounded');
+
+  for (const query of [ '?status=nonsense', '?limit=0', '?limit=1000', '?limit=half' ]) {
+    t.equal(
+      (await server.fetch(`/registry/v1/admin/versions${query}`, { headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` } })).status,
+      400,
+      `${query} is refused`,
+    );
+  }
+  t.equal((await server.fetch('/registry/v1/admin/versions')).status, 401, 'the listing is behind the token');
+});
+
 t.test('a sync run reports its checkpoints without its lease owner', async t => {
   const db    = await freshDatabase();
   const runId = randomUUID();

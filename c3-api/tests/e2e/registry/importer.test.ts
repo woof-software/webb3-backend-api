@@ -523,6 +523,136 @@ t.test('a new attempt at the same commit inherits what was reviewed for the last
 });
 
 /*
+ * An import that is not finished answers with how far it has got. Without
+ * that, a resumable import looks erratic: two invocations of the same run
+ * report different counts of markets processed, and nothing in the answer
+ * says how much of the source is left.
+ */
+t.test('an unfinished import says how many roots are imported and how many are left', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [
+    { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) },
+    { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) },
+  ];
+
+  const first = await runInvocation(deps(db, roots, 1));
+  t.equal(first.status, 'running', 'one root of two leaves the run open');
+  t.same(
+    { expected: first.expected, completed: first.completed, outstanding: first.outstanding },
+    { expected: 2, completed: 1, outstanding: 1 },
+    'and the answer says what the commit has, what is imported, and what is still to attempt',
+  );
+
+  /*
+   * The second root is one the chain cannot answer for, so it is attempted
+   * and stays outstanding: the counts, not the status, are what show that
+   * the invocation made no progress.
+   */
+  const second = await runInvocation(deps(db, roots, 1));
+  t.equal(second.status, 'running');
+  t.same(
+    { expected: second.expected, completed: second.completed, outstanding: second.outstanding },
+    { expected: 2, completed: 1, outstanding: 1 },
+    'a root that failed is still outstanding, and nothing new is imported',
+  );
+});
+
+/*
+ * The five attempts a root gets are for the root being wrong. An invocation
+ * that ran out of what a Worker is given fails every root it has left at
+ * once, and those failures say nothing about them.
+ */
+t.test('an interrupted invocation does not spend the budget of the roots it never read', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [
+    { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) },
+    { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) },
+  ];
+
+  const attemptsOf = async (runId: string) => {
+    const rows = await db.prepare(
+      `SELECT root_path, attempts, status FROM sync_run_items WHERE sync_run_id = ?1 ORDER BY root_path`
+    ).bind(runId).all<{ root_path: string, attempts: number, status: string }>();
+    return Object.fromEntries((rows.results ?? []).map(row => [ row.root_path, row.attempts ]));
+  };
+
+  const first = await runInvocation(deps(db, roots, 2));
+  t.equal(first.status, 'running');
+  t.same(await attemptsOf(first.runId!), { [USDC_ROOT]: 1, [WETH_ROOT]: 0 },
+    'the root the chain did not answer for is back where it started');
+
+  /*
+   * Five more invocations. If the failures were spending attempts, the root
+   * would be abandoned and the run would end; it does not, because every one
+   * of those invocations imported nothing new and therefore... spends them.
+   */
+  let last = first;
+  for (let invocation = 0; invocation < 5; invocation++) {
+    last = await runInvocation(deps(db, roots, 2));
+  }
+  t.equal(last.status, 'failed', 'an invocation that imports nothing does spend them, so the run ends');
+  t.same(await attemptsOf(first.runId!), { [USDC_ROOT]: 1, [WETH_ROOT]: 5 },
+    'and the root that never answered is abandoned after its five attempts');
+});
+
+/*
+ * A run's commit, its attempt and whether it holds the candidate are decided
+ * when the run is created. An invocation that continues one cannot honour a
+ * request to change any of them, and must not look as though it did.
+ */
+t.test('a request that continues a run refuses what only a new run could do', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [
+    { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) },
+    { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) },
+  ];
+
+  const started = await runInvocation(deps(db, roots, 1));
+  t.equal(started.status, 'running', 'a run is in progress');
+
+  for (const request of [
+    { forceNewAttempt: true, reason: 'rebuild' },
+    { holdForReview: true,   reason: 'hold it' },
+    { sourceCommitSha: 'b'.repeat(40), reason: 'that commit' },
+  ]) {
+    await t.rejects(
+      runInvocation(deps(db, roots, 1), request),
+      { code: 'SYNC_ALREADY_RUNNING' },
+      `${Object.keys(request)[0]} is refused while a run is in progress`,
+    );
+  }
+
+  const continued = await runInvocation(deps(db, roots, 1));
+  t.equal(continued.runId, started.runId, 'and the run is still there to continue, with its lease free');
+  t.equal(continued.expected, 2);
+
+  /*
+   * The refusal must not disturb a run that is being imported right now. An
+   * invocation whose lease has not expired owns its fence; taking that lease
+   * to decide whether to refuse would make the running invocation lose the
+   * market it is in the middle of importing.
+   */
+  const owner = randomUUID();
+  await db.prepare(
+    `UPDATE sync_runs SET lease_owner = ?1, lease_generation = 7, lease_expires_at = ?2 WHERE id = ?3`
+  ).bind(owner, new Date(Date.now() + 900_000).toISOString(), started.runId!).run();
+
+  await t.rejects(
+    runInvocation(deps(db, roots, 1), { forceNewAttempt: true, reason: 'rebuild' }),
+    { code: 'SYNC_ALREADY_RUNNING' },
+    'a request for a new run is refused while one is being imported',
+  );
+
+  const fence = await db.prepare(`SELECT lease_owner, lease_generation FROM sync_runs WHERE id = ?1`)
+    .bind(started.runId!).first<{ lease_owner: string, lease_generation: number }>();
+  t.same(fence, { lease_owner: owner, lease_generation: 7 },
+    'and the invocation that holds the run keeps its fence');
+});
+
+/*
  * The Cron imports a couple of markets an hour. An operator bringing an
  * environment up asks for the whole source at once — but a failing root is
  * still attempted once per request, never retried inside it.
@@ -541,6 +671,7 @@ t.test('one invocation can import the whole source, one attempt per root', async
   const attempts = await db.prepare(
     `SELECT root_path, attempts FROM sync_run_items WHERE sync_run_id = ?1 ORDER BY root_path`
   ).bind(result.runId).all<{ root_path: string, attempts: number }>();
-  t.same((attempts.results ?? []).map(item => item.attempts), [ 1, 1 ],
-    'and the root the chain cannot answer for was tried once, not retried until it ran out');
+  t.same((attempts.results ?? []).map(item => item.attempts), [ 1, 0 ],
+    'and the root the chain did not answer for kept its budget: the invocation had already imported one, '
+      + 'so the failure was the invocation running out, not the root being wrong');
 });

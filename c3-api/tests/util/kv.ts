@@ -14,7 +14,7 @@
 type CacheSeed = { [_: string]: any };
 // Mirrors the StoredValueMeta shape the seed format historically used: the
 // JSON-stringified value encoded as utf-8 bytes.
-type StoredValueMeta = { value: Uint8Array };
+type StoredValueMeta = { value: Uint8Array, metadata?: unknown };
 type StorageMap = Map<string, StoredValueMeta>;
 
 const ENCODER = new TextEncoder();
@@ -41,14 +41,32 @@ function MemoryKv({ seed = {} }: { seed?: CacheSeed | StorageMap }): KVNamespace
   // encoded seed is reused across multiple bindings in some tests).
   const store: StorageMap = new Map(encodeSeed(seed));
 
+  /*
+   * `get` honours the type argument, as the real binding does. A double that
+   * always answered with a string would make every `get(key, 'json')` read
+   * like a corrupt entry: the caller would discard it, refill it, and never
+   * exercise the cache it is testing.
+   */
   const memoryKv = {
-    async get(key: string): Promise<string | null> {
+    async get(key: string, type?: string | { type?: string }): Promise<unknown> {
       const entry = store.get(key);
-      return entry ? DECODER.decode(entry.value) : null;
+      if (entry === undefined) {
+        return null;
+      }
+      const text = DECODER.decode(entry.value);
+      const kind = typeof(type) === 'string' ? type : type?.type;
+      return kind === 'json' ? JSON.parse(text) : text;
     },
-    async put(key: string, value: string): Promise<void> {
+    async getWithMetadata(key: string, type?: string | { type?: string }): Promise<{ value: unknown, metadata: unknown }> {
+      const entry = store.get(key);
+      return {
+        value:    await memoryKv.get(key, type),
+        metadata: entry?.metadata ?? null,
+      };
+    },
+    async put(key: string, value: string, options?: { metadata?: unknown }): Promise<void> {
       const str = typeof value === 'string' ? value : String(value);
-      store.set(key, { value: ENCODER.encode(str) });
+      store.set(key, { value: ENCODER.encode(str), ...(options?.metadata === undefined ? {} : { metadata: options.metadata }) });
     },
     async delete(key: string): Promise<void> {
       store.delete(key);

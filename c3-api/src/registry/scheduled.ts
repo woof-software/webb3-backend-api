@@ -3,6 +3,7 @@ import * as Debug from '../../lib/debug-log.js';
 import type * as KnownNetwork from '../../lib/well-known/networks/network.js';
 import type { Env, ServiceBindings } from '../../entrypoint.js';
 
+import { cacheDepsOf, warmSnapshot } from './cache.js';
 import { proxyTransport } from './enrichment.js';
 import { RegistryError, isRegistryError } from './errors.js';
 import { ImporterDeps, InvocationResult, ManualRequest, runInvocation } from './importer.js';
@@ -56,11 +57,12 @@ function registryFetch(env: Env): (input: Request | string, init?: RequestInit) 
   };
 }
 
-function importerDeps(env: Env): ImporterDeps {
+function importerDeps(env: Env, debug?: ImporterDeps['debug']): ImporterDeps {
   const token = env.COMET_GITHUB_TOKEN;
   const fetch = registryFetch(env);
   return {
     db: env.APP_DB,
+    ...(debug === undefined ? {} : { debug }),
     source: {
       repository: env.COMET_SOURCE_REPOSITORY,
       ref:        env.COMET_SOURCE_REF,
@@ -90,8 +92,20 @@ function importerDeps(env: Env): ImporterDeps {
 async function runRegistrySync(env: Env, request: ManualRequest = {}): Promise<InvocationResult> {
   const debug = Debug.MakeLogger([ 'registry' ]).configure(env);
   try {
-    const result = await runInvocation(importerDeps(env), request);
+    const result = await runInvocation(importerDeps(env, debug), request);
     debug.log({ registrySync: result });
+    /*
+     * A candidate that validated is immutable and may be activated at any
+     * moment, so its bytes are cached now, by the invocation nobody is
+     * waiting on, rather than by the first request after the activation.
+     */
+    if (result.status === 'completed' && result.outcome === 'imported' && result.held !== true && result.versionId !== undefined) {
+      try {
+        await warmSnapshot(cacheDepsOf(env, debug), result.versionId);
+      } catch (error) {
+        debug.error(`registry snapshot not warmed`, { versionId: result.versionId, error });
+      }
+    }
     return result;
   } catch (error) {
     /*

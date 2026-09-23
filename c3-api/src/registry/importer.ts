@@ -10,7 +10,7 @@ import {
   enrichMarket,
   readFeeds,
 } from './enrichment.js';
-import { RegistryError, isRegistryError } from './errors.js';
+import { RegistryError, isRegistryError, isTransportFailure } from './errors.js';
 import {
   MarketOverlay,
   NetworkOverlay,
@@ -45,6 +45,7 @@ import {
   dueForDiscovery,
   failItem,
   finishRun,
+  MAX_ITEM_ATTEMPTS,
   pendingItems,
   recordUpstreamCheck,
   releaseLease,
@@ -72,6 +73,8 @@ import { CheckResult, failures, hasFailures, validateCandidate, validateMarketIm
  */
 type ImporterDeps = {
   db:     D1Database,
+  // where the cause of a failure goes; D1 keeps only its sanitized form
+  debug?: { error: (...parameters: unknown[]) => unknown },
   source: SourceConfig,
   // one transport per network, so each chain is read through its own endpoint
   transportFor: (network: string) => RpcTransport,
@@ -103,6 +106,16 @@ type InvocationResult = {
   held?:      boolean,
   // checks that failed on a candidate that is held rather than validated
   checksFailed?: number,
+  /*
+   * How far the run has got, in roots: how many the commit has, how many are
+   * imported, and how many are still to attempt. A caller that sees
+   * `running` learns from these whether the last invocation made progress,
+   * and what is left; a root that exhausted its attempts is in neither of the
+   * last two.
+   */
+  expected?:    number,
+  completed?:   number,
+  outstanding?: number,
   /*
    * What stopped an invocation that failed on a registry error, so a caller
    * that answers a person can tell a request it has to refuse from a source
@@ -418,11 +431,52 @@ async function finishCandidate(
 }
 
 /*
+ * How far a run has got, in roots. One statement, so every answer can carry
+ * it: a caller that is told `running` needs to know whether the invocation
+ * made progress and how much is left, and deriving that from the status
+ * alone is what makes a resumable import look erratic.
+ */
+async function progressOf(db: D1Database, runId: string): Promise<{
+  expected: number, completed: number, outstanding: number,
+}> {
+  // `outstanding` is pendingItems' predicate, in the same statement as the run's own counters
+  const counts = await db.prepare(
+    `SELECT run.expected_count AS expected, run.completed_count AS completed,
+            (SELECT COUNT(*) FROM sync_run_items
+             WHERE sync_run_id = ?1 AND status <> 'completed' AND attempts < ?2) AS outstanding
+     FROM sync_runs AS run WHERE run.id = ?1`
+  ).bind(runId, MAX_ITEM_ATTEMPTS).first<{ expected: number, completed: number, outstanding: number }>();
+  return counts ?? { expected: 0, completed: 0, outstanding: 0 };
+}
+
+/*
  * One Cron invocation: continue the running import, or start one. Returns
  * what it did, which is also what the administrative status endpoint reports.
  */
 async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): Promise<InvocationResult> {
   const { db, config } = deps;
+
+  /*
+   * A run's commit, its attempt and whether it holds the candidate are all
+   * decided when the run is created, so a request carrying any of the three
+   * is asking for a new run. If one is unfinished it is refused — and
+   * refused before the lease is touched: taking the lease first would abort
+   * an invocation that is alive and merely overran it, losing the market it
+   * was importing.
+   */
+  const wantsNewRun = request.sourceCommitSha !== undefined
+    || request.forceNewAttempt === true
+    || request.holdForReview === true;
+  if (wantsNewRun) {
+    const unfinished = await runningRun(db);
+    if (unfinished !== null) {
+      throw new RegistryError(
+        'SYNC_ALREADY_RUNNING',
+        `an import is in progress; continue it with an empty body, or wait for it to finish`,
+        unfinished.id,
+      );
+    }
+  }
 
   let fence = await acquireRun(db, { leaseSeconds: config.leaseSeconds, now: deps.now });
   if (fence === null) {
@@ -475,6 +529,8 @@ async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): P
   const networkFeeds = new Map<number, Map<Address, PriceFeedV1>>();
   const importChecks: CheckResult[] = [];
   let processed = 0;
+  // roots this invocation actually imported, which is what tells a failure apart from an interruption
+  let imported  = 0;
 
   /*
    * At most one attempt per root in one invocation. A failed root goes back
@@ -483,25 +539,53 @@ async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): P
    * retry of every root inside a single request.
    */
   const batch = Math.min(request.markets ?? config.marketsPerInvocation, await pendingItems(db, fence.runId));
+  // every root this invocation has claimed, so none of them is claimed twice
+  const tried: string[] = [];
   while (processed < batch) {
-    const item = await claimItem(db, fence, { now: deps.now });
+    const item = await claimItem(db, fence, { now: deps.now, except: tried });
     if (item === null) {
       break;
     }
+    tried.push(item.id);
     let committed: boolean;
     try {
-      const imported = await importMarket(deps, versionId, {
+      const importedRoot = await importMarket(deps, versionId, {
         rootPath:           item.root_path,
         upstreamNetworkKey: item.upstream_network_key,
         deploymentKey:      item.deployment_key,
         sourceBlobSha:      item.source_blob_sha,
       }, run.source_commit_sha, overlays, networkFeeds);
-      importChecks.push(...imported.checks);
-      committed = await completeItem(db, fence, { id: item.id, checksum: imported.checksum }, { now: deps.now });
+      importChecks.push(...importedRoot.checks);
+      committed = await completeItem(db, fence, { id: item.id, checksum: importedRoot.checksum }, { now: deps.now });
+      imported += 1;
     } catch (error) {
       // diagnostics are sanitized: an upstream body or a token never reaches D1
       const message = isRegistryError(error) ? `${error.code}: ${error.message}` : 'an unexpected error interrupted the import';
-      committed = await failItem(db, fence, { id: item.id, error: message }, { now: deps.now });
+      /*
+       * D1 keeps the sanitized code, because an upstream body or a token
+       * must never be written where diagnostics are read. The cause itself
+       * goes to the logs, where it is the only way to tell which limit or
+       * which provider ended the invocation.
+       */
+      deps.debug?.error(`registry root failed`, { rootPath: item.root_path, error });
+      /*
+       * A transport failure in an invocation that has already imported
+       * something is the invocation running out — of the subrequests or the
+       * time a Worker is given — rather than anything about this root, so it
+       * does not spend one of the root's five attempts. That is what stops a
+       * large source from exhausting every root's budget in five invocations
+       * and leaving a candidate that can never be completed.
+       *
+       * An invocation that has imported nothing gets no such benefit: a chain
+       * or a provider that answers for no root at all is a failure this run
+       * has to end on, or it would hold the one running slot forever and the
+       * registry would stop following the source.
+       */
+      const interrupted = isTransportFailure(error) && imported > 0;
+      committed = await failItem(db, fence, { id: item.id, error: message }, {
+        now:           deps.now,
+        spendsAttempt: !interrupted,
+      });
     }
     /*
      * A checkpoint that does not commit means the lease was taken over while
@@ -510,19 +594,24 @@ async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): P
      * invocations out of one candidate.
      */
     if (!committed) {
-      return { status: 'running', runId: fence.runId, versionId, processed, reason: 'the lease was taken over' };
+      return {
+        status: 'running', runId: fence.runId, versionId, processed,
+        ...await progressOf(db, fence.runId),
+        reason: 'the lease was taken over',
+      };
     }
     processed++;
   }
 
-  if (await pendingItems(db, fence.runId) > 0) {
+  const progress = await progressOf(db, fence.runId);
+  if (progress.outstanding > 0) {
     // more roots remain: release the fence so the next invocation continues
     await releaseLease(db, fence);
-    return { status: 'running', runId: fence.runId, versionId, processed };
+    return { status: 'running', runId: fence.runId, versionId, processed, ...progress };
   }
 
   const finished = await finishCandidate(deps, fence, versionId, importChecks);
-  return { ...finished, processed };
+  return { ...finished, processed, ...await progressOf(db, fence.runId) };
 }
 
 export type { ImporterDeps, InvocationResult, InvocationStatus, ManualRequest };

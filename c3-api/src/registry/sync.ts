@@ -170,8 +170,21 @@ async function releaseLease(db: D1Database, fence: Fence): Promise<boolean> {
  * condition proves the caller still owns an unexpired run, so claiming and
  * the fence check cannot disagree.
  */
-async function claimItem(db: D1Database, fence: Fence, options: ClockOption = {}): Promise<SyncRunItemRow | null> {
+async function claimItem(
+  db: D1Database,
+  fence: Fence,
+  options: ClockOption & { except?: readonly string[] } = {},
+): Promise<SyncRunItemRow | null> {
   const timestamp = at(options.now);
+  /*
+   * `except` is what this invocation has already tried. An attempt that was
+   * given back — because the invocation ran out rather than the root being
+   * wrong — leaves the root looking untouched, and the ordering below would
+   * then hand it straight back to the same invocation, which would spend its
+   * whole batch on one root and never reach the others.
+   */
+  const excluded = options.except ?? [];
+  const holes    = excluded.map((_, index) => `?${index + 6}`).join(', ');
   const claimed = await db.prepare(
     `UPDATE sync_run_items
      SET status = 'processing', attempts = attempts + 1, claim_owner = ?1,
@@ -191,11 +204,13 @@ async function claimItem(db: D1Database, fence: Fence, options: ClockOption = {}
            OR item.status = 'failed'
            OR (item.status = 'processing' AND item.claim_generation < ?2)
          )
+         ${excluded.length === 0 ? '' : `AND item.id NOT IN (${holes})`}
        ORDER BY item.attempts, item.root_path
        LIMIT 1
      )
      RETURNING *`
-  ).bind(fence.owner, fence.generation, timestamp, fence.runId, MAX_ITEM_ATTEMPTS).first<SyncRunItemRow>();
+  ).bind(fence.owner, fence.generation, timestamp, fence.runId, MAX_ITEM_ATTEMPTS, ...excluded)
+    .first<SyncRunItemRow>();
   return claimed ?? null;
 }
 
@@ -204,17 +219,26 @@ async function commitItem(
   fence: Fence,
   item: { id: string, checksum?: string, error?: string },
   status: Extract<SyncItemStatus, 'completed' | 'failed'>,
-  options: ClockOption = {},
+  options: ClockOption & { spendsAttempt?: boolean } = {},
 ): Promise<boolean> {
   const timestamp = at(options.now);
   /*
+   * An attempt is spent unless the caller says the failure was not about
+   * this root. Claiming an item increments the counter, so giving it back is
+   * a decrement here, and the root keeps the budget it never used.
+   */
+  const refunded = status === 'failed' && options.spendsAttempt === false;
+  /*
    * Counters count roots, not attempts: a root that failed but may still be
    * retried is not yet a failed root, and counting it as one would exceed the
-   * expected count the schema enforces.
+   * expected count the schema enforces. A refunded attempt can never be the
+   * last one, so it never makes a root a failed root.
    */
   const increment = status === 'completed'
     ? `completed_count = completed_count + 1`
-    : `failed_count = failed_count + (
+    : refunded
+      ? `failed_count = failed_count`
+      : `failed_count = failed_count + (
          SELECT CASE WHEN attempts >= ${MAX_ITEM_ATTEMPTS} THEN 1 ELSE 0 END
          FROM sync_run_items WHERE id = ?5
        )`;
@@ -250,7 +274,7 @@ async function commitItem(
            completed_at = ?2,
            root_checksum = COALESCE(?3, root_checksum),
            last_error = ?4,
-           updated_at = ?5
+           updated_at = ?5${refunded ? ',\n           attempts = MAX(attempts - 1, 0)' : ''}
        WHERE id = ?6 AND sync_run_id = ?7 AND claim_owner = ?8 AND claim_generation = ?9
          AND status = 'processing'
          AND EXISTS (
@@ -283,7 +307,17 @@ async function completeItem(db: D1Database, fence: Fence, item: { id: string, ch
   return commitItem(db, fence, item, 'completed', options);
 }
 
-async function failItem(db: D1Database, fence: Fence, item: { id: string, error: string }, options: ClockOption = {}): Promise<boolean> {
+/*
+ * Records a failed attempt at one root. `spendsAttempt: false` says the
+ * failure was the carrier's, not the root's — see isTransportFailure — and
+ * the root's budget is left as it was.
+ */
+async function failItem(
+  db: D1Database,
+  fence: Fence,
+  item: { id: string, error: string },
+  options: ClockOption & { spendsAttempt?: boolean } = {},
+): Promise<boolean> {
   return commitItem(db, fence, item, 'failed', options);
 }
 

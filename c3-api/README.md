@@ -101,6 +101,32 @@ What that means for the endpoints:
   `APP_DB`. Governance decodes proposal action targets against the static
   constants and consults the registry only for a target they do not name.
 
+## What a request reads
+
+A version never changes once it exists, and only the pointer to the active
+one moves. So a request reads the pointer from D1 — one statement — and
+everything else from somewhere cheaper:
+
+- the isolate holds the catalog it built from the version the pointer names,
+  and reuses it for as long as that pointer does not move;
+- the bytes of a version are cached in the `kv_registry` namespace under a key
+  that names the version and its checksum, so an isolate that has never seen
+  it pays a KV read rather than hydrating the snapshot out of D1;
+- a validated candidate is cached before it is activated — by the import that
+  validated it, by `POST .../validate`, and by the activation itself — so an
+  activation is a pointer move and no request pays the serialization;
+- `REGISTRY_SNAPSHOT_CACHE_TTL_S` is how long a cached version lives, and the
+  `max-age` public reads advertise.
+
+When D1 cannot be reached at all, a request is answered from the version D1
+last named, for up to `REGISTRY_STALE_FALLBACK_MAX_S` after that. Such a
+response carries `X-Registry-Stale` with its age in seconds and
+`Cache-Control: no-store`, so nothing downstream keeps it and no client
+mistakes it for the current version. Set the window to `0` in an environment
+that would rather fail than answer from an older version. A D1 that answers
+"no version is active" is an answer, not an outage: it is served as `503`,
+never from the cache.
+
 An operator changes what the API serves by importing, reviewing, validating
 and activating a version; see the admin routes in [./API.md](./API.md). The
 step-by-step procedure, with what to expect at each step and what to do when

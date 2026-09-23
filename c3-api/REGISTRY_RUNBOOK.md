@@ -154,7 +154,29 @@ import it is never zero, because nothing has been reviewed — the missing
 default market alone is one of them. You work it down in the steps below.
 
 **If not.** `"status": "running"` means the import has more to do: send the
-same request again. An error means the import could not finish; see
+same request **with an empty body** (`{}`) and repeat until it answers
+`"completed"`. The answer says how far it has got —
+
+```json
+{ "status": "running", "expected": 29, "completed": 23, "outstanding": 6 }
+```
+
+— where `expected` is how many markets the source has, `completed` how many
+are imported, and `outstanding` how many are still to try. A market the chain
+did not answer for goes back into the queue and is tried again by the next
+request, so the number each request gets through varies. Which markets are
+left, and why, is in `GET /registry/v1/admin/sync-runs/<syncRunId>`.
+
+One request imports as many markets as fit in a single Worker invocation.
+Locally that is usually the whole source at once; a deployed Worker is given
+less, so the markets it does not reach fail — without being held against
+them — and the next request picks them up. Repeating the request is the whole
+procedure; there is nothing to tune.
+
+Do not repeat the request with `forceNewAttempt` or `holdForReview` while it
+is running: those decisions belong to the run that is already in progress, so
+the request is refused with `409` rather than quietly ignoring them. An error
+means the import could not finish; see
 [When something goes wrong](#when-something-goes-wrong).
 
 ### 2. Read what the release proposes
@@ -349,6 +371,22 @@ the version that is on, and checks the result. Switching it on is always a
 person's decision.
 
 ### 1. Find the draft
+
+Every version there is, newest first, with the one that is on named:
+
+```sh
+curl -s "$API/registry/v1/admin/versions" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+Postman:
+
+```http
+GET {{API}}/registry/v1/admin/versions
+Authorization: Bearer {{TOKEN}}
+```
+
+`?status=importing` narrows it to the drafts still open — usually the one you
+are looking for. Put its `id` in `V`.
 
 Send the import request. While an import runs, and once the newest commit is
 imported, the answer names the draft in `registryVersionId`:
@@ -581,6 +619,41 @@ is the `previousVersionId` in the answer of the activation you are undoing,
 and it is also in the activation history that
 `GET /registry/v1/admin/versions/<the version that is on>` lists.
 
+## Keeping an eye on it
+
+One request tells you whether the registry is well:
+
+```sh
+curl -s "$API/registry/v1/admin/status" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+Postman:
+
+```http
+GET {{API}}/registry/v1/admin/status
+Authorization: Bearer {{TOKEN}}
+```
+
+**You should see** `"alerts": []`. Everything else in the answer is context:
+which version is on and who switched it on, whether its data is cached, when
+the source was last checked, how the last import went, and which drafts are
+still open.
+
+When `alerts` is not empty, each name says what to do:
+
+| Alert | What it means | What to do |
+|---|---|---|
+| `no-active-version` | Nothing is switched on, so every market route answers `503` | Bring a version up — [Bringing an environment up for the first time](#bringing-an-environment-up-for-the-first-time) |
+| `candidate-awaiting-review` | A draft is waiting and no import is running | Review it, or switch it on — [When the source changes](#when-the-source-changes) |
+| `last-sync-failed` | The last import failed | Read its run: `GET /registry/v1/admin/sync-runs/<id>` tells you which root failed and why |
+| `sync-stalled` | A run says it is running, but nobody is continuing it | The hourly import resumes it by itself; if the alert stays for hours, look at the worker's logs |
+| `sync-overdue` | The source has not been checked for more than two days | The hourly trigger is not firing, or every invocation fails before it records a check |
+| `snapshot-not-cached` | The active version is not in the cache | Harmless by itself — the next request refills it. If it persists, the KV namespace is misconfigured for this environment |
+| `cache-unreadable` | The KV namespace itself did not answer | Check the `kv_registry` binding of this environment: until it answers there is no cache, and no older version to fall back on if the database fails |
+
+This is the request to point a monitor at: poll it every few minutes and
+alert when `alerts` is not empty, or when the request itself fails.
+
 ## Known differences
 
 What `shadow` reports for a registry bootstrapped from
@@ -615,4 +688,5 @@ A difference not in it is worth a developer's look before switching on.
 | `409` on apply, naming another digest | The proposal changed since you read it | Read the review again, and apply its digest |
 | `409` on validate, "the import … is still running" | The import has not finished | Send step 1 again until it completes |
 | `idle` from import, "a candidate of this commit is held for review" | A draft of this commit is already waiting for you | Use that draft — its id is in the answer — or force a new attempt |
-| `409 SYNC_ALREADY_RUNNING` | Another import is running right now — the hourly one, or a request you already sent | Wait for it to finish and read its run, rather than forcing a new attempt over it |
+| `409 SYNC_ALREADY_RUNNING` | An import is in progress — the hourly one, a request you already sent, or one you are asking to change with `forceNewAttempt`, `holdForReview` or `sourceCommitSha` | Continue it with an empty body until it says `completed`; only then ask for a new attempt |
+| Answers carry `X-Registry-Stale: <seconds>` | The database could not be reached, so the API is answering from the version it last saw, and saying how old it is | Check the database's health; the API recovers by itself once D1 answers, and starts returning `503` if the outage outlasts the configured window |
