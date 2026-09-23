@@ -263,6 +263,41 @@ t.test('a root that keeps failing stops being retried', async t => {
   t.ok(fence.runId, 'a new run may start once the previous one is terminal');
 });
 
+/*
+ * An attempt is given back when the failure was the invocation's rather than
+ * the root's. What must not follow is the same invocation claiming that root
+ * again: it looks untouched, it sorts first, and one root would then consume
+ * the whole batch while the others were never tried.
+ */
+t.test('an attempt can be given back, and the root is not claimed again by the same invocation', async t => {
+  const db    = await freshDatabase();
+  const fence = await newRun(db);
+
+  const first = await claimItem(db, fence, { now: clockAt(T0) });
+  t.equal(first?.attempts, 1, 'claiming spends an attempt');
+  await failItem(db, fence, { id: first!.id, error: 'the node provider did not answer' }, {
+    now:           clockAt(T0),
+    spendsAttempt: false,
+  });
+
+  const refunded = await db.prepare(`SELECT attempts, status FROM sync_run_items WHERE id = ?1`)
+    .bind(first!.id).first<{ attempts: number, status: string }>();
+  t.same(refunded, { attempts: 0, status: 'failed' }, 'and giving it back leaves the root as it was');
+  t.equal((await runningRun(db))?.failed_count, 0, 'a refunded attempt never makes a root a failed root');
+
+  const next = await claimItem(db, fence, { now: clockAt(T0), except: [ first!.id ] });
+  t.not(next?.id, first!.id, 'the same invocation claims a different root');
+  t.equal(next?.attempts, 1);
+
+  /*
+   * A later invocation is a different one, and the root is claimable again —
+   * with the budget it never spent.
+   */
+  const later = await claimItem(db, fence, { now: clockAt(T0) });
+  t.equal(later?.id, first!.id, 'the refunded root is claimed first by whoever comes next');
+  t.equal(later?.attempts, 1, 'spending its first attempt for the first time');
+});
+
 t.test('a finished run records what it produced', async t => {
   const db    = await freshDatabase();
   const fence = await newRun(db);

@@ -162,7 +162,7 @@ async function route(
    * first handler that needs it, and every response whose content depended on
    * it says which version answered.
    */
-  const registry = requestCatalog(context.env);
+  const registry = requestCatalog(context.env, context.debug);
   const answer = async (): Promise<Response> => {
     try {
       return await unsafeRoute(request, context, instantiateEvaluator, registry);
@@ -192,7 +192,7 @@ async function route(
   const response = await answer();
   const catalog  = registry.loaded();
   if (catalog !== null) {
-    for (const [ name, value ] of Object.entries(catalogHeaders(catalog))) {
+    for (const [ name, value ] of Object.entries(catalogHeaders(catalog, registry.staleFor()))) {
       response.headers.set(name, value);
     }
   }

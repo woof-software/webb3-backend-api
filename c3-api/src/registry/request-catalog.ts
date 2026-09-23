@@ -3,7 +3,16 @@ import type { Env } from '../../entrypoint.js';
 import type { RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
 
 import { Catalog, catalogOf } from './catalog.js';
-import { readActiveVersionId, readRegistrySnapshot } from './repository.js';
+import type { CacheDeps } from './cache.js';
+import {
+  activePointer,
+  cacheDepsOf,
+  cachedSnapshot,
+  isUnreachable,
+  noteFallback,
+  snapshotFor,
+  stalePointer,
+} from './cache.js';
 import { registryHeaders } from './version-headers.js';
 
 /*
@@ -24,6 +33,12 @@ type RequestCatalog = {
   load(): Promise<Catalog>,
   // the version that answered this request, if one was loaded
   loaded(): Catalog | null,
+  /*
+   * How old that version is, in seconds, when it was served from the cache
+   * because D1 could not be reached. Null means the pointer was verified, so
+   * the answer is the version that is on.
+   */
+  staleFor(): number | null,
 };
 
 /*
@@ -70,35 +85,102 @@ function nextExpiry(snapshot: RegistrySnapshotV1, now: number): number | null {
   return due.length === 0 ? null : Math.min(...due);
 }
 
-async function activeCatalog(db: D1Database): Promise<Catalog | null> {
-  const versionId = await readActiveVersionId(db);
-  if (versionId === null) {
-    active.delete(db);
-    return null;
-  }
+// the clock the cache was given, so an injected one decides expiry as well as staleness
+function clockOf(deps: CacheDeps): number {
+  return (deps.now?.() ?? new Date()).getTime();
+}
 
-  const now  = Date.now();
-  const kept = active.get(db);
-  if (kept !== undefined && kept.versionId === versionId && (kept.until === null || now < kept.until)) {
-    return kept.catalog;
-  }
-
-  const snapshot = await readRegistrySnapshot(db, versionId);
-  if (snapshot === null) {
-    active.delete(db);
-    return null;
-  }
+function catalogFrom(deps: CacheDeps, snapshot: RegistrySnapshotV1, now: number): Catalog {
   const catalog = catalogOf(snapshot, new Date(now));
-  active.set(db, { versionId, catalog, until: nextExpiry(snapshot, now) });
+  active.set(deps.db, { versionId: snapshot.registryVersion.id, catalog, until: nextExpiry(snapshot, now) });
   return catalog;
 }
 
-function requestCatalog(env: Env): RequestCatalog {
+/*
+ * The catalog of the version that is on.
+ *
+ * The order is what keeps a hot isolate cheap: read the pointer, which is one
+ * D1 statement; if it still names the version this isolate built its catalog
+ * from, nothing else is read at all. Only a pointer that moved, or an isolate
+ * that has just started, pays the snapshot — from KV where another isolate
+ * has already cached it, and from D1 otherwise.
+ *
+ * When D1 does not answer, the cache may still hold the version it last
+ * named. That answer is served rather than failing the request, and the age
+ * of it is carried back so the response can say so.
+ */
+async function activeCatalog(deps: CacheDeps): Promise<{ catalog: Catalog, staleFor: number | null } | null> {
+  /*
+   * What to answer with when D1 did not answer. The pointer record is read
+   * first and on its own, because an isolate that already holds the catalog
+   * of that version has nothing left to read: an outage is when rebuilding
+   * every market from the cached bytes, on every request, is least
+   * affordable.
+   */
+  const fallback = async (error: unknown) => {
+    if (!isUnreachable(error)) {
+      // the database answered, and what it said is a fault to raise, not to paper over
+      throw error;
+    }
+    const stale = await stalePointer(deps);
+    if (stale === null) {
+      throw error;
+    }
+    const at   = clockOf(deps);
+    const kept = active.get(deps.db);
+    if (kept !== undefined && kept.versionId === stale.pointer.id && (kept.until === null || at < kept.until)) {
+      return { catalog: kept.catalog, staleFor: stale.staleFor };
+    }
+    const snapshot = await cachedSnapshot(deps, stale.pointer);
+    if (snapshot === null) {
+      throw error;
+    }
+    return { catalog: catalogFrom(deps, snapshot, at), staleFor: stale.staleFor };
+  };
+
+  let pointer;
+  try {
+    pointer = await activePointer(deps);
+  } catch (error) {
+    noteFallback(deps, 'pointer', error);
+    return fallback(error);
+  }
+
+  if (pointer === null) {
+    active.delete(deps.db);
+    return null;
+  }
+
+  const now  = clockOf(deps);
+  const kept = active.get(deps.db);
+  if (kept !== undefined && kept.versionId === pointer.id && (kept.until === null || now < kept.until)) {
+    return { catalog: kept.catalog, staleFor: null };
+  }
+
+  let resolved;
+  try {
+    resolved = await snapshotFor(deps, pointer);
+  } catch (error) {
+    noteFallback(deps, 'snapshot', error);
+    return fallback(error);
+  }
+  if (resolved === null) {
+    active.delete(deps.db);
+    return null;
+  }
+
+  return { catalog: catalogFrom(deps, resolved.snapshot, now), staleFor: null };
+}
+
+function requestCatalog(env: Env, debug?: CacheDeps['debug']): RequestCatalog {
+  const deps = cacheDepsOf(env, debug);
   let pending: Promise<Catalog> | null = null;
   let catalog: Catalog | null          = null;
+  let staleFor: number | null          = null;
 
   return {
-    loaded: () => catalog,
+    loaded:   () => catalog,
+    staleFor: () => staleFor,
     load() {
       /*
        * A failed load is not memoized: the promise is cleared so a later
@@ -109,7 +191,7 @@ function requestCatalog(env: Env): RequestCatalog {
       pending ??= (async () => {
         let loaded;
         try {
-          loaded = await activeCatalog(env.APP_DB);
+          loaded = await activeCatalog(deps);
         } catch (error) {
           pending = null;
           throw new RegistryUnavailable(`the comet registry could not be read`, error);
@@ -118,7 +200,8 @@ function requestCatalog(env: Env): RequestCatalog {
           pending = null;
           throw new RegistryUnavailable(`no comet registry version is active`);
         }
-        catalog = loaded;
+        catalog  = loaded.catalog;
+        staleFor = loaded.staleFor;
         return catalog;
       })();
       return pending;
@@ -130,8 +213,16 @@ function requestCatalog(env: Env): RequestCatalog {
  * The headers a registry-dependent response carries: they name the version a
  * client was served without changing any response body.
  */
-function catalogHeaders(catalog: Catalog): Record<string, string> {
-  return registryHeaders({ id: catalog.versionId, checksum: catalog.checksum });
+function catalogHeaders(catalog: Catalog, staleFor: number | null = null): Record<string, string> {
+  return {
+    ...registryHeaders({ id: catalog.versionId, checksum: catalog.checksum }),
+    /*
+     * An answer computed from a version the database could not confirm says
+     * so and may not be stored — by a browser, a proxy or anything else. The
+     * two travel together, so a caller cannot set one and forget the other.
+     */
+    ...(staleFor === null ? {} : { 'X-Registry-Stale': String(staleFor), 'Cache-Control': 'no-store' }),
+  };
 }
 
 export type { RequestCatalog };

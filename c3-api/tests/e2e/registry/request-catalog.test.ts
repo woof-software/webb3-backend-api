@@ -35,6 +35,20 @@ async function freshDatabase(): Promise<D1Database> {
   return APP_DB;
 }
 
+/*
+ * The environment a request reads the registry through: the same D1 and KV
+ * bindings the worker holds, and the cache settings it is configured with.
+ */
+async function environmentOf(db: D1Database): Promise<Env> {
+  const { kv_registry } = await server.getWorker<Env>().getEnv();
+  return {
+    APP_DB:                        db,
+    kv_registry,
+    REGISTRY_SNAPSHOT_CACHE_TTL_S: '300',
+    REGISTRY_STALE_FALLBACK_MAX_S: '3600',
+  } as Env;
+}
+
 async function activate(db: D1Database, versionId: string): Promise<void> {
   await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
   await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
@@ -51,7 +65,7 @@ async function activate(db: D1Database, versionId: string): Promise<void> {
 
 t.test('the active version is built once and reused, until another one is activated', async t => {
   const db  = await freshDatabase();
-  const env = { APP_DB: db } as Env;
+  const env = await environmentOf(db);
 
   await t.rejects(requestCatalog(env).load(), { name: 'RegistryUnavailable' }, 'with nothing active there is nothing to serve');
 
@@ -73,7 +87,7 @@ t.test('the active version is built once and reused, until another one is activa
 
 t.test('one request resolves everything from the version it loaded', async t => {
   const db  = await freshDatabase();
-  const env = { APP_DB: db } as Env;
+  const env = await environmentOf(db);
 
   const { versionId } = await seedCandidate(db, snapshot);
   await activate(db, versionId);
@@ -88,4 +102,54 @@ t.test('one request resolves everything from the version it loaded', async t => 
   const next = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
   await activate(db, next.versionId);
   t.equal(await request.load(), loaded, 'a version activated mid-request does not change what it answers with');
+});
+
+/*
+ * The consumer path has the same fallback the registry's own reads have: a
+ * market route keeps answering from the version D1 last named, and the
+ * response says how old that version is.
+ */
+t.test('a request that cannot reach D1 is served the last version it named', async t => {
+  const db  = await freshDatabase();
+  const env = await environmentOf(db);
+
+  const { versionId } = await seedCandidate(db, snapshot);
+  await activate(db, versionId);
+
+  /*
+   * One binding that stops answering, rather than a second one: an isolate
+   * holds what it built per database binding, so replacing the binding would
+   * measure a different isolate than the one the outage happens to.
+   */
+  let reachable = true;
+  const flaky = new Proxy(db, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if ((property === 'prepare' || property === 'batch') && typeof(value) === 'function') {
+        return (...parameters: unknown[]) => {
+          if (!reachable) {
+            throw new Error(`D1_ERROR: network connection lost`);
+          }
+          return (value as (...parameters: unknown[]) => unknown).apply(target, parameters);
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as D1Database;
+
+  const flakyEnv = { ...env, APP_DB: flaky } as Env;
+  const loaded   = await requestCatalog(flakyEnv).load();
+  t.equal(loaded.versionId, versionId);
+
+  reachable = false;
+  const request = requestCatalog(flakyEnv);
+  const catalog = await request.load();
+  t.equal(catalog.versionId, versionId, 'the version the cache holds answers the request');
+  t.type(request.staleFor(), 'number', 'and the request knows the answer is an older one');
+  t.equal(catalog, loaded,
+    'the catalog this isolate already holds is reused: an outage is when rebuilding it is least affordable');
+
+  const closed = requestCatalog({ ...flakyEnv, REGISTRY_STALE_FALLBACK_MAX_S: '0' } as Env);
+  await t.rejects(closed.load(), { name: 'RegistryUnavailable' },
+    'with no window configured the route fails rather than answering from the cache');
 });

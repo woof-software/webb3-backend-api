@@ -6,7 +6,7 @@ import * as Debug from './lib/debug-log.js';
 import { route }      from './src/router.js';
 import * as Evaluator from './src/evaluator.js';
 
-import { isAdminRoute } from './src/http/cors.js';
+import { EXPOSED_HEADERS, isAdminRoute } from './src/http/cors.js';
 import { isRegistryPath } from './src/registry/router.js';
 import { runRegistrySync } from './src/registry/scheduled.js';
 
@@ -100,6 +100,14 @@ export { Env, ServiceBindings };
  */
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
+  /*
+   * Every route that resolves a market names the registry version it was
+   * computed from, and says when that version came from the cache because
+   * the database could not be reached. A browser client can only read those
+   * headers if the response exposes them, and the list is the registry's own
+   * so the two routers cannot drift apart.
+   */
+  'Access-Control-Expose-Headers': EXPOSED_HEADERS,
 };
 
 /*

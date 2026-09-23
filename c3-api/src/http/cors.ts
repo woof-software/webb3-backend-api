@@ -8,8 +8,19 @@
  * at all, which is what keeps a cross-origin script from reading a response
  * even if it manages to send the request.
  */
+/*
+ * The version headers are the contract a browser client reads: which version
+ * answered, and whether the answer came from the cache because the database
+ * could not be reached. A response that does not expose them leaves a
+ * cross-origin client unable to see either, and it would take a stale answer
+ * for a current one.
+ */
+const EXPOSED_HEADERS = 'X-Registry-Version, X-Registry-Checksum, X-Registry-Stale';
+
+
 const PUBLIC_CORS: Record<string, string> = {
-  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Origin':   '*',
+  'Access-Control-Expose-Headers': EXPOSED_HEADERS,
 };
 
 const PUBLIC_PREFLIGHT: Record<string, string> = {
@@ -34,4 +45,4 @@ function corsHeadersFor(pathname: string, { preflight = false }: { preflight?: b
   return preflight ? { ...PUBLIC_PREFLIGHT } : { ...PUBLIC_CORS };
 }
 
-export { PUBLIC_CORS, PUBLIC_PREFLIGHT, corsHeadersFor, isAdminRoute };
+export { EXPOSED_HEADERS, PUBLIC_CORS, PUBLIC_PREFLIGHT, corsHeadersFor, isAdminRoute };

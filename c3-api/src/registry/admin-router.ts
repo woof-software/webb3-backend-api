@@ -4,7 +4,9 @@ import { authenticateAdmin } from '../http/bearer-auth.js';
 import { ApiError, methodNotAllowed } from '../http/errors.js';
 import { MAX_BODY_BYTES, jsonResponse, readJsonObject } from '../http/json.js';
 
+import { cacheDepsOf } from './cache.js';
 import { proxyTransport, readFeeds } from './enrichment.js';
+import { registryStatus } from './status.js';
 import {
   FeedReader,
   OverlayDocuments,
@@ -23,6 +25,7 @@ import {
   getShadow,
   getSyncRun,
   getVersionDetail,
+  getVersions,
   postActivation,
   postValidate,
 } from './handlers.js';
@@ -71,6 +74,8 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/sync$/,                                                  method: 'POST', handler: 'sync',           family: 'sync' },
   { pattern: /^\/registry\/v1\/admin\/sync-runs\/([^/]+)$/,                                    method: 'GET',  handler: 'syncRun',        family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/shadow$/,                                                method: 'GET',  handler: 'shadow',         family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/status$/,                                                method: 'GET',  handler: 'status',         family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/versions$/,                                              method: 'GET',  handler: 'versions',       family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)$/,                                     method: 'GET',  handler: 'version',        family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/shadow$/,                             method: 'GET',  handler: 'shadow',         family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/changes$/,                            method: 'GET',  handler: 'changes',        family: 'read' },
@@ -211,6 +216,14 @@ async function postSync(env: Env, body: Record<string, unknown>, actor: string):
     status:            result.status,
     outcome:           result.outcome ?? null,
     processed:         result.processed,
+    /*
+     * How far the run has got, so a caller can see that an import which
+     * answers `running` is making progress: how many roots the commit has,
+     * how many are imported, and how many this invocation left to attempt.
+     */
+    expected:          result.expected ?? null,
+    completed:         result.completed ?? null,
+    outstanding:       result.outstanding ?? null,
     heldForReview:     result.held === true,
     checksFailed:      result.checksFailed ?? 0,
     reason:            result.reason ?? null,
@@ -300,10 +313,19 @@ async function routeAdmin(
     : await readJsonObject(request, { maxBytes: route.handler === 'overlays' ? MAX_OVERLAYS_BODY_BYTES : MAX_BODY_BYTES });
 
   switch (route.handler) {
+    case 'status':
+      /*
+       * Whether the registry is healthy, in one answer: what is active, what
+       * the cache holds, when the source was last checked, and which
+       * candidates are waiting. A monitor polls this and alerts on `alerts`.
+       */
+      return jsonResponse(await registryStatus(env, cacheDepsOf(env, context.debug)));
     case 'sync':
       return await postSync(env, body, context.actor);
     case 'syncRun':
       return await getSyncRun(context, versionId!);
+    case 'versions':
+      return await getVersions(context, new URL(request.url).searchParams);
     case 'version':
       return await getVersionDetail(context, versionId!);
     case 'proposal':

@@ -14,6 +14,19 @@ Endpoints that resolve a market answer `503` when no version is active, and
 `400` for an address the active version does not describe. The registry's own
 endpoints are documented under [Registry v1](#registry-v1).
 
+When the database cannot be reached, a response may instead be computed from
+the version that was active the last time it could. It then carries its age
+in seconds and is not cacheable:
+
+```
+X-Registry-Stale: 137
+Cache-Control:    no-store
+```
+
+A client that must not act on an older version refuses such a response; one
+that only reads can use it. How long that is allowed is per environment, and
+a `503` is the answer once the window has passed.
+
 ## Pagination
 
 Many endpoints are paginated for convenience. If an endpoint is paginated,
@@ -644,11 +657,42 @@ an environment is held regardless. `markets` bounds how many markets this
 request imports, from 1 to 50, and defaults to 50. Answers `202` with the
 run, the version it is importing into, and `heldForReview`.
 
+An import is resumable, and one request does not have to finish it. A request
+that leaves work behind answers `running` with how far the run has got:
+
+```json
+{ "status": "running", "processed": 23, "expected": 29, "completed": 23, "outstanding": 6 }
+```
+
+`expected` is how many roots the commit has, `completed` how many are
+imported, and `outstanding` how many are still to attempt — a root whose read
+failed goes back into the pool and is attempted again by the next request, so
+the count of markets one request processes varies. Send the same request with
+an empty body until the answer says `completed`.
+
+How much one request imports depends on what a single Worker invocation is
+given: locally that is often the whole source, and in a deployed environment
+it is a part of it.
+
+A root gets five attempts, after which it is abandoned and the candidate
+cannot validate. Those attempts are for the root being wrong. A request that
+imports some markets and then loses the node provider, or runs out of what a
+Worker is given in one invocation, fails the rest without spending their
+attempts: that failure is about the invocation, not about them. An invocation
+that imports nothing at all does spend them, so a source or a chain that
+answers for nothing ends the run instead of holding it open forever.
+
+A commit, an attempt and the decision to hold a candidate all belong to the
+run that was created with them, so a request that would continue an existing
+run and carries `sourceCommitSha`, `forceNewAttempt` or `holdForReview` is
+refused with `409 SYNC_ALREADY_RUNNING` rather than silently ignoring them.
+The same status answers a request sent while another invocation holds the
+run's lease.
+
 A held candidate is validated too, so its diagnostics can be read, but keeps
 its `importing` status: `checksFailed` says how many of its checks failed, and
 is `0` for one that would validate as it stands. A candidate another
-invocation is importing into is not one held for review, and asking for a sync
-while that run holds its lease answers `409 SYNC_ALREADY_RUNNING`.
+invocation is importing into is not one held for review.
 
 When the import fails, the answer says whether trying again can help. A
 request the registry refuses answers with the status its code maps to — a
@@ -657,11 +701,100 @@ failed its checks is `422` with `syncRunId` and `registryVersionId` in
 `details`, to read its validation by. Only a source that did not answer is
 `503`.
 
+## `GET /registry/v1/admin/status`
+### description:
+
+Whether the registry is healthy, in one answer: the active version and who
+switched it on, whether its bytes are cached, when the source was last
+checked, the last import run, and the candidates still open.
+
+`alerts` is that state reduced to the conditions worth acting on, so a monitor
+can check that it is empty without knowing the registry's rules:
+
+| Alert | Means |
+|---|---|
+| `no-active-version` | nothing is activated, so every market route answers `503` |
+| `candidate-awaiting-review` | a draft is open and no import is running: somebody has to review or discard it |
+| `last-sync-failed` | the most recent import run ended failed |
+| `sync-stalled` | a run says it is running but its lease expired, so no invocation is continuing it |
+| `sync-overdue` | the source has not been checked for more than twice the configured interval |
+| `snapshot-not-cached` | the active version's bytes are not in the cache, so every cold isolate hydrates it from D1 again |
+| `cache-unreadable` | the KV namespace did not answer at all: there is no cache, and no fallback if the database fails next |
+
+```sh
+$ curl -s "$API/registry/v1/admin/status" -H "Authorization: Bearer $TOKEN" | jq
+```
+```json
+{
+  "environment": "stage",
+  "checkedAt": "2026-09-23T09:12:41.004Z",
+  "active": {
+    "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
+    "checksum": "1bd74ebe00d845e0fa5e648b22a2c39e60d9a62bf6c58190320fa01cd9a26a4a",
+    "activatedAt": "2026-09-21T18:44:02.881Z",
+    "activatedBy": "registry-admin:stage",
+    "ageSeconds": 138518
+  },
+  "cache": { "snapshotCached": true, "pointerAgeSeconds": 412 },
+  "sync": {
+    "lastRun": {
+      "id": "0d0b3c4e-1d5c-4f0e-9d0a-2a2f2a9f0b61",
+      "status": "completed", "outcome": "no_change",
+      "startedAt": "2026-09-23T08:00:01.117Z", "completedAt": "2026-09-23T08:00:04.902Z",
+      "ageSeconds": 4116, "failedCount": 0, "expectedCount": 29, "completedCount": 29,
+      "lastError": null, "leaseExpiresAt": null
+    },
+    "upstreamCheckedAt": "2026-09-23T08:00:04.900Z",
+    "upstreamAgeSeconds": 4116,
+    "intervalSeconds": 86400
+  },
+  "candidates": { "importing": [], "invalid": 0 },
+  "alerts": []
+}
+```
+
 ## `GET /registry/v1/admin/sync-runs/{sync_run_id}`
 ### description:
 
 One import run and its per-root checkpoints, including why a root failed and
 when the run becomes resumable.
+
+## `GET /registry/v1/admin/versions`
+### description:
+
+Every version, newest first, with the active one named. This is how an
+operator finds the id of the draft they are working on, or of the version to
+roll back to.
+
+Query parameters:
+- `status` — [optional] — `importing`, `validated` or `invalid`
+- `limit` — [optional] — [default 20, max 100]
+
+It is a summary per version, never a snapshot: what each was built from and
+what became of it. The markets of one version are read by its id.
+
+```sh
+$ curl -s "$API/registry/v1/admin/versions?status=importing" -H "Authorization: Bearer $TOKEN" | jq
+```
+```json
+{
+  "activeVersionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
+  "versions": [
+    {
+      "id": "c0d77dad-b30e-495f-95aa-a9f457b39174",
+      "status": "importing",
+      "attempt": 2,
+      "isActive": false,
+      "sourceRepository": "compound-foundation/comet",
+      "sourceCommitSha": "a34d9b571c833b5d77f052ab8e2dbdbe10df726d",
+      "snapshotChecksum": null,
+      "createdAt": "2026-09-23T08:12:44.019Z",
+      "validatedAt": null,
+      "createdBy": "registry-admin:stage"
+    }
+  ]
+}
+```
 
 ## `GET /registry/v1/admin/versions/{version_id}`
 ### description:

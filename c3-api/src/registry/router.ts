@@ -5,6 +5,8 @@ import { ApiError, ApiErrorCode, errorBody, isApiError } from '../http/errors.js
 import { jsonResponse } from '../http/json.js';
 
 import { routeAdmin } from './admin-router.js';
+import type { CacheDeps, CachedSnapshot } from './cache.js';
+import { activeSnapshot, cacheDepsOf, warmSnapshot } from './cache.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
@@ -29,8 +31,18 @@ function isRegistryPath(pathname: string): boolean {
 }
 
 function maxAgeOf(env: Env): number {
-  const configured = Number(env.REGISTRY_SNAPSHOT_CACHE_TTL_S);
-  return Number.isInteger(configured) && configured > 0 ? configured : 300;
+  return cacheDepsOf(env).ttlSeconds;
+}
+
+/*
+ * The cache one request reads the active version through. It is built per
+ * request and asked at most once, so two handlers of one response cannot be
+ * served different versions.
+ */
+function activeReader(env: Env, debug: NonNullable<CacheDeps['debug']>): () => Promise<CachedSnapshot | null> {
+  const deps = cacheDepsOf(env, debug);
+  let pending: Promise<CachedSnapshot | null> | null = null;
+  return () => pending ??= activeSnapshot(deps);
 }
 
 /*
@@ -91,8 +103,22 @@ async function routeRegistry(
 
   const requestId = crypto.randomUUID();
   const context: RegistryContext = {
-    db:    env.APP_DB,
-    actor: env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`,
+    db:     env.APP_DB,
+    actor:  env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`,
+    debug,
+    active: activeReader(env, debug),
+    /*
+     * Warming is an optimization, and an optimization may not fail a command
+     * that has already committed: an activation whose pointer has moved must
+     * not answer 500 because KV or D1 hiccuped afterwards.
+     */
+    warm: async versionId => {
+      try {
+        await warmSnapshot(cacheDepsOf(env, debug), versionId);
+      } catch (error) {
+        debug.error(`registry snapshot not warmed`, { versionId, error });
+      }
+    },
   };
 
   try {

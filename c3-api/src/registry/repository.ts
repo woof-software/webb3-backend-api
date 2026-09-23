@@ -22,6 +22,7 @@ import {
 } from '../../lib/model/comet-registry.js';
 
 import { RegistryError } from './errors.js';
+import type { VersionRef } from './version-headers.js';
 import {
   MarketOverlay,
   NetworkOverlay,
@@ -612,6 +613,64 @@ async function readActiveVersionId(db: D1Database): Promise<string | null> {
   return active ?? null;
 }
 
+/*
+ * The active version and the checksum of its snapshot, in one statement.
+ *
+ * This is what a request pays to find out whether what it already holds is
+ * still current: the pointer is the only thing that moves, and the checksum
+ * with it names the immutable bytes a cache entry may be keyed by. Hydrating
+ * the snapshot to learn its checksum would defeat the cache it is read for.
+ */
+async function readActivePointer(db: D1Database): Promise<VersionRef | null> {
+  const pointer = await db.prepare(
+    `SELECT version.id AS id, version.snapshot_checksum AS checksum
+     FROM registry_state AS state
+     JOIN registry_versions AS version ON version.id = state.active_version_id
+     WHERE state.singleton_id = 1`
+  ).first<{ id: string, checksum: string | null }>();
+  return pointer === null || pointer === undefined || pointer.checksum === null
+    ? null
+    : { id: pointer.id, checksum: pointer.checksum };
+}
+
+/*
+ * The versions there are, newest first, with the active one named.
+ *
+ * An operator who has run a few imports has several ids and no way to tell
+ * them apart; everything else about a version is read by id, so something
+ * has to list them. It is bounded and never carries a snapshot: this says
+ * which versions exist and what became of them, not what is in them.
+ */
+async function readVersions(
+  db: D1Database,
+  { status, limit }: { status?: string, limit: number },
+): Promise<{
+  versions:        Array<RegistryVersionRow & { is_active: number }>,
+  activeVersionId: string | null,
+}> {
+  /*
+   * The pointer travels with the rows rather than being read after them: two
+   * reads could straddle an activation, and the answer would then name one
+   * version as active while every row was marked against another.
+   */
+  const rows = await db.prepare(
+    `SELECT version.*, state.active_version_id AS active_version_id,
+            CASE WHEN state.active_version_id = version.id THEN 1 ELSE 0 END AS is_active
+     FROM registry_versions AS version
+     LEFT JOIN registry_state AS state ON state.singleton_id = 1
+     WHERE ?1 IS NULL OR version.status = ?1
+     ORDER BY version.created_at DESC, version.attempt DESC
+     LIMIT ?2`
+  ).bind(status ?? null, limit).all<RegistryVersionRow & { is_active: number, active_version_id: string | null }>();
+
+  const versions = rows.results ?? [];
+  return {
+    versions,
+    // an empty listing carries no row to read it from
+    activeVersionId: versions[0]?.active_version_id ?? (versions.length === 0 ? await readActiveVersionId(db) : null),
+  };
+}
+
 async function readVersion(db: D1Database, versionId: string): Promise<RegistryVersionRow | null> {
   const version = await db
     .prepare(`SELECT * FROM registry_versions WHERE id = ?1`)
@@ -623,8 +682,17 @@ async function readVersion(db: D1Database, versionId: string): Promise<RegistryV
  * A stored version as the wire contract serves it. Only a validated version
  * has a snapshot checksum, so only a validated version can be served.
  */
-async function readRegistrySnapshot(db: D1Database, versionId: string): Promise<RegistrySnapshotV1 | null> {
-  const version = await readVersion(db, versionId);
+/*
+ * `known` is the version row, where the caller has already read it. The
+ * snapshot is hydrated from it either way; passing it in saves a statement
+ * for a caller that needed the row first for something else.
+ */
+async function readRegistrySnapshot(
+  db: D1Database,
+  versionId: string,
+  known?: RegistryVersionRow,
+): Promise<RegistrySnapshotV1 | null> {
+  const version = known ?? await readVersion(db, versionId);
   if (version === null || version.status !== 'validated' || version.snapshot_checksum === null) {
     return null;
   }
@@ -638,11 +706,6 @@ async function readRegistrySnapshot(db: D1Database, versionId: string): Promise<
     },
     networks: await readSnapshot(db, versionId),
   };
-}
-
-async function readActiveSnapshot(db: D1Database): Promise<RegistrySnapshotV1 | null> {
-  const activeVersionId = await readActiveVersionId(db);
-  return activeVersionId === null ? null : readRegistrySnapshot(db, activeVersionId);
 }
 
 /*
@@ -1065,13 +1128,14 @@ export {
   latestValidationAttempt,
   readActivationHistory,
   readActiveOverlays,
-  readActiveSnapshot,
+  readActivePointer,
   readActiveVersionId,
   readImportOverlays,
   readOverlays,
   readRegistrySnapshot,
   readValidationSummary,
   readVersion,
+  readVersions,
   markInvalid,
   markValidated,
   recordValidationResults,
