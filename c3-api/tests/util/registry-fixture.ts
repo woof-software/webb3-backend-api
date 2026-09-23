@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 import type { RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
+import type { Catalog } from '../../src/registry/catalog.js';
+import { catalogOf } from '../../src/registry/catalog.js';
 import {
   createCandidate,
   writeCandidateSnapshot,
@@ -18,6 +20,15 @@ const FIXTURE_PATH = './tests/fixtures/registry/registry-snapshot-v1.json';
 
 function loadRegistrySnapshotFixture(): RegistrySnapshotV1 {
   return JSON.parse(readFileSync(FIXTURE_PATH, 'utf8'));
+}
+
+/*
+ * The fixture as a request catalog, for tests of computations that resolve
+ * markets and tokens through the registry. It is the same materialization the
+ * worker builds per request, so a test exercises the path production takes.
+ */
+function fixtureCatalog(snapshot: RegistrySnapshotV1 = loadRegistrySnapshotFixture()): Catalog {
+  return catalogOf(snapshot);
 }
 
 function sha256Hex(value: string): string {
@@ -83,6 +94,7 @@ async function seedCandidate(
 export type { SeedOptions, SeededCandidate };
 
 export {
+  fixtureCatalog,
   loadRegistrySnapshotFixture,
   seedCandidate,
   sha256Hex,

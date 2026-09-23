@@ -12,7 +12,10 @@ import * as rewards from '../lib/computations/rewards.js';
 import { snakeifyCamelObject } from '../lib/camel-snake.js';
 
 import { Comet, StandaloneContract } from '../lib/well-known/contracts/types.js'
-import { getCometContractsForNetwork } from '../lib/well-known/contracts/utils.js';
+
+import { registryOf } from '../lib/model/comet-registry.js';
+
+import type { Catalog } from './registry/catalog.js';
 
 import {
   AllNetworks,
@@ -35,8 +38,20 @@ type Dependencies = (
   | rewards.RewardsSummary
 );
 
+/*
+ * The markets of one network, as the activated registry lists them.
+ *
+ * A market route either names one Comet, which the router already resolved
+ * through the same catalog, or asks for all of them. "All" means every market
+ * the version still serves, deprecated ones included: a position in a
+ * deprecated market must keep reporting.
+ */
+function marketsOf(catalog: Catalog, network: KnownNetwork.Name): Eth.Contract<StandaloneContract<Comet>>[] {
+  return catalog.marketsOn(network).map(entry => entry.comet);
+}
+
 async function latestSummary(
-  { apiHost, nodeHost, nodeKey, network, contract, queryParams }: MarketRouteData,
+  { apiHost, nodeHost, nodeKey, network, contract, queryParams, catalog }: MarketRouteData,
   context: UninstantiatedRouterContext,
 ): Promise<Response> {
   const includeTestnets = queryParams.get('testnets') === 'include';
@@ -68,7 +83,7 @@ async function latestSummary(
     selectedNetworks.map(async (network) => {
       const selectedContracts =
         contract === AllContracts
-          ? getCometContractsForNetwork(network)
+          ? marketsOf(catalog, network)
           : [contract];
 
       if (selectedContracts.length === 0) {
@@ -141,6 +156,23 @@ async function latestRewardsSummary(
   });
 
   /*
+   * A market the version gives no rewards has no reward price to value them
+   * with: its reward feed stands at the zero address only to keep the
+   * contract shape uniform, and reading it would fail rather than answer. The
+   * route says so instead, the way the dapp-data route leaves such a market
+   * out.
+   */
+  if (registryOf(contract)?.market.capabilities.rewards === false) {
+    return new Response(
+      JSON.stringify({
+        error: `Rewards are not available for this market`,
+        code:  'REWARDS_NOT_AVAILABLE',
+      }),
+      { status: 404 }
+    );
+  }
+
+  /*
    * FIXME: this can still be improved by using types in MarketRouteData
    */
   const rewardsTokenPriceFeed = (
@@ -167,7 +199,7 @@ async function latestRewardsSummary(
 }
 
 async function historicalSummary(
-  { apiHost, nodeHost, nodeKey, network, contract, queryParams }: MarketRouteData,
+  { apiHost, nodeHost, nodeKey, network, contract, queryParams, catalog }: MarketRouteData,
   context: Context,
 ): Promise<Response> {
   const includeTestnets = queryParams.get('testnets') === 'include';
@@ -197,7 +229,7 @@ async function historicalSummary(
     selectedNetworks.map(async (network) => {
       const selectedContracts =
         contract === AllContracts
-          ? getCometContractsForNetwork(network)
+          ? marketsOf(catalog, network)
           : [contract];
 
       if (selectedContracts.length === 0) {
@@ -287,7 +319,7 @@ async function historicalSummary(
 }
 
 async function rewardsDappData(
-  { apiHost, nodeHost, nodeKey, network, contract, queryParams }: MarketRouteData,
+  { apiHost, nodeHost, nodeKey, network, contract, queryParams, catalog }: MarketRouteData,
   context: UninstantiatedRouterContext,
 ): Promise<Response> {
   const includeTestnets = queryParams.get('testnets') === 'include';
@@ -319,18 +351,18 @@ async function rewardsDappData(
 
   const marketRewards = await Promise.all(
     selectedNetworks.map(async (networkName) => {
-      const selectedContracts =
-        contract === AllContracts
-          ? getCometContractsForNetwork(networkName)
-          : [ contract ];
+      /*
+       * Only markets whose rewards the registry says are usable. A market
+       * without a reward price feed cannot be valued, which is why the whole
+       * of Scroll and Ronin used to be excluded by name here; the version now
+       * states it per market.
+       */
+      const selectedContracts = (contract === AllContracts ? marketsOf(catalog, networkName) : [ contract ])
+        .filter(selected => registryOf(selected)?.market.capabilities.rewards ?? true);
 
       if (selectedContracts.length === 0) {
         return [];
       }
-
-      if (networkName === 'ronin-mainnet' || networkName === 'scroll-mainnet') {
-      return [];
-    }
 
       const rewards = await evaluator.evaluate(
         evaluator.split(selectedContracts.map((selectedContract) =>

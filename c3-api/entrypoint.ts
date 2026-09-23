@@ -6,6 +6,8 @@ import * as Debug from './lib/debug-log.js';
 import { route }      from './src/router.js';
 import * as Evaluator from './src/evaluator.js';
 
+import { isAdminRoute } from './src/http/cors.js';
+import { isRegistryPath } from './src/registry/router.js';
 import { runRegistrySync } from './src/registry/scheduled.js';
 
 import * as v2           from './lib/computations/v2.js';
@@ -68,6 +70,8 @@ interface Env extends Flags.Env, ServiceBindings {
   COMET_SYNC_LEASE_SECONDS: string,
   REGISTRY_SNAPSHOT_CACHE_TTL_S: string,
   REGISTRY_STALE_FALLBACK_MAX_S: string,
+  // the operator identity recorded in audit rows, never taken from a request
+  COMET_REGISTRY_ADMIN_ACTOR?: string,
   // comet registry secrets, never set in wrangler.toml
   COMET_REGISTRY_ADMIN_TOKEN_HASH?: string,
   COMET_GITHUB_TOKEN?: string,
@@ -112,7 +116,13 @@ const SECURITY_HEADERS: Record<string, string> = {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method === 'OPTIONS') {
+    const { pathname } = new URL(request.url);
+    /*
+     * The registry answers its own preflight, because its administrative
+     * routes must not advertise cross-origin access the way the public
+     * routes do.
+     */
+    if (request.method === 'OPTIONS' && !isRegistryPath(pathname)) {
       return new Response(null, {
         status: 204,
         headers: {
@@ -155,7 +165,15 @@ export default {
         ...sleuthQuery,
       }),
     );
-    for (const [name, value] of Object.entries({ ...CORS_HEADERS, ...SECURITY_HEADERS })) {
+    /*
+     * Security headers apply everywhere. The wildcard CORS header does not:
+     * an authenticated administrative write must not be readable by a script
+     * on any origin, so those routes keep the headers their own router set.
+     */
+    const headers = isAdminRoute(pathname)
+      ? SECURITY_HEADERS
+      : { ...CORS_HEADERS, ...SECURITY_HEADERS };
+    for (const [name, value] of Object.entries(headers)) {
       response.headers.set(name, value);
     }
     return response;

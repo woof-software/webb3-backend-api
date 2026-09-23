@@ -6,9 +6,9 @@ import { sha256    } from '../../lib/hash.js';
 import { BigNumber } from '../../lib/bignumber.js';
 import { BigFixnum } from '../../lib/bigfixnum.js';
 
-import { Comet }          from '../../lib/well-known/contracts/types.js';
 import * as KnownNetwork  from '../../lib/well-known/networks/network.js';
-import * as ContractUtils from '../../lib/well-known/contracts/utils.js';
+
+import type { Catalog } from '../registry/catalog.js';
 
 import * as governanceModel from '../../lib/model/governance.js';
 
@@ -53,6 +53,22 @@ const MAX_ENRICH_TRANSACTION_HISTORY_ITEMS = 50;
 // Parallel batch size for parallel enriching process
 const PARALLEL_BATCH_SIZE = 10;
 
+/*
+ * One log stream: the markets whose events are read together, and the rewards
+ * contract whose claim events belong with them. Markets are grouped by their
+ * rewards contract, because a stream is read as one range of logs and the
+ * rewards contract is part of that range.
+ */
+type StreamEvent = {
+  network: KnownNetwork.Name; // Will change to chain-id later
+  marketContractAddresses: Eth.Address[];
+  rewardsContractAddress: Eth.Address;
+};
+
+function streamKeyOf({ network, rewardsContractAddress }: StreamEvent): string {
+  return `${network}|${rewardsContractAddress.toLowerCase()}`;
+}
+
 interface Cursor {
   network: KnownNetwork.Name;
   blockNumber: number;
@@ -62,6 +78,13 @@ interface Cursor {
 };
 
 type CursorPayload = {
+  /*
+   * The registry version this page was read against. A cursor is only
+   * meaningful within one version: markets, and the streams they are read
+   * from, are what the version defines. It is optional because cursors issued
+   * before the registry carry none, and those are accepted once and upgraded.
+   */
+  registryVersionId?: string;
   profilesByAddress: { [key: Eth.Address]: governanceModel.Profile };
   filter: {
     markets: string[];
@@ -72,11 +95,8 @@ type CursorPayload = {
     contractAddresses: string[];
     networks: string[];
   };
-  streamEvents: Array<{
-    network: KnownNetwork.Name; // Will change to chain-id later
-    marketContractAddresses: Eth.Address[];
-    rewardsContractAddress: Eth.Address;
-  }>;
+  streamEvents: StreamEvent[];
+  // keyed by stream, not by network: one network can have several streams
   cursors: { [key: string]: Cursor };
 };
 
@@ -112,87 +132,58 @@ function Api({ env, debug, flags = {} }: Context) {
   });
 }
 
-function GetAllTestStreamEvents(): { network: KnownNetwork.Name, marketContractAddresses: Eth.Address[], rewardsContractAddress: Eth.Address }[] {
-  const streamEvents: { network: KnownNetwork.Name, marketContractAddresses: Eth.Address[], rewardsContractAddress: Eth.Address }[] = [];
-  // Get all Comet contracts in testnet
-  // Maybe there will be a way to get all markets across all network, but now manually add all markets here
-  streamEvents.push({
-    network: 'ethereum-sepolia',
-    marketContractAddresses: [
-      Eth.wellKnownContractsByNetwork['ethereum-sepolia']['Comet']['cUSDCv3'].address,
-      Eth.wellKnownContractsByNetwork['ethereum-sepolia']['Comet']['cWETHv3'].address,
-    ],
-    rewardsContractAddress: Eth.wellKnownContractsByNetwork['ethereum-sepolia']['Comet']['cUSDCv3'].rewards.contract.address,
-  });
+/*
+ * The log streams of one registry version.
+ *
+ * A market is readable here when the version says its transaction history is
+ * served, and markets that share a rewards contract are read as one stream.
+ * Before the registry this list was written out by hand, which meant a market
+ * missing from it had no reachable history at all — indistinguishable from a
+ * market with no activity — while the `markets[]` query parameter could only
+ * filter what these streams had already fetched.
+ */
+function streamEventsOf(catalog: Catalog): StreamEvent[] {
+  const streams = new Map<string, StreamEvent>();
 
-  return streamEvents;
+  for (const entry of catalog.markets()) {
+    const comet   = entry.market.contracts.comet;
+    const rewards = entry.market.contracts.rewards;
+    if (!entry.market.capabilities.transactionHistory || comet === null || rewards === null) {
+      continue;
+    }
+    const stream = { network: entry.network, marketContractAddresses: [ comet ], rewardsContractAddress: rewards };
+    const key    = streamKeyOf(stream);
+    const known  = streams.get(key);
+    if (known === undefined) {
+      streams.set(key, stream);
+    } else {
+      known.marketContractAddresses.push(comet);
+    }
+  }
+
+  return [ ...streams.values() ];
 }
 
-function GetAllStreamEvents(): { network: KnownNetwork.Name, marketContractAddresses: Eth.Address[], rewardsContractAddress: Eth.Address }[] {
-  const streamEvents: { network: KnownNetwork.Name, marketContractAddresses: Eth.Address[], rewardsContractAddress: Eth.Address }[] = [];
-  // Get all Comet contracts in both 'cUSDCv3' and 'weth' markets
-  // Maybe there will be a way to get all markets across all network, but now manually add all markets here
-  streamEvents.push({
-    network: 'ethereum-mainnet',
-    marketContractAddresses: [
-      Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cUSDCv3'].address,
-      Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cWETHv3'].address,
-      Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cUSDTv3'].address,
-      /*
-       * ciUSDCv3 must be listed HERE, not just declared in the registry: this
-       * list decides which contracts' logs are fetched, while the `markets[]`
-       * query parameter only filters items already fetched from these streams.
-       * A market absent from this list has no transaction history reachable by
-       * any query, and the empty response is indistinguishable from a market
-       * with no activity.
-       *
-       * NOTE: cwstETHv3, cUSDSv3 and cWBTCv3 are absent for exactly that
-       * reason and so currently have no reachable history. Pre-existing; not
-       * addressed here.
-       */
-      Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['ciUSDCv3'].address,
-    ],
-    rewardsContractAddress: Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cUSDCv3'].rewards.contract.address,
-  });
-
-  streamEvents.push({
-    network: 'polygon-mainnet',
-    marketContractAddresses: [
-      Eth.wellKnownContractsByNetwork['polygon-mainnet']['Comet']['cUSDCv3'].address,
-    ],
-    rewardsContractAddress: Eth.wellKnownContractsByNetwork['polygon-mainnet']['Comet']['cUSDCv3'].rewards.contract.address,
-  });
-
-  streamEvents.push({
-    network: 'arbitrum-mainnet',
-    marketContractAddresses: [
-      Eth.wellKnownContractsByNetwork['arbitrum-mainnet']['Comet']['cUSDCv3'].address,
-      Eth.wellKnownContractsByNetwork['arbitrum-mainnet']['Comet']['cUSDC.ev3'].address,
-    ],
-    rewardsContractAddress: Eth.wellKnownContractsByNetwork['arbitrum-mainnet']['Comet']['cUSDCv3'].rewards.contract.address,
-  });
-
-  streamEvents.push({
-    network: 'base-mainnet',
-    marketContractAddresses: [
-      Eth.wellKnownContractsByNetwork['base-mainnet']['Comet']['cUSDCv3'].address,
-      Eth.wellKnownContractsByNetwork['base-mainnet']['Comet']['cUSDbCv3'].address,
-      Eth.wellKnownContractsByNetwork['base-mainnet']['Comet']['cWETHv3'].address,
-    ],
-    rewardsContractAddress: Eth.wellKnownContractsByNetwork['base-mainnet']['Comet']['cUSDCv3'].rewards.contract.address,
-  });
-
-  streamEvents.push({
-    network: 'optimism-mainnet',
-    marketContractAddresses: [
-      Eth.wellKnownContractsByNetwork['optimism-mainnet']['Comet']['cUSDCv3'].address,
-      Eth.wellKnownContractsByNetwork['optimism-mainnet']['Comet']['cUSDTv3'].address,
-      Eth.wellKnownContractsByNetwork['optimism-mainnet']['Comet']['cWETHv3'].address,
-    ],
-    rewardsContractAddress: Eth.wellKnownContractsByNetwork['optimism-mainnet']['Comet']['cUSDCv3'].rewards.contract.address,
-  });
-  
-  return streamEvents;
+/*
+ * The contracts of a stream, as the pinned version materializes them. Every
+ * address in a stream came from this same catalog, so a market that the
+ * version does not describe cannot appear here.
+ */
+function contractsOf(catalog: Catalog, stream: StreamEvent): {
+  marketContracts: Eth.Contract[],
+  rewardsContract: Eth.Contract,
+} {
+  const markets = stream.marketContractAddresses
+    .map(address => catalog.marketAt(stream.network, address))
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+  if (markets.length === 0) {
+    throw new Error(`stream ${streamKeyOf(stream)} has no market in the active registry`);
+  }
+  return {
+    marketContracts: markets.map(entry => entry.comet),
+    // every market of a stream shares one rewards contract, by construction
+    rewardsContract: markets[0]!.comet.rewards.contract,
+  };
 }
 
 function GetAllMigratorsAddresses(): Eth.Address[] {
@@ -207,6 +198,59 @@ function getDefiSaverProxyRegistryContract(): { [key: string]: Eth.Contract }{
   const proxyRegistryContract: { [key: string]: Eth.Contract } = {};
   proxyRegistryContract['ethereum-mainnet'] = Eth.wellKnownContractsByNetwork['ethereum-mainnet']['DFSProxyRegistry']['default'];
   return proxyRegistryContract;
+}
+
+/*
+ * A cursor issued before the registry, read against the version that is
+ * active now.
+ *
+ * Such a cursor keyed its per-stream state by network, because every network
+ * had exactly one stream, so each of this version's streams resumes from the
+ * position its network had reached.
+ *
+ * A stream on a network the old cursor never saw has no position to resume
+ * from, and none can be derived: the cursor holds block numbers of other
+ * chains, not the time the pages it served reached back to. Starting such a
+ * stream anywhere would emit items newer than pages already served, and
+ * history paged newest-first would jump forward in the middle. So the session
+ * the old cursor belongs to continues with the networks it had; restarting
+ * pagination without a cursor brings in every stream this version serves.
+ * Only a client paging at the cutover ever holds such a cursor.
+ *
+ * A cursor that carried no explicit `markets[]` filter had the old stream list
+ * baked into its networks and contract addresses; the filter is rewritten to
+ * the streams the session keeps, which may hold markets the old list did not.
+ */
+function upgradeLegacyCursor(
+  payload: CursorPayload,
+  streamEvents: StreamEvent[],
+  registryVersionId: string,
+): CursorPayload {
+  const kept    = streamEvents.filter(stream => payload.cursors[stream.network] !== undefined);
+  const cursors: { [key: string]: Cursor } = {};
+
+  for (const stream of kept) {
+    const previous = payload.cursors[stream.network]!;
+    cursors[streamKeyOf(stream)] = {
+      network:                 stream.network,
+      marketContractAddresses: stream.marketContractAddresses,
+      rewardsContractAddress:  stream.rewardsContractAddress,
+      blockNumber:             previous.blockNumber,
+      transactionHash:         previous.transactionHash,
+    };
+  }
+
+  // an empty markets[] filter meant "everything the session reads"
+  const filter = payload.filter.markets.length > 0 ? payload.filter : {
+    ...payload.filter,
+    networks:          [ ...new Set(kept.map(stream => stream.network as string)) ],
+    contractAddresses: kept.flatMap(stream => [
+      ...stream.marketContractAddresses,
+      stream.rewardsContractAddress,
+    ] as string[]),
+  };
+
+  return { ...payload, registryVersionId, filter, streamEvents: kept, cursors };
 }
 
 // Filter to apply before history items get enriched, if filter it before we can save some API calls in enrichment
@@ -275,7 +319,7 @@ function filterTransactionHistoryItem(
 }
 
 async function getTransactionHistory(
-  { apiHost, nodeHost, nodeKey, accountAddress, queryParams }: TransactionHistoryRouteData,
+  { apiHost, nodeHost, nodeKey, accountAddress, queryParams, catalog }: TransactionHistoryRouteData,
   context: Context,
 ): Promise<Response> {
   // ****************** HELPER FUNCTIONS ******************
@@ -300,6 +344,7 @@ async function getTransactionHistory(
           network,
           marketContracts,
           rewardsContract,
+          catalog,
           blockNumber: startBlockNumber,
         }
       }));
@@ -318,6 +363,7 @@ async function getTransactionHistory(
         network,
         accountAddress,
         item: rawItem,
+        catalog,
       }
     }));
   }
@@ -343,6 +389,15 @@ async function getTransactionHistory(
     // Block number anchor tracking, to track the last raw items loaded block number according to the index projected block number
     const blockNumberAnchor: { [key: string]: Eth.BlockNumber[] } = {};
 
+    /*
+     * The contracts of every stream, resolved once. They are fixed for the
+     * whole request, while the merge loop below revisits every stream on every
+     * item it emits.
+     */
+    const streamContracts = new Map(
+      streamEvents.map(stream => [ streamKeyOf(stream), contractsOf(catalog, stream) ]),
+    );
+
     // DefiSaver proxy registry contract
     const defiSaverProxyRegistryContract = getDefiSaverProxyRegistryContract();
 
@@ -350,22 +405,17 @@ async function getTransactionHistory(
     const defiSaverProxies: { [key: string]: Promise<Eth.Address[]> } = {};
 
     // Initialize queues on first run
-    streamEvents.map(({ network, marketContractAddresses, rewardsContractAddress }) => {
-      const targetMarketContracts = marketContractAddresses.map(address => (
-        Fallible.must(ContractUtils.lookupInWellKnown(
-          { network, address },
-          Eth.wellKnownContractsByNetwork
-        ))));
-      const targetRewardsContract: Eth.Contract = Fallible.must(ContractUtils.lookupInWellKnown(
-        { network, address: rewardsContractAddress },
-        Eth.wellKnownContractsByNetwork
-      ));
-      const cursor = cursors[network];
+    streamEvents.map((stream) => {
+      const { network } = stream;
+      const streamId = streamKeyOf(stream);
+      const { marketContracts: targetMarketContracts, rewardsContract: targetRewardsContract } =
+        streamContracts.get(streamId)!;
+      const cursor = cursors[streamId];
       if (cursor === undefined) {
         throw new Error('Cursor is undefined, cursor may failed on initialization');
       }
-      if (rawItemsLoadingBatch[network] === undefined) {
-        rawItemsLoadingBatch[network] = [];
+      if (rawItemsLoadingBatch[streamId] === undefined) {
+        rawItemsLoadingBatch[streamId] = [];
       }
 
       // Promise to get latest block
@@ -393,7 +443,7 @@ async function getTransactionHistory(
       }
 
       // Initialize and populate the first loading batch job to include the offset settings from query
-      rawItemsLoadingBatch[network].push(
+      rawItemsLoadingBatch[streamId].push(
         Promise.all([latestBlockNumber, defiSaverProxies[network]]).then(([latestBlockNum, proxies]) => {
           return getRawTransactionHistoryItems(
             accountAddress,
@@ -424,49 +474,43 @@ async function getTransactionHistory(
     while (mergedItems.length < itemsLimit && enrichedItemCount <= MAX_ENRICH_TRANSACTION_HISTORY_ITEMS) {
       let maxTimestamp = Number.MIN_SAFE_INTEGER;
       let maxTimestampItem: TransactionHistoryItem | undefined = undefined;
-      let maxTimestampNetwork: KnownNetwork.Name | undefined = undefined;
-      for (const m of streamEvents) {
-        const { network, marketContractAddresses, rewardsContractAddress } = m;
-        const targetMarketContracts = marketContractAddresses.map(address => (
-          Fallible.must(ContractUtils.lookupInWellKnown(
-            { network, address },
-            Eth.wellKnownContractsByNetwork
-          ))));
-        const targetRewardsContract = Fallible.must(ContractUtils.lookupInWellKnown(
-          { network, address: rewardsContractAddress },
-          Eth.wellKnownContractsByNetwork
-        ));
+      let maxTimestampStream: string | undefined = undefined;
+      for (const stream of streamEvents) {
+        const { network } = stream;
+        const streamId = streamKeyOf(stream);
+        const { marketContracts: targetMarketContracts, rewardsContract: targetRewardsContract } =
+          streamContracts.get(streamId)!;
 
         // Initialize blockNumberAnchor to populate the first anchor number
-        if (blockNumberAnchor[network] === undefined) {
+        if (blockNumberAnchor[streamId] === undefined) {
           if (latestBlockPromises[network] === undefined) {
-            blockNumberAnchor[network] = [cursors[network].blockNumber];
+            blockNumberAnchor[streamId] = [cursors[streamId].blockNumber];
           } else {
             // This means the anchor should be initialized from async promise input
-            blockNumberAnchor[network] = [await latestBlockPromises[network].then(block => block.number)];
+            blockNumberAnchor[streamId] = [await latestBlockPromises[network].then(block => block.number)];
             // Also update cursor blocknumber for later uses
-            cursors[network] = {
-              ...cursors[network],
-              blockNumber: blockNumberAnchor[network][0],
+            cursors[streamId] = {
+              ...cursors[streamId],
+              blockNumber: blockNumberAnchor[streamId][0],
             };
           }
         }
         // Immediate item is undefined, need to load more items from raw queue and enrich it
         let reachedEnd = false;
         while (true
-          && immediateEnrichedItem[network] === undefined
+          && immediateEnrichedItem[streamId] === undefined
           && !reachedEnd
           && enrichedItemCount <= MAX_ENRICH_TRANSACTION_HISTORY_ITEMS
         ) {
           // Fill/Refill the PARALLEL_BATCH_SIZE raw items queue to load all raw items in parallel
           if (false
-            || rawItemsLoadingBatch[network] === undefined
-            || rawItemsLoadingBatch[network].length < PARALLEL_BATCH_SIZE) {
-            if (rawItemsLoadingBatch[network] === undefined) {
-              rawItemsLoadingBatch[network] = [];
+            || rawItemsLoadingBatch[streamId] === undefined
+            || rawItemsLoadingBatch[streamId].length < PARALLEL_BATCH_SIZE) {
+            if (rawItemsLoadingBatch[streamId] === undefined) {
+              rawItemsLoadingBatch[streamId] = [];
             }
-            while (rawItemsLoadingBatch[network].length < PARALLEL_BATCH_SIZE) {
-              const blockNumber = blockNumberAnchor[network][blockNumberAnchor[network].length - 1];
+            while (rawItemsLoadingBatch[streamId].length < PARALLEL_BATCH_SIZE) {
+              const blockNumber = blockNumberAnchor[streamId][blockNumberAnchor[streamId].length - 1];
               const newPrecedingBlockResult = Index.TransactionHistoryIndex.preceding(
                 {
                   accountAddress,
@@ -479,8 +523,8 @@ async function getTransactionHistory(
                 break;
               }
               const newPrecedingBlockNumber = Fallible.unwrap(newPrecedingBlockResult).blockNumber;
-              blockNumberAnchor[network].push(newPrecedingBlockNumber);
-              rawItemsLoadingBatch[network].push(getRawTransactionHistoryItems(
+              blockNumberAnchor[streamId].push(newPrecedingBlockNumber);
+              rawItemsLoadingBatch[streamId].push(getRawTransactionHistoryItems(
                 accountAddress,
                 [ ...await defiSaverProxies[network] ],
                 newPrecedingBlockNumber,
@@ -493,32 +537,32 @@ async function getTransactionHistory(
 
           // If rawItemsQueue is empty, load more raw items
           if (false
-            || rawItemsQueue[network] === undefined
-            || rawItemsQueue[network].length === 0
+            || rawItemsQueue[streamId] === undefined
+            || rawItemsQueue[streamId].length === 0
           ) {
             let moreRawTransactionHistory = [];
-            while (moreRawTransactionHistory.length < 1 && rawItemsLoadingBatch[network].length > 0) {
-              const rawItems = await rawItemsLoadingBatch[network].shift()!;
+            while (moreRawTransactionHistory.length < 1 && rawItemsLoadingBatch[streamId].length > 0) {
+              const rawItems = await rawItemsLoadingBatch[streamId].shift()!;
               moreRawTransactionHistory.push(...rawItems);
             }
-            if (rawItemsLoadingBatch[network].length === 0) {
+            if (rawItemsLoadingBatch[streamId].length === 0) {
               reachedEnd = true;
             }
-            rawItemsQueue[network] = moreRawTransactionHistory;
+            rawItemsQueue[streamId] = moreRawTransactionHistory;
           }
 
           // Fill/Refill up to PARALLEL_BATCH_SIZE items into enrichingBatch to process in parallel
           if (false
-            || enrichingBatch[network] === undefined
-            || enrichingBatch[network].length < PARALLEL_BATCH_SIZE) {
-            if (enrichingBatch[network] === undefined) {
-              enrichingBatch[network] = [];
+            || enrichingBatch[streamId] === undefined
+            || enrichingBatch[streamId].length < PARALLEL_BATCH_SIZE) {
+            if (enrichingBatch[streamId] === undefined) {
+              enrichingBatch[streamId] = [];
             }
             // Keep moving items from raw queue until the batch is filled back to BATCH_SIZE or raw queue is empty
-            while (enrichingBatch[network].length < PARALLEL_BATCH_SIZE && rawItemsQueue[network].length > 0) {
-              const rawItem = rawItemsQueue[network].pop()!;
+            while (enrichingBatch[streamId].length < PARALLEL_BATCH_SIZE && rawItemsQueue[streamId].length > 0) {
+              const rawItem = rawItemsQueue[streamId].pop()!;
               if (filterRawTransactionHistoryItem(networks, contractAddresses, rawItem)) {
-                enrichingBatch[network].push(
+                enrichingBatch[streamId].push(
                   enrichRawTransactionHistoryItem(accountAddress, network, rawItem)
                 );
               }
@@ -526,28 +570,28 @@ async function getTransactionHistory(
           }
 
           // Pull 1 item from enrichingBatch and filter the enriched item into immediateEnrichedItem
-          if (enrichingBatch[network] !== undefined && enrichingBatch[network].length > 0) {
-            const itemPromise = enrichingBatch[network].shift();
+          if (enrichingBatch[streamId] !== undefined && enrichingBatch[streamId].length > 0) {
+            const itemPromise = enrichingBatch[streamId].shift();
             if (itemPromise === undefined) {
               throw new Error('Queue shall not be empty here');
             }
             const enrichedItem = await itemPromise;
             enrichedItemCount += 1;
-            while (blockNumberAnchor[network].length > 1 && enrichedItem.blockNumber < blockNumberAnchor[network][1]) {
+            while (blockNumberAnchor[streamId].length > 1 && enrichedItem.blockNumber < blockNumberAnchor[streamId][1]) {
               // Previous index projected block number is not longer needed
-              blockNumberAnchor[network].shift();
+              blockNumberAnchor[streamId].shift();
               // Update cursor preceding block number
-              cursors[network] = {
-                ...cursors[network],
-                blockNumber: blockNumberAnchor[network][0],
+              cursors[streamId] = {
+                ...cursors[streamId],
+                blockNumber: blockNumberAnchor[streamId][0],
               };
             }
             if (filterTransactionHistoryItem(accountAddress, actions, initiatedBy, enrichedItem)) {
-              immediateEnrichedItem[network] = enrichedItem;
+              immediateEnrichedItem[streamId] = enrichedItem;
             } else {
               // Update cursor transaction hash, so next time we can start from the next item
-              cursors[network] = {
-                ...cursors[network],
+              cursors[streamId] = {
+                ...cursors[streamId],
                 transactionHash: enrichedItem.transactionHash,
               };
             }
@@ -555,25 +599,25 @@ async function getTransactionHistory(
         }
 
         // Compare immediate item with max block number
-        if (immediateEnrichedItem[network] !== undefined) {
-          const item = immediateEnrichedItem[network];
+        if (immediateEnrichedItem[streamId] !== undefined) {
+          const item = immediateEnrichedItem[streamId];
           if (item.timestamp > maxTimestamp) {
             maxTimestamp = item.timestamp;
             maxTimestampItem = item;
-            maxTimestampNetwork = network;
+            maxTimestampStream = streamId;
           }
         }
       }
 
-      if (maxTimestampItem !== undefined && maxTimestampNetwork !== undefined) {
+      if (maxTimestampItem !== undefined && maxTimestampStream !== undefined) {
         // Add max item cadidate to mergedTrxHistItems
         mergedItems.push(maxTimestampItem);
 
         // Delete immediate item
-        delete immediateEnrichedItem[maxTimestampNetwork];
+        delete immediateEnrichedItem[maxTimestampStream];
 
         // Update cursor
-        const currentCursor = cursors[maxTimestampNetwork];
+        const currentCursor = cursors[maxTimestampStream];
         if (currentCursor === undefined) {
           throw new Error('Cursor is undefined, cursor may failed on initialization');
         }
@@ -583,17 +627,20 @@ async function getTransactionHistory(
           transactionHash: maxTimestampItem.transactionHash,
         };
 
-        cursors[maxTimestampNetwork] = newCursor;
+        cursors[maxTimestampStream] = newCursor;
       } else {
         // No more items to load, break and return
         done = true;
         // TODO: hans: A little hacky one off update cursor to the last block number
         // But now the cursor block# is tracked along the items getting loaded, which no item will be able to trigger this when it's on contract creation time
-        for (const network of networks) {
-          cursors[network] = {
-            ...cursors[network],
-            blockNumber: blockNumberAnchor[network][0],
-          };
+        for (const stream of streamEvents) {
+          const streamId = streamKeyOf(stream);
+          if (blockNumberAnchor[streamId] !== undefined) {
+            cursors[streamId] = {
+              ...cursors[streamId],
+              blockNumber: blockNumberAnchor[streamId][0],
+            };
+          }
         }
         break;
       }
@@ -672,9 +719,15 @@ async function getTransactionHistory(
     return { networkParam, address };
   });
 
+  /*
+   * The streams this version serves. A `markets[]` filter narrows which items
+   * are kept, not which streams are read: a market is only addressable when
+   * the active version describes it and says its history is served.
+   */
+  const streamEvents = streamEventsOf(catalog);
+
   const contractAddresses: string[] = [];
   const networks: string[] = [];
-  let loadTestnet = false;
   if (parsedMarkets.length > 0) {
     for (const m of parsedMarkets) {
       const { networkParam, address } = m;
@@ -695,30 +748,35 @@ async function getTransactionHistory(
       }
 
       const networkAlias = KnownNetwork.canonicalNameOf(network);
-      if (networkAlias === 'ethereum-sepolia') loadTestnet = true;
       if (!networks.includes(networkAlias)) networks.push(networkAlias);
-      if ((networks.includes('ethereum-mainnet') || networks.includes('polygon-mainnet')) && loadTestnet) {
-        return new Response(`Request can't mix with ethereum-mainnet and testnet`, { status: 400 });
-      }
-      const cometContract = ContractUtils.lookupInWellKnown(
-        { network: networkAlias, address },
-        Eth.wellKnownContractsByNetwork
-      );
-      if (!Comet.is(cometContract)) {
+
+      /*
+       * A market is filterable only if some stream actually reads it. The
+       * capability alone is not enough: a market the version describes
+       * without the rewards contract its stream is grouped by has no logs
+       * fetched for it, and answering 200 with an empty page would be
+       * indistinguishable from a market nobody has used.
+       */
+      const market = catalog.marketAt(networkAlias, address);
+      const stream = market === null ? undefined : streamEvents.find(candidate => (
+        candidate.network === networkAlias
+          && candidate.marketContractAddresses.includes(market.market.contracts.comet!)
+      ));
+      if (market === null || stream === undefined) {
         return new Response(`Invalid market address ${address}`, { status: 400 });
       }
       contractAddresses.push(address);
       // Push rewards contract address to contractAddresses if it is not already there
       // TODO: contract addresses used in api seems are mixing between with upper case and all lower case ones, should be consistent
       // For now, we use filter and compare both in lower case for comparison
-      if (contractAddresses.filter((a) => a.toLowerCase() === cometContract.rewards.contract.address.toLowerCase()).length === 0) {
-        contractAddresses.push(cometContract.rewards.contract.address);
+      const rewardsAddress = stream.rewardsContractAddress;
+      if (contractAddresses.filter((a) => a.toLowerCase() === rewardsAddress.toLowerCase()).length === 0) {
+        contractAddresses.push(rewardsAddress);
       }
     }
   } else {
-    // Default to include all ethereum-mainnet markets
-    // Just include everything from sources
-    GetAllStreamEvents().forEach((m) => {
+    // Default to every market the version serves history for
+    streamEvents.forEach((m) => {
       if (!networks.includes(m.network)) networks.push(m.network);
       m.marketContractAddresses.forEach((contractAddress) => {
         contractAddresses.push(contractAddress);
@@ -727,13 +785,13 @@ async function getTransactionHistory(
     });
   }
 
-  const streamEvents = loadTestnet ? GetAllTestStreamEvents() : GetAllStreamEvents();
   if (cursor === null || cursor === undefined) {
     let profilesByAddress: { [_ in Eth.Address]: governanceModel.Profile } = {};
     // No cursor provided, use provided filters
     // Iterate over all markets and get transaction history items
     // Initializing cursor
     const cursorPayload: CursorPayload = {
+      registryVersionId: catalog.versionId,
       profilesByAddress,
       filter: {
         markets: markets,
@@ -749,14 +807,15 @@ async function getTransactionHistory(
     // Populate cursor info
     const latestBlocks: {[key: string]: Promise<Eth.Block>} = {};
     streamEvents.map((m) => {
-      cursorPayload.cursors[m.network] = {
+      cursorPayload.cursors[streamKeyOf(m)] = {
         network: m.network,
         marketContractAddresses: m.marketContractAddresses,
         rewardsContractAddress: m.rewardsContractAddress,
         transactionHash: '0x0',
         blockNumber: 0,
       };
-      latestBlocks[m.network] = evaluate(pull1({ ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: 'latest', network: m.network } }));
+      // one latest block per network, however many streams it has
+      latestBlocks[m.network] ??= evaluate(pull1({ ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: 'latest', network: m.network } }));
     });
 
     const [ transactionHistoryResponse, defiSaverProxies ] = await (
@@ -778,10 +837,41 @@ async function getTransactionHistory(
     ), { status: 200 });
   } else {
     // Cursor provided, parse cursor
-    const cursorPayload = Fallible.must(await cache.get<CursorPayload>(cursor));
-    if (cursorPayload === null) {
+    const storedPayload = Fallible.must(await cache.get<CursorPayload>(cursor));
+    if (storedPayload === null) {
       return new Response('Cursor is invalid', { status: 400 });
     } else {
+      /*
+       * A cursor belongs to one registry version. Its stream keys, market
+       * addresses, and block anchors describe the markets of that version, so
+       * a page read against a different version would silently mix two
+       * descriptions of the same addresses. The client is told to start over
+       * instead.
+       *
+       * A cursor issued before the registry carries no version. It is
+       * accepted once against the current version and upgraded, so pagination
+       * in progress at the cutover continues rather than breaking.
+       */
+      const cursorPayload = storedPayload.registryVersionId === catalog.versionId
+        ? storedPayload
+        : storedPayload.registryVersionId === undefined
+          ? upgradeLegacyCursor(storedPayload, streamEvents, catalog.versionId)
+          : null;
+
+      if (cursorPayload === null) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code:    'REGISTRY_VERSION_CHANGED',
+              message: 'the market registry changed; restart pagination without a cursor',
+              cursorRegistryVersionId: storedPayload.registryVersionId ?? null,
+              registryVersionId:       catalog.versionId,
+            },
+          }),
+          { status: 409, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+
       // Validate cursor and match if the provided filters are the same
       if (cursorPayload.filter.markets.length !== markets.length) {
         return new Response('Cursor is having different markets filter', { status: 400 });
@@ -813,6 +903,7 @@ async function getTransactionHistory(
         }
       }
 
+      // every stream of a cursor resumes from its own position
       const [ transactionHistoryResponse, defiSaverProxies ] = await (
         loadTransactionHistoryItems(
           accountAddress,
@@ -837,9 +928,14 @@ async function getTransactionHistory(
 
 export type {
   Context,
+  CursorPayload,
   Dependencies,
+  StreamEvent,
 };
 
 export {
   getTransactionHistory,
+  streamEventsOf,
+  streamKeyOf,
+  upgradeLegacyCursor,
 };

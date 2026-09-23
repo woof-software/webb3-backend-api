@@ -38,6 +38,12 @@ its own physical database, and all of them apply the single ordered
 migration stream in [./migrations](./migrations). Never renumber a
 migration that has been applied anywhere.
 
+Migrations are numbered in the order they are applied, not by feature:
+`0001` is the Comet registry schema, `0002` marks the markets nobody has
+reviewed yet, and `0003` adds how the frontend lists a market — its slug and
+whether it is institutional — so the Agreements migration that the
+implementation plan calls `0002` is `0004` here.
+
 Apply migrations to the local Miniflare database under `.wrangler/state`:
 ```sh
 npm run d1:migrate:local
@@ -70,6 +76,145 @@ handler locally:
 npm run start:scheduled
 curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=0+*+*+*+*"
 ```
+
+# The Comet Market Registry
+
+Markets, their tokens, and their price feeds come from the registry in
+`APP_DB`, not from the static constants. One activated version answers a
+whole request: the router loads it once, hands the same catalog to every
+computation of that request, and reports which version answered in
+`X-Registry-Version` and `X-Registry-Checksum` on the response.
+
+What that means for the endpoints:
+
+- a route that resolves a market — `/market/...`, `/account/.../rewards`,
+  `/account/.../transaction_history` — answers `503` when no version is
+  active. There is no static market list to fall back to, and serving one
+  nobody reviewed would be worse than failing;
+- an address the active version does not describe is not a market, and is
+  refused with `400`, on any network;
+- transaction history cursors carry the version they were issued against. A
+  cursor from another version is refused with `409 REGISTRY_VERSION_CHANGED`
+  and the client restarts pagination; a cursor issued before the registry is
+  accepted once and upgraded;
+- routes that resolve no market — governance, V2, gas price — never read
+  `APP_DB`. Governance decodes proposal action targets against the static
+  constants and consults the registry only for a target they do not name.
+
+An operator changes what the API serves by importing, reviewing, validating
+and activating a version; see the admin routes in [./API.md](./API.md). The
+step-by-step procedure, with what to expect at each step and what to do when
+something else happens, is [./REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md).
+
+## Bringing a registry up from nothing
+
+An import writes every market it finds. What the source and the chain state
+— addresses, tokens, decimals, feeds, collateral — it reads itself; what they
+cannot state — names, whether a market is served, its capabilities, the unit
+its base is quoted in, its reward feed, price exceptions — is a reviewed
+decision, inherited from the active version. A market no version has
+reviewed is written disabled, with every capability off, and marked
+unreviewed: its rows exist and can be reviewed in place, and until then it
+changes nothing the API serves.
+
+The first import of an environment has nothing to inherit, so every market
+arrives unreviewed. That run imports the whole source and then holds the
+candidate open instead of validating it, because a version of nothing but
+unreviewed markets could only end invalid.
+
+There are ten networks and twenty-nine markets to review, and every value is
+one this API already acts on: the static constants name the markets and their
+feeds, the branches the registry replaced decided their capabilities, quote
+units and price exceptions, and the frontend lists them under its labels. The
+Worker proposes those decisions for the markets the candidate imported
+(`src/registry/bootstrap.ts`), so the review is reading a document rather
+than typing, and nothing runs outside the environment:
+
+```sh
+# 1. import the whole source in one request. The run ends "heldForReview";
+#    note the registryVersionId it answers
+curl -X POST .../registry/v1/admin/sync -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{}'
+
+# 2. read what this release proposes for that candidate, and its digest
+curl .../registry/v1/admin/versions/$VERSION/proposal/review -H "Authorization: Bearer $TOKEN"
+
+# 3. apply exactly what was read, by its digest: every decision, one transaction
+curl -X POST .../registry/v1/admin/versions/$VERSION/proposal/apply \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"reason": "first registry version", "digest": "<digest>"}'
+
+# 4. validate, compare with the constants, activate
+curl -X POST .../registry/v1/admin/versions/$VERSION/validate ...
+curl         .../registry/v1/admin/versions/$VERSION/shadow ...
+curl -X POST .../registry/v1/admin/versions/$VERSION/activate ...
+```
+
+An administrative sync imports up to fifty markets per request (`markets`
+bounds it); the Cron keeps to `COMET_SYNC_MARKETS_PER_INVOCATION` an hour,
+which is what the steady state needs. Either way each root is attempted at
+most once per request, so a node provider that is briefly down costs one
+attempt of each root, not all five.
+
+The proposal is built from the candidate's own markets by the release serving
+the request, so it cannot describe another set of markets than the one it is
+applied to, and a release deployed to stage and then to production proposes
+the same decisions for the same commit. `apply` builds it again and writes it
+only if it still has the digest the operator read; the write goes through the
+same route as `PUT /versions/{id}/overlays` — every document parsed and every
+row it names found before anything is written, and one D1 transaction.
+Applying the same digest again is safe: it answers `changed: false`.
+
+The review puts every proposed decision in a table — names, status, the
+default market, creation blocks, capabilities, quote units, USD and reward
+feeds, price exceptions, presentation — says where each kind of value came
+from, and lists apart what no source could answer. A market the constants do
+not describe is not proposed at all: it stays switched off until it is
+described with the market overlay route. The quote units are read from the
+chain rather than the constants, which are wrong about them in places.
+Labels and presentation data — asset display overrides and unwrapped
+collateral pairs — exist nowhere but the frontend, so they are copied once
+from it at a named commit. Nothing in this API reads the presentation, but
+the first version already serves it, and the frontend stops being where it is
+decided.
+
+A correction belongs in the tables of `src/registry/bootstrap.ts`: the release
+that carries it proposes it. Once a version is active, the registry is where
+the decisions live, and a later version inherits them.
+
+### A market the source adds later
+
+A new deployment in the Comet repository arrives with the next commit as one
+more unreviewed market: disabled, not failing anything, while the rest of the
+commit validates and can be activated as usual. To serve it, import the
+commit again with the candidate held, review the new market, validate:
+
+```sh
+curl -X POST .../registry/v1/admin/sync ... \
+  -d '{"forceNewAttempt": true, "holdForReview": true, "reason": "review the new market"}'
+curl -X PUT  .../registry/v1/admin/versions/$VERSION/markets/<chain>/<key>/overlay ...
+curl -X POST .../registry/v1/admin/versions/$VERSION/validate ...
+```
+
+A new attempt at the same commit inherits what was reviewed for the attempt
+before it, so a candidate that ended invalid does not mean reviewing it all
+again.
+
+Two diagnostics are worth knowing:
+
+```sh
+# what the active version says against what the static constants still say
+curl -H "Authorization: Bearer $TOKEN" .../registry/v1/admin/shadow
+# the same for a validated candidate, before activating it
+curl -H "Authorization: Bearer $TOKEN" .../registry/v1/admin/versions/$ID/shadow
+```
+
+A bootstrapped version does not agree with the constants entirely, because
+the constants are out of date in places the chain is not: placeholder reward
+configurations, feeds the markets have since moved off, renamed tokens. The
+runbook lists every difference to expect and why
+([Known differences](./REGISTRY_RUNBOOK.md#known-differences)); anything beyond
+them is worth reading before activating.
 
 # Testing
 
@@ -246,14 +391,17 @@ per-network, but in general should not exceed ~3hrs (10,800s).
 4. Add well-known contracts
 
 Under `lib/well-known/contracts` each network has a module where the
-well-known ERC-20, Comet, PriceFeed, and other contracts on that network
-are described.
+well-known contracts on that network are described.
 
-Usually, a new network will need, at minimum, `PriceFeed`s for the base
-asset and for bridged `COMP`; ERC-20s for the base asset, for bridged
-`COMP`, and for every supported collateral asset on every configured
-deployment of Comet; and one `Comet` contract for each deployed market on
-that network.
+Markets do not belong there any more. Comet deployments, their base,
+collateral and reward tokens, and their price feeds come from the Comet
+registry: add the network to the allowlist in
+`src/registry/source/roots.ts`, import it, review its overlay, and activate
+the version. Nothing about a new market requires a Worker release.
+
+What a new network still needs here is everything the registry does not
+describe: the governance contracts, a `BridgeReceiver` corollary where
+governance is bridged, and any V2 or tooling contracts the API names.
 
 See `lib/well-known/contracts/polygon-mainnet.ts` for an example.
 

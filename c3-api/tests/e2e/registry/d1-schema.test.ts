@@ -330,8 +330,22 @@ t.test('migration 0001 creates strict tables and an empty active pointer', async
     'market_assets_single_base',
     'market_assets_single_reward',
     'markets_one_default_per_version',
+    'markets_slug_per_network',
     'sync_runs_only_one_running',
   ], 'partial unique indexes exist');
+
+  const added = await db.prepare(
+    `SELECT name FROM pragma_table_info('markets') WHERE name = 'reviewed'
+     UNION ALL SELECT name FROM pragma_table_info('registry_networks') WHERE name = 'reviewed'
+     UNION ALL SELECT name FROM pragma_table_info('sync_runs') WHERE name = 'hold_for_review'`
+  ).all<{ name: string }>();
+  t.equal((added.results ?? []).length, 3, 'migration 0002 adds the review flags and the hold');
+
+  const listing = await db.prepare(
+    `SELECT name FROM pragma_table_info('markets') WHERE name IN ('slug', 'is_institutional') ORDER BY name`
+  ).all<{ name: string }>();
+  t.same((listing.results ?? []).map(row => row.name), [ 'is_institutional', 'slug' ],
+    'migration 0003 adds how the frontend lists a market');
 
   const state = await db.prepare('SELECT singleton_id, active_version_id FROM registry_state').all();
   t.same(
@@ -626,6 +640,97 @@ t.test('review and audit records are append-only', async t => {
   await activate(db, versionId);
   await t.rejects(() => run(db, `UPDATE registry_activations SET reason = 'edited'`), { message: /append-only/ });
   await t.rejects(() => run(db, `DELETE FROM registry_activations`), { message: /append-only/ });
+});
+
+/*
+ * A market the import wrote without anyone reviewing it. Its rows exist so
+ * they can be reviewed in place, and the schema is what guarantees that until
+ * then the API cannot offer it: an unreviewed market is disabled and never the
+ * default, whatever the code that wrote it did.
+ */
+t.test('a market nobody has reviewed cannot be served', async t => {
+  const { APP_DB: db } = await freshEnv();
+  const candidate = await insertCandidate(db);
+  const scope     = { registry_version_id: candidate.registry_version_id, network_id: candidate.network_id };
+
+  await insertRow(db, 'markets', marketRow(randomUUID(), scope, {
+    deployment_key: 'unreviewed',
+    status:         'disabled',
+    creation_block: 0,
+    reviewed:       0,
+  }));
+  await t.rejects(
+    () => insertRow(db, 'markets', marketRow(randomUUID(), scope, { deployment_key: 'served', reviewed: 0 })),
+    { message: /nobody has reviewed must be disabled/ },
+    'an unreviewed market is not written enabled',
+  );
+  await t.rejects(
+    () => insertRow(db, 'markets', marketRow(randomUUID(), scope, {
+      deployment_key: 'default', status: 'disabled', is_default: 1, reviewed: 0,
+    })),
+    { message: /nobody has reviewed must be disabled/ },
+    'nor as the default',
+  );
+  await t.rejects(
+    () => run(db, `UPDATE markets SET status = 'enabled' WHERE deployment_key = 'unreviewed'`),
+    { message: /nobody has reviewed must be disabled/ },
+    'and cannot be enabled without being reviewed',
+  );
+
+  await run(db, `UPDATE markets SET status = 'enabled', creation_block = 7, reviewed = 1 WHERE deployment_key = 'unreviewed'`);
+  const reviewed = await db.prepare(`SELECT status, reviewed FROM markets WHERE deployment_key = 'unreviewed'`)
+    .first<{ status: string, reviewed: number }>();
+  t.same(reviewed, { status: 'enabled', reviewed: 1 }, 'a review is what enables it, in the same statement');
+
+  await t.rejects(
+    () => insertRow(db, 'markets', marketRow(randomUUID(), scope, { deployment_key: 'bad-flag', reviewed: 2 })),
+    CHECK_FAILED,
+  );
+  const network = await db.prepare(`SELECT reviewed FROM registry_networks WHERE id = ?1`)
+    .bind(candidate.network_id).first<number>('reviewed');
+  t.equal(network, 1, 'a row written without the flag is a reviewed one, as every row before it was');
+});
+
+/*
+ * A slug is what the frontend addresses a market by where its label is shared
+ * with another market of the network, so it has to name exactly one of them.
+ */
+t.test('a slug names one market of a network, in the form the frontend reads', async t => {
+  const { APP_DB: db } = await freshEnv();
+  const candidate = await insertCandidate(db);
+  const scope     = { registry_version_id: candidate.registry_version_id, network_id: candidate.network_id };
+
+  await insertRow(db, 'markets', marketRow(randomUUID(), scope, {
+    deployment_key: 'institutional_usdc', slug: 'usdc-institutional', is_institutional: 1,
+  }));
+  const stored = await db.prepare(`SELECT slug, is_institutional FROM markets WHERE deployment_key = 'institutional_usdc'`)
+    .first<{ slug: string, is_institutional: number }>();
+  t.same(stored, { slug: 'usdc-institutional', is_institutional: 1 });
+
+  await t.rejects(
+    () => insertRow(db, 'markets', marketRow(randomUUID(), scope, { deployment_key: 'second', slug: 'usdc-institutional' })),
+    { message: /UNIQUE constraint failed/ },
+    'no two markets of one network share a slug',
+  );
+  await t.rejects(
+    () => insertRow(db, 'markets', marketRow(randomUUID(), scope, { deployment_key: 'upper', slug: 'USDC-Institutional' })),
+    CHECK_FAILED,
+    'a slug is lowercase, as the frontend compares it',
+  );
+  await t.rejects(
+    () => insertRow(db, 'markets', marketRow(randomUUID(), scope, { deployment_key: 'spaced', slug: 'usdc institutional' })),
+    CHECK_FAILED,
+    'and holds only what a market key can',
+  );
+  await t.rejects(
+    () => insertRow(db, 'markets', marketRow(randomUUID(), scope, { deployment_key: 'flag', is_institutional: 2 })),
+    CHECK_FAILED,
+  );
+
+  await insertRow(db, 'markets', marketRow(randomUUID(), scope, { deployment_key: 'plain' }));
+  const plain = await db.prepare(`SELECT slug, is_institutional FROM markets WHERE deployment_key = 'plain'`)
+    .first<{ slug: string | null, is_institutional: number }>();
+  t.same(plain, { slug: null, is_institutional: 0 }, 'a market written without them is listed by its label, as a standard one');
 });
 
 t.test('composite keys keep rows inside one version and network', async t => {

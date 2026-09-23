@@ -7,10 +7,24 @@ import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
 import type * as jsonRpc from '../../../lib/json-rpc.js';
+import type { RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
 import { runInvocation } from '../../../src/registry/importer.js';
+import {
+  FeedReader,
+  replaceMarketOverlay,
+  replaceNetworkOverlay,
+  validateStoredVersion,
+} from '../../../src/registry/admin.js';
 import { gitBlobSha } from '../../../src/registry/source/github.js';
-import { readSnapshot, recordValidationResults, markValidated, snapshotChecksum } from '../../../src/registry/repository.js';
+import {
+  markValidated,
+  readSnapshot,
+  readUnreviewed,
+  readValidationSummary,
+  recordValidationResults,
+  snapshotChecksum,
+} from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
@@ -123,10 +137,10 @@ function deps(db: D1Database, roots: Array<{ path: string, content: string, sha:
  * fixture is seeded and activated first: this is the second import of a
  * registry, which is the normal case.
  */
-async function activateFixture(db: D1Database): Promise<string> {
-  const { versionId } = await seedCandidate(db, snapshot);
+async function activateFixture(db: D1Database, source: RegistrySnapshotV1 = snapshot): Promise<string> {
+  const { versionId } = await seedCandidate(db, source);
   await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
+  await markValidated(db, versionId, await snapshotChecksum(source.networks));
   await db.batch([
     db.prepare(
       `INSERT INTO registry_activations (id, registry_version_id, previous_version_id, action, actor, reason, created_at)
@@ -166,17 +180,21 @@ t.test('an import reads the source, the chain, and the reviewed overlay', async 
   t.equal(market.baseAsset.token.symbol, 'USDC', 'the base asset comes from the chain');
   t.equal(market.collateralAssets.length, 13, 'with every collateral asset the Comet reports');
   t.same({
-    displayName:  market.displayName,
-    contractName: market.contractName,
-    isDefault:    market.isDefault,
-    status:       market.status,
-    capabilities: market.capabilities,
+    displayName:     market.displayName,
+    contractName:    market.contractName,
+    slug:            market.slug,
+    isInstitutional: market.isInstitutional,
+    isDefault:       market.isDefault,
+    status:          market.status,
+    capabilities:    market.capabilities,
   }, {
-    displayName:  fixture.displayName,
-    contractName: fixture.contractName,
-    isDefault:    fixture.isDefault,
-    status:       fixture.status,
-    capabilities: fixture.capabilities,
+    displayName:     fixture.displayName,
+    contractName:    fixture.contractName,
+    slug:            fixture.slug,
+    isInstitutional: fixture.isInstitutional,
+    isDefault:       fixture.isDefault,
+    status:          fixture.status,
+    capabilities:    fixture.capabilities,
   }, 'and the reviewed decisions inherited from the active version');
   t.same(market.rewardAsset?.priceFeed, REWARD_FEED, 'the overlay feed is read for its decimals');
 
@@ -282,18 +300,247 @@ t.test('a root that never imports cannot produce a validated version', async t =
   );
 });
 
-t.test('a market without a reviewed overlay is refused', async t => {
+/*
+ * A market no version has reviewed is imported all the same. Its rows exist,
+ * so they can be reviewed in place, but it is disabled with every capability
+ * off until someone decides otherwise — and it does not fail the commit it
+ * arrived with, which refusing it would.
+ */
+t.test('a market nobody has reviewed is imported, but not served', async t => {
   const db = await freshDatabase();
-  // no active version, so nothing is inherited: the first import of a
-  // registry has to be reviewed before it can validate
-  const usdcSha = await gitBlobSha(usdcContent);
-  const result  = await runInvocation(deps(db, [ { path: USDC_ROOT, content: usdcContent, sha: usdcSha } ]));
 
-  t.equal(result.status, 'running', 'the run remains open for a retry');
-  const item = await db.prepare(
-    `SELECT status, last_error FROM sync_run_items WHERE sync_run_id = ?1`
-  ).bind(result.runId).first<{ status: string, last_error: string }>();
-  t.equal(item?.status, 'failed');
-  t.match(item?.last_error, /OVERLAY_MISSING/, 'the checkpoint says what is missing');
-  t.match(item?.last_error, /must be reviewed/, 'and why it cannot be imported');
+  /*
+   * An active version that has never seen the usdc deployment, so the source
+   * adds it: the same thing a new market in the Comet repository looks like.
+   */
+  await activateFixture(db, {
+    ...snapshot,
+    networks: snapshot.networks.map(network => network.chainId !== 1 ? network : {
+      ...network,
+      markets: network.markets
+        .filter(market => market.deploymentKey !== 'usdc')
+        .map(market => market.deploymentKey === 'weth' ? { ...market, isDefault: true } : market),
+    }),
+  });
+
+  const result = await runInvocation(deps(db, [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ]));
+  t.equal(result.status, 'failed', 'this source holds nothing but the new market, so there is no default to validate');
+
+  const market = await db.prepare(
+    `SELECT deployment_key, status, is_default, reviewed, display_name,
+            rewards_enabled, account_rewards_enabled, transaction_history_enabled
+     FROM markets WHERE registry_version_id = ?1`
+  ).bind(result.versionId).first<Record<string, unknown>>();
+  t.same(market, {
+    deployment_key:              'usdc',
+    status:                      'disabled',
+    is_default:                  0,
+    reviewed:                    0,
+    display_name:                'usdc',
+    rewards_enabled:             0,
+    account_rewards_enabled:     0,
+    transaction_history_enabled: 0,
+  }, 'the new market is imported disabled, named by its deployment key, with every capability off');
+
+  const network = await db.prepare(
+    `SELECT reviewed, display_name FROM registry_networks WHERE registry_version_id = ?1`
+  ).bind(result.versionId).first<{ reviewed: number, display_name: string }>();
+  t.same(network, { reviewed: 1, display_name: 'Ethereum' }, 'its network keeps the decisions the active version made');
+
+  /*
+   * The unreviewed market contributes no failure of its own: what this
+   * version lacks is a default, which only a reviewed market can be. With the
+   * rest of the source beside it, the commit would validate.
+   */
+  const summary = await readValidationSummary(db, result.versionId!);
+  t.same(summary.checks.filter(check => !check.passed).map(check => check.name), [ 'single-default-market' ],
+    'nothing about the unreviewed market fails');
+});
+
+/*
+ * The first import of a registry, which is the one case where nothing can be
+ * inherited: there is no active version to clone an overlay from. Every market
+ * is imported unreviewed, and the run leaves the candidate open, because a
+ * version of nothing but unreviewed markets could only ever end invalid.
+ */
+t.test('the first import of a registry is held for review, then reviewed in place', async t => {
+  const db    = await freshDatabase();
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  const imported = await runInvocation(deps(db, roots));
+  t.equal(imported.status, 'completed', 'every root is imported');
+  t.equal(imported.held, true, 'and the candidate is held for review');
+
+  const versionId = imported.versionId!;
+  const status    = async () => db.prepare(`SELECT status FROM registry_versions WHERE id = ?1`)
+    .bind(versionId).first<string>('status');
+  t.equal(await status(), 'importing', 'so it stays open, where its rows can still be reviewed');
+  t.same(await readUnreviewed(db, versionId), { networks: [ 1 ], markets: [ '1/usdc' ] },
+    'and it says what is left to review');
+
+  /*
+   * Once discovery is due again, the same commit is found with a candidate
+   * already importing. Starting a new attempt over it would throw away the
+   * review in progress, so discovery leaves it alone.
+   */
+  await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1`).bind('2020-01-01T00:00:00.000Z').run();
+  const again = await runInvocation(deps(db, roots));
+  t.equal(again.status, 'idle', 'a later sync leaves a held candidate alone');
+  t.match(again.reason, /held for review/, 'and says why');
+  t.equal(again.versionId, versionId, 'naming the candidate it is waiting on');
+
+  const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
+  const usdc    = mainnet.markets.find(market => market.deploymentKey === 'usdc')!;
+  const noFeeds: FeedReader = async () => new Map();
+
+  await replaceNetworkOverlay(db, {
+    versionId,
+    chainId: 1,
+    actor:   'test-admin',
+    reason:  'bootstrap: review ethereum mainnet',
+    overlay: {
+      displayName:               mainnet.displayName,
+      assetDisplayOverrides:     mainnet.presentation.assetDisplayOverrides,
+      unwrappedCollateralAssets: mainnet.presentation.unwrappedCollateralAssets,
+      priceExceptions:           mainnet.priceExceptions,
+    },
+  }, noFeeds);
+  const reviewed = await replaceMarketOverlay(db, {
+    versionId,
+    chainId:       1,
+    deploymentKey: 'usdc',
+    actor:         'test-admin',
+    reason:        'bootstrap: review the mainnet usdc market',
+    overlay: {
+      displayName:          usdc.displayName,
+      contractName:         usdc.contractName,
+      slug:                 usdc.slug,
+      isInstitutional:      usdc.isInstitutional,
+      isDefault:            usdc.isDefault,
+      status:               usdc.status,
+      creationBlock:        usdc.creationBlock,
+      collateralValueQuote: usdc.collateralValueQuote,
+      capabilities:         usdc.capabilities,
+      baseAsset: {
+        displayName:         usdc.baseAsset.displayName,
+        isWrappedNative:     usdc.baseAsset.isWrappedNative,
+        usdPriceFeedAddress: usdc.baseAsset.usdPriceFeed?.address ?? null,
+      },
+      rewardPriceFeed: { address: REWARD_FEED.address, quote: usdc.rewardAsset!.priceFeedQuote! },
+    },
+  }, async () => new Map([ [ REWARD_FEED.address, REWARD_FEED ] ]));
+  t.equal(reviewed.changed, true, 'the review is applied to the rows the import wrote');
+  t.same(await readUnreviewed(db, versionId), { networks: [], markets: [] }, 'and nothing is left unreviewed');
+
+  const validated = await validateStoredVersion(db, versionId);
+  t.equal(validated.version.status, 'validated', 'so the first version of the registry validates');
+
+  const [ stored ] = await readSnapshot(db, versionId);
+  t.same({
+    displayName:  stored?.markets[0]?.displayName,
+    contractName: stored?.markets[0]?.contractName,
+    isDefault:    stored?.markets[0]?.isDefault,
+    capabilities: stored?.markets[0]?.capabilities,
+  }, {
+    displayName:  usdc.displayName,
+    contractName: usdc.contractName,
+    isDefault:    usdc.isDefault,
+    capabilities: usdc.capabilities,
+  }, 'carrying the decisions that were reviewed for it');
+});
+
+/*
+ * A candidate that is importing means one of two things, and they need
+ * opposite answers: nobody is working on it and it is waiting for review, or
+ * another invocation is importing into it right now. Telling the second one
+ * to "validate it or force a new attempt" would invite an operator to
+ * restart a run that is in progress.
+ */
+t.test('a candidate another invocation is importing is not one held for review', async t => {
+  const db    = await freshDatabase();
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  const imported  = await runInvocation(deps(db, roots));
+  const versionId = imported.versionId!;
+  t.equal(imported.held, true, 'the first import of a registry is held');
+  t.ok((imported.checksFailed ?? 0) > 0, 'and says how many of its checks failed');
+  t.match(imported.reason, /checks failed/, 'so an operator is not told only that it completed');
+
+  // another invocation, importing into that same candidate, with a live lease
+  await db.prepare(
+    `INSERT INTO sync_runs (
+       id, source_commit_sha, tracked_ref, registry_version_id, trigger_kind,
+       status, lease_owner, lease_generation, lease_expires_at, expected_count, started_at
+     ) VALUES (?1, ?2, 'main', ?3, 'scheduled', 'running', ?4, 1, ?5, 1, ?6)`
+  ).bind(
+    randomUUID(), COMMIT, versionId, randomUUID(),
+    new Date(Date.now() + 900_000).toISOString(), new Date().toISOString(),
+  ).run();
+  await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1`).bind('2020-01-01T00:00:00.000Z').run();
+
+  await t.rejects(
+    runInvocation(deps(db, roots)),
+    { code: 'SYNC_ALREADY_RUNNING' },
+    'the caller hears that a sync is running, not that the candidate awaits review',
+  );
+});
+
+/*
+ * A review happens in place, so a candidate that ends invalid is frozen with
+ * the reviews in it. Rebuilding the same source must not mean reviewing every
+ * market again.
+ */
+t.test('a new attempt at the same commit inherits what was reviewed for the last one', async t => {
+  const db    = await freshDatabase();
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  const first  = await runInvocation(deps(db, roots));
+  const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
+  await replaceNetworkOverlay(db, {
+    versionId: first.versionId!,
+    chainId:   1,
+    actor:     'test-admin',
+    reason:    'reviewed for the attempt that is about to fail',
+    overlay: {
+      displayName:               mainnet.displayName,
+      assetDisplayOverrides:     mainnet.presentation.assetDisplayOverrides,
+      unwrappedCollateralAssets: mainnet.presentation.unwrappedCollateralAssets,
+      priceExceptions:           mainnet.priceExceptions,
+    },
+  }, async () => new Map());
+
+  // validated before the market was reviewed: no default market, so invalid
+  const failed = await validateStoredVersion(db, first.versionId!);
+  t.equal(failed.version.status, 'invalid');
+
+  const next = await runInvocation(deps(db, roots), { forceNewAttempt: true, reason: 'rebuild after review' });
+  t.not(next.versionId, first.versionId, 'a new attempt is a new candidate');
+
+  const [ network ] = await readSnapshot(db, next.versionId!);
+  t.equal(network?.displayName, mainnet.displayName, 'which carries the network the previous attempt reviewed');
+  t.same(await readUnreviewed(db, next.versionId!), { networks: [], markets: [ '1/usdc' ] },
+    'and still lists the market nobody reviewed');
+});
+
+/*
+ * The Cron imports a couple of markets an hour. An operator bringing an
+ * environment up asks for the whole source at once — but a failing root is
+ * still attempted once per request, never retried inside it.
+ */
+t.test('one invocation can import the whole source, one attempt per root', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [
+    { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) },
+    { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) },
+  ];
+
+  const result = await runInvocation(deps(db, roots, 1), { markets: 50 });
+  t.equal(result.processed, 2, 'both roots in one invocation, despite a batch of one configured');
+
+  const attempts = await db.prepare(
+    `SELECT root_path, attempts FROM sync_run_items WHERE sync_run_id = ?1 ORDER BY root_path`
+  ).bind(result.runId).all<{ root_path: string, attempts: number }>();
+  t.same((attempts.results ?? []).map(item => item.attempts), [ 1, 1 ],
+    'and the root the chain cannot answer for was tried once, not retried until it ran out');
 });

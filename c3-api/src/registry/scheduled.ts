@@ -100,7 +100,7 @@ async function runRegistrySync(env: Env, request: ManualRequest = {}): Promise<I
      */
     const reason = isRegistryError(error) ? `${error.code}: ${error.message}` : 'an unexpected error interrupted the import';
     debug.error(`registry sync failed`, { reason });
-    return { status: 'failed', processed: 0, reason };
+    return { status: 'failed', processed: 0, reason, ...(isRegistryError(error) ? { error } : {}) };
   }
 }
 

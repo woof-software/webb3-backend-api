@@ -21,7 +21,7 @@ import {
 
 import type { MarketEnrichment } from './enrichment.js';
 import { RegistryError } from './errors.js';
-import { sha256Hex } from './source/roots.js';
+import { sha256Hex } from '../../lib/hash.js';
 
 /*
  * The reviewed overlay: everything about a market that the chain and the
@@ -37,8 +37,10 @@ import { sha256Hex } from './source/roots.js';
  */
 type MarketOverlay = {
   displayName:          string,
+  slug:                 string | null,
   contractName:         string | null,
   isDefault:            boolean,
+  isInstitutional:      boolean,
   status:               MarketStatus,
   creationBlock:        number,
   collateralValueQuote: PriceQuote,
@@ -235,9 +237,15 @@ function parseNetworkOverlay(value: unknown, scope: string = 'overlay'): Network
 
 function parseMarketOverlay(value: unknown, scope: string = 'overlay'): MarketOverlay {
   const entry = object(value, [
-    'displayName', 'contractName', 'isDefault', 'status', 'creationBlock',
+    'displayName', 'slug', 'contractName', 'isDefault', 'isInstitutional', 'status', 'creationBlock',
     'collateralValueQuote', 'capabilities', 'baseAsset', 'rewardPriceFeed',
   ], scope);
+
+  // lowercase, as the frontend compares it, and within what its market keys accept
+  const slug = entry.slug;
+  if (slug !== null && (typeof(slug) !== 'string' || !/^[a-z0-9][a-z0-9.-]{0,63}$/.test(slug))) {
+    fail(`${scope}.slug must be null or up to 64 lowercase letters, digits, dots and hyphens`, scope);
+  }
 
   const capabilities = object(entry.capabilities, [ 'rewards', 'accountRewards', 'transactionHistory' ], `${scope}.capabilities`);
   const baseAsset    = object(entry.baseAsset, [ 'displayName', 'isWrappedNative', 'usdPriceFeedAddress' ], `${scope}.baseAsset`);
@@ -258,8 +266,10 @@ function parseMarketOverlay(value: unknown, scope: string = 'overlay'): MarketOv
 
   return {
     displayName:          text(entry.displayName, `${scope}.displayName`),
+    slug:                 slug as string | null,
     contractName:         entry.contractName === null ? null : text(entry.contractName, `${scope}.contractName`),
     isDefault:            flag(entry.isDefault, `${scope}.isDefault`),
+    isInstitutional:      flag(entry.isInstitutional, `${scope}.isInstitutional`),
     status:               member(entry.status, MARKET_STATUSES, `${scope}.status`),
     creationBlock,
     collateralValueQuote: member(entry.collateralValueQuote, PRICE_QUOTES, `${scope}.collateralValueQuote`),
@@ -276,6 +286,39 @@ function parseMarketOverlay(value: unknown, scope: string = 'overlay'): MarketOv
         : address(baseAsset.usdPriceFeedAddress, `${scope}.baseAsset.usdPriceFeedAddress`),
     },
     rewardPriceFeed,
+  };
+}
+
+/*
+ * The overlay a stored market carries: its decisions, without the facts the
+ * import read. It is the document the overlay routes accept, so a market that
+ * is already described can be read, changed, and written back, and a similar
+ * market is where describing a new one starts.
+ */
+function overlayOfMarket(market: MarketV1): MarketOverlay {
+  return {
+    displayName:          market.displayName,
+    slug:                 market.slug,
+    contractName:         market.contractName,
+    isDefault:            market.isDefault,
+    isInstitutional:      market.isInstitutional,
+    status:               market.status,
+    creationBlock:        market.creationBlock,
+    collateralValueQuote: market.collateralValueQuote,
+    capabilities:         { ...market.capabilities },
+    baseAsset: {
+      displayName:         market.baseAsset.displayName,
+      isWrappedNative:     market.baseAsset.isWrappedNative,
+      usdPriceFeedAddress: market.baseAsset.usdPriceFeed?.address ?? null,
+    },
+    /*
+     * A feed without the unit it answers in is not a feed anything can use,
+     * and validation refuses it; a candidate can still hold one, and this
+     * document has to be one the route takes back, so it reads as none.
+     */
+    rewardPriceFeed: market.rewardAsset?.priceFeed == null || market.rewardAsset.priceFeedQuote === null
+      ? null
+      : { address: market.rewardAsset.priceFeed.address, quote: market.rewardAsset.priceFeedQuote },
   };
 }
 
@@ -339,8 +382,10 @@ function applyMarketOverlay(
     id,
     deploymentKey:        root.deploymentKey,
     displayName:          overlay.displayName,
+    slug:                 overlay.slug,
     contractName:         overlay.contractName,
     isDefault:            overlay.isDefault,
+    isInstitutional:      overlay.isInstitutional,
     status:               overlay.status,
     creationBlock:        overlay.creationBlock,
     collateralValueQuote: overlay.collateralValueQuote,
@@ -400,6 +445,56 @@ function orderNetworks(networks: NetworkV1[]): NetworkV1[] {
   return [ ...networks ].sort((left, right) => left.chainId - right.chainId);
 }
 
+/*
+ * The overlay of a market nobody has reviewed.
+ *
+ * It decides nothing: the market is disabled, so nothing serves it, has
+ * every capability off, is not the default, and carries no USD or reward
+ * feed. Its names are identifiers the source and the chain already state —
+ * the upstream deployment key and the base token's own name — rather than
+ * labels someone would have chosen. The creation block is left at zero,
+ * which validation accepts only for a market that is not served.
+ *
+ * The rows written from it are marked unreviewed, so nothing clones them
+ * into the next version as if they had been decided.
+ */
+function provisionalMarketOverlay(deploymentKey: string, baseTokenName: string): MarketOverlay {
+  return {
+    displayName:          deploymentKey,
+    slug:                 null,
+    contractName:         null,
+    isDefault:            false,
+    isInstitutional:      false,
+    status:               'disabled',
+    creationBlock:        0,
+    collateralValueQuote: 'usd',
+    capabilities: {
+      rewards:            false,
+      accountRewards:     false,
+      transactionHistory: false,
+    },
+    baseAsset: {
+      displayName:         baseTokenName,
+      isWrappedNative:     false,
+      usdPriceFeedAddress: null,
+    },
+    rewardPriceFeed: null,
+  };
+}
+
+/*
+ * The overlay of a network nobody has reviewed: named by its canonical name,
+ * with no presentation data and no price exceptions.
+ */
+function provisionalNetworkOverlay(canonicalName: string): NetworkOverlay {
+  return {
+    displayName:               canonicalName,
+    assetDisplayOverrides:     [],
+    unwrappedCollateralAssets: [],
+    priceExceptions:           [],
+  };
+}
+
 export type { MarketOverlay, NetworkOverlay };
 
 export {
@@ -409,6 +504,9 @@ export {
   orderNetworks,
   overlayDigest,
   overlayFeedAddresses,
+  overlayOfMarket,
   parseMarketOverlay,
   parseNetworkOverlay,
+  provisionalMarketOverlay,
+  provisionalNetworkOverlay,
 };

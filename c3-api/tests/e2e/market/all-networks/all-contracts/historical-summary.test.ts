@@ -22,6 +22,7 @@ import * as Debug    from '../../../../../lib/debug-log.js';
 import "../../../../../shim/node-self.js";
 
 import { setupTestEnvVars } from '../../../../util/setupTestEnvVars.js';
+import { activeRegistryDatabase } from '../../../../util/registry-database.js';
 /*
  * High-level test suite configuration.
  */
@@ -120,6 +121,14 @@ t.test(`/${route} @ block=${mainnetBlockNumber}`, async (t) => {
    */
   // pre-encode seed JSON into in-memory KV format so we only encode once.
   const seed = encodeSeed(seedJson);
+  /*
+   * Markets come from the activated registry, so this test seeds one: the
+   * frozen snapshot fixture, activated in a D1 database of its own. The
+   * recorded expectation covers the markets that version describes.
+   */
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+
   const testEnv: Env = makeTestEnv(
     {
       V3_API_HOST: apiHost,
@@ -128,6 +137,7 @@ t.test(`/${route} @ block=${mainnetBlockNumber}`, async (t) => {
       MEMORY_CACHE_SEED: "market-historical-summary",
       kv_testnet: MemoryKv({ seed }),
       kv_mainnet: MemoryKv({ seed }),
+      APP_DB: registry.db,
     },
     process.env
   );

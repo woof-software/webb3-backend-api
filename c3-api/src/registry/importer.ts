@@ -2,6 +2,7 @@ import {
   Address,
   NetworkV1,
   PriceFeedV1,
+  SyncOutcome,
 } from '../../lib/model/comet-registry.js';
 
 import {
@@ -18,6 +19,8 @@ import {
   networkOverlayFeedAddresses,
   orderNetworks,
   overlayFeedAddresses,
+  provisionalMarketOverlay,
+  provisionalNetworkOverlay,
 } from './overlay.js';
 import {
   createCandidate,
@@ -26,7 +29,8 @@ import {
   latestValidationAttempt,
   markInvalid,
   markValidated,
-  readActiveOverlays,
+  readActiveVersionId,
+  readImportOverlays,
   readSnapshot,
   recordValidationResults,
   snapshotChecksum,
@@ -44,6 +48,7 @@ import {
   pendingItems,
   recordUpstreamCheck,
   releaseLease,
+  runningRun,
   startRun,
 } from './sync.js';
 import {
@@ -79,13 +84,32 @@ type ImporterDeps = {
   now?:  Clock,
 };
 
+/*
+ * What one invocation did. `idle` means there was nothing due, which is the
+ * usual answer between daily discovery windows.
+ */
+const INVOCATION_STATUSES = [ 'idle', 'running', 'completed', 'failed' ] as const;
+
+type InvocationStatus = (typeof INVOCATION_STATUSES)[number];
+
 type InvocationResult = {
-  status:  'idle' | 'running' | 'completed' | 'failed',
-  runId?:  string,
+  status:     InvocationStatus,
+  runId?:     string,
   versionId?: string,
-  outcome?: 'imported' | 'no_change',
-  processed: number,
-  reason?: string,
+  outcome?:   SyncOutcome,
+  processed:  number,
+  reason?:    string,
+  // every root is imported and the candidate is left open for review
+  held?:      boolean,
+  // checks that failed on a candidate that is held rather than validated
+  checksFailed?: number,
+  /*
+   * What stopped an invocation that failed on a registry error, so a caller
+   * that answers a person can tell a request it has to refuse from a source
+   * that did not answer. It never leaves the process: the reason is the
+   * sanitized form of it.
+   */
+  error?:     RegistryError,
 };
 
 type ManualRequest = {
@@ -93,6 +117,17 @@ type ManualRequest = {
   forceNewAttempt?: boolean,
   reason?:          string,
   requestedBy?:     string,
+  /*
+   * Leave the candidate open once every root is imported, so a market the
+   * source has added can be reviewed in place before the version validates.
+   */
+  holdForReview?:   boolean,
+  /*
+   * How many markets this invocation imports. The Cron keeps to its small
+   * configured batch; an operator bringing an environment up asks for the
+   * whole source in one request.
+   */
+  markets?:         number,
 };
 
 function now(clock: Clock | undefined): Date {
@@ -122,6 +157,30 @@ async function startImport(
   }
 
   const attempts = await findAttemptsByCommit(db, source.repository, commitSha);
+
+  /*
+   * A candidate of this commit that is still importing, with no run left to
+   * continue it, is one an operator is reviewing. Starting another attempt
+   * over it would abandon that review, so only an explicit new attempt does.
+   *
+   * A candidate whose run is still there is not that: another invocation is
+   * importing into it right now, and holds the lease this one could not take.
+   * That falls through to startRun, where the index that allows one running
+   * sync refuses it, which is what the caller has to hear.
+   */
+  const held    = attempts.find(attempt => attempt.status === 'importing');
+  const working = held === undefined ? null : await runningRun(db);
+  if (held !== undefined && request.forceNewAttempt !== true && working?.registry_version_id !== held.id) {
+    await recordUpstreamCheck(db, { now: deps.now });
+    return {
+      result: {
+        status: 'idle', versionId: held.id, processed: 0,
+        reason: 'a candidate of this commit is held for review; validate it or force a new attempt',
+      },
+      fence: null,
+    };
+  }
+
   const imported = attempts.find(attempt => attempt.status === 'validated');
   if (imported !== undefined && request.forceNewAttempt !== true) {
     // upstream answered and has nothing new, so the interval starts here
@@ -143,6 +202,7 @@ async function startImport(
     requestedBy:     request.requestedBy ?? deps.actor,
     reason:          request.reason ?? null,
     roots,
+    ...(request.holdForReview === true ? { holdForReview: true } : {}),
   }, { leaseSeconds: config.leaseSeconds, now: deps.now });
 
   /*
@@ -163,6 +223,12 @@ async function startImport(
 /*
  * Imports one market: read its root at the pinned commit, read the chain, and
  * combine both with the reviewed overlay inherited from the active version.
+ *
+ * A market no version has reviewed is imported all the same, with the
+ * provisional overlay: disabled, every capability off, marked unreviewed. Its
+ * rows are what an operator reviews in place, and until then it changes
+ * nothing the API serves. Refusing it instead would fail the whole commit
+ * over one deployment nobody has looked at yet.
  */
 async function importMarket(
   deps: ImporterDeps,
@@ -176,23 +242,11 @@ async function importMarket(
   const transport = deps.transportFor(root.network);
   const enrichment = await enrichMarket(transport, root);
 
-  const marketKey     = `${root.chainId}/${root.deploymentKey}`;
-  const marketOverlay = overlays.markets.get(marketKey);
-  if (marketOverlay === undefined) {
-    throw new RegistryError(
-      'OVERLAY_MISSING',
-      `${marketKey} has no reviewed overlay: a new market must be reviewed before it can be imported`,
-      root.rootPath,
-    );
-  }
-  const networkOverlay = overlays.networks.get(root.chainId);
-  if (networkOverlay === undefined) {
-    throw new RegistryError(
-      'OVERLAY_MISSING',
-      `chain ${root.chainId} has no reviewed overlay`,
-      root.rootPath,
-    );
-  }
+  const marketKey       = `${root.chainId}/${root.deploymentKey}`;
+  const reviewedMarket  = overlays.markets.get(marketKey);
+  const reviewedNetwork = overlays.networks.get(root.chainId);
+  const marketOverlay   = reviewedMarket ?? provisionalMarketOverlay(root.deploymentKey, enrichment.baseToken.name);
+  const networkOverlay  = reviewedNetwork ?? provisionalNetworkOverlay(root.network);
 
   /*
    * A reviewed reward feed only makes sense with the reward token the chain
@@ -254,8 +308,8 @@ async function importMarket(
     throw new RegistryError('CHAIN_CONTRACT_MISSING', `${marketKey} failed ${failed}`, root.rootPath);
   }
 
-  const networkId = await ensureNetwork(deps.db, versionId, network);
-  await writeMarket(deps.db, versionId, networkId, market);
+  const networkId = await ensureNetwork(deps.db, versionId, network, reviewedNetwork !== undefined);
+  await writeMarket(deps.db, versionId, networkId, market, reviewedMarket !== undefined);
 
   return { checksum: root.checksum, checks };
 }
@@ -264,6 +318,12 @@ async function importMarket(
  * Assembles what the run imported, validates it, and gives the candidate its
  * terminal status. Validation is fail-closed: a candidate that does not pass
  * completely becomes invalid and keeps its diagnostics.
+ *
+ * A held run validates too, so its diagnostics are there to read, but leaves
+ * the candidate importing: its markets are reviewed in place, which a
+ * terminal version no longer allows, and an operator validates it once they
+ * are. The first import of an environment is always held. Nothing it imports
+ * can have been reviewed yet, so it could only ever end invalid.
  */
 async function finishCandidate(
   deps: ImporterDeps,
@@ -279,10 +339,10 @@ async function finishCandidate(
    * whether the candidate is complete.
    */
   const counts = await deps.db.prepare(
-    `SELECT expected_count,
+    `SELECT expected_count, hold_for_review,
             (SELECT COUNT(*) FROM sync_run_items WHERE sync_run_id = ?1 AND status = 'completed') AS imported
      FROM sync_runs WHERE id = ?1`
-  ).bind(fence.runId).first<{ expected_count: number, imported: number }>();
+  ).bind(fence.runId).first<{ expected_count: number, hold_for_review: number, imported: number }>();
 
   const results = [
     ...importChecks,
@@ -300,7 +360,33 @@ async function finishCandidate(
   const attempt = await latestValidationAttempt(deps.db, versionId) + 1;
   await recordValidationResults(deps.db, versionId, attempt, results);
 
-  if (hasFailures(results)) {
+  const held   = counts?.hold_for_review === 1 || await readActiveVersionId(deps.db) === null;
+  const failed = failures(results).length;
+  if (held) {
+    const closed = await finishRun(
+      deps.db,
+      fence,
+      { status: 'completed', outcome: 'imported', registryVersionId: versionId },
+      { now: deps.now },
+    );
+    /*
+     * A held candidate is not validated: it is left open for review. Its
+     * checks still ran, and a caller told only that the import completed
+     * would not know that some of them failed.
+     */
+    return {
+      status: 'completed', outcome: 'imported', runId: fence.runId, versionId, processed: 0, held: true,
+      ...(failed === 0 ? {} : { checksFailed: failed }),
+      reason: [
+        closed
+          ? 'every root is imported; the candidate is held for review'
+          : 'the candidate is held for review, and the lease was taken over before the run closed',
+        ...(failed === 0 ? [] : [ `${failed} of its checks failed` ]),
+      ].join('; '),
+    };
+  }
+
+  if (failed > 0) {
     await markInvalid(deps.db, versionId);
     const closed = await finishRun(
       deps.db,
@@ -385,12 +471,19 @@ async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): P
       .bind(versionId, fence.runId).run();
   }
 
-  const overlays     = await readActiveOverlays(db);
+  const overlays     = await readImportOverlays(db, versionId);
   const networkFeeds = new Map<number, Map<Address, PriceFeedV1>>();
   const importChecks: CheckResult[] = [];
   let processed = 0;
 
-  while (processed < config.marketsPerInvocation) {
+  /*
+   * At most one attempt per root in one invocation. A failed root goes back
+   * into the pool, so a batch larger than what is outstanding would claim it
+   * again straight away — and a chain that is briefly down would burn every
+   * retry of every root inside a single request.
+   */
+  const batch = Math.min(request.markets ?? config.marketsPerInvocation, await pendingItems(db, fence.runId));
+  while (processed < batch) {
     const item = await claimItem(db, fence, { now: deps.now });
     if (item === null) {
       break;
@@ -432,9 +525,10 @@ async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): P
   return { ...finished, processed };
 }
 
-export type { ImporterDeps, InvocationResult, ManualRequest };
+export type { ImporterDeps, InvocationResult, InvocationStatus, ManualRequest };
 
 export {
+  INVOCATION_STATUSES,
   importMarket,
   runInvocation,
 };

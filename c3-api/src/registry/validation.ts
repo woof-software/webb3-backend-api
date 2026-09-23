@@ -90,6 +90,17 @@ function validateMarketImport({ chainId, deploymentKey, market, enrichment }: Ma
   ];
 }
 
+/*
+ * The names of those checks. A candidate is validated against its stored rows
+ * long after the chain answered, so what the chain said is carried forward
+ * from the attempt that heard it rather than dropped.
+ */
+const IMPORT_CHECKS = [
+  'market-contracts-deployed',
+  'reward-token-matches-chain',
+  'base-asset-matches-chain',
+] as const;
+
 function validateMarket(network: NetworkV1, market: MarketV1): CheckResult[] {
   const scope   = marketScope(network, market);
   const results: CheckResult[] = [];
@@ -122,6 +133,21 @@ function validateMarket(network: NetworkV1, market: MarketV1): CheckResult[] {
     reward === null || reward.priceFeedQuote !== 'base' || quotedInBase,
     { priceFeedQuote: reward?.priceFeedQuote ?? null, collateralValueQuote: market.collateralValueQuote },
   ));
+  /*
+   * Transaction history is read from one range of logs covering a market and
+   * the rewards contract its claims are emitted by, so a market whose history
+   * is served must name that contract. Without it the market would be
+   * addressable and answer an empty page, which is indistinguishable from a
+   * market nobody has used. The capability is a reviewed decision, made after
+   * the import, so this is checked over the stored rows.
+   */
+  results.push(check(
+    'transaction-history-requires-rewards-contract',
+    scope,
+    !market.capabilities.transactionHistory || market.contracts.rewards !== null,
+    { transactionHistory: market.capabilities.transactionHistory, rewards: market.contracts.rewards },
+  ));
+
   // rewards cannot be priced without a feed, so the capability must be off
   results.push(check(
     'rewards-capability-has-feed',
@@ -151,7 +177,17 @@ function validateMarket(network: NetworkV1, market: MarketV1): CheckResult[] {
     { baseAsset: market.baseAsset.token.address },
   ));
 
-  results.push(check('creation-block-known', scope, market.creationBlock > 0, { creationBlock: market.creationBlock }));
+  /*
+   * History and indexes start from the creation block, so a market the API
+   * serves must state it. One that is disabled is not served; a market
+   * nobody has reviewed is disabled and does not know it yet.
+   */
+  results.push(check(
+    'creation-block-known',
+    scope,
+    market.status === 'disabled' || market.creationBlock > 0,
+    { creationBlock: market.creationBlock, status: market.status },
+  ));
   results.push(check(
     'comet-contract-declared',
     scope,
@@ -189,6 +225,23 @@ function validateNetwork(network: NetworkV1): CheckResult[] {
     scope,
     new Set(comets).size === comets.length,
     { comets },
+  ));
+
+  /*
+   * The frontend addresses a market of a network by its slug, or by its label
+   * where it has none, so no two markets it lists may answer to the same one:
+   * the second would be unreachable, and a link to it would open the first.
+   * Two markets may share a label only if a slug tells them apart. A disabled
+   * market is not listed, so it takes no key.
+   */
+  const listingKeys = network.markets
+    .filter(market => market.status !== 'disabled')
+    .map(market => (market.slug ?? market.displayName).toLowerCase());
+  results.push(check(
+    'market-listing-keys-unique',
+    scope,
+    new Set(listingKeys).size === listingKeys.length,
+    { listingKeys: listingKeys.filter((key, index) => listingKeys.indexOf(key) !== index) },
   ));
 
   /*
@@ -280,6 +333,7 @@ function failures(results: CheckResult[]): CheckResult[] {
 export type { CandidateInput, CheckResult, MarketImportInput };
 
 export {
+  IMPORT_CHECKS,
   failures,
   hasFailures,
   validateCandidate,

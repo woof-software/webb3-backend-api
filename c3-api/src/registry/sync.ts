@@ -1,11 +1,15 @@
 import {
   DeploymentPath,
+  SyncItemStatus,
   SyncOutcome,
   SyncRunItemRow,
   SyncRunRow,
+  SyncRunStatus,
+  SyncTriggerKind,
 } from '../../lib/model/comet-registry.js';
 
 import { RegistryError } from './errors.js';
+import { changedRows } from './repository.js';
 
 /*
  * The sync fence. One registry import may run at a time, and one invocation
@@ -37,10 +41,12 @@ type RootCheckpoint = DeploymentPath & { sourceBlobSha: string };
 type RunInput = {
   sourceCommitSha: string,
   trackedRef:      string | null,
-  triggerKind:     'scheduled' | 'manual',
+  triggerKind:     SyncTriggerKind,
   requestedBy:     string | null,
   reason:          string | null,
   roots:           RootCheckpoint[],
+  // leave the candidate open for review once every root is imported
+  holdForReview?:  boolean,
 };
 
 /*
@@ -65,10 +71,6 @@ function expiry(clock: Clock | undefined, seconds: number): string {
   return new Date(base + seconds * 1000).toISOString();
 }
 
-function changed(result: D1Result): number {
-  return (result as unknown as { meta?: { changes?: number } }).meta?.changes ?? 0;
-}
-
 /*
  * Starts a new run and its per-root checkpoints in one transaction. The
  * partial unique index on a running status is what makes two concurrent
@@ -83,11 +85,12 @@ async function startRun(db: D1Database, input: RunInput, options: LeaseOptions):
     db.prepare(
       `INSERT INTO sync_runs (
          id, source_commit_sha, tracked_ref, trigger_kind, requested_by, reason,
-         status, lease_owner, lease_generation, lease_expires_at, expected_count, started_at
-       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, 1, ?8, ?9, ?10)`
+         status, lease_owner, lease_generation, lease_expires_at, expected_count, started_at, hold_for_review
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, 1, ?8, ?9, ?10, ?11)`
     ).bind(
       runId, input.sourceCommitSha, input.trackedRef, input.triggerKind, input.requestedBy, input.reason,
       owner, expiry(options.now, options.leaseSeconds), input.roots.length, timestamp,
+      input.holdForReview === true ? 1 : 0,
     ),
     ...input.roots.map(root => db.prepare(
       `INSERT INTO sync_run_items (
@@ -146,7 +149,7 @@ async function renewLease(db: D1Database, fence: Fence, options: LeaseOptions): 
     `UPDATE sync_runs SET lease_expires_at = ?1
      WHERE id = ?2 AND status = 'running' AND lease_owner = ?3 AND lease_generation = ?4`
   ).bind(expiry(options.now, options.leaseSeconds), fence.runId, fence.owner, fence.generation).run();
-  return changed(result) === 1;
+  return changedRows(result) === 1;
 }
 
 /*
@@ -158,7 +161,7 @@ async function releaseLease(db: D1Database, fence: Fence): Promise<boolean> {
     `UPDATE sync_runs SET lease_owner = NULL, lease_expires_at = NULL
      WHERE id = ?1 AND status = 'running' AND lease_owner = ?2 AND lease_generation = ?3`
   ).bind(fence.runId, fence.owner, fence.generation).run();
-  return changed(result) === 1;
+  return changedRows(result) === 1;
 }
 
 /*
@@ -200,7 +203,7 @@ async function commitItem(
   db: D1Database,
   fence: Fence,
   item: { id: string, checksum?: string, error?: string },
-  status: 'completed' | 'failed',
+  status: Extract<SyncItemStatus, 'completed' | 'failed'>,
   options: ClockOption = {},
 ): Promise<boolean> {
   const timestamp = at(options.now);
@@ -269,8 +272,8 @@ async function commitItem(
    * Both statements change one row, or the result is stale and neither does:
    * a late result from a replaced invocation must not move the counters.
    */
-  const committed = changed(itemResult!) === 1 && changed(runResult!) === 1;
-  if (!committed && (changed(itemResult!) !== 0 || changed(runResult!) !== 0)) {
+  const committed = changedRows(itemResult!) === 1 && changedRows(runResult!) === 1;
+  if (!committed && (changedRows(itemResult!) !== 0 || changedRows(runResult!) !== 0)) {
     throw new RegistryError('SYNC_FENCE_INCONSISTENT', `a checkpoint update changed an unexpected number of rows`, item.id);
   }
   return committed;
@@ -291,7 +294,7 @@ async function failItem(db: D1Database, fence: Fence, item: { id: string, error:
 async function finishRun(
   db: D1Database,
   fence: Fence,
-  finish: { status: 'completed' | 'failed', outcome?: SyncOutcome, registryVersionId?: string, error?: string },
+  finish: { status: Exclude<SyncRunStatus, 'running'>, outcome?: SyncOutcome, registryVersionId?: string, error?: string },
   options: ClockOption = {},
 ): Promise<boolean> {
   const result = await db.prepare(
@@ -308,7 +311,7 @@ async function finishRun(
     at(options.now),
     fence.runId, fence.owner, fence.generation,
   ).run();
-  return changed(result) === 1;
+  return changedRows(result) === 1;
 }
 
 async function runningRun(db: D1Database): Promise<SyncRunRow | null> {
