@@ -1,3 +1,4 @@
+-- Migration number: 0001    2026-09-21T18:26:34.867Z
 -- Comet registry schema for the shared APP_DB database.
 --
 -- Registry versions are immutable snapshots of Comet markets built from one
