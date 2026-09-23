@@ -30,7 +30,7 @@ const PRESENTATION_KEYS = ['assetDisplayOverrides', 'unwrappedCollateralAssets']
 const OVERRIDE_KEYS     = ['tokenAddress', 'displayAddress', 'symbol', 'name'];
 const UNWRAPPED_KEYS    = ['wrappedTokenAddress', 'tokenAddress', 'symbol', 'name'];
 const MARKET_KEYS       = [
-  'id', 'deploymentKey', 'displayName', 'contractName', 'isDefault', 'status', 'creationBlock',
+  'id', 'deploymentKey', 'displayName', 'slug', 'contractName', 'isDefault', 'isInstitutional', 'status', 'creationBlock',
   'collateralValueQuote', 'capabilities', 'contracts', 'baseAsset', 'rewardAsset', 'collateralAssets',
 ];
 const CAPABILITY_KEYS   = ['rewards', 'accountRewards', 'transactionHistory'];
@@ -213,7 +213,9 @@ t.test('markets are typed, unique, ordered, and have exactly one enabled default
     checkPattern(problems, market.deploymentKey, SLUG, `${where}.deploymentKey`);
     checkText(problems, market.displayName, `${where}.displayName`);
     if (market.contractName !== null) checkText(problems, market.contractName, `${where}.contractName`);
+    if (market.slug !== null) checkPattern(problems, market.slug, /^[a-z0-9][a-z0-9.-]{0,63}$/, `${where}.slug`);
     checkBoolean(problems, market.isDefault, `${where}.isDefault`);
+    checkBoolean(problems, market.isInstitutional, `${where}.isInstitutional`);
     if (!STATUSES.includes(market.status)) problems.push(`${where}.status: ${JSON.stringify(market.status)} is not one of ${STATUSES}`);
     checkInteger(problems, market.creationBlock, 0, Number.MAX_SAFE_INTEGER, `${where}.creationBlock`);
     if (!QUOTES.includes(market.collateralValueQuote)) problems.push(`${where}.collateralValueQuote: not one of ${QUOTES}`);

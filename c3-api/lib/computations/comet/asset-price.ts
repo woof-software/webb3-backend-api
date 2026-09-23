@@ -1,6 +1,9 @@
 import { BigFixnum } from '../../bigfixnum.js';
 import * as Compute  from '../../symbolic/computation.js';
 
+import type { Address, PriceExceptionV1, RegistryAnnotation } from '../../model/comet-registry.js';
+import { registryOf } from '../../model/comet-registry.js';
+
 import type { AssetInfo } from './asset-info.js';
 import type { GetPrice  } from './get-price.js';
 
@@ -11,26 +14,69 @@ type AssetPrice = Compute.Spec<{
   returns: BigFixnum,
 }>;
 
+/*
+ * What the version says about the feed a Comet reports for this asset.
+ *
+ * A feed that reverts, or that was retired with a last known answer, is an
+ * exception the registry carries for its network: the operator reviewed it,
+ * recorded why, and the version states it. Before the registry these were
+ * branches on network and feed address compiled into this computation, which
+ * meant a deprecated feed could only be handled by shipping a new Worker.
+ */
+function exceptionFor(annotation: RegistryAnnotation | null, priceFeed: Address): PriceExceptionV1 | null {
+  const address = priceFeed.toLowerCase();
+  return annotation?.priceExceptions.find(exception => exception.priceFeedAddress === address) ?? null;
+}
+
+/*
+ * The scale of that feed, as the registry read it on chain. A feed this
+ * version does not describe falls back to eight decimals, which is what every
+ * caller assumed before the registry existed.
+ */
+const ASSUMED_DECIMALS = 8;
+
+function decimalsOf(annotation: RegistryAnnotation | null, priceFeed: Address): number {
+  const address = priceFeed.toLowerCase();
+  const market  = annotation?.market;
+  if (market === undefined) {
+    return ASSUMED_DECIMALS;
+  }
+  const feeds = [
+    market.baseAsset.priceFeed,
+    ...(market.baseAsset.usdPriceFeed === null ? [] : [ market.baseAsset.usdPriceFeed ]),
+    ...market.collateralAssets.map(asset => asset.priceFeed),
+  ];
+  return feeds.find(feed => feed.address === address)?.decimals ?? ASSUMED_DECIMALS;
+}
+
 const { implement, pipe1, pull1 } = Compute.Functor<AssetPrice>({});
 const assetPrice = implement({
   version: 0, // NOTE(jordan): 0 is "no version;" FIXME: migrate
   compute: ({ apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network }) => pipe1([
     { assetInfo: { apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network } },
     ({ priceFeed }) => {
-      // Work around for deprecated wUSDM price feed.
-      if (network === 'ethereum-mainnet' && priceFeed === '0xe3a409eD15CD53aFdEFdd191ad945cEC528A2496') {
-        return BigFixnum.from({ decimals: 8, value: 0 });
-      // Work around for deprecated pumpBTC / BTC exchange rate feed (cWBTCv3 collateral).
-      // Last published answer (2026-09-03, retired aggregator 0x918c6cde1cdd940934820b8fa3a2c8b26a60736c).
-      } else if (network === 'ethereum-mainnet' && priceFeed === '0x351a133Fd850ea81ed8a782016e308aCBADDec91') {
-        return BigFixnum.from({ decimals: 8, value: 102447384 });
-      } else if (network === 'arbitrum-mainnet' && priceFeed === '0x13cDFB7db5e2F58e122B2e789b59dE13645349C4') {
-        return BigFixnum.from({ decimals: 8, value: 0 });
-      } else if (network === 'optimism-mainnet' 
-        && (priceFeed === '0x66228d797eb83ecf3465297751f6b1D4d42b7627')
-          || priceFeed === '0x7E86318Cc4bc539043F204B39Ce0ebeD9F0050Dc'
-        ) {
-        return BigFixnum.from({ decimals: 8, value: 0 });
+      const annotation = registryOf(contract);
+      const exception  = exceptionFor(annotation, priceFeed);
+
+      if (exception !== null) {
+        switch (exception.kind) {
+          case 'zero_price':
+            return BigFixnum.from({ decimals: decimalsOf(annotation, priceFeed), value: 0 });
+          case 'fixed_price':
+            return BigFixnum.from({ decimals: exception.price.decimals, value: exception.price.value });
+          case 'deprecated_price_remap':
+            return pull1({
+              getPrice: {
+                apiHost,
+                nodeHost,
+                nodeKey,
+                network,
+                contract,
+                blockNumber,
+                priceFeed: exception.replacementPriceFeed,
+              },
+            });
+        }
       }
 
       return pull1({
@@ -42,8 +88,8 @@ const assetPrice = implement({
           contract,
           blockNumber,
           priceFeed: {
-            address: priceFeed,
-            decimals: 8, // FIXME: this is an assumption that could break
+            address:  priceFeed,
+            decimals: decimalsOf(annotation, priceFeed),
           },
         },
       });

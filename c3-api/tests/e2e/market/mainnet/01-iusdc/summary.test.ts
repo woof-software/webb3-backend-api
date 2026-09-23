@@ -3,7 +3,8 @@ import * as streamInto from 'node:stream/consumers';
 
 import { makeTestEnv } from '../../../../util/test-env.js';
 
-import { wellKnownContractsByNetwork } from '../../../../../lib/eth-constants.js';
+import type { RegistrySnapshotV1 } from '../../../../../lib/model/comet-registry.js';
+import { catalogOf } from '../../../../../src/registry/catalog.js';
 import * as KnownNetwork from '../../../../../lib/well-known/networks/network.js';
 import * as Debug    from '../../../../../lib/debug-log.js';
 import * as Flags    from '../../../../../lib/flags.js';
@@ -12,6 +13,8 @@ import * as Eth   from '../../../../../lib/eth-constants.js';
 import C3Api, { Env } from '../../../../../entrypoint.js';
 
 import { setupTestEnvVars } from '../../../../util/setupTestEnvVars.js';
+import { activeRegistryDatabase } from '../../../../util/registry-database.js';
+import { loadRegistrySnapshotFixture } from '../../../../util/registry-fixture.js';
 
 /* tests are running in node.js, so we need to shim in the 'self' object
  * that workers scripts depend upon.
@@ -25,6 +28,49 @@ const testDebug = debug.scope('test');
 testDebug.log({ flags });
 
 const { apiHost, nodeHost, nodeKey } = setupTestEnvVars();
+
+const CIUSDCV3 = '0x207158a267cbd2598bb3d611d8cbdee2709f2f8c';
+
+/*
+ * The institutional USDC market, described the way the registry would after
+ * importing it: same base asset and rewards as the mainnet USDC market, its
+ * own Comet and configurator. The frozen fixture does not carry it, and this
+ * test is about what a near-empty market reports, not about the fixture.
+ *
+ * ciUSDCv3 has no timelock, which is why its contracts differ from the other
+ * mainnet markets beyond the Comet address.
+ */
+function withInstitutionalUsdc(): RegistrySnapshotV1 {
+  const snapshot = loadRegistrySnapshotFixture();
+  return {
+    ...snapshot,
+    networks: snapshot.networks.map(network => {
+      if (network.chainId !== 1) {
+        return network;
+      }
+      const usdc = network.markets.find(market => market.deploymentKey === 'usdc')!;
+      return {
+        ...network,
+        markets: [ ...network.markets, {
+          ...usdc,
+          id:              '00000000-0000-4000-8000-0000000001ff',
+          deploymentKey:   'iusdc',
+          displayName:     'USDC',
+          slug:            'usdc-institutional',
+          contractName:    'ciUSDCv3',
+          isDefault:       false,
+          isInstitutional: true,
+          creationBlock:   21_035_000,
+          contracts: {
+            ...usdc.contracts,
+            comet:        CIUSDCV3 as `0x${string}`,
+            configurator: '0x316f9708bb98af7da9c68c1c3b5e79039cd336e3' as `0x${string}`,
+          },
+        } ],
+      };
+    }),
+  };
+}
 
 /*
  * ciUSDCv3 is newly deployed and nearly empty, which is the point of covering
@@ -40,14 +86,18 @@ const { apiHost, nodeHost, nodeKey } = setupTestEnvVars();
  * requires V3_API_HOST / NODE_PROXY_HOST / NODE_PROXY_KEY in the environment.
  */
 t.test(`/market/.../summary response format looks reasonable for a near-empty market`, async t => {
+  const registry = await activeRegistryDatabase({ snapshot: withInstitutionalUsdc() });
+  t.teardown(() => registry.dispose());
+
   const testEnv: Env = makeTestEnv({
     'V3_API_HOST': apiHost,
     'NODE_PROXY_HOST': nodeHost,
     'NODE_PROXY_KEY': nodeKey,
     'MEMORY_CACHE_SEED': 'market',
+    APP_DB: registry.db,
   });
   const network: KnownNetwork.Name = 'ethereum-mainnet';
-  const contract = wellKnownContractsByNetwork[network]['Comet']['ciUSDCv3'];
+  const contract = catalogOf(registry.snapshot).marketAt(network, CIUSDCV3)!.comet;
   const request  = new Request(`https://${nodeHost}/market/${network}/${contract.address}/summary`);
 
   const response = await C3Api.fetch(request, testEnv);

@@ -12,6 +12,8 @@ import {
   normalizeAddress,
 } from '../../../lib/model/comet-registry.js';
 
+import { sha256Hex } from '../../../lib/hash.js';
+
 import { RegistryError } from '../errors.js';
 
 /*
@@ -46,21 +48,14 @@ const ROOT_CONTRACT_ROLES: Record<string, ContractRole> = Object.fromEntries(
   CONTRACT_ROLES.map(role => [ CONTRACT_ROLE_KEYS[role], role ])
 );
 
+const ENCODER = new TextEncoder();
+
 const DEPLOYMENT_PATH  = /^deployments\/([a-z0-9][a-z0-9-]{0,31})\/([a-z0-9][a-z0-9._-]{0,63})\/roots\.json$/;
 const ROOT_KEY_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 
 // one roots.json is a small flat map; these bounds reject anything unexpected
 const MAX_ROOT_BYTES = 64 * 1024;
 const MAX_ROOT_KEYS  = 200;
-
-const ENCODER = new TextEncoder();
-
-async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', ENCODER.encode(value));
-  return [ ...new Uint8Array(digest) ]
-    .map(byte => byte.toString(16).padStart(2, '0'))
-    .join('');
-}
 
 function isSupportedNetworkKey(key: string): boolean {
   return Object.hasOwn(SUPPORTED_NETWORKS, key);
@@ -219,6 +214,5 @@ export {
   networkOf,
   parseDeploymentPath,
   parseRoot,
-  sha256Hex,
   sourceChecksum,
 };

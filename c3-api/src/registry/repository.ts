@@ -1,4 +1,6 @@
 import {
+  ActivationAction,
+  ActivationResultV1,
   Address,
   CONTRACT_ROLES,
   CONTRACT_ROLE_KEYS,
@@ -9,11 +11,14 @@ import {
   MarketV1,
   NetworkPriceExceptionRow,
   NetworkV1,
+  PriceExceptionV1,
   PriceQuote,
   RegistryNetworkRow,
+  RegistrySnapshotV1,
   RegistryVersionRow,
   TokenV1,
   ValidationResultRow,
+  ValidationSummaryV1,
 } from '../../lib/model/comet-registry.js';
 
 import { RegistryError } from './errors.js';
@@ -23,7 +28,8 @@ import {
   parseMarketOverlay,
   parseNetworkOverlay,
 } from './overlay.js';
-import { sha256Hex } from './source/roots.js';
+import { canonicalJson } from '../../lib/canonical-json.js';
+import { sha256Hex } from '../../lib/hash.js';
 
 /*
  * Writes to the registry tables of APP_DB. The database owns the invariants:
@@ -105,7 +111,7 @@ async function snapshotChecksum(networks: NetworkV1[]): Promise<string> {
     ...network,
     markets: network.markets.map(({ id: _id, ...market }) => market),
   }));
-  return sha256Hex(JSON.stringify(semantic));
+  return sha256Hex(canonicalJson(semantic));
 }
 
 /*
@@ -181,7 +187,20 @@ async function clearCandidateSnapshot(db: D1Database, versionId: string): Promis
 
 type Scope = { registry_version_id: string, network_id: string };
 
-function networkStatement(db: D1Database, versionId: string, networkId: string, network: NetworkV1): D1PreparedStatement {
+/*
+ * `reviewed` says whether the decisions in a row were made by someone. A row
+ * written from a reviewed overlay says so; one written for a network or
+ * market nobody has reviewed carries the provisional values of
+ * provisionalNetworkOverlay and provisionalMarketOverlay, and is not cloned
+ * into the next version.
+ */
+function networkStatement(
+  db: D1Database,
+  versionId: string,
+  networkId: string,
+  network: NetworkV1,
+  reviewed: boolean = true,
+): D1PreparedStatement {
   return insertStatement(db, 'registry_networks', {
     id:                   networkId,
     registry_version_id:  versionId,
@@ -191,6 +210,7 @@ function networkStatement(db: D1Database, versionId: string, networkId: string, 
     display_name:         network.displayName,
     is_testnet:           boolean(network.testnet),
     metadata:             JSON.stringify(network.presentation),
+    reviewed:             boolean(reviewed),
   });
 }
 
@@ -218,6 +238,7 @@ function marketStatements(
   scope: Scope,
   market: MarketV1,
   tokenIds: Map<Address, string>,
+  reviewed: boolean = true,
 ): { statements: D1PreparedStatement[], tokens: number, contracts: number, assets: number } {
   const statements: D1PreparedStatement[] = [];
   let tokens = 0;
@@ -248,14 +269,17 @@ function marketStatements(
     ...scope,
     deployment_key:              market.deploymentKey,
     display_name:                market.displayName,
+    slug:                        market.slug,
     contract_name:               market.contractName,
     creation_block:              market.creationBlock,
     status:                      market.status,
     is_default:                  boolean(market.isDefault),
+    is_institutional:            boolean(market.isInstitutional),
     rewards_enabled:             boolean(market.capabilities.rewards),
     account_rewards_enabled:     boolean(market.capabilities.accountRewards),
     transaction_history_enabled: boolean(market.capabilities.transactionHistory),
     collateral_value_quote:      market.collateralValueQuote,
+    reviewed:                    boolean(reviewed),
   }));
 
   let contracts = 0;
@@ -360,7 +384,12 @@ async function writeCandidateSnapshot(
  * row id. An import discovers a network when it reaches the first market on
  * it, and later markets of the same network find it already written.
  */
-async function ensureNetwork(db: D1Database, versionId: string, network: NetworkV1): Promise<string> {
+async function ensureNetwork(
+  db: D1Database,
+  versionId: string,
+  network: NetworkV1,
+  reviewed: boolean = true,
+): Promise<string> {
   const existing = await db.prepare(
     `SELECT id FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = ?2`
   ).bind(versionId, network.chainId).first<string>('id');
@@ -371,7 +400,7 @@ async function ensureNetwork(db: D1Database, versionId: string, network: Network
   const networkId = crypto.randomUUID();
   const scope     = { registry_version_id: versionId, network_id: networkId };
   await db.batch([
-    networkStatement(db, versionId, networkId, network),
+    networkStatement(db, versionId, networkId, network, reviewed),
     ...exceptionStatements(db, scope, network),
   ]);
   return networkId;
@@ -388,6 +417,7 @@ async function writeMarket(
   versionId: string,
   networkId: string,
   market: MarketV1,
+  reviewed: boolean = true,
 ): Promise<void> {
   const known = await db.prepare(
     `SELECT id, address FROM tokens WHERE registry_version_id = ?1 AND network_id = ?2`
@@ -401,6 +431,7 @@ async function writeMarket(
     { registry_version_id: versionId, network_id: networkId },
     market,
     tokenIds,
+    reviewed,
   );
 
   /*
@@ -490,8 +521,10 @@ async function readSnapshot(db: D1Database, versionId: string): Promise<NetworkV
           id:                   market.id,
           deploymentKey:        market.deployment_key,
           displayName:          market.display_name,
+          slug:                 market.slug,
           contractName:         market.contract_name,
           isDefault:            market.is_default === 1,
+          isInstitutional:      market.is_institutional === 1,
           status:               market.status,
           creationBlock:        market.creation_block,
           collateralValueQuote: market.collateral_value_quote,
@@ -533,21 +566,230 @@ async function readSnapshot(db: D1Database, versionId: string): Promise<NetworkV
       presentation,
       priceExceptions: (exceptionRows.results ?? [])
         .filter(exception => exception.network_id === network.id)
-        .map(exception => {
-          const shared = {
+        .map((exception): PriceExceptionV1 => {
+          // each branch is written out, so the key order follows the wire
+          // contract and the kind stays a literal the union can discriminate
+          if (exception.kind === 'fixed_price') {
+            return {
+              kind:             'fixed_price',
+              priceFeedAddress: exception.price_feed_address,
+              price:            { value: exception.fixed_price_value!, decimals: exception.fixed_price_decimals! },
+              provenance:       exception.provenance,
+              expiresAt:        exception.expires_at,
+            };
+          }
+          if (exception.kind === 'deprecated_price_remap') {
+            return {
+              kind:                 'deprecated_price_remap',
+              priceFeedAddress:     exception.price_feed_address,
+              replacementPriceFeed: {
+                address:  exception.replacement_price_feed_address!,
+                decimals: exception.replacement_price_feed_decimals!,
+              },
+              provenance:           exception.provenance,
+              expiresAt:            exception.expires_at,
+            };
+          }
+          return {
+            kind:             'zero_price',
             priceFeedAddress: exception.price_feed_address,
             provenance:       exception.provenance,
             expiresAt:        exception.expires_at,
           };
-          return exception.kind === 'fixed_price'
-            ? { kind: exception.kind, ...shared, price: { value: exception.fixed_price_value!, decimals: exception.fixed_price_decimals! } }
-            : exception.kind === 'deprecated_price_remap'
-              ? { kind: exception.kind, ...shared, replacementPriceFeed: { address: exception.replacement_price_feed_address!, decimals: exception.replacement_price_feed_decimals! } }
-              : { kind: exception.kind, ...shared };
         }),
       markets,
     };
   });
+}
+
+/*
+ * The version a request resolves against, and the snapshot it serves.
+ */
+async function readActiveVersionId(db: D1Database): Promise<string | null> {
+  const active = await db
+    .prepare(`SELECT active_version_id FROM registry_state WHERE singleton_id = 1`)
+    .first<string | null>('active_version_id');
+  return active ?? null;
+}
+
+async function readVersion(db: D1Database, versionId: string): Promise<RegistryVersionRow | null> {
+  const version = await db
+    .prepare(`SELECT * FROM registry_versions WHERE id = ?1`)
+    .bind(versionId).first<RegistryVersionRow>();
+  return version ?? null;
+}
+
+/*
+ * A stored version as the wire contract serves it. Only a validated version
+ * has a snapshot checksum, so only a validated version can be served.
+ */
+async function readRegistrySnapshot(db: D1Database, versionId: string): Promise<RegistrySnapshotV1 | null> {
+  const version = await readVersion(db, versionId);
+  if (version === null || version.status !== 'validated' || version.snapshot_checksum === null) {
+    return null;
+  }
+  return {
+    schemaVersion: 1,
+    registryVersion: {
+      id:               version.id,
+      sourceRepository: version.source_repository,
+      sourceCommitSha:  version.source_commit_sha,
+      checksum:         version.snapshot_checksum,
+    },
+    networks: await readSnapshot(db, versionId),
+  };
+}
+
+async function readActiveSnapshot(db: D1Database): Promise<RegistrySnapshotV1 | null> {
+  const activeVersionId = await readActiveVersionId(db);
+  return activeVersionId === null ? null : readRegistrySnapshot(db, activeVersionId);
+}
+
+/*
+ * Moves the active pointer, auditing the change. Both statements carry the
+ * same condition, so activating the version that is already active writes
+ * neither: it is an idempotent no-op, not a second activation event.
+ *
+ * The pointer trigger refuses a target that is not validated, and because
+ * both statements run in one batch, a refused pointer change rolls back the
+ * audit event with it.
+ */
+async function activateVersion(
+  db: D1Database,
+  input: { versionId: string, action: ActivationAction, actor: string, reason: string },
+): Promise<ActivationResultV1> {
+  const version = await readVersion(db, input.versionId);
+  if (version === null) {
+    throw new RegistryError('CANDIDATE_STATE_CONFLICT', `no such registry version`, input.versionId);
+  }
+  if (version.status !== 'validated' || version.snapshot_checksum === null) {
+    throw new RegistryError(
+      'CANDIDATE_STATE_CONFLICT',
+      `only a validated version can be ${input.action === 'rollback' ? 'restored' : 'activated'}`,
+      input.versionId,
+    );
+  }
+
+  const activationId = crypto.randomUUID();
+  const timestamp    = new Date().toISOString();
+
+  const [ auditResult, pointerResult ] = await db.batch([
+    db.prepare(
+      `INSERT INTO registry_activations (id, registry_version_id, previous_version_id, action, actor, reason, created_at)
+       SELECT ?1, ?2, active_version_id, ?3, ?4, ?5, ?6
+       FROM registry_state
+       WHERE singleton_id = 1 AND active_version_id IS NOT ?2`
+    ).bind(activationId, input.versionId, input.action, input.actor, input.reason, timestamp),
+    db.prepare(
+      `UPDATE registry_state SET active_version_id = ?1, updated_at = ?2
+       WHERE singleton_id = 1 AND active_version_id IS NOT ?1`
+    ).bind(input.versionId, timestamp),
+  ]);
+
+  const audited = changedRows(auditResult!);
+  const moved   = changedRows(pointerResult!);
+  if (audited !== moved) {
+    throw new RegistryError(
+      'CANDIDATE_STATE_CONFLICT',
+      `the activation audit and the pointer disagree`,
+      input.versionId,
+    );
+  }
+
+  /*
+   * What was replaced is read back from the audit row this activation wrote,
+   * not from a read taken before the batch. Two activations can race, and the
+   * answer an operator is given must be the one the audit trail records, not
+   * the state the request happened to observe on the way in.
+   */
+  const previousVersionId = moved === 1
+    ? await db.prepare(`SELECT previous_version_id FROM registry_activations WHERE id = ?1`)
+        .bind(activationId).first<string | null>('previous_version_id')
+    : null;
+
+  return {
+    action:            input.action,
+    activationId:      moved === 1 ? activationId : null,
+    previousVersionId: previousVersionId ?? null,
+    targetVersionId:   input.versionId,
+    changed:           moved === 1,
+    registryVersion:   { id: input.versionId, checksum: version.snapshot_checksum },
+  };
+}
+
+/*
+ * The latest complete validation attempt of a version, which is the one that
+ * decided its status.
+ */
+/*
+ * The checks one attempt recorded, as they were recorded. Validating a stored
+ * candidate carries forward the ones the chain answered, which only the
+ * attempt that imported it could have run.
+ */
+async function readAttemptChecks(
+  db: D1Database,
+  versionId: string,
+  attempt: number,
+): Promise<Array<{ check_name: string, scope: string, passed: number, details?: Record<string, unknown> }>> {
+  const { results } = await db.prepare(
+    `SELECT check_name, scope, passed, details FROM validation_results
+     WHERE registry_version_id = ?1 AND validation_attempt = ?2`
+  ).bind(versionId, attempt).all<{ check_name: string, scope: string, passed: number, details: string }>();
+
+  return (results ?? []).map(row => ({
+    check_name: row.check_name,
+    scope:      row.scope,
+    passed:     row.passed,
+    ...(row.passed === 1 ? {} : { details: JSON.parse(row.details) as Record<string, unknown> }),
+  }));
+}
+
+async function readValidationSummary(db: D1Database, versionId: string): Promise<ValidationSummaryV1> {
+  const attempt = await latestValidationAttempt(db, versionId);
+  if (attempt === 0) {
+    return { attempt: 0, passed: 0, failed: 0, checks: [] };
+  }
+  const { results } = await db.prepare(
+    `SELECT check_name, scope, passed, details FROM validation_results
+     WHERE registry_version_id = ?1 AND validation_attempt = ?2
+     ORDER BY passed, check_name, scope`
+  ).bind(versionId, attempt).all<{ check_name: string, scope: string, passed: number, details: string }>();
+
+  const checks = (results ?? []).map(row => ({
+    name:   row.check_name,
+    scope:  row.scope,
+    passed: row.passed === 1,
+    ...(row.passed === 1 ? {} : { details: JSON.parse(row.details) as unknown }),
+  }));
+  return {
+    attempt,
+    passed: checks.filter(check => check.passed).length,
+    failed: checks.filter(check => !check.passed).length,
+    checks,
+  };
+}
+
+async function readActivationHistory(
+  db: D1Database,
+  versionId: string,
+): Promise<Array<{ id: string, action: string, previousVersionId: string | null, actor: string, reason: string, createdAt: string }>> {
+  const { results } = await db.prepare(
+    `SELECT id, action, previous_version_id, actor, reason, created_at
+     FROM registry_activations
+     WHERE registry_version_id = ?1 OR previous_version_id = ?1
+     ORDER BY created_at DESC, rowid DESC`
+  ).bind(versionId).all<{
+    id: string, action: string, previous_version_id: string | null,
+    actor: string, reason: string, created_at: string,
+  }>();
+  return (results ?? []).map(row => ({
+    id:                row.id,
+    action:            row.action,
+    previousVersionId: row.previous_version_id,
+    actor:             row.actor,
+    reason:            row.reason,
+    createdAt:         row.created_at,
+  }));
 }
 
 /*
@@ -557,9 +799,14 @@ async function readSnapshot(db: D1Database, versionId: string): Promise<NetworkV
  * whose stored overlay no longer satisfies the contract.
  */
 async function readOverlays(db: D1Database, versionId: string): Promise<ClonedOverlays> {
+  /*
+   * Only what someone reviewed is an overlay. A row written for a network or
+   * market nobody reviewed carries provisional values, and cloning those into
+   * the next version would turn them into decisions nobody made.
+   */
   const networkRows = await db.prepare(
     `SELECT chain_id, canonical_name, upstream_network_key, display_name, is_testnet, metadata
-     FROM registry_networks WHERE registry_version_id = ?1 ORDER BY chain_id`
+     FROM registry_networks WHERE registry_version_id = ?1 AND reviewed = 1 ORDER BY chain_id`
   ).bind(versionId).all<{
     chain_id: number, canonical_name: string, upstream_network_key: string,
     display_name: string, is_testnet: number, metadata: string,
@@ -569,13 +816,13 @@ async function readOverlays(db: D1Database, versionId: string): Promise<ClonedOv
     `SELECT network.chain_id AS chain_id, exception.*
      FROM network_price_exceptions AS exception
      JOIN registry_networks AS network ON network.id = exception.network_id
-     WHERE exception.registry_version_id = ?1
+     WHERE exception.registry_version_id = ?1 AND network.reviewed = 1
      ORDER BY network.chain_id, exception.price_feed_address`
   ).bind(versionId).all<NetworkPriceExceptionRow & { chain_id: number }>();
 
   const marketRows = await db.prepare(
-    `SELECT network.chain_id AS chain_id, market.deployment_key, market.display_name, market.contract_name,
-            market.is_default, market.status, market.creation_block, market.collateral_value_quote,
+    `SELECT network.chain_id AS chain_id, market.deployment_key, market.display_name, market.slug, market.contract_name,
+            market.is_default, market.is_institutional, market.status, market.creation_block, market.collateral_value_quote,
             market.rewards_enabled, market.account_rewards_enabled, market.transaction_history_enabled,
             base.display_name AS base_display_name, base.is_wrapped_native,
             base.usd_price_feed_address, reward.price_feed_address AS reward_price_feed_address,
@@ -584,11 +831,11 @@ async function readOverlays(db: D1Database, versionId: string): Promise<ClonedOv
      JOIN registry_networks AS network ON network.id = market.network_id
      LEFT JOIN market_assets AS base ON base.market_id = market.id AND base.role = 'base'
      LEFT JOIN market_assets AS reward ON reward.market_id = market.id AND reward.role = 'reward'
-     WHERE market.registry_version_id = ?1
+     WHERE market.registry_version_id = ?1 AND market.reviewed = 1
      ORDER BY network.chain_id, market.creation_block, market.deployment_key`
   ).bind(versionId).all<{
-    chain_id: number, deployment_key: string, display_name: string, contract_name: string | null,
-    is_default: number, status: MarketStatus, creation_block: number, collateral_value_quote: PriceQuote,
+    chain_id: number, deployment_key: string, display_name: string, slug: string | null, contract_name: string | null,
+    is_default: number, is_institutional: number, status: MarketStatus, creation_block: number, collateral_value_quote: PriceQuote,
     rewards_enabled: number, account_rewards_enabled: number, transaction_history_enabled: number,
     base_display_name: string | null, is_wrapped_native: number | null,
     usd_price_feed_address: string | null, reward_price_feed_address: string | null,
@@ -621,8 +868,10 @@ async function readOverlays(db: D1Database, versionId: string): Promise<ClonedOv
   for (const row of marketRows.results ?? []) {
     markets.set(`${row.chain_id}/${row.deployment_key}`, parseMarketOverlay({
       displayName:          row.display_name,
+      slug:                 row.slug,
       contractName:         row.contract_name,
       isDefault:            row.is_default === 1,
+      isInstitutional:      row.is_institutional === 1,
       status:               row.status,
       creationBlock:        row.creation_block,
       collateralValueQuote: row.collateral_value_quote,
@@ -658,6 +907,77 @@ async function readActiveOverlays(db: D1Database): Promise<ClonedOverlays> {
     return { networks: new Map(), markets: new Map() };
   }
   return readOverlays(db, activeVersionId);
+}
+
+/*
+ * The overlay an import applies: what the active version says, with what was
+ * reviewed for the earlier attempts at the same commit over it.
+ *
+ * An earlier attempt matters because a review happens in place, in the rows
+ * of an importing candidate, and a candidate that ends invalid is frozen with
+ * those rows in it. The next attempt at the same source inherits them rather
+ * than asking for the same review again. A different commit does not: what
+ * was reviewed for it and then activated is already the active version.
+ *
+ * Every earlier attempt is read, oldest first, so the newest review of a
+ * market wins and one attempt that reviewed nothing — it failed on the chain
+ * before anyone saw it — does not lose the review an attempt before it
+ * carried.
+ */
+async function readImportOverlays(db: D1Database, versionId: string): Promise<ClonedOverlays> {
+  const active  = await readActiveOverlays(db);
+  const earlier = await db.prepare(
+    `SELECT previous.id
+     FROM registry_versions AS current
+     JOIN registry_versions AS previous
+       ON previous.source_repository = current.source_repository
+      AND previous.source_commit_sha = current.source_commit_sha
+      AND previous.attempt < current.attempt
+     WHERE current.id = ?1
+     ORDER BY previous.attempt`
+  ).bind(versionId).all<{ id: string }>();
+
+  const inherited = { networks: new Map(active.networks), markets: new Map(active.markets) };
+  for (const attempt of earlier.results ?? []) {
+    const reviewed = await readOverlays(db, attempt.id);
+    for (const [ chainId, overlay ] of reviewed.networks) {
+      inherited.networks.set(chainId, overlay);
+    }
+    for (const [ key, overlay ] of reviewed.markets) {
+      inherited.markets.set(key, overlay);
+    }
+  }
+  return inherited;
+}
+
+/*
+ * What in a version nobody has reviewed: the networks and markets an import
+ * wrote with provisional values. It is what an operator works through before
+ * the version can be offered, and what a new deployment in the source shows
+ * up as.
+ */
+async function readUnreviewed(db: D1Database, versionId: string): Promise<{
+  networks: number[],
+  markets:  string[],
+}> {
+  const [ networks, markets ] = await db.batch([
+    db.prepare(
+      `SELECT chain_id FROM registry_networks
+       WHERE registry_version_id = ?1 AND reviewed = 0 ORDER BY chain_id`
+    ).bind(versionId),
+    db.prepare(
+      `SELECT network.chain_id, market.deployment_key
+       FROM markets AS market
+       JOIN registry_networks AS network ON network.id = market.network_id
+       WHERE market.registry_version_id = ?1 AND market.reviewed = 0
+       ORDER BY network.chain_id, market.deployment_key`
+    ).bind(versionId),
+  ]);
+  return {
+    networks: ((networks!.results ?? []) as Array<{ chain_id: number }>).map(row => row.chain_id),
+    markets:  ((markets!.results ?? []) as Array<{ chain_id: number, deployment_key: string }>)
+      .map(row => `${row.chain_id}/${row.deployment_key}`),
+  };
 }
 
 /*
@@ -711,8 +1031,17 @@ async function markInvalid(db: D1Database, versionId: string): Promise<void> {
   assertChanged(result, versionId, `the candidate is no longer importing`);
 }
 
+/*
+ * Rows a statement changed. D1 reports it in `meta.changes`, which the
+ * workers-types version this worker resolves does not declare.
+ */
+// how many rows a statement changed; workers-types does not type `meta.changes` on every version
+function changedRows(result: D1Result): number {
+  return (result as unknown as { meta?: { changes?: number } }).meta?.changes ?? 0;
+}
+
 function assertChanged(result: D1Result, versionId: string, message: string): void {
-  const changes = (result as unknown as { meta?: { changes?: number } }).meta?.changes ?? 0;
+  const changes = changedRows(result);
   if (changes !== 1) {
     throw new RegistryError('CANDIDATE_STATE_CONFLICT', message, versionId);
   }
@@ -721,17 +1050,28 @@ function assertChanged(result: D1Result, versionId: string, message: string): vo
 export type { CandidateInput, ClonedOverlays, SnapshotCounts };
 
 export {
+  readAttemptChecks,
+  changedRows,
   BATCH_SIZE,
+  activateVersion,
   clearCandidateSnapshot,
   createCandidate,
   ensureNetwork,
   findAttempts,
   findAttemptsByCommit,
   readSnapshot,
+  readUnreviewed,
   writeMarket,
   latestValidationAttempt,
+  readActivationHistory,
   readActiveOverlays,
+  readActiveSnapshot,
+  readActiveVersionId,
+  readImportOverlays,
   readOverlays,
+  readRegistrySnapshot,
+  readValidationSummary,
+  readVersion,
   markInvalid,
   markValidated,
   recordValidationResults,

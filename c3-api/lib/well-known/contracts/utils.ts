@@ -32,6 +32,8 @@ import {
 } from './types.js';
 import { wellKnownENSHashes } from '../ens-hashes.js';
 
+import type { ResolvedMarket } from '../../model/registry-lookup.js';
+
 export {
   Contract,
   //
@@ -453,7 +455,7 @@ function describeContractCallForHumans(
       for (let i = 0; i < unwrappedActions.targets.length; ++i) {
         const targetContract = contractForLocation(
           { network: mappedPolygonNetwork, address: unwrappedActions.targets[i] },
-          Eth.wellKnownContractsByNetwork,
+          wellKnownContracts,
         )
         const { signature, data } = governance.proposal.parseSignatureAndCalldata(
           unwrappedActions.sigs[i],
@@ -512,7 +514,7 @@ function describeContractCallForHumans(
       for (let i = 0; i < unwrappedActions.targets.length; ++i) {
         const targetContract = contractForLocation(
           { network: mappedArbitrumNetwork, address: unwrappedActions.targets[i] },
-          Eth.wellKnownContractsByNetwork,
+          wellKnownContracts,
         )
         const { signature, data } = governance.proposal.parseSignatureAndCalldata(
           unwrappedActions.sigs[i],
@@ -572,7 +574,7 @@ function describeContractCallForHumans(
       for (let i = 0; i < unwrappedActions.targets.length; ++i) {
         const targetContract = contractForLocation(
           { network: mappedOptimismNetwork, address: unwrappedActions.targets[i] },
-          Eth.wellKnownContractsByNetwork,
+          wellKnownContracts,
         )
         const formattedAction = describeContractCallForHumans(
           targetContract,
@@ -633,7 +635,7 @@ function describeContractCallForHumans(
       for (let i = 0; i < unwrappedActions.targets.length; ++i) {
         const targetContract = contractForLocation(
           { network: mappedBaseNetwork, address: unwrappedActions.targets[i] },
-          Eth.wellKnownContractsByNetwork,
+          wellKnownContracts,
         )
         const formattedAction = describeContractCallForHumans(
           targetContract,
@@ -962,56 +964,42 @@ function getNetworkIfCrossChain({ network, target, signature }: {
   }
 }
 
-/**
- * Helper function to convert a token amount to a string
+/*
+ * The static contracts of one network, with the markets and tokens of a
+ * registry version merged in.
  *
- * @param network Network
- * @param address Address of the token, if its comet's cUSDCv3 or cWETHv3, we use the base token
- * @param amount Amount of the token
- * @returns Stringified amount
+ * Governance decodes proposal action targets against the contracts this API
+ * knows by name. The protocol's own contracts — governors, COMP, V2, the
+ * bridges — are static and stay static; markets and their tokens come from
+ * the activated version, so a proposal that configures a market added after
+ * this Worker was built still reads as something rather than as a bare
+ * address. A target neither source knows keeps its address, as before.
  */
-function stringifyTokenAmount(network: KnownNetwork.Name, address: Eth.Address, amount: BigNumber): string {
-  return toTokenBase(amount, getTokenDecimals(network, address));
-}
-
-function getTokenSymbol(network: KnownNetwork.Name, address: Eth.Address): string {
-  const tokenContract = lookupInWellKnown({ network, address }, Eth.wellKnownContractsByNetwork);
-  if (Comet.is(tokenContract))     return tokenContract.base.asset.canonicalName;
-  if (TokenLike.is(tokenContract)) return tokenContract.canonicalName;
-  else                             return '';
-}
-
-function getBaseTokenAddress(network: KnownNetwork.Name, address: Eth.Address): Eth.Address {
-  const contract = lookupInWellKnown({ network, address }, Eth.wellKnownContractsByNetwork);
-  if (Comet.is(contract)) return contract.base.asset.address;
-  else                    return '0x0';
-}
-
-function getTokenDecimals(network: KnownNetwork.Name, address: Eth.Address): number {
-  const contract = lookupInWellKnown({ network, address }, Eth.wellKnownContractsByNetwork);
-  if (Comet.is(contract))     return contract.base.asset.decimals;
-  if (TokenLike.is(contract)) return contract.decimals;
-  else                        return 18;
-}
-
-function getCometContractsForNetwork (networkName: KnownNetwork.Name): Eth.Contract<StandaloneContract<Comet>>[] {
-  const wellKnownContracts = Eth.wellKnownContractsByNetwork[networkName];
-  if (!('Comet' in wellKnownContracts)) {
-    return [];
+function withRegistryContracts(
+  wellKnownContracts: WellKnownContractsByNetworkAddress,
+  markets: ResolvedMarket[],
+): WellKnownContractsByNetworkAddress {
+  if (markets.length === 0) {
+    return wellKnownContracts;
   }
-  const marketContracts: Eth.Contract<StandaloneContract<Comet>>[] =
-    Object.values(wellKnownContracts['Comet']);
+  const merged: { [network: string]: { [address: string]: any } } = {};
 
-  const uniqueMarketContracts = marketContracts.filter(
-    (contract, index) =>
-      index ===
-      marketContracts.findIndex(
-        (otherContract) => contract.address === otherContract.address
-      )
-  );
+  for (const { comet } of markets) {
+    const network = comet.network;
+    merged[network] ??= { ...wellKnownContracts[network] };
+    merged[network]![comet.address.toLowerCase()] = comet;
+    for (const token of [ comet.base.asset, comet.rewards.asset ]) {
+      // a token the constants already name keeps that name
+      merged[network]![token.address.toLowerCase()] ??= token;
+    }
+  }
 
-  return uniqueMarketContracts;
-};
+  /*
+   * Every network the version describes, because a proposal executed on
+   * mainnet can bridge actions that configure a market on another chain.
+   */
+  return { ...wellKnownContracts, ...merged };
+}
 
 export {
   StaticWellKnownContracts,
@@ -1020,9 +1008,5 @@ export {
   describeContractCallForHumans,
   decodeFunctionDataFromSignature,
   getNetworkIfCrossChain,
-  stringifyTokenAmount,
-  getTokenSymbol,
-  getBaseTokenAddress,
-  getTokenDecimals,
-  getCometContractsForNetwork,
+  withRegistryContracts,
 };

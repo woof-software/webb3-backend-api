@@ -9,6 +9,7 @@ import * as Eth from "../../../../../lib/eth-constants.js";
 import C3Api, { Env } from "../../../../../entrypoint.js";
 
 import { setupTestEnvVars } from '../../../../util/setupTestEnvVars.js';
+import { activeRegistryDatabase } from '../../../../util/registry-database.js';
 
 /* tests are running in node.js, so we need to shim in the 'self' object
  * that workers scripts depend upon.
@@ -23,13 +24,23 @@ testDebug.log({ flags });
 
 const { apiHost, nodeHost, nodeKey } = setupTestEnvVars();
 
+
+/*
+ * Markets, tokens, and feeds come from the activated registry, so this test
+ * seeds one: the frozen snapshot fixture, activated in a D1 database of its
+ * own. Nothing here resolves a market from the static constants any more.
+ */
 t.test(`/market/all-networks/all-contracts/summary`, async (t) => {
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+
   const testEnv: Env = makeTestEnv(
     {
       V3_API_HOST: apiHost,
       NODE_PROXY_HOST: nodeHost,
       NODE_PROXY_KEY: nodeKey,
       MEMORY_CACHE_SEED: "market",
+      APP_DB: registry.db,
     },
     process.env
   );

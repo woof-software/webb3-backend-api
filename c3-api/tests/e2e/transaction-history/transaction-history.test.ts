@@ -32,6 +32,10 @@ import { makeTestEnv } from '../../util/test-env.js';
 import '../../../shim/node-self.js';
 
 import { setupTestEnvVars } from '../../util/setupTestEnvVars.js';
+import { activeRegistryDatabase } from '../../util/registry-database.js';
+
+import { catalogOf } from '../../../src/registry/catalog.js';
+import { streamEventsOf } from '../../../src/transaction-history-handler/transaction-history-items-handler.js';
 
 const { apiHost, nodeHost, nodeKey } = setupTestEnvVars();
 
@@ -114,12 +118,25 @@ t.test(`transaction history`, async t => {
   const seed = encodeSeed(seedJson);
 
   /*
+   * The markets whose history is read, and the networks they are on, are what
+   * the activated registry says they are. This test seeds one — the frozen
+   * snapshot fixture — and mocks a latest block for exactly the networks that
+   * version serves history for.
+   */
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+  const historyNetworks = [ ...new Set(
+    streamEventsOf(catalogOf(registry.snapshot)).map(stream => stream.network)
+  ) ] as Mainnets[];
+
+  /*
    * Set up the test env, seeding in-memory test KVs with the cache seed.
    */
   const testEnv: Env = {
     ...globalEnv,
     'kv_testnet': MemoryKv({ seed }),
     'kv_mainnet': MemoryKv({ seed }),
+    'APP_DB':     registry.db,
   };
 
   /*
@@ -136,14 +153,7 @@ t.test(`transaction history`, async t => {
     /*
      * Mock 1 'latest' block request per supported mainnet.
      */
-    const mainnets: Mainnets[] = [
-      'ethereum-mainnet',
-      'polygon-mainnet',
-      'arbitrum-mainnet',
-      'optimism-mainnet',
-      'base-mainnet',
-    ];
-    for (const network of mainnets) {
+    for (const network of historyNetworks) {
       mock.rpc.expectPost(fetch, Eth.nodeEndpoint(testEnv.NODE_PROXY_HOST, testEnv.NODE_PROXY_KEY, network),
         mock.rpc.ethGetBlock(testBlocks[network], { reference: 'latest' })
       );

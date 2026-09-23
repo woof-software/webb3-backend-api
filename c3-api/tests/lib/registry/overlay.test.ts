@@ -21,6 +21,8 @@ const OTHER     = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
 const marketOverlay = {
   displayName:          'USDC',
   contractName:         'cUSDCv3',
+  slug:                 null,
+  isInstitutional:      false,
   isDefault:            true,
   status:               'enabled',
   creationBlock:        15331586,

@@ -12,6 +12,15 @@ import * as transactionHistoryHandler from './transaction-history-handler/transa
 
 import type { Contract } from '../lib/well-known/contracts/types.js';
 
+import type { Catalog } from './registry/catalog.js';
+import {
+  RequestCatalog,
+  catalogHeaders,
+  isRegistryUnavailable,
+  requestCatalog,
+} from './registry/request-catalog.js';
+import { routeRegistry } from './registry/router.js';
+
 import type * as Evaluator from './evaluator.js';
 
 /*
@@ -74,6 +83,8 @@ interface MarketRouteData {
   network: KnownNetwork.Name | typeof AllNetworks;
   contract: Contract | typeof AllContracts;
   queryParams: URL['searchParams'];
+  // the one registry version that answers this request
+  catalog: Catalog;
 }
 
 interface GovernanceRouteData {
@@ -83,6 +94,12 @@ interface GovernanceRouteData {
   network: Extract<KnownNetwork.Name, `ethereum-${'mainnet'}`>;
   contract: Contract | typeof AllContracts;
   queryParams: URL['searchParams'];
+  /*
+   * The registry, not loaded. Governance resolves its own contracts
+   * statically; only proposal action targets the constants do not know are
+   * looked up here, so a governance request that needs none never reads D1.
+   */
+  registry: RequestCatalog;
 }
 
 interface V2RouteData {
@@ -102,6 +119,7 @@ interface TransactionHistoryRouteData {
   nodeKey: string;
   accountAddress: Eth.Address;
   queryParams: URL['searchParams'];
+  catalog: Catalog;
 }
 
 interface AccountRouteData {
@@ -110,6 +128,7 @@ interface AccountRouteData {
   nodeKey: string;
   account: Eth.Address;
   testnets: 'include' | 'exclude';
+  catalog: Catalog;
 }
 
 // Example Route: /{resource api}/<network>/<contract-specifier>/{endpoint suffix}
@@ -138,22 +157,66 @@ async function route(
   context: Omit<Context, 'evaluator'>,
   instantiateEvaluator: Evaluator.InstantiateFn<Scope>,
 ): Promise<Response> {
-  try {
-    return await unsafeRoute(request, context, instantiateEvaluator);
-  } catch (e: unknown) {
-    context.debug.clearDanglingGroups();
-    context.debug.error(e, (e as any).cause);
-    return new Response((e as Error).message, { status: 500 });
+  /*
+   * The registry version of this request. It is loaded at most once, by the
+   * first handler that needs it, and every response whose content depended on
+   * it says which version answered.
+   */
+  const registry = requestCatalog(context.env);
+  const answer = async (): Promise<Response> => {
+    try {
+      return await unsafeRoute(request, context, instantiateEvaluator, registry);
+    } catch (e: unknown) {
+      context.debug.clearDanglingGroups();
+      context.debug.error(e, (e as any).cause);
+      /*
+       * A route that needs the registry cannot be answered from anywhere
+       * else: after the cutover there is no static market list to fall back
+       * to, so the request fails while the rest of the API keeps working.
+       */
+      if (isRegistryUnavailable(e)) {
+        return new Response(
+          JSON.stringify({ error: `the comet registry is unavailable`, requestId: crypto.randomUUID() }),
+          { status: 503, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response((e as Error).message, { status: 500 });
+    }
+  };
+
+  /*
+   * Whatever the outcome, a response that was computed against a version says
+   * which one. That holds for a failure too: an error a client reports is
+   * only diagnosable if it says what it was computed against.
+   */
+  const response = await answer();
+  const catalog  = registry.loaded();
+  if (catalog !== null) {
+    for (const [ name, value ] of Object.entries(catalogHeaders(catalog))) {
+      response.headers.set(name, value);
+    }
   }
+  return response;
 }
 
 async function unsafeRoute(
   request: Request,
   context: Omit<Context, 'evaluator'>,
   instantiateEvaluator: Evaluator.InstantiateFn<Scope>,
+  registry: RequestCatalog,
 ): Promise<Response> {
   const url = new URL(request.url);
   let route = url.pathname;
+
+  /*
+   * The registry answers its own routes, including their errors and CORS.
+   * It is dispatched before the four-segment matcher below, which would
+   * otherwise claim paths such as /registry/v1/networks/1/markets.
+   */
+  const registryResponse = await routeRegistry(request, context.env, context);
+  if (registryResponse !== null) {
+    return registryResponse;
+  }
 
   // A URL path is generally split into 4 major parts:
   // 1. the resource API, e.g. 'market' or 'governance'
@@ -224,6 +287,7 @@ async function unsafeRoute(
           nodeKey: context.env.NODE_PROXY_KEY,
           accountAddress,
           queryParams: url.searchParams,
+          catalog: await registry.load(),
         },
         context
       );
@@ -253,6 +317,7 @@ async function unsafeRoute(
           nodeKey: context.env.NODE_PROXY_KEY,
           testnets,
           account: accountAddress,
+          catalog: await registry.load(),
         },
         {
           ...context,
@@ -317,11 +382,28 @@ async function unsafeRoute(
     return new Response(`Error: Cannot specify a contract when querying all networks`, { status: 400 });
   }
 
-  // Maybe resolve to a well known contract.
+  if (!isValidResourceAPI(resourceApi)) {
+    return new Response(`Error: Not a valid resource API`, { status: 400 });
+  }
+
+  /*
+   * A market address is resolved through the registry, and a governance one
+   * through the static constants.
+   *
+   * The two resolve differently because they answer different questions: a
+   * market is whatever the activated version says is a market, while the
+   * governors, COMP, and the V2 contracts are part of the protocol this API
+   * is built against and do not change with an import.
+   */
+  const catalog = resourceApi === 'market' ? await registry.load() : null;
   const maybeWellKnownContract = (() => {
     // If we specify all networks, we must also be querying all contracts
     if (contractSpecifier === AllContracts || networkAlias === AllNetworks) {
       return AllContracts;
+    }
+    if (catalog !== null) {
+      return catalog.marketAt(networkAlias, contractSpecifier as Eth.Address)?.comet
+          ?? Fallible.Outcome.Of.Failure('no such market in the active registry');
     }
     if (contractSpecifier === DefaultCompContract) {
       return (Eth.wellKnownContractsByNetwork[networkAlias] as any)['COMP']['default'];
@@ -334,10 +416,6 @@ async function unsafeRoute(
 
   if (Fallible.isFailure(maybeWellKnownContract)) {
     return new Response(`Error: Contract address not known`, { status: 400 });
-  }
-
-  if (!isValidResourceAPI(resourceApi)) {
-    return new Response(`Error: Not a valid resource API`, { status: 400 });
   }
 
   if (resourceApi === 'market') {
@@ -359,6 +437,7 @@ async function unsafeRoute(
             network: networkAlias,
             contract: maybeWellKnownContract,
             queryParams: url.searchParams,
+            catalog: catalog!,
           },
           {
             ...context,
@@ -375,6 +454,7 @@ async function unsafeRoute(
           network: networkAlias,
           contract: maybeWellKnownContract,
           queryParams: url.searchParams,
+          catalog: catalog!,
         },
         {
           ...context,
@@ -398,6 +478,7 @@ async function unsafeRoute(
         network: networkAlias as Extract<KnownNetwork.Name, `ethereum-${'mainnet'}`>,
         contract: maybeWellKnownContract,
         queryParams: url.searchParams,
+        registry,
       }, {
         ...context,
         evaluator: instantiateEvaluator(networkEnvironment),

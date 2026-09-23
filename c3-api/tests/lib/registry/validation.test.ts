@@ -104,6 +104,34 @@ t.test('a market whose parts disagree is rejected', async t => {
   );
 });
 
+/*
+ * History is read from one range of logs covering the market and the rewards
+ * contract its claims come from. A market whose history is served without
+ * naming that contract would be addressable and answer nothing. The
+ * capability is a review, made after the import, so this is checked over the
+ * stored rows rather than at import time, where it could never fail: an
+ * unreviewed market serves no history yet.
+ */
+t.test('history is served only by a market that names its rewards contract', async t => {
+  t.same(
+    failingChecks(networks => {
+      const market = mainnetMarket(networks, 'usdc');
+      market.contracts = { ...market.contracts, rewards: null };
+    }),
+    [ 'transaction-history-requires-rewards-contract' ],
+    'transaction history without the rewards contract it is read with',
+  );
+  t.same(
+    failingChecks(networks => {
+      const market = mainnetMarket(networks, 'usdc');
+      market.contracts    = { ...market.contracts, rewards: null };
+      market.capabilities = { ...market.capabilities, transactionHistory: false };
+    }),
+    [],
+    'while a market that serves no history needs no rewards contract',
+  );
+});
+
 t.test('an assembled market must match what the chain answered', async t => {
   t.same(
     failingImportChecks(() => {}),
@@ -125,6 +153,7 @@ t.test('an assembled market must match what the chain answered', async t => {
     [ 'base-asset-matches-chain' ],
     'a base asset the Comet does not name',
   );
+
 });
 
 t.test('malformed collateral is rejected', async t => {
@@ -169,6 +198,40 @@ t.test('registry-wide invariants are enforced', async t => {
     }),
     [ 'default-market-is-enabled' ],
     'a deprecated market as the default',
+  );
+  /*
+   * The frontend addresses a market by its slug, or by its label where it has
+   * none. Two listed markets of one network answering to the same key would
+   * make the second unreachable.
+   */
+  t.same(
+    failingChecks(networks => { mainnetMarket(networks, 'usdt').displayName = 'usdc'; }),
+    [ 'market-listing-keys-unique' ],
+    'two markets of one network under one label, compared as the frontend does, ignoring case',
+  );
+  t.same(
+    failingChecks(networks => { mainnetMarket(networks, 'usdt').slug = 'usdc'; }),
+    [ 'market-listing-keys-unique' ],
+    'or a slug that is another market\'s label',
+  );
+  t.same(
+    failingChecks(networks => {
+      const institutional = mainnetMarket(networks, 'usdt');
+      institutional.displayName     = 'USDC';
+      institutional.slug            = 'usdc-institutional';
+      institutional.isInstitutional = true;
+    }),
+    [],
+    'a shared label is fine where a slug tells the markets apart',
+  );
+  t.same(
+    failingChecks(networks => {
+      const market = mainnetMarket(networks, 'usdt');
+      market.displayName = 'USDC';
+      market.status      = 'disabled';
+    }),
+    [],
+    'and a disabled market is not listed, so it takes no key',
   );
   t.same(
     failingChecks(networks => { networks.reverse(); }),
@@ -221,7 +284,24 @@ t.test('registry-wide invariants are enforced', async t => {
   t.same(
     failingChecks(networks => { mainnetMarket(networks, 'usdc').creationBlock = 0; }),
     [ 'creation-block-known' ],
-    'a market with no creation block',
+    'a served market with no creation block',
+  );
+  /*
+   * A market nobody has reviewed is imported disabled, and the chain cannot
+   * cheaply say when it was deployed. It is not served, so nothing starts an
+   * index from it, and it must not fail the commit it arrived with.
+   */
+  t.same(
+    failingChecks(networks => {
+      const mainnet = networks.find(network => network.chainId === 1)!;
+      const weth    = mainnetMarket(networks, 'weth');
+      weth.creationBlock = 0;
+      weth.status        = 'disabled';
+      // stored markets are read back in creation-block order, so it comes first
+      mainnet.markets = [ weth, ...mainnet.markets.filter(market => market !== weth) ];
+    }),
+    [],
+    'while a disabled market may leave it unknown',
   );
 });
 

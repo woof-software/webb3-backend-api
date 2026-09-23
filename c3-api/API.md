@@ -1,4 +1,19 @@
 # Endpoints
+
+## The market registry
+
+Markets, tokens, and price feeds come from one activated registry version.
+Every response whose content depends on it carries the version that answered:
+
+```
+X-Registry-Version:  8f1e0f3c-3b7a-4e8f-9a1b-1f0f0b9a2c44
+X-Registry-Checksum: 1bd74ebe00d845e0fa5e648b22a2c39e60d9a62bf6c58190320fa01cd9a26a4a
+```
+
+Endpoints that resolve a market answer `503` when no version is active, and
+`400` for an address the active version does not describe. The registry's own
+endpoints are documented under [Registry v1](#registry-v1).
+
 ## Pagination
 
 Many endpoints are paginated for convenience. If an endpoint is paginated,
@@ -71,6 +86,15 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
 
 Point-in-time summary at the most-recently-sampled block (which may not be
 the 'latest' block per se) of rewards rates and APRs for a v3 market.
+
+A market the active registry version gives no rewards — the Scroll and Ronin
+markets, and a Comet with no rewards configured, such as mainnet ciUSDCv3 —
+answers `404` rather than a summary, because there is no reward price to
+value its rewards with:
+
+```json
+{ "error": "Rewards are not available for this market", "code": "REWARDS_NOT_AVAILABLE" }
+```
 
 ```sh
 $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3/rewards/summary'
@@ -472,6 +496,21 @@ Query parameters:
 - `actions[]` (optional): array of actions to filter transactions by. Default is all actions. (e.g. filter only borrow actions `actions[]=Borrow`)
 - `cursor` (optional): The first response (with no cursor parameter) will return with a cursor value, to pass that cursor value will allow request to get more transaction history further in the past.
 
+A cursor belongs to the registry version it was issued against. If that
+version is no longer the active one, the request answers `409` and the client
+restarts pagination without a cursor:
+
+```json
+{
+  "error": {
+    "code": "REGISTRY_VERSION_CHANGED",
+    "message": "the market registry changed; restart pagination without a cursor",
+    "cursorRegistryVersionId": "8f1e0f3c-...",
+    "registryVersionId": "b2c4d6e8-..."
+  }
+}
+```
+
 ```sh
 $ curl 'localhost:8787/account/0xcfc50541c3dEaf725ce738EF87Ace2Ad778Ba0C5/transaction_history?limit=30&actions[]=Borrow&markets[]=1_0xc3d688B66703497DAA19211EEdff47f25384cdc3'
 ```
@@ -542,5 +581,331 @@ $ curl 'localhost:8787/account/0xcfc50541c3dEaf725ce738EF87Ace2Ad778Ba0C5/transa
     }
     ...
   ]
+}
+```
+
+# Registry v1
+
+Everything under `/registry/v1` is answered by the registry, including its
+errors, which use one envelope:
+
+```json
+{ "error": { "code": "NOT_FOUND", "message": "...", "requestId": "..." } }
+```
+
+Public reads are cacheable and carry `ETag`, `X-Registry-Version` and
+`X-Registry-Checksum`; they answer `503 REGISTRY_NOT_ACTIVE` when no version
+is active. Administrative routes require `Authorization: Bearer <token>`, are
+rate limited per actor, and answer no CORS headers at all.
+
+## `/registry/v1/active`
+### description:
+
+The whole activated snapshot: networks, their markets, and the presentation
+and price-exception data an application needs to render them. This is the
+bootstrap read; everything below serves parts of the same version.
+
+```sh
+$ curl 'localhost:8787/registry/v1/active'
+```
+
+## `/registry/v1/networks`
+### description:
+
+The networks of the active version, without their markets.
+
+## `/registry/v1/networks/{chain_id}/markets`
+### description:
+
+The markets of one chain, in the same order the snapshot lists them.
+
+## `/registry/v1/networks/{chain_id}/markets/{comet_address}`
+### description:
+
+One market, addressed by its Comet. A `disabled` market answers `404`; a
+`deprecated` one is served, because positions and history in it must stay
+reachable.
+
+## `/registry/v1/versions/{version_id}`
+### description:
+
+A validated version by id, so a session that pinned one can refetch exactly
+what it pinned even after another version was activated.
+
+## `POST /registry/v1/admin/sync`
+### description:
+
+Starts or continues an import. `sourceCommitSha` pins an explicit commit,
+`forceNewAttempt` rebuilds an attempt, and `holdForReview` leaves the
+candidate open once every root is imported, so a market the source added can
+be reviewed before the version validates; each of the three is a decision
+rather than routine scheduling, and requires a `reason`. The first import of
+an environment is held regardless. `markets` bounds how many markets this
+request imports, from 1 to 50, and defaults to 50. Answers `202` with the
+run, the version it is importing into, and `heldForReview`.
+
+A held candidate is validated too, so its diagnostics can be read, but keeps
+its `importing` status: `checksFailed` says how many of its checks failed, and
+is `0` for one that would validate as it stands. A candidate another
+invocation is importing into is not one held for review, and asking for a sync
+while that run holds its lease answers `409 SYNC_ALREADY_RUNNING`.
+
+When the import fails, the answer says whether trying again can help. A
+request the registry refuses answers with the status its code maps to — a
+`sourceCommitSha` the tracked ref cannot reach is `422` — and a candidate that
+failed its checks is `422` with `syncRunId` and `registryVersionId` in
+`details`, to read its validation by. Only a source that did not answer is
+`503`.
+
+## `GET /registry/v1/admin/sync-runs/{sync_run_id}`
+### description:
+
+One import run and its per-root checkpoints, including why a root failed and
+when the run becomes resumable.
+
+## `GET /registry/v1/admin/versions/{version_id}`
+### description:
+
+A version with its validation summary and activation history.
+
+## `POST /registry/v1/admin/versions/{version_id}/validate`
+### description:
+
+Re-runs validation over a candidate and records the result. Answers `422`
+when the candidate is invalid, with the checks that decided it, and `409`
+while its import is still running.
+
+It takes no body. Validation decides nothing: it checks the stored candidate
+and records every check it ran, exactly as the scheduled import does
+unattended. The decision a person makes about a version, with its reason, is
+the activation.
+
+## `POST /registry/v1/admin/versions/{version_id}/activate`
+### description:
+
+Makes a validated version the one the API serves. Requires a `reason`, which
+is stored with the audit event. Activating the version that is already active
+changes nothing.
+
+## `POST /registry/v1/admin/versions/{version_id}/rollback`
+### description:
+
+The same move in the other direction, recorded as a rollback.
+
+## `PUT /registry/v1/admin/versions/{version_id}/networks/{chain_id}/overlay`
+### description:
+
+Replaces the reviewed overlay of one network: display names, asset display
+overrides, unwrapped collateral assets, and price exceptions. An overlay is a
+complete document; a missing key is a missing decision, not a default.
+
+The overlay is applied to the rows the import wrote, and a network reviewed
+this way stops being listed as unreviewed. A chain the candidate has not
+imported yet answers `404`: the import writes every network it reaches, so
+the answer is to let it continue.
+
+## `PUT /registry/v1/admin/versions/{version_id}/markets/{chain_id}/{deployment_key}/overlay`
+### description:
+
+The same for one market: its display name, status, capabilities, quote unit,
+USD feed, and reward feed. A market the import wrote without a review is
+disabled until this is applied to it, and
+`GET /registry/v1/admin/versions/{version_id}` lists what is still
+unreviewed.
+
+It also states how the frontend lists the market. `displayName` is its label,
+`slug` — lowercase letters, digits, dots and hyphens, or `null` — is what the
+frontend addresses it by where the label is shared with another market of
+the same network, and `isInstitutional` lists it in the institutional section.
+Within a network, no two markets that are not disabled may answer to the same
+`slug`, or to the same label where they have none; validation refuses a
+version where they do, and a slug another market of the network keeps is
+refused with `409`.
+
+## `GET /registry/v1/admin/versions/{version_id}/markets/{chain_id}/{deployment_key}/overlay`
+### description:
+
+The overlay a market of the version carries, in the form the `PUT` above
+takes: read it, change what is different, and send it back with a reason. The
+overlay of a similar market is where describing a new one starts. A market
+nobody has reviewed answers with the provisional decisions its import wrote,
+and `reviewed: false`.
+
+```json
+{
+  "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
+  "scope": "8453/usdc",
+  "reviewed": true,
+  "overlay": {
+    "displayName": "USDC",
+    "slug": null,
+    "contractName": "cUSDCv3",
+    "isDefault": false,
+    "isInstitutional": false,
+    "status": "enabled",
+    "creationBlock": 11699480,
+    "collateralValueQuote": "usd",
+    "capabilities": { "rewards": true, "accountRewards": true, "transactionHistory": true },
+    "baseAsset": { "displayName": "USD Coin", "isWrappedNative": false, "usdPriceFeedAddress": null },
+    "rewardPriceFeed": { "address": "0x9dda783de64a9d1a60c49ca761ebe528c35ba428", "quote": "usd" }
+  }
+}
+```
+
+## `PUT /registry/v1/admin/versions/{version_id}/overlays`
+### description:
+
+Many overlays in one request: the way a new environment is reviewed, where
+every network and market the first import wrote needs its decisions at once.
+`GET /versions/{version_id}/proposal` answers with exactly this body under
+`bundle`.
+
+Network overlays are keyed by chain id and market overlays by
+`chainId/deploymentKey`; each is the same complete document the one-scope
+routes take, decided the same way, and `reason` is stored with every audit
+event the request records. Up to 100 overlays, in a body of up to 512 KiB.
+
+The request is applied all at once or not at all. Every document is parsed
+and every network and market it names is found before anything is written,
+and the writes are one D1 transaction: a document the parser refuses answers
+`400` naming it, and scopes the candidate has not imported answer `404`
+naming all of them, with nothing written in either case. A request may move
+the default market or a slug between the markets it names, or swap two slugs,
+in whatever order it names them. Only an importing candidate is
+writable (`409` otherwise).
+
+```json
+{
+  "reason": "bootstrap: derived from the static constants against Compound-Foundation/comet@a34d9b571c83",
+  "networks": { "1": { "displayName": "Ethereum", "assetDisplayOverrides": [], "unwrappedCollateralAssets": [], "priceExceptions": [] } },
+  "markets":  { "1/usdc": { "displayName": "USDC", "contractName": "cUSDCv3", "...": "..." } }
+}
+```
+
+The answer says what each document changed, in the order the request named
+them, and what the candidate still has unreviewed. A document identical to
+what is stored changes nothing and records no event, so sending the same
+directory again is safe.
+
+```json
+{
+  "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
+  "changed": true,
+  "snapshotChecksum": null,
+  "documents": [
+    { "scopeType": "network", "scopeKey": "1",      "changed": true,  "overlayEventId": "0d0f3f7e-..." },
+    { "scopeType": "market",  "scopeKey": "1/usdc", "changed": true,  "overlayEventId": "5b1c2a90-..." },
+    { "scopeType": "market",  "scopeKey": "1/weth", "changed": false, "overlayEventId": null }
+  ],
+  "unreviewed": { "networks": [], "markets": [] }
+}
+```
+
+## `GET /registry/v1/admin/versions/{version_id}/proposal`
+### `GET /registry/v1/admin/versions/{version_id}/proposal/review`
+### description:
+
+What the release serving the request proposes as the first review of a
+version: for every market the version imported that the static constants
+describe, the decisions the API already acts on, and for every network, its
+name, presentation and price exceptions. A market the constants do not
+describe is not proposed; it is listed under `needsDecision`, and stays
+switched off until it is described with the market overlay route.
+
+`/proposal` answers with the proposal as data: its `digest`, what it leaves
+undecided, and under `bundle` the body `PUT /versions/{version_id}/overlays`
+takes. `/proposal/review` answers with the same proposal as a document to read
+(`text/markdown`), naming the digest to apply it by. Neither changes anything.
+
+```json
+{
+  "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
+  "digest": "3f9a1c0e7b2d4a61",
+  "needsDecision": [],
+  "bundle": { "reason": "bootstrap: derived from the static constants against Compound-Foundation/comet@a34d9b571c83", "networks": { "...": "..." }, "markets": { "...": "..." } }
+}
+```
+
+## `POST /registry/v1/admin/versions/{version_id}/proposal/apply`
+### description:
+
+Applies the proposal by its digest: `{"reason": "...", "digest": "<16 hex>"}`.
+The proposal is built again and written only if it still has that digest, so
+what is applied is exactly what was read; one that changed since — another
+release, another version — answers `409` with its current digest in
+`details`. The write is the one `PUT /versions/{version_id}/overlays` makes,
+all of it or none, and answers the same way, with the `digest` beside it.
+Only an importing version is writable.
+
+## `GET /registry/v1/admin/shadow`
+### `GET /registry/v1/admin/versions/{version_id}/shadow`
+### description:
+
+What the active version — or a validated candidate, before activating it —
+says against what the static constants in the Worker still say. `agrees` is
+the one flag a check can read; `differences` names every field the two answer
+differently, and `onlyInStatic` / `onlyInRegistry` the markets only one of
+them describes.
+
+```json
+{
+  "agrees": false,
+  "shadow": {
+    "versionId": "8f1e0f3c-3b7a-4e8f-9a1b-1f0f0b9a2c44",
+    "checksum": "1bd74ebe...",
+    "staticMarkets": 29,
+    "registryMarkets": 29,
+    "onlyInStatic": [],
+    "onlyInRegistry": [],
+    "differences": [
+      {
+        "scope": "1/wbtc",
+        "field": "baseAsset.priceFeed",
+        "static": "0xf4030086522a5beea4988f8ca5b36dbc97bee88c",
+        "registry": "0xfdfd9c85ad200c506cf9e21f1fd8dd01932fbb23"
+      }
+    ]
+  }
+}
+```
+
+## `GET /registry/v1/admin/versions/{version_id}/changes`
+### description:
+
+What a version changes against the version that is on: the networks and
+markets it adds or drops, and every fact and decision of the others that
+differs. It is what to read before switching a newer version on, where the
+shadow comparison only measures against the static constants.
+
+It answers for a candidate that is still importing as well, because that is
+when a market the source has added is described: such a market is listed
+under `markets.added` whole, with everything its import read from the source
+and the chain, and `reviewed: false` until someone describes it. With no
+version on, `comparedWith` is `null` and everything is added.
+
+A change is one field on a flattened path, with both answers. Lists are
+compared by position with their length beside them, so a collateral the
+source adds reads as a longer list and one more entry.
+
+```json
+{
+  "versionId": "0b7c2e7a-1d5e-4f39-8c55-6f7b1c4f2a10",
+  "status": "importing",
+  "comparedWith": "d9698ddd-ab86-46bc-a412-c71df7d20414",
+  "networks": { "added": [], "removed": [], "changed": [] },
+  "markets": {
+    "added": [
+      { "scope": "8453/usdt", "reviewed": false, "market": { "deploymentKey": "usdt", "status": "disabled", "...": "..." } }
+    ],
+    "removed": [],
+    "changed": [
+      {
+        "scope": "42161/usdc",
+        "field": "baseAsset.priceFeed.address",
+        "before": "0x50834f3163758fcc1df9973b6e91f0f0f0434ad3",
+        "after": "0x880d36763bb470cd395b7d6c76b50446fa70ace5"
+      }
+    ]
+  }
 }
 ```

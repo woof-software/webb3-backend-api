@@ -9,6 +9,8 @@
  * pattern is unanchored and so accepts an address embedded in other text.
  */
 
+import { keccak256 } from '../hash.js';
+
 // same shape as Eth.Address, without importing the runtime constants module
 type Address = `0x${string}`;
 
@@ -24,6 +26,7 @@ const MARKET_STATUSES  = [ 'enabled', 'deprecated', 'disabled' ] as const;
 const VERSION_STATUSES = [ 'importing', 'invalid', 'validated' ] as const;
 const EXCEPTION_KINDS  = [ 'zero_price', 'fixed_price', 'deprecated_price_remap' ] as const;
 
+const ACTIVATION_ACTIONS = [ 'activate', 'rollback' ] as const;
 const SYNC_TRIGGER_KINDS = [ 'scheduled', 'manual' ] as const;
 const SYNC_RUN_STATUSES  = [ 'running', 'failed', 'completed' ] as const;
 const SYNC_OUTCOMES      = [ 'imported', 'no_change' ] as const;
@@ -53,7 +56,8 @@ type MarketStatus  = (typeof MARKET_STATUSES)[number];
 type VersionStatus = (typeof VERSION_STATUSES)[number];
 type ExceptionKind = (typeof EXCEPTION_KINDS)[number];
 
-type SyncTriggerKind = (typeof SYNC_TRIGGER_KINDS)[number];
+type ActivationAction = (typeof ACTIVATION_ACTIONS)[number];
+type SyncTriggerKind  = (typeof SYNC_TRIGGER_KINDS)[number];
 type SyncRunStatus   = (typeof SYNC_RUN_STATUSES)[number];
 type SyncOutcome     = (typeof SYNC_OUTCOMES)[number];
 type SyncItemStatus  = (typeof SYNC_ITEM_STATUSES)[number];
@@ -72,6 +76,21 @@ function isAddress(value: unknown): value is Address {
 
 function normalizeAddress(value: Address | string): Address {
   return value.toLowerCase() as Address;
+}
+
+/*
+ * The EIP-55 form of an address, which is how the API writes addresses out:
+ * the case of each letter carries one bit of the keccak256 of the lowercase
+ * address. Lookups keep comparing the lowercase form.
+ */
+function checksumAddress(value: Address | string): Address {
+  const lower = value.toLowerCase().slice(2);
+  const hash  = keccak256(lower);
+  let checksummed = '0x';
+  for (let index = 0; index < lower.length; index++) {
+    checksummed += parseInt(hash[index]!, 16) >= 8 ? lower[index]!.toUpperCase() : lower[index]!;
+  }
+  return checksummed as Address;
 }
 
 function isCommitSha(value: unknown): value is string {
@@ -142,10 +161,12 @@ type MarketRow = {
   network_id:                  string,
   deployment_key:              string,
   display_name:                string,
+  slug:                        string | null,
   contract_name:               string | null,
   creation_block:              number,
   status:                      MarketStatus,
   is_default:                  number,
+  is_institutional:            number,
   rewards_enabled:             number,
   account_rewards_enabled:     number,
   transaction_history_enabled: number,
@@ -292,8 +313,15 @@ type MarketV1 = {
   id:                   string,
   deploymentKey:        string,
   displayName:          string,
+  /*
+   * What the frontend addresses the market by where its label is shared with
+   * another market of the same network; null where the label alone does.
+   */
+  slug:                 string | null,
   contractName:         string | null,
   isDefault:            boolean,
+  // listed in the frontend's institutional section rather than with the standard markets
+  isInstitutional:      boolean,
   status:               MarketStatus,
   creationBlock:        number,
   collateralValueQuote: PriceQuote,
@@ -374,7 +402,75 @@ type RegistrySnapshotV1 = {
   networks:        NetworkV1[],
 };
 
+/*
+ * How a response that resolved a version identifies it. It is deliberately
+ * smaller than the snapshot's own reference: a convenience read states which
+ * version answered, not where it came from.
+ */
+type VersionRefV1 = {
+  id:       string,
+  checksum: string,
+};
+
+type ActivationResultV1 = {
+  action:            ActivationAction,
+  activationId:      string | null,
+  previousVersionId: string | null,
+  targetVersionId:   string,
+  changed:           boolean,
+  registryVersion:   VersionRefV1,
+};
+
+type ValidationCheckV1 = {
+  name:     string,
+  scope:    string,
+  passed:   boolean,
+  details?: unknown,
+};
+
+type ValidationSummaryV1 = {
+  attempt: number,
+  passed:  number,
+  failed:  number,
+  checks:  ValidationCheckV1[],
+};
+
+/*
+ * What a Comet contract carries when it was materialized from the registry:
+ * the version that described it, the market as that version describes it, and
+ * the exceptions of its network.
+ *
+ * It travels on the contract object itself so that a computation which
+ * already receives a contract needs no second parameter threaded through
+ * every caller. `digest` identifies the market's content, and is what keeps
+ * cached results of two different versions apart when, and only when, the
+ * version changed something a computation can observe.
+ */
+type RegistryAnnotation = {
+  versionId:       string,
+  digest:          string,
+  chainId:         number,
+  deploymentKey:   string,
+  market:          MarketV1,
+  priceExceptions: PriceExceptionV1[],
+};
+
+/*
+ * The registry description behind a contract, or null for one that came from
+ * the static constants. A computation branches on what the registry says,
+ * never on where the contract came from — except here, which is the one place
+ * that tells the two apart.
+ */
+function registryOf(contract: unknown): RegistryAnnotation | null {
+  const annotation = (contract as { registry?: unknown } | null)?.registry;
+  return typeof(annotation) === 'object' && annotation !== null && 'digest' in annotation
+    ? annotation as RegistryAnnotation
+    : null;
+}
+
 export type {
+  ActivationAction,
+  ActivationResultV1,
   Address,
   AssetDisplayOverrideV1,
   AssetRole,
@@ -399,6 +495,7 @@ export type {
   RegistryNetworkRow,
   RegistrySnapshotV1,
   RegistryVersionRefV1,
+  RegistryAnnotation,
   RegistryVersionRow,
   RewardAssetV1,
   SyncItemStatus,
@@ -410,11 +507,16 @@ export type {
   TokenRow,
   TokenV1,
   UnwrappedCollateralAssetV1,
+  ValidationCheckV1,
   ValidationResultRow,
+  ValidationSummaryV1,
+  VersionRefV1,
   VersionStatus,
 };
 
 export {
+  checksumAddress,
+  ACTIVATION_ACTIONS,
   ASSET_ROLES,
   CONTRACT_ROLES,
   CONTRACT_ROLE_KEYS,
@@ -430,4 +532,5 @@ export {
   isChecksum,
   isCommitSha,
   normalizeAddress,
+  registryOf,
 };

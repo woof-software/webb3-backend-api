@@ -3,7 +3,8 @@ import * as Fallible           from '../../lib/fallible/fallible.js';
 import { snakeifyCamelObject } from '../../lib/camel-snake.js';
 
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
-import { getCometContractsForNetwork } from '../../lib/well-known/contracts/utils.js';
+
+import type { CatalogMarket } from '../registry/catalog.js';
 
 import { AccountRouteData } from '../router.js';
 
@@ -12,8 +13,34 @@ import { Context } from './handlers.js';
 import * as cometRewards        from '../../lib/computations/comet-rewards.js';
 import * as accountComputations from '../../lib/computations/account.js';
 
+/*
+ * The markets whose account rewards the registry says are claimable, grouped
+ * by the rewards contract that holds them.
+ *
+ * The grouping is not cosmetic: one Sleuth query reads the reward configs of
+ * every market it is given from a single CometRewards, so markets that do not
+ * share one must not be batched together. Networks without rewards used to be
+ * excluded by name; the version now states it per market.
+ */
+function rewardGroups(
+  catalog: AccountRouteData['catalog'],
+  networks: KnownNetwork.Name[],
+): Array<{ network: KnownNetwork.Name, contracts: CatalogMarket['comet'][] }> {
+  return networks.flatMap(network => {
+    const byRewards = new Map<string, CatalogMarket['comet'][]>();
+    for (const entry of catalog.marketsOn(network)) {
+      const rewards = entry.market.contracts.rewards;
+      if (!entry.market.capabilities.accountRewards || rewards === null) {
+        continue;
+      }
+      byRewards.set(rewards, [ ...(byRewards.get(rewards) ?? []), entry.comet ]);
+    }
+    return [ ...byRewards.values() ].map(contracts => ({ network, contracts }));
+  });
+}
+
 async function rewardsSummary(
-  { apiHost, nodeHost, nodeKey, account, testnets }: AccountRouteData,
+  { apiHost, nodeHost, nodeKey, account, testnets, catalog }: AccountRouteData,
   context: Context
 ): Promise<Response> {
   const allNetworks = KnownNetwork.getNames({
@@ -22,17 +49,9 @@ async function rewardsSummary(
 
   const evaluator = context.evaluator;
 
-  const accountRewards = await Promise.all(allNetworks.map(async (network) => {
-    const contracts = getCometContractsForNetwork(network);
+  const groups = rewardGroups(catalog, allNetworks);
 
-    if (contracts.length === 0) {
-      return [];
-    }
-
-    if (network === 'ronin-mainnet' || network === 'scroll-mainnet') {
-      return [];
-    }
-
+  const accountRewards = await Promise.all(groups.map(async ({ network, contracts }) => {
     const rewards = await evaluator.evaluate(evaluator.pipe1([
       { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: 'latest', network } },
       latestBlock => {
@@ -87,4 +106,4 @@ async function rewardsSummary(
   return new Response(JSON.stringify(flattedAccountRewards));
 }
 
-export { rewardsSummary };
+export { rewardGroups, rewardsSummary };
