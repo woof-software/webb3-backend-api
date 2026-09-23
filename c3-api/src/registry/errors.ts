@@ -75,7 +75,18 @@ function isRegistryError(error: unknown): error is RegistryError {
  * spends an attempt would retry forever — which is what the `sync-stalled`
  * alert watches for.
  */
-const TRANSPORT_CODES: ReadonlySet<RegistryErrorCode> = new Set([ 'CHAIN_REQUEST_FAILED' ]);
+const TRANSPORT_CODES: ReadonlySet<RegistryErrorCode> = new Set([
+  // the node provider did not answer
+  'CHAIN_REQUEST_FAILED',
+  /*
+   * The source did not answer either — the request threw, or GitHub refused
+   * it with a status. A root is read from GitHub before it is read from the
+   * chain, so this is the first thing that fails when an invocation runs out
+   * of the subrequests it is given, and it says as little about the root as a
+   * provider timing out does.
+   */
+  'SOURCE_REQUEST_FAILED',
+]);
 
 // what a Worker or a network says when it is the carrier that failed, not the payload
 const INFRASTRUCTURE = /too many subrequests|exceeded .*cpu|network connection lost|fetch failed|connection (reset|refused|closed)|timed? ?out/i;
