@@ -785,6 +785,10 @@ method, but by providing:
 1. An ABI signature, like `function getPrice(address) returns (uint256)`
 2. A transformation from context to function parameters
 3. A parser from the raw ABI response into the desired return type
+4. Optionally, what a revert of the call answers (`reverted`). Without it a
+   revert fails the computation, as any other error of the call does; the
+   real `getPrice` answers one, to report a price feed Chainlink retired
+   instead of failing every summary that reads it
 
 Behind the scenes, a `compute` function is generated for you that uses the
 implemented methods to abstract away the boilerplate involved in invoking

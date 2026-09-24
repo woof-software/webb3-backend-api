@@ -38,13 +38,17 @@ summaries, their history, the rewards routes and `/account/{address}/rewards`
 - `partially` (summaries and history only): the base asset was priced, and at
   least one collateral was not. The totals leave that collateral out, and
   `collaterals` says which it was.
-- `error`: the base asset, or for the rewards routes the reward token, could
-  not be priced. Only what identifies the market is reported, with the node's
-  message:
+- `error`: the base asset could not be priced, or — for the rewards routes —
+  a price the rewards are valued in: the reward token's, the base asset's, or
+  the USD price a base-quoted reward is converted with. Only what identifies
+  the market is reported, with the node's message:
 
 ```json
 { "chain_id": 1, "comet": { "address": "0xe85d…9293" }, "status": "error", "message": "execution reverted" }
 ```
+
+`/market/{network}/{address}/rewards/summary` names no market in its answer,
+so its `error` is `{ "status": "error", "message": … }` alone.
 
 A summary lists every collateral with its own status:
 
@@ -58,7 +62,9 @@ A summary lists every collateral with its own status:
 
 A history reports this per day, with the day's `date` and `timestamp`. A
 market is read in full again once a registry version that says how to price
-the feed is active. A node that does not answer still fails the whole request.
+the feed is active. Only a price feed reports a status this way: a node that
+does not answer, or any other call that reverts, still fails the whole
+request.
 
 ## Pagination
 

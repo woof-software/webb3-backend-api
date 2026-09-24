@@ -20,7 +20,8 @@ import '../../../../shim/node-self.js';
 
 /*
  * A price read answers a feed that reverts instead of failing, and still
- * fails when the node does not answer.
+ * fails when the node does not answer. It is made through ethCall, so the
+ * cache seeds and index bias every other call uses apply to it too.
  */
 const flags = Flags.parseWithDefaults(process.env);
 const debug = Debug.MakeLogger([]).configure(process.env);
@@ -54,9 +55,9 @@ function answerWith(answer: { result: string } | { error: jsonRpc.Error }) {
 
 function read() {
   const cache = new MemoryCache({}, [ BigNumber.JsonReviver, BigFixnum.JsonReviver ]);
-  const { pull1, evaluate } = Evaluator.instantiate<comet.ReadPrice>({ ...evm, ...comet }, { cache, debug, flags });
+  const { pull1, evaluate } = Evaluator.instantiate<comet.GetPrice>({ ...evm, ...comet }, { cache, debug, flags });
   return evaluate(pull1({
-    readPrice: { apiHost: '', nodeHost, nodeKey, network, contract, blockNumber: block, priceFeed },
+    getPrice: { apiHost: '', nodeHost, nodeKey, network, contract, blockNumber: block, priceFeed },
   }));
 }
 
@@ -70,14 +71,14 @@ t.test('a feed that answers is a price', async t => {
 });
 
 t.test('a feed that reverts is an answer, not a failure', async t => {
-  const logged: unknown[] = [];
+  const logged: string[] = [];
   const consoleError = console.error;
   console.error = (...args: unknown[]) => { logged.push(args.join(' ')); };
   t.teardown(() => { console.error = consoleError; });
 
   answerWith({ error: { code: 3, message: 'execution reverted', data: '0x' } });
   t.strictSame(await read(), { status: 'error', message: 'execution reverted' });
-  t.match(logged, [ /./, /^price feed reverted: 0xe3a409ed15cd53afdefdd191ad945cec528a2496 read by / ], 'and names the feed');
+  t.match(logged, [ /^price feed reverted: 0xe3a409ed15cd53afdefdd191ad945cec528a2496 read by / ], 'and names the feed');
   fetch.satisfy(t);
 });
 

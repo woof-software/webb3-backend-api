@@ -5,10 +5,11 @@ import * as Constant from '../../constants.js';
 
 import * as KnownNetwork from '../../well-known/networks/network.js';
 
-import type { GetPrice     } from '../comet/get-price.js';
+import type { GetPrice, PriceRead } from '../comet/get-price.js';
 import type { BasePrice    } from '../comet/base-price.js';
 import type { TotalBorrow  } from '../comet/total-borrow.js';
 
+import type { AprRead                    } from './supply-rewards-apr.js';
 import type { TotalsBasic                } from './totals-basic.js';
 import type { BaseMinForRewards          } from './base-min-for-rewards.js';
 import type { BorrowRewardsRatePerSecond } from './borrow-rewards-rate-per-second.js';
@@ -40,12 +41,13 @@ type BorrowRewardsApr = Compute.Spec<{
       decimals: number,
     },
   },
-  returns: BigFixnum;
+  returns: AprRead;
 }>;
 
 const { implement, pipe, pipe1 } = Compute.Functor<BorrowRewardsApr>({});
 const borrowRewardsApr = implement({
-  version: 1,
+  // 2: a price that reverts is answered, not thrown
+  version: 2,
   compute({ apiHost, nodeHost, nodeKey, rewardsTokenPriceFeed, blockNumber, contract, network }) {
     /*
      * The base price in the unit the reward feed answers in: the market's own
@@ -74,15 +76,21 @@ const borrowRewardsApr = implement({
         totalsBasic: { totalBorrowBase },
       }) => pipe1([
         basePriceComputation,
-        basePrice => {
-          if (totalBorrowBase.lte(baseMinForRewards)) {
-            return BigFixnum.from({ value: 0 });
+        (basePrice: PriceRead): AprRead => {
+          if (rewardsTokenPrice.status === 'error') {
+            return rewardsTokenPrice;
           }
-          const borrowValue = basePrice.mul(totalBorrow);
-          const rewardsValueAnnual = rewardsTokenPrice
+          if (basePrice.status === 'error') {
+            return basePrice;
+          }
+          if (totalBorrowBase.lte(baseMinForRewards)) {
+            return { status: 'success', apr: BigFixnum.from({ value: 0 }) };
+          }
+          const borrowValue = basePrice.price.mul(totalBorrow);
+          const rewardsValueAnnual = rewardsTokenPrice.price
             .mul(borrowRewardsRatePerSecond)
             .mul(Constant.secondsPerYear);
-          return rewardsValueAnnual.div(borrowValue);
+          return { status: 'success', apr: rewardsValueAnnual.div(borrowValue) };
         },
       ])
     ]);

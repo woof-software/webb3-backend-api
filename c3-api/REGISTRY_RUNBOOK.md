@@ -607,19 +607,13 @@ retired: the Comet reads it through `getPrice`, which reverts with it.
 ### 1. Find the feed
 
 A read that reverts logs one line (`npx wrangler tail --env production`, or
-the worker's logs in the Cloudflare dashboard). A summary logs the feed:
+the worker's logs in the Cloudflare dashboard), naming the feed and the
+Comet that read it:
 
 ```
 price feed reverted: 0xe3a409ed15cd53afdefdd191ad945cec528a2496 read by 0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840 on ethereum-mainnet at block 23400000: execution reverted
 ```
 
-The rewards routes log the market and the call:
-
-```
-market call reverted: 1/usdt on ethereum-mainnet (0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840): call to 0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840 with 0x41976e09000000000000000000000000e3a409ed15cd53afdefdd191ad945cec528a2496 reverted at block 23400000: execution reverted
-```
-
-There `0x41976e09` is `getPrice`, and the last 40 hex digits are the feed.
 The market's `collateralAssets` in
 `GET /registry/v1/networks/<chainId>/markets/<comet>` say which asset reads
 it.
@@ -694,8 +688,7 @@ the first request after the switch: the exception changes what its summaries
 are cached under.
 
 `GET /registry/v1/admin/status` does not report a market whose feed reverts:
-alert on the `price feed reverted:` and `market call reverted:` log lines
-instead.
+alert on the `price feed reverted:` log line instead.
 
 ## Switching back
 

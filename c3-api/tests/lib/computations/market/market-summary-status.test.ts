@@ -12,6 +12,8 @@ import { MemoryCache } from '../../../../lib/symbolic/cache.js';
 import * as comet  from '../../../../lib/computations/comet.js';
 import * as market from '../../../../lib/computations/market.js';
 
+import { collateralValue } from '../../../../lib/computations/market/collaterals.js';
+
 import { catalogOf } from '../../../../src/registry/catalog.js';
 
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../../util/registry-fixture.js';
@@ -51,31 +53,38 @@ function evaluator(computations: Record<string, unknown>) {
   return Evaluator.instantiate<any>(computations as any, { cache, debug, flags });
 }
 
-function summaryOf(answers: { basePriceRead?: unknown, baseUsdPrice?: unknown, collateralPrices: unknown }) {
+/*
+ * A collateral of the summary's market: `totalCollateral` units held.
+ */
+const collateral = (asset: string, symbol: string, totalCollateral: number, price: unknown) => (
+  { asset, symbol, totalCollateral: BigFixnum.from({ value: totalCollateral }), price }
+);
+
+function summaryOf(answers: { basePrice?: unknown, baseUsdPrice?: unknown, collaterals: unknown }) {
   const { evaluate, pull1 } = evaluator({
-    marketSummary:          market.marketSummary,
-    basePriceRead:          stub(() => answers.basePriceRead ?? read(one())),
-    baseUsdPrice:           stub(() => answers.baseUsdPrice ?? read(one())),
-    borrowApr:              stub(() => BigFixnum.from({ decimals: 2, value: 5 })),
-    supplyApr:              stub(() => BigFixnum.from({ decimals: 2, value: 3 })),
-    totalBorrow:            stub(() => BigFixnum.from({ value: 10 })),
-    totalSupply:            stub(() => BigFixnum.from({ value: 20 })),
-    totalCollateralValue:   stub(() => BigFixnum.from({ value: 30 })),
-    collateralPrices:       stub(() => answers.collateralPrices),
-    collateralAssetSymbols: stub(() => [ 'COMP', 'wUSDM' ]),
-    utilization:            stub(() => BigFixnum.from({ decimals: 2, value: 50 })),
+    marketSummary: market.marketSummary,
+    basePrice:     stub(() => answers.basePrice ?? read(one())),
+    baseUsdPrice:  stub(() => answers.baseUsdPrice ?? read(one())),
+    borrowApr:     stub(() => BigFixnum.from({ decimals: 2, value: 5 })),
+    supplyApr:     stub(() => BigFixnum.from({ decimals: 2, value: 3 })),
+    totalBorrow:   stub(() => BigFixnum.from({ value: 10 })),
+    totalSupply:   stub(() => BigFixnum.from({ value: 20 })),
+    collaterals:   stub(() => answers.collaterals),
+    utilization:   stub(() => BigFixnum.from({ decimals: 2, value: 50 })),
   });
   return evaluate(pull1({ marketSummary: { apiHost: '', nodeHost: '', nodeKey: '', network, contract: usdt, block } }));
 }
 
 t.test('a market whose every price reads is a success', async t => {
   const summary = await summaryOf({
-    collateralPrices: [ { asset: COMP, read: read(one()) }, { asset: WUSDM, read: read(one()) } ],
+    collaterals: [ collateral(COMP, 'COMP', 3, read(one())), collateral(WUSDM, 'wUSDM', 4, read(one())) ],
   });
   t.match(summary, {
     chainId: 1,
     status:  'success',
-    totalBorrowValue: '10.0',
+    totalBorrowValue:       '10.0',
+    totalCollateralValue:   '7.0',
+    collateralAssetSymbols: [ 'COMP', 'wUSDM' ],
     collaterals: [
       { address: COMP,  symbol: 'COMP',  status: 'success' },
       { address: WUSDM, symbol: 'wUSDM', status: 'success' },
@@ -86,22 +95,23 @@ t.test('a market whose every price reads is a success', async t => {
 
 t.test('a collateral that reverts makes the market partial', async t => {
   const summary = await summaryOf({
-    collateralPrices: [ { asset: COMP, read: read(one()) }, { asset: WUSDM, read: reverted } ],
+    collaterals: [ collateral(COMP, 'COMP', 3, read(one())), collateral(WUSDM, 'wUSDM', 4, reverted) ],
   });
   t.match(summary, {
     status: 'partially',
-    totalBorrowValue: '10.0',
+    totalBorrowValue:     '10.0',
+    totalCollateralValue: '3.0',
     collaterals: [
       { address: COMP,  status: 'success' },
       { address: WUSDM, status: 'error', message: 'execution reverted' },
     ],
-  }, 'the rest of the market is reported in full');
+  }, 'the rest of the market is reported in full, and its value leaves the collateral out');
   t.notOk('message' in (summary as any), 'the market itself carries no message');
 });
 
 t.test('a base price that reverts makes the market an error', async t => {
-  for (const answers of [ { basePriceRead: reverted }, { baseUsdPrice: reverted } ]) {
-    const summary = await summaryOf({ ...answers, collateralPrices: [ { asset: COMP, read: read(one()) } ] });
+  for (const answers of [ { basePrice: reverted }, { baseUsdPrice: reverted } ]) {
+    const summary = await summaryOf({ ...answers, collaterals: [ collateral(COMP, 'COMP', 3, read(one())) ] });
     t.strictSame(summary, {
       chainId: 1,
       comet:   { address: usdt.address },
@@ -111,17 +121,35 @@ t.test('a base price that reverts makes the market an error', async t => {
   }
 });
 
-t.test('the collateral value leaves out what could not be priced', async t => {
-  const { evaluate, pull1 } = evaluator({
-    totalCollateralValue: market.totalCollateralValue,
-    numAssets:            stub(() => 2),
-    assetTotalCollateral: stub(({ assetNumber }) => BigFixnum.from({ value: assetNumber === 0 ? 3 : 1_000 })),
-    assetPrice:           stub(({ assetNumber }) => assetNumber === 0 ? read(BigFixnum.from({ value: 2 })) : reverted),
+t.test('every collateral is read once, in one pass', async t => {
+  const reads: string[] = [];
+  const counted = (name: string, answer: (context: any) => unknown) => stub(context => {
+    reads.push(`${name}:${context.assetNumber ?? context.contract.address}`);
+    return answer(context);
   });
-  const total = await evaluate(pull1({
-    totalCollateralValue: { apiHost: '', nodeHost: '', nodeKey: '', network, contract: usdt, blockNumber: block.number },
+  const { evaluate, pull1 } = evaluator({
+    collaterals:          market.collaterals,
+    numAssets:            stub(() => 2),
+    assetInfo:            counted('assetInfo', ({ assetNumber }) => ({ asset: assetNumber === 0 ? COMP : WUSDM })),
+    assetTotalCollateral: counted('assetTotalCollateral', ({ assetNumber }) => BigFixnum.from({ value: assetNumber === 0 ? 3 : 1_000 })),
+    assetPrice:           counted('assetPrice', ({ assetNumber }) => assetNumber === 0 ? read(BigFixnum.from({ value: 2 })) : reverted),
+    symbol:               counted('symbol', ({ contract }) => contract.address === COMP ? 'COMP' : 'wUSDM'),
+  });
+  const collaterals = await evaluate(pull1({
+    collaterals: { apiHost: '', nodeHost: '', nodeKey: '', network, contract: usdt, blockNumber: block.number },
   }));
-  t.equal(total.toString(), '6', 'three of the first at two, and none of the second');
+
+  t.match(collaterals, [
+    { asset: COMP,  symbol: 'COMP',  price: { status: 'success' } },
+    { asset: WUSDM, symbol: 'wUSDM', price: reverted },
+  ]);
+  t.equal(collateralValue(collaterals as any).toString(), '6', 'three of the first at two, and none of the second');
+  t.strictSame(reads.sort(), [
+    'assetInfo:0', 'assetInfo:1',
+    'assetPrice:0', 'assetPrice:1',
+    'assetTotalCollateral:0', 'assetTotalCollateral:1',
+    `symbol:${COMP}`, `symbol:${WUSDM}`,
+  ].sort(), 'and each read is made once');
 });
 
 t.test('a collateral the registry prices is never read', async t => {
@@ -129,7 +157,7 @@ t.test('a collateral the registry prices is never read', async t => {
   const { evaluate, pull1 } = evaluator({
     assetPrice: comet.assetPrice,
     assetInfo:  stub(({ assetNumber }) => ({ asset: COMP, scale: 1, priceFeed: assetNumber === 0 ? ZERO_PRICED_FEED : COMP })),
-    readPrice:  stub(({ priceFeed }) => { reads.push(priceFeed.address); return reverted; }),
+    getPrice:   stub(({ priceFeed }) => { reads.push(priceFeed.address); return reverted; }),
   });
   const context = { apiHost: '', nodeHost: '', nodeKey: '', network, contract: usdt, blockNumber: block.number };
 

@@ -17,8 +17,6 @@ import { registryOf } from '../lib/model/comet-registry.js';
 
 import type { Catalog } from './registry/catalog.js';
 
-import { eachOrMarketError, isMarketError, orMarketError, succeeded } from './market-status.js';
-
 import {
   AllNetworks,
   AllContracts,
@@ -93,7 +91,7 @@ async function latestSummary(
       }
 
       const summary = await Promise.all(
-        selectedContracts.map(async (contract) => orMarketError(network, contract, () =>
+        selectedContracts.map(async (contract) =>
           evaluate(
             pipe1([
               { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: "latest", network } },
@@ -106,7 +104,7 @@ async function latestSummary(
               },
             ])
           )
-        ))
+        )
       );
 
       return summary.map(snakeifyCamelObject);
@@ -181,7 +179,7 @@ async function latestRewardsSummary(
     (contract as unknown as StandaloneContract<Comet>)
     .rewards.priceFeed
   );
-  const rewardsSummary = await orMarketError(network, contract, () => evaluate(pipe1([
+  const rewardsSummary = await evaluate(pipe1([
     { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: 'latest', network } },
     latestBlock => {
       const projected = Fallible.must(rewards.rewardsSummary.index.project({
@@ -195,8 +193,8 @@ async function latestRewardsSummary(
       }));
       return pull1({ rewardsSummary: projected });
     },
-  ])));
-  const snaked = snakeifyCamelObject(isMarketError(rewardsSummary) ? rewardsSummary : succeeded(rewardsSummary));
+  ]));
+  const snaked = snakeifyCamelObject(rewardsSummary);
   return new Response(JSON.stringify(snaked));
 }
 
@@ -265,7 +263,7 @@ async function historicalSummary(
             })
           );
 
-          const historicalSummary = await orMarketError(network, contract, () => evaluate(
+          const historicalSummary = await evaluate(
             pull1({
               historicalMarketDaySummaries: {
                 apiHost,
@@ -280,15 +278,7 @@ async function historicalSummary(
                 },
               },
             })
-          ));
-          /*
-           * A day whose price reads revert reports it itself, with its date.
-           * Only a revert outside them fails the whole history, which is
-           * then the one error of the market, with no day to extrapolate.
-           */
-          if (isMarketError(historicalSummary)) {
-            return [ historicalSummary ];
-          }
+          );
 
           /*
            * Backfill by presuming the 1st sample extrapolates back into the past
@@ -374,8 +364,8 @@ async function rewardsDappData(
         return [];
       }
 
-      const rewards = await eachOrMarketError(networkName, selectedContracts, markets => evaluator.evaluate(
-        evaluator.split(markets.map((selectedContract) =>
+      const rewards = await evaluator.evaluate(
+        evaluator.split(selectedContracts.map((selectedContract) =>
           evaluator.pipe1([
             { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: 'latest', network: networkName } },
             (latestBlock) => {
@@ -391,11 +381,9 @@ async function rewardsDappData(
             }
           ])
         )
-      )));
+      ));
 
-      return rewards
-        .map(reward => isMarketError(reward) ? reward : succeeded(reward))
-        .map(snakeifyCamelObject);
+      return rewards.map(snakeifyCamelObject);
     })
   );
 

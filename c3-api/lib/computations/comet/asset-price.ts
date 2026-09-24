@@ -5,7 +5,7 @@ import type { Address, PriceExceptionV1, RegistryAnnotation } from '../../model/
 import { registryOf } from '../../model/comet-registry.js';
 
 import type { AssetInfo } from './asset-info.js';
-import type { PriceRead, ReadPrice } from './read-price.js';
+import type { GetPrice, PriceRead } from './get-price.js';
 
 /*
  * The price of a collateral asset, or why it could not be read: one
@@ -13,7 +13,7 @@ import type { PriceRead, ReadPrice } from './read-price.js';
  */
 type AssetPrice = Compute.Spec<{
   name: 'assetPrice',
-  depends: [ AssetInfo, ReadPrice ],
+  depends: [ AssetInfo, GetPrice ],
   expects: AssetInfo['expects'],
   returns: PriceRead,
 }>;
@@ -71,7 +71,7 @@ const assetPrice = implement({
             return { status: 'success', price: BigFixnum.from({ decimals: exception.price.decimals, value: exception.price.value }) };
           case 'deprecated_price_remap':
             return pull1({
-              readPrice: {
+              getPrice: {
                 apiHost,
                 nodeHost,
                 nodeKey,
@@ -85,7 +85,7 @@ const assetPrice = implement({
       }
 
       return pull1({
-        readPrice: {
+        getPrice: {
           apiHost,
           nodeHost,
           nodeKey,

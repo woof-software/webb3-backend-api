@@ -99,9 +99,28 @@ t.test('postBatch responses may be out of order', async t => {
     ]));
   // perform the postBatch
   const responses = Fallible.must(await jsonRpc.postBatch({ endpoint, calls }));
-  // check that responses are ordered and parsed exactly as expected
-  for (const expected of expectedResponses) {
-    const response = responses.find(({ id }) => id === expected.id);
-    t.strictSame(response, expected);
+  // check that responses are put back in the order of their calls, so a
+  // caller can read them by index
+  t.strictSame(responses, expectedResponses);
+});
+
+t.test('a revert is told apart from a node that could not serve the call', async t => {
+  const reverts: JsonRpc.Error[] = [
+    { code: 3,      message: 'execution reverted', data: '0x' },
+    { code: -32000, message: 'execution reverted' },
+    { code: -32000, message: 'Execution reverted: BadPrice' },
+    { code: -32015, message: 'VM execution error.', data: 'revert' },
+  ];
+  for (const error of reverts) {
+    t.ok(jsonRpc.isExecutionReverted(error), JSON.stringify(error));
+  }
+  const failures: JsonRpc.Error[] = [
+    { code: -32000, message: 'header not found' },
+    { code: -32000, message: 'upstream error' },
+    { code: -32015, message: 'VM execution error.', data: 'out of gas' },
+    { code: 429,    message: 'rate limited' },
+  ];
+  for (const error of failures) {
+    t.notOk(jsonRpc.isExecutionReverted(error), JSON.stringify(error));
   }
 });

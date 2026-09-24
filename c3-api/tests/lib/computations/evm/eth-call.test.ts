@@ -9,7 +9,10 @@ import { BigFixnum } from '../../../../lib/bigfixnum.js';
 import * as Evaluator  from '../../../../lib/symbolic/evaluator.js';
 import { MemoryCache } from '../../../../lib/symbolic/cache.js';
 
-import * as evm from '../../../../lib/computations/evm.js';
+import * as evm   from '../../../../lib/computations/evm.js';
+import * as comet from '../../../../lib/computations/comet.js';
+
+import { getCoder } from '../../../../lib/computations/abi-function.js';
 
 import type * as jsonRpc from '../../../../lib/json-rpc.js';
 
@@ -18,9 +21,9 @@ import * as mock from '../../../util/mock/mock.js';
 import '../../../../shim/node-self.js';
 
 /*
- * What an eth_call the node answered with an error turns into. A revert is a
- * fact about the contract, which handlers leave a market out for; anything
- * else is a failure of the node, which must still fail the request.
+ * What an eth_call the node answered with an error turns into. A revert is
+ * the contract's answer, which ethCall hands to the function that made the
+ * call; anything else is a failure of the node, which still fails.
  */
 const flags = Flags.parseWithDefaults(process.env);
 const debug = Debug.MakeLogger([]).configure(process.env);
@@ -38,12 +41,12 @@ t.before(() => {
   global.fetch = mock.fetch({ passthrough: false });
 });
 
-function answerWith(error: jsonRpc.Error) {
+function answerWith(error: jsonRpc.Error, callData = data) {
   const request: jsonRpc.Request = {
     jsonrpc: '2.0',
     id:      0,
     method:  'eth_call',
-    params:  [ { to: contract.address, data }, `0x${block.toString(16)}` ],
+    params:  [ { to: contract.address, data: callData }, `0x${block.toString(16)}` ],
   };
   mock.rpc.expectPost(fetch, Eth.nodeEndpoint(nodeHost, nodeKey, network), [
     request,
@@ -51,40 +54,44 @@ function answerWith(error: jsonRpc.Error) {
   ]);
 }
 
-async function call(): Promise<unknown> {
+function evaluator() {
   const cache = new MemoryCache({}, [ BigNumber.JsonReviver, BigFixnum.JsonReviver ]);
-  const { pull1, evaluate } = Evaluator.instantiate<evm.EthCall>(evm, { cache, debug, flags });
-  try {
-    await evaluate(pull1({
-      ethCall: { apiHost: '', nodeHost, nodeKey, network, contract, blockNumber: block, data },
-    }));
-  } catch (error) {
-    return error;
-  }
-  throw new Error('the call was expected to fail');
+  return Evaluator.instantiate<evm.EthCall | comet.NumAssets>({ ...evm, ...comet }, { cache, debug, flags });
 }
 
-t.test('a revert with data is told apart from other failures', async t => {
+function call() {
+  const { pull1, evaluate } = evaluator();
+  return evaluate(pull1({
+    ethCall: { apiHost: '', nodeHost, nodeKey, network, contract, blockNumber: block, data },
+  }));
+}
+
+t.test('a revert with data is answered, not thrown', async t => {
   answerWith({ code: 3, message: 'execution reverted', data: '0x' });
-  const error = await call();
-
-  t.ok(evm.isCallReverted(error), 'it is a revert');
-  t.same((error as evm.CallReverted).call, { network, to: contract.address, data, block }, 'and says which call');
-  t.match((error as Error).message, /^ethCall: call error: /, 'with the message it always had');
+  t.strictSame(await call(), { reverted: { code: 3, message: 'execution reverted' } });
   fetch.satisfy(t);
 });
 
-t.test('a revert without data is a revert too', async t => {
+t.test('a revert without data is answered too', async t => {
   answerWith({ code: -32000, message: 'execution reverted' });
-  t.ok(evm.isCallReverted(await call()));
+  t.strictSame(await call(), { reverted: { code: -32000, message: 'execution reverted' } });
   fetch.satisfy(t);
 });
 
-t.test('a node that cannot serve the call is not a revert', async t => {
+t.test('a node that cannot serve the call still fails', async t => {
   answerWith({ code: -32000, message: 'header not found' });
-  const error = await call();
+  await t.rejects(call(), /header not found/, 'a failure of the node says nothing about the contract');
+  fetch.satisfy(t);
+});
 
-  t.notOk(evm.isCallReverted(error), 'a failure of the node says nothing about the market');
-  t.match((error as Error).message, /header not found/);
+t.test('a function that does not answer reverts still fails on one', async t => {
+  const numAssets = getCoder('function numAssets() view returns (uint8)').encode([]);
+  answerWith({ code: 3, message: 'execution reverted', data: '0x' }, numAssets);
+  const { pull1, evaluate } = evaluator();
+  await t.rejects(
+    evaluate(pull1({ numAssets: { apiHost: '', nodeHost, nodeKey, network, contract, blockNumber: block } })),
+    /^ethCall: call error: .*execution reverted/,
+    'as every function did before a revert could be answered',
+  );
   fetch.satisfy(t);
 });

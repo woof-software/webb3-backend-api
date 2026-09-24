@@ -17,7 +17,11 @@ import {
 import {
   GetPrice,
   BaseBorrowMin,
+  type PriceError,
+  type PriceRead,
 } from '../comet.js';
+
+import type { MarketIdentity } from './market-summary.js';
 
 import {
   BorrowRewardsApr,
@@ -35,7 +39,9 @@ type MarketRewards = Compute.Spec<{
     network: KnownNetwork.Name; // network on which market is deployed
     contract: Eth.Contract<StandaloneContract<Comet>>; // comet contract for the market
   };
-  returns: {
+  // a price the rewards are valued in that reverts leaves only what identifies the market
+  returns: MarketIdentity & PriceError | {
+    status: 'success';
     chainId: number;
     comet: {
       address: Eth.Address;
@@ -81,8 +87,8 @@ function baseAssetLabel(contract: Eth.Contract<StandaloneContract<Comet>>): { sy
 
 const { implement, pipe, pipe1 } = Compute.Functor<MarketRewards>({});
 const marketRewards = implement({
-  // 4: the base asset is labelled by the market's reviewed decisions
-  version: 4,
+  // 5: a price that reverts is reported as the market's status
+  version: 5,
   index: Index.MinutelyBlockIndex,
   key(name, { block, ...context }) {
     const { block: projected } = Fallible.must(this.index.project({ block, ...context }));
@@ -95,6 +101,9 @@ const marketRewards = implement({
         apiHost, nodeHost, nodeKey, contract, network, block
       }));
     const blockNumber = projected.block.number;
+    const { chainId } = Fallible.must(
+      KnownNetwork.lookup({ name: network })
+    );
 
     const annotation  = registryOf(contract);
     const rewardAsset = annotation?.market.rewardAsset ?? null;
@@ -146,15 +155,13 @@ const marketRewards = implement({
         borrowRewardsApr: BigFixnum,
       },
       rewardAssetPrice: string,
-    ) => {
-      const { chainId } = Fallible.must(
-        KnownNetwork.lookup({ name: network })
-      );
+    ): MarketRewards['returns'] => {
       const baseAsset = baseAssetLabel(contract);
       const rewardAssetDescription =
         (contract.rewards.asset.description as string | undefined) ?? null;
 
       return {
+        status: 'success',
         chainId,
         comet: {
           address: contract.address,
@@ -208,9 +215,22 @@ const marketRewards = implement({
           blockNumber,
         },
       },
-      ({ getPrice: rewardAssetPrice, ...results }) => {
+      ({ getPrice: rewardAssetPrice, baseBorrowMin, supplyRewardsApr, borrowRewardsApr }) => {
+        const failure = ({ status, message }: PriceError): MarketRewards['returns'] => (
+          { chainId, comet: { address: contract.address }, status, message }
+        );
+        if (rewardAssetPrice.status === 'error') {
+          return failure(rewardAssetPrice);
+        }
+        if (supplyRewardsApr.status === 'error') {
+          return failure(supplyRewardsApr);
+        }
+        if (borrowRewardsApr.status === 'error') {
+          return failure(borrowRewardsApr);
+        }
+        const results = { baseBorrowMin, supplyRewardsApr: supplyRewardsApr.apr, borrowRewardsApr: borrowRewardsApr.apr };
         if (usdConversionFeed === null) {
-          return summary(results, rewardAssetPrice.toString());
+          return summary(results, rewardAssetPrice.price.toString());
         }
         return pipe1([
           {
@@ -224,7 +244,9 @@ const marketRewards = implement({
               blockNumber,
             },
           },
-          baseAssetUsdPrice => summary(results, rewardAssetPrice.mul(baseAssetUsdPrice).toString()),
+          (baseAssetUsdPrice: PriceRead) => baseAssetUsdPrice.status === 'error'
+            ? failure(baseAssetUsdPrice)
+            : summary(results, rewardAssetPrice.price.mul(baseAssetUsdPrice.price).toString()),
         ]);
       },
     ]);

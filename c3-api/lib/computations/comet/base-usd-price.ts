@@ -3,13 +3,13 @@ import * as Compute from "../../symbolic/computation.js";
 
 import * as KnownNetwork from "../../well-known/networks/network.js";
 
-import type { PriceRead, ReadPrice } from "./read-price.js";
+import type { GetPrice, PriceRead } from "./get-price.js";
 
 import { Comet, StandaloneContract } from "../../well-known/contracts/types.js";
 
 type BaseUsdPrice = Compute.Spec<{
   name: "baseUsdPrice";
-  depends: [ReadPrice];
+  depends: [GetPrice];
   expects: {
     apiHost: string;
     nodeHost: string;
@@ -27,7 +27,7 @@ const baseUsdPrice = implement({
   version: 1,
   compute: ({ apiHost, nodeHost, nodeKey, blockNumber, contract, network }) =>
     pull1({
-      readPrice: {
+      getPrice: {
         apiHost,
         nodeHost,
         nodeKey,

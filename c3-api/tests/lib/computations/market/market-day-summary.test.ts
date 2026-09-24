@@ -70,6 +70,7 @@ t.test(`market-summary@block:15435126`, async t => {
     comet: {
       address: '0xc3d688b66703497daa19211eedff47f25384cdc3',
     },
+    status: 'success',
     borrowApr: '0.040676825873232',
     supplyApr: '0.023842766908944',
     totalBorrowValue:     '4314230.2466899356248',
@@ -83,7 +84,14 @@ t.test(`market-summary@block:15435126`, async t => {
       'WETH',
       'UNI',
       'LINK'
-    ]
+    ],
+    collaterals: [
+      { address: '0xc00e94Cb662C3520282E6f5717214004A7f26888', symbol: 'COMP', status: 'success' },
+      { address: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', symbol: 'WBTC', status: 'success' },
+      { address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', symbol: 'WETH', status: 'success' },
+      { address: '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984', symbol: 'UNI',  status: 'success' },
+      { address: '0x514910771AF9Ca656af840dff83E8264EcF986CA', symbol: 'LINK', status: 'success' },
+    ],
   });
 });
 
@@ -139,6 +147,7 @@ t.test(`market-day-summary@block:16380543`, async t => {
     comet: {
       address: '0xc3d688b66703497daa19211eedff47f25384cdc3',
     },
+    status: 'success',
     date: '2023-01-10',
     timestamp: 1_673_374_861,
     borrowApr: '0.033119718020784',
@@ -154,7 +163,14 @@ t.test(`market-day-summary@block:16380543`, async t => {
       'WETH',
       'UNI',
       'LINK'
-    ]
+    ],
+    collaterals: [
+      { address: '0xc00e94Cb662C3520282E6f5717214004A7f26888', symbol: 'COMP', status: 'success' },
+      { address: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', symbol: 'WBTC', status: 'success' },
+      { address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', symbol: 'WETH', status: 'success' },
+      { address: '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984', symbol: 'UNI',  status: 'success' },
+      { address: '0x514910771AF9Ca656af840dff83E8264EcF986CA', symbol: 'LINK', status: 'success' },
+    ],
   });
 
   /*
@@ -162,7 +178,7 @@ t.test(`market-day-summary@block:16380543`, async t => {
    */
   const cachedKeys1 = Object.keys(cache.store);
   const expectedKeys = [
-    `marketSummary-v5:(block:${projected.block.number};contract:${context.contract.address};network:${context.network})`,
+    `marketSummary-v6:(block:${projected.block.number};contract:${context.contract.address};network:${context.network})`,
     /*
      * FIXME(jordan): since we project(..) within compute(..), the
      * index.includes(..) check fails on the block unless it happens

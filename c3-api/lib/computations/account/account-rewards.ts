@@ -35,17 +35,22 @@ type AccountRewards = Compute.Spec<{
     contract: Eth.Contract<StandaloneContract<Comet>>;
     account: Eth.Address;
   };
-  returns: market.MarketRewards['returns'] & {
-    amountOwed: BigFixnum;
-    walletBalance: BigFixnum;
-    supplyBalance: BigFixnum;
-    borrowBalance: BigFixnum;
-  };
+  // a market whose rewards cannot be valued reports only what identifies it
+  returns: Extract<market.MarketRewards['returns'], { status: 'error' }> | (
+    & Extract<market.MarketRewards['returns'], { status: 'success' }>
+    & {
+      amountOwed: BigFixnum;
+      walletBalance: BigFixnum;
+      supplyBalance: BigFixnum;
+      borrowBalance: BigFixnum;
+    }
+  );
 }>;
 
 const { implement, pipe } = Compute.Functor<AccountRewards>({});
 const accountRewards = implement({
-  version: 2,
+  // 3: a price that reverts is reported as the market's status
+  version: 3,
   index: Index.BlockIndexOnIntervalSeconds(60 * 5),
   key(name, { block, ...context }) {
     const { block: projected } = Fallible.must(this.index.project({ block, ...context }));
@@ -103,7 +108,10 @@ const accountRewards = implement({
         borrowBalanceOf,
         erc20Balance,
         getRewardOwed,
-      }) => {
+      }): AccountRewards['returns'] => {
+        if (marketRewards.status === 'error') {
+          return marketRewards;
+        }
         return {
           ...marketRewards,
           amountOwed: getRewardOwed,

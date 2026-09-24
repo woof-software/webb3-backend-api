@@ -8,18 +8,16 @@ import * as Fallible from "../../fallible/fallible.js";
 
 import {
   Utilization,
-  type BasePriceRead,
+  type BasePrice,
   type TotalBorrow,
   type TotalSupply,
   type BaseUsdPrice,
-  type CollateralPrices,
 } from '../comet.js';
 
 import type { BorrowApr } from './borrow-apr.js';
 import type { SupplyApr } from './supply-apr.js';
-import type { TotalCollateralValue } from './total-collateral-value.js';
+import { type Collaterals, collateralValue } from './collaterals.js';
 import { Comet, StandaloneContract } from '../../well-known/contracts/types.js';
-import { CollateralAssetSymbols } from '../comet/collateral-asset-symbols.js';
 
 /*
  * How much of a market could be priced. Every read of a price goes through
@@ -47,15 +45,13 @@ type CollateralStatus = (
 type MarketSummary = Compute.Spec<{
   name: 'marketSummary',
   depends: [
-    BasePriceRead,
+    BasePrice,
     BaseUsdPrice,
     BorrowApr,
     SupplyApr,
     TotalBorrow,
     TotalSupply,
-    TotalCollateralValue,
-    CollateralPrices,
-    CollateralAssetSymbols,
+    Collaterals,
     Utilization,
   ],
   expects: {
@@ -124,25 +120,21 @@ const marketSummary = implement({
       {
         borrowApr: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
         supplyApr: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
-        basePriceRead: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
+        basePrice: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
         baseUsdPrice: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
         totalBorrow: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
         totalSupply: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
-        totalCollateralValue: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
-        collateralPrices: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
-        collateralAssetSymbols: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
+        collaterals: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
         utilization: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
       },
       ({
         borrowApr,
         supplyApr,
-        basePriceRead,
+        basePrice,
         baseUsdPrice,
         totalBorrow,
         totalSupply,
-        totalCollateralValue,
-        collateralPrices,
-        collateralAssetSymbols,
+        collaterals,
         utilization,
       }): MarketSummary['returns'] => {
         const identity = {
@@ -151,31 +143,31 @@ const marketSummary = implement({
             address: contract.address,
           },
         };
-        if (basePriceRead.status === 'error') {
-          return { ...identity, status: 'error', message: basePriceRead.message };
+        if (basePrice.status === 'error') {
+          return { ...identity, status: 'error', message: basePrice.message };
         }
         if (baseUsdPrice.status === 'error') {
           return { ...identity, status: 'error', message: baseUsdPrice.message };
         }
-        const collaterals = collateralPrices.map(({ asset, read }, index): CollateralStatus => ({
+        const statuses = collaterals.map(({ asset, symbol, price }): CollateralStatus => ({
           address: asset,
-          symbol:  collateralAssetSymbols[index],
-          ...(read.status === 'success'
+          symbol,
+          ...(price.status === 'success'
             ? { status: 'success' as const }
-            : { status: 'error' as const, message: read.message }),
+            : { status: 'error' as const, message: price.message }),
         }));
         return {
           ...identity,
-          status: collaterals.some(collateral => collateral.status === 'error') ? 'partially' : 'success',
+          status: statuses.some(collateral => collateral.status === 'error') ? 'partially' : 'success',
           borrowApr: borrowApr.toString(),
           supplyApr: supplyApr.toString(),
-          totalBorrowValue: totalBorrow.mul(basePriceRead.price).toString(),
-          totalSupplyValue: totalSupply.mul(basePriceRead.price).toString(),
-          totalCollateralValue: totalCollateralValue.toString(),
+          totalBorrowValue: totalBorrow.mul(basePrice.price).toString(),
+          totalSupplyValue: totalSupply.mul(basePrice.price).toString(),
+          totalCollateralValue: collateralValue(collaterals).toString(),
           utilization: utilization.toString(),
           baseUsdPrice: baseUsdPrice.price.toString(),
-          collateralAssetSymbols: collateralAssetSymbols,
-          collaterals,
+          collateralAssetSymbols: collaterals.map(({ symbol }) => symbol),
+          collaterals: statuses,
         };
       },
     ]);
