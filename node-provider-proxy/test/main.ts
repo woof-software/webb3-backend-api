@@ -451,6 +451,66 @@ test('upstream errors are masked from clients', async () => {
   }));
 });
 
+/*
+ * An eth_call against a contract that reverts, as answered upstream and as
+ * a client of the proxy asks it.
+ */
+function revertingCall(network: string, error: jsonRpc.Error) {
+  const endpoint = `http://node-provider.test.local/${network}`;
+  const call: jsonRpc.Call = {
+    method: 'eth_call',
+    params: [
+      {
+        to: '0xe85dc543813b8c2cfeaac371517b925a166a9293',
+        data: '0x41976e09000000000000000000000000e3a409ed15cd53afdefdd191ad945cec528a2496',
+      },
+      'latest',
+    ],
+  };
+  return {
+    call,
+    request:  jsonRpc.preparePost({ call, endpoint }),
+    response: { id: 0, jsonrpc: '2.0', error } as jsonRpc.Response,
+  };
+}
+
+test('reverts reach clients unmasked and are not retried', async () => {
+  const env = makeTestEnv({});
+  env.settings = { ...env.settings, retryIndividualFailedRpcs: true };
+  const revert = { code: 3, message: 'execution reverted', data: '0x' };
+  const { call, request, response: rpcResponse } = revertingCall('ethereum-mainnet', revert);
+  const endpoints = providers.instantiate(env);
+  // one upstream call: the fallback provider is not asked again
+  fetch.expect(endpoints['ethereum-mainnet'][0].uri, {
+    method: 'POST',
+    body: { type: 'json', value: { id: 0, jsonrpc: '2.0', ...call } },
+  })
+    .returns(JSON.stringify(rpcResponse));
+  const response = await Api.fetch(request, env);
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), JSON.stringify(rpcResponse));
+});
+
+test('a failed rpc is still answered when no provider can retry it', async () => {
+  const env = makeTestEnv({});
+  env.settings = { ...env.settings, retryIndividualFailedRpcs: true };
+  // scroll has a single provider, so there is nothing to fall back on
+  const { call, request, response: rpcResponse } = revertingCall('scroll-mainnet', { code: -11111, message: 'what up' });
+  const endpoints = providers.instantiate(env);
+  fetch.expect(endpoints['scroll-mainnet'][0].uri, {
+    method: 'POST',
+    body: { type: 'json', value: { id: 0, jsonrpc: '2.0', ...call } },
+  })
+    .returns(JSON.stringify(rpcResponse));
+  const response = await Api.fetch(request, env);
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), JSON.stringify({
+    id: 0,
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'upstream error' },
+  }));
+});
+
 // fallback tests
 test('active fallback is selected by JSON filter object', async () => {
   const env = makeTestEnv({});

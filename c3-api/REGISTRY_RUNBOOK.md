@@ -596,6 +596,100 @@ new market's decided fields.
 Then steps 4, 6 and 7 of the first bring-up, and step 2 above for what the
 draft changes. The new market is under `added`, now with `"reviewed": true`.
 
+## A market that stopped answering
+
+A market whose price feed reverts is reported with `"status": "partially"`
+(a collateral's feed) or `"status": "error"` (its base or reward feed) until
+a version says how to price what broke — see
+[Market status](./API.md#market-status). Almost always it is a feed Chainlink
+retired: the Comet reads it through `getPrice`, which reverts with it.
+
+### 1. Find the feed
+
+A read that reverts logs one line (`npx wrangler tail --env production`, or
+the worker's logs in the Cloudflare dashboard), naming the feed and the
+Comet that read it:
+
+```
+price feed reverted: 0xe3a409ed15cd53afdefdd191ad945cec528a2496 read by 0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840 on ethereum-mainnet at block 23400000: execution reverted
+```
+
+The market's `collateralAssets` in
+`GET /registry/v1/networks/<chainId>/markets/<comet>` say which asset reads
+it.
+
+A price exception covers collateral feeds only. When the feed is the market's
+base feed, the Comet itself cannot price its base asset and only its
+governance can replace the feed. A reward feed or a base USD feed is changed
+in the market's overlay instead (`rewardPriceFeed`,
+`baseAsset.usdPriceFeedAddress`): hold a draft as in step 1 of
+[Describing a new market](#describing-a-new-market), read the market's own
+overlay with `GET …/markets/<chainId>/<deploymentKey>/overlay`, and send it
+back changed as in its step 5.
+
+### 2. Decide how to price it
+
+| Kind | Use it when | What it needs |
+|---|---|---|
+| `deprecated_price_remap` | Another feed answers the same pair | `replacementPriceFeedAddress`; the registry reads its decimals on chain |
+| `fixed_price` | The asset keeps a value but no feed answers any more | `price.value`, the feed's last answer as an integer string, and `price.decimals`, the feed's scale |
+| `zero_price` | The asset is being wound down and should count for nothing | Nothing more |
+
+The `provenance` of each says what broke and why this price: it is what the
+next operator reads.
+
+### 3. Hold a draft and write the exception
+
+Step 1 of [Describing a new market](#describing-a-new-market) holds the
+draft. A network overlay is replaced as a whole, so start from the one the
+active version has:
+
+```sh
+curl -s "$API/registry/v1/networks" | jq '.networks[] | select(.chainId == 1) | {
+  displayName,
+  assetDisplayOverrides:     .presentation.assetDisplayOverrides,
+  unwrappedCollateralAssets: .presentation.unwrappedCollateralAssets,
+  priceExceptions: [ .priceExceptions[] | if .kind == "deprecated_price_remap"
+    then (. + { replacementPriceFeedAddress: .replacementPriceFeed.address } | del(.replacementPriceFeed))
+    else . end ]
+}' > overlay.json
+
+jq '.priceExceptions += [{
+  "kind": "zero_price",
+  "priceFeedAddress": "0xe3a409ed15cd53afdefdd191ad945cec528a2496",
+  "provenance": "wUSDM / USD (cUSDTv3 collateral) reverts since <date>; <why this price>",
+  "expiresAt": null
+}]' overlay.json > overlay.next.json
+
+curl -s -X PUT "$API/registry/v1/admin/versions/$V/networks/1/overlay" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "$(jq '{ reason: "price the feed 1/usdt reads, which reverts", overlay: . }' overlay.next.json)" | jq
+```
+
+Postman:
+
+```http
+PUT {{API}}/registry/v1/admin/versions/{{V}}/networks/1/overlay
+Authorization: Bearer {{TOKEN}}
+Content-Type: application/json
+
+{
+  "reason": "price the feed 1/usdt reads, which reverts",
+  "overlay": <the contents of overlay.next.json>
+}
+```
+
+**You should see** `"changed": true`.
+
+### 4. Check and switch on
+
+Steps 4, 6 and 7 of the first bring-up. The market reports `success` from
+the first request after the switch: the exception changes what its summaries
+are cached under.
+
+`GET /registry/v1/admin/status` does not report a market whose feed reverts:
+alert on the `price feed reverted:` log line instead.
+
 ## Switching back
 
 ```sh
@@ -689,4 +783,5 @@ A difference not in it is worth a developer's look before switching on.
 | `409` on validate, "the import … is still running" | The import has not finished | Send step 1 again until it completes |
 | `idle` from import, "a candidate of this commit is held for review" | A draft of this commit is already waiting for you | Use that draft — its id is in the answer — or force a new attempt |
 | `409 SYNC_ALREADY_RUNNING` | An import is in progress — the hourly one, a request you already sent, or one you are asking to change with `forceNewAttempt`, `holdForReview` or `sourceCommitSha` | Continue it with an empty body until it says `completed`; only then ask for a new attempt |
+| A market reports `"status": "partially"` or `"status": "error"` | A price feed it reads reverts, usually one Chainlink retired | [A market that stopped answering](#a-market-that-stopped-answering) |
 | Answers carry `X-Registry-Stale: <seconds>` | The database could not be reached, so the API is answering from the version it last saw, and saying how old it is | Check the database's health; the API recovers by itself once D1 answers, and starts returning `503` if the outage outlasts the configured window |

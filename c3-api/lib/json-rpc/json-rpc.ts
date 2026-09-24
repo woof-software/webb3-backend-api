@@ -36,6 +36,7 @@ function configure<FetchFailure>({
   return {
     configure,
     formatError,
+    isExecutionReverted,
     expectBatch,
     expectRequest,
     expectResponse,
@@ -266,7 +267,33 @@ async function expectBatch(
       throw new Error(`${prefix}: id=${response.id} not in source batch`);
     }
   });
-  return responses;
+  /*
+   * A server may answer a batch in any order — the node provider proxy puts
+   * the calls that failed last — so each call is matched to its response by
+   * id, which is what lets a caller read the responses by index.
+   */
+  return batch.map(({ id }) => {
+    const response = responses.find(response => response.id === id);
+    if (response === undefined) {
+      throw new Error(`Invalid JSON-RPC batch response: no response for id=${id}`);
+    }
+    return response;
+  });
+}
+
+/*
+ * Whether an error is the EVM reverting the call rather than the node
+ * failing to serve it. A revert is the contract's answer at that block: every
+ * provider gives the same one, and asking again changes nothing.
+ *
+ * Geth and its forks answer `3` when the revert carries data and `-32000`
+ * with the same message when it does not; Nethermind answers `-32015` and
+ * says it in `data`.
+ */
+function isExecutionReverted(error: JsonRpcError): boolean {
+  return error.code === 3
+    || /^execution reverted/i.test(error.message)
+    || (error.code === -32015 && /revert/i.test(String(error.data ?? '')));
 }
 
 /*
@@ -473,6 +500,7 @@ export {
   post,
   postBatch,
   formatError,
+  isExecutionReverted,
   // Request preparation methods
   preparePost,
   preparePostBatch,

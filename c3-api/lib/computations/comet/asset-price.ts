@@ -5,13 +5,17 @@ import type { Address, PriceExceptionV1, RegistryAnnotation } from '../../model/
 import { registryOf } from '../../model/comet-registry.js';
 
 import type { AssetInfo } from './asset-info.js';
-import type { GetPrice  } from './get-price.js';
+import type { GetPrice, PriceRead } from './get-price.js';
 
+/*
+ * The price of a collateral asset, or why it could not be read: one
+ * collateral whose feed reverts leaves the rest of its market readable.
+ */
 type AssetPrice = Compute.Spec<{
   name: 'assetPrice',
   depends: [ AssetInfo, GetPrice ],
   expects: AssetInfo['expects'],
-  returns: BigFixnum,
+  returns: PriceRead,
 }>;
 
 /*
@@ -51,7 +55,8 @@ function decimalsOf(annotation: RegistryAnnotation | null, priceFeed: Address): 
 
 const { implement, pipe1, pull1 } = Compute.Functor<AssetPrice>({});
 const assetPrice = implement({
-  version: 0, // NOTE(jordan): 0 is "no version;" FIXME: migrate
+  // 1: a price that reverts is answered, not thrown
+  version: 1,
   compute: ({ apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network }) => pipe1([
     { assetInfo: { apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network } },
     ({ priceFeed }) => {
@@ -61,9 +66,9 @@ const assetPrice = implement({
       if (exception !== null) {
         switch (exception.kind) {
           case 'zero_price':
-            return BigFixnum.from({ decimals: decimalsOf(annotation, priceFeed), value: 0 });
+            return { status: 'success', price: BigFixnum.from({ decimals: decimalsOf(annotation, priceFeed), value: 0 }) };
           case 'fixed_price':
-            return BigFixnum.from({ decimals: exception.price.decimals, value: exception.price.value });
+            return { status: 'success', price: BigFixnum.from({ decimals: exception.price.decimals, value: exception.price.value }) };
           case 'deprecated_price_remap':
             return pull1({
               getPrice: {

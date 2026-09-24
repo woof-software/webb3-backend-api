@@ -64,6 +64,7 @@ t.test(`market-rewards@block:17813902`, async t => {
 
   const result = await evaluator.evaluate(evaluator.pull1({ marketRewards }));
   t.strictSame(result, {
+    status: 'success',
     chainId: 1,
     comet: {
       address: '0xc3d688b66703497daa19211eedff47f25384cdc3',

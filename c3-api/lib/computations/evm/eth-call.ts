@@ -9,6 +9,15 @@ import * as KnownNetwork from '../../well-known/networks/network.js';
 
 import { EvmRpc } from './rpc.js';
 
+/*
+ * A call the EVM reverted: the contract's answer at that block, which every
+ * provider gives alike, as opposed to a node that could not serve the call.
+ * ethCall answers it rather than failing, and the function that made the
+ * call decides what it means (abi-function.ts): most fail on it, and a price
+ * read reports it.
+ */
+type Reverted = { reverted: { code: number, message: string } };
+
 type EthCall = Compute.Spec<{
   name: 'ethCall',
   depends: [ EvmRpc ],
@@ -21,7 +30,7 @@ type EthCall = Compute.Spec<{
     contract: Contract,
     blockNumber: Eth.BlockNumber,
   },
-  returns: BytesLike,
+  returns: BytesLike | Reverted,
 }>;
 
 const { implement, pipe1 } = Compute.Functor<EthCall>({});
@@ -39,6 +48,9 @@ const ethCall = implement({
     return pipe1([
       { evmRpc: { frame: { apiHost, nodeHost, nodeKey, network }, items: [ call ] } },
       ([{ result, error }]) => {
+        if (error && jsonRpc.isExecutionReverted(error)) {
+          return { reverted: { code: error.code, message: error.message } };
+        }
         if (error) {
           console.error({ error });
           throw new Error(`ethCall: call error: ${JSON.stringify(error)}`);
@@ -57,4 +69,8 @@ function isBytesLike(data: any): data is BytesLike {
   return typeof data === 'string' || (data instanceof Array);
 }
 
-export { EthCall, ethCall };
+function isReverted(result: BytesLike | Reverted): result is Reverted {
+  return typeof(result) === 'object' && result !== null && 'reverted' in result;
+}
+
+export { EthCall, ethCall, Reverted, isReverted };

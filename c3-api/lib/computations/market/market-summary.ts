@@ -16,9 +16,31 @@ import {
 
 import type { BorrowApr } from './borrow-apr.js';
 import type { SupplyApr } from './supply-apr.js';
-import type { TotalCollateralValue } from './total-collateral-value.js';
+import { type Collaterals, collateralValue } from './collaterals.js';
 import { Comet, StandaloneContract } from '../../well-known/contracts/types.js';
-import { CollateralAssetSymbols } from '../comet/collateral-asset-symbols.js';
+
+/*
+ * How much of a market could be priced. Every read of a price goes through
+ * the feed's latestRoundData, which reverts once Chainlink retires the feed:
+ *
+ * - success:   every price was read.
+ * - partially: the base asset was priced, and at least one collateral was
+ *              not; the totals leave that collateral out, and `collaterals`
+ *              says which it was.
+ * - error:     the base asset could not be priced, so nothing of the market
+ *              can be valued; only what identifies it is reported.
+ */
+type MarketIdentity = {
+  chainId: number,
+  comet: {
+    address: Eth.Address,
+  },
+};
+
+type CollateralStatus = (
+  & { address: Eth.Address, symbol: string }
+  & ({ status: 'success' } | { status: 'error', message: string })
+);
 
 type MarketSummary = Compute.Spec<{
   name: 'marketSummary',
@@ -29,8 +51,7 @@ type MarketSummary = Compute.Spec<{
     SupplyApr,
     TotalBorrow,
     TotalSupply,
-    TotalCollateralValue,
-    CollateralAssetSymbols,
+    Collaterals,
     Utilization,
   ],
   expects: {
@@ -41,23 +62,30 @@ type MarketSummary = Compute.Spec<{
     network:  KnownNetwork.Name, // network on which market is deployed
     contract: Eth.Contract<StandaloneContract<Comet>>,    // comet contract for the market
   },
-  returns: {
-    chainId: number;
-    comet: {
-      address: Eth.Address;
-    };
-    supplyApr: string,
-    borrowApr: string,
-    totalBorrowValue: string,
-    totalSupplyValue: string,
-    totalCollateralValue: string,
-    utilization: string,
-  },
+  returns: (
+    | MarketIdentity & {
+        status:  'error',
+        message: string,
+      }
+    | MarketIdentity & {
+        status: 'success' | 'partially',
+        supplyApr: string,
+        borrowApr: string,
+        totalBorrowValue: string,
+        totalSupplyValue: string,
+        totalCollateralValue: string,
+        utilization: string,
+        baseUsdPrice: string,
+        collateralAssetSymbols: string[],
+        collaterals: CollateralStatus[],
+      }
+  ),
 }>;
 
 const { implement, pipe } = Compute.Functor<MarketSummary>({});
 const marketSummary = implement({
-  version: 5,
+  // 6: every price read reports a status instead of failing the summary
+  version: 6,
   /*
    * validate that the block requested does not predate the market
    * contract creation block.
@@ -96,8 +124,7 @@ const marketSummary = implement({
         baseUsdPrice: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
         totalBorrow: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
         totalSupply: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
-        totalCollateralValue: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
-        collateralAssetSymbols: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
+        collaterals: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
         utilization: { apiHost, nodeHost, nodeKey, blockNumber: block.number, contract, network },
       },
       ({
@@ -107,28 +134,50 @@ const marketSummary = implement({
         baseUsdPrice,
         totalBorrow,
         totalSupply,
-        totalCollateralValue,
-        collateralAssetSymbols,
+        collaterals,
         utilization,
-      }) => {
-        return {
+      }): MarketSummary['returns'] => {
+        const identity = {
           chainId,
           comet: {
             address: contract.address,
           },
+        };
+        if (basePrice.status === 'error') {
+          return { ...identity, status: 'error', message: basePrice.message };
+        }
+        if (baseUsdPrice.status === 'error') {
+          return { ...identity, status: 'error', message: baseUsdPrice.message };
+        }
+        const statuses = collaterals.map(({ asset, symbol, price }): CollateralStatus => ({
+          address: asset,
+          symbol,
+          ...(price.status === 'success'
+            ? { status: 'success' as const }
+            : { status: 'error' as const, message: price.message }),
+        }));
+        return {
+          ...identity,
+          status: statuses.some(collateral => collateral.status === 'error') ? 'partially' : 'success',
           borrowApr: borrowApr.toString(),
           supplyApr: supplyApr.toString(),
-          totalBorrowValue: totalBorrow.mul(basePrice).toString(),
-          totalSupplyValue: totalSupply.mul(basePrice).toString(),
-          totalCollateralValue: totalCollateralValue.toString(),
+          totalBorrowValue: totalBorrow.mul(basePrice.price).toString(),
+          totalSupplyValue: totalSupply.mul(basePrice.price).toString(),
+          totalCollateralValue: collateralValue(collaterals).toString(),
           utilization: utilization.toString(),
-          baseUsdPrice: baseUsdPrice.toString(),
-          collateralAssetSymbols: collateralAssetSymbols,
+          baseUsdPrice: baseUsdPrice.price.toString(),
+          collateralAssetSymbols: collaterals.map(({ symbol }) => symbol),
+          collaterals: statuses,
         };
       },
     ]);
   },
 });
+
+export type {
+  CollateralStatus,
+  MarketIdentity,
+};
 
 export {
   MarketSummary,

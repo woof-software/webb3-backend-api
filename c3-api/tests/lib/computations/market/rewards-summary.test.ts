@@ -54,6 +54,7 @@ t.test(`rewards-summary@block:16380543`, async t => {
   };
   const result = await evaluator.evaluate(evaluator.pull1({ rewardsSummary }));
   t.strictSame(result, {
+    status: 'success',
     supplyRewardsApr: '0.0',
     borrowRewardsApr: '0.02509046997784825315218',
     supplyRewardsRatePerSecond: '0.0',

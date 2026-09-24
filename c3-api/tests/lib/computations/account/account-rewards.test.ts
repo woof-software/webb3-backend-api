@@ -74,6 +74,7 @@ t.test(
       evaluator.pull1({ accountRewards })
     );
     t.strictSame(result, {
+      status: 'success',
       chainId: 1,
       comet: { address: '0xc3d688b66703497daa19211eedff47f25384cdc3' },
       cometRewards: { address: '0x1b0e765f6224c21223aea2af16c1c46e38885a40' },
@@ -151,6 +152,7 @@ t.test(`account-rewards@block:17835961 verify supplyBalance`, async () => {
 
   const result = await evaluator.evaluate(evaluator.pull1({ accountRewards }));
   t.strictSame(result, {
+    status: 'success',
     chainId: 1,
     comet: { address: '0xc3d688b66703497daa19211eedff47f25384cdc3' },
     cometRewards: { address: '0x1b0e765f6224c21223aea2af16c1c46e38885a40' },
@@ -220,6 +222,7 @@ t.test(`account-rewards@block:17835961 verify usdc walletBalance`, async () => {
 
   const result = await evaluator.evaluate(evaluator.pull1({ accountRewards }));
   t.strictSame(result, {
+    status: 'success',
     chainId: 1,
     comet: { address: '0xc3d688b66703497daa19211eedff47f25384cdc3' },
     cometRewards: { address: '0x1b0e765f6224c21223aea2af16c1c46e38885a40' },

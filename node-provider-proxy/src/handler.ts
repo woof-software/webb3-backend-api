@@ -292,7 +292,12 @@ export async function handleRequest(
   const maskedResponses: jsonRpc.Response[]  = [];
   const erroredResponses: jsonRpc.Response[] = [];
   for (const response of responses) {
-    if (!('error' in response)) {
+    /*
+     * A revert is the contract's answer, not the provider failing: every
+     * provider gives the same one. It is neither retried nor masked, so a
+     * client can tell a call that reverts from one that was not served.
+     */
+    if (!('error' in response) || jsonRpc.isExecutionReverted(response.error!)) {
       maskedResponses.push(response);
       continue;
     }
@@ -344,6 +349,9 @@ export async function handleRequest(
           endpoint: fallback,
         });
       }
+    } else {
+      // with no other provider to ask, the errors are the answer
+      erroredResponses.push(...responses.filter(response => erroredRpcs.some(({ id }) => id === response.id)));
     }
   }
 

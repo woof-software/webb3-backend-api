@@ -92,7 +92,8 @@ async function rewardsSummary(
 
     return rewards
       .filter((r): r is NotSkip => r !== 'SKIP')
-      .map((reward) => ({
+      // a market whose rewards could not be valued has no amounts to format
+      .map((reward) => reward.status === 'error' ? reward : ({
         ...reward,
         amountOwed: reward.amountOwed.toString(),
         walletBalance: reward.walletBalance.toString(),

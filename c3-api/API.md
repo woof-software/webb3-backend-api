@@ -27,6 +27,45 @@ A client that must not act on an older version refuses such a response; one
 that only reads can use it. How long that is allowed is per environment, and
 a `503` is the answer once the window has passed.
 
+## Market status
+
+Every price is read through its feed's `latestRoundData`, which reverts once
+Chainlink retires the feed. So every market a market route answers — the
+summaries, their history, the rewards routes and `/account/{address}/rewards`
+— carries a `status`:
+
+- `success`: everything was read.
+- `partially` (summaries and history only): the base asset was priced, and at
+  least one collateral was not. The totals leave that collateral out, and
+  `collaterals` says which it was.
+- `error`: the base asset could not be priced, or — for the rewards routes —
+  a price the rewards are valued in: the reward token's, the base asset's, or
+  the USD price a base-quoted reward is converted with. Only what identifies
+  the market is reported, with the node's message:
+
+```json
+{ "chain_id": 1, "comet": { "address": "0xe85d…9293" }, "status": "error", "message": "execution reverted" }
+```
+
+`/market/{network}/{address}/rewards/summary` names no market in its answer,
+so its `error` is `{ "status": "error", "message": … }` alone.
+
+A summary lists every collateral with its own status:
+
+```json
+"status": "partially",
+"collaterals": [
+  { "address": "0xc00e…6888", "symbol": "COMP",  "status": "success" },
+  { "address": "0x57f5…7812", "symbol": "wUSDM", "status": "error", "message": "execution reverted" }
+]
+```
+
+A history reports this per day, with the day's `date` and `timestamp`. A
+market is read in full again once a registry version that says how to price
+the feed is active. Only a price feed reports a status this way: a node that
+does not answer, or any other call that reverts, still fails the whole
+request.
+
 ## Pagination
 
 Many endpoints are paginated for convenience. If an endpoint is paginated,
