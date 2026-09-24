@@ -21,7 +21,8 @@ type MarketDaySummary = Compute.Spec<{
 
 const { implement, pipe1 } = Compute.Functor<MarketDaySummary>({});
 const marketDaySummary = implement({
-  version: 5,
+  // 6: summaries report the status of their price reads
+  version: 6,
   index: Index.DailyBlockIndex,
   /*
    * Key the computation by the materialized `date' of the block,

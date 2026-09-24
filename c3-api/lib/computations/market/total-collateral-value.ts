@@ -7,6 +7,10 @@ import type {
   AssetTotalCollateral,
 } from '../comet.js';
 
+/*
+ * The value of the collateral a market holds, over the assets whose price
+ * could be read: collateralPrices says which could not.
+ */
 type TotalCollateralValue = Compute.Spec<{
   name: 'totalCollateralValue',
   depends: [ AssetTotalCollateral, NumAssets, AssetPrice ],
@@ -29,7 +33,9 @@ const totalCollateralValue = implement({
         }),
         results => results.reduce(
           (sum: BigFixnum, { assetTotalCollateral, assetPrice }) => {
-            return sum.add(assetTotalCollateral.mul(assetPrice));
+            return assetPrice.status === 'success'
+              ? sum.add(assetTotalCollateral.mul(assetPrice.price))
+              : sum;
           },
           BigFixnum.from({ value: 0 }),
         ),

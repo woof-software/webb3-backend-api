@@ -14,6 +14,7 @@ export type Evm = (
 
 export { EvmRpc,      evmRpc      } from './evm/rpc.js';
 export { EthCall,     ethCall     } from './evm/eth-call.js';
+export { CallReverted, isCallReverted } from './evm/eth-call.js';
 export { EthGetLogs,  ethGetLogs  } from './evm/eth-get-logs.js';
 export { EthGetBlock, ethGetBlock } from './evm/eth-get-block.js';
 export {

@@ -6,6 +6,8 @@ import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
 import type { CatalogMarket } from '../registry/catalog.js';
 
+import { eachOrMarketError, isMarketError, succeeded } from '../market-status.js';
+
 import { AccountRouteData } from '../router.js';
 
 import { Context } from './handlers.js';
@@ -51,8 +53,8 @@ async function rewardsSummary(
 
   const groups = rewardGroups(catalog, allNetworks);
 
-  const accountRewards = await Promise.all(groups.map(async ({ network, contracts }) => {
-    const rewards = await evaluator.evaluate(evaluator.pipe1([
+  const accountRewards = await Promise.all(groups.map(async ({ network, contracts: groupContracts }) => {
+    const rewards = await eachOrMarketError(network, groupContracts, contracts => evaluator.evaluate(evaluator.pipe1([
       { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: 'latest', network } },
       latestBlock => {
 
@@ -86,13 +88,13 @@ async function rewardsSummary(
             }
           ]);
       },
-    ]));
+    ])));
 
     type NotSkip = Exclude<(typeof rewards[number]), 'SKIP'>;
 
     return rewards
       .filter((r): r is NotSkip => r !== 'SKIP')
-      .map((reward) => ({
+      .map((reward) => isMarketError(reward) ? reward : succeeded({
         ...reward,
         amountOwed: reward.amountOwed.toString(),
         walletBalance: reward.walletBalance.toString(),
