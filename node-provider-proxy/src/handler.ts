@@ -12,6 +12,13 @@ import type {
 
 import type { Settings } from './settings.js';
 
+/*
+ * The most calls one upstream batch carries. Alchemy accepts up to 1000 and
+ * recommends staying under 50; the registry import bounds its own batches at
+ * the same 100 (c3-api/src/registry/enrichment.ts).
+ */
+const MAX_CALLS_PER_BATCH = 100;
+
 interface HandlerContext {
   kv:        KVNamespace,
   settings:  Settings,
@@ -209,11 +216,21 @@ export async function handleRequest(
       }));
       return [ response ];
     }
-    // otherwise, post an RPC batch
-    return Fallible.must(await jsonRpc.postBatch({
+    /*
+     * otherwise, post an RPC batch, in pieces a provider serves reliably. A
+     * client that batches every market of a network sends a couple of
+     * hundred calls at once; the pieces cost this invocation's subrequests,
+     * not the client's, and each piece's responses come back in its order.
+     */
+    const pieces: jsonRpc.Request[][] = [];
+    for (let index = 0; index < rpcs.length; index += MAX_CALLS_PER_BATCH) {
+      pieces.push(rpcs.slice(index, index + MAX_CALLS_PER_BATCH));
+    }
+    const responses = await Promise.all(pieces.map(async piece => Fallible.must(await jsonRpc.postBatch({
       endpoint: nodeEndpoint.uri,
-      calls: rpcs,
-    }));
+      calls: piece,
+    }))));
+    return responses.flat();
   }
   async function performRpcs_reportLatency(
     rpcs: jsonRpc.Request[],
