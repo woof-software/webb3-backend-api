@@ -323,6 +323,56 @@ test('one-item batch RPCs are unwrapped', async () => {
   assert.deepEqual(bodyText, JSON.stringify([ rpcResponse ]));
 });
 
+test('a large batch goes upstream in pieces and comes back in order', async () => {
+  const env = makeTestEnv({});
+  const endpoint = 'http://node-provider.test.local/ethereum-mainnet';
+  const calls: jsonRpc.Call[] = Array.from({ length: 250 }, (_, index) => (
+    { method: 'eth_getBalance', params: [ `0x${index.toString(16).padStart(40, '0')}`, 'latest' ] }
+  ));
+  const request = jsonRpc.preparePostBatch({ endpoint, calls });
+  const endpoints = providers.instantiate(env);
+  // 100, 100 and 50 calls, each answered in reverse to show order is restored
+  for (const [ start, end ] of [ [ 0, 100 ], [ 100, 200 ], [ 200, 250 ] ]) {
+    const piece = calls.slice(start, end).map((call, offset) => ({ id: start + offset, jsonrpc: '2.0', ...call }));
+    fetch.expect(endpoints['ethereum-mainnet'][0].uri, {
+      method: 'POST',
+      body: { type: 'json', value: piece },
+    })
+      .returns(JSON.stringify(piece.map(({ id }) => ({ id, jsonrpc: '2.0', result: `0x${id.toString(16)}` })).reverse()));
+  }
+  const response = await Api.fetch(request, env);
+  const responses = await response.json() as jsonRpc.Response[];
+  assert.equal(responses.length, 250);
+  assert.deepEqual(responses.map(({ id }) => id), calls.map((_, index) => index));
+  assert.deepEqual(responses.map(({ result }) => result), calls.map((_, index) => `0x${index.toString(16)}`));
+});
+
+test('a piece that fails fails the whole batch, with no partial answer', async () => {
+  const env = makeTestEnv({});
+  // scroll has a single provider, so there is nothing to fall back on
+  const endpoint = 'http://node-provider.test.local/scroll-mainnet';
+  const calls: jsonRpc.Call[] = Array.from({ length: 250 }, (_, index) => (
+    { method: 'eth_getBalance', params: [ `0x${index.toString(16).padStart(40, '0')}`, 'latest' ] }
+  ));
+  const request = jsonRpc.preparePostBatch({ endpoint, calls });
+  const endpoints = providers.instantiate(env);
+  for (const [ start, end ] of [ [ 0, 100 ], [ 100, 200 ], [ 200, 250 ] ]) {
+    const piece = calls.slice(start, end).map((call, offset) => ({ id: start + offset, jsonrpc: '2.0', ...call }));
+    const expectation = fetch.expect(endpoints['scroll-mainnet'][0].uri, {
+      method: 'POST',
+      body: { type: 'json', value: piece },
+    });
+    if (end === 250) {
+      expectation.returns('bad gateway', { status: 502 });
+    } else {
+      expectation.returns(JSON.stringify(piece.map(({ id }) => ({ id, jsonrpc: '2.0', result: '0x1' }))));
+    }
+  }
+  const response = await Api.fetch(request, env);
+  assert.equal(response.status, 503);
+  assert.equal(await response.text(), 'upstream error');
+});
+
 // CORS is handled correctly
 test('OPTIONS requests get proper CORS headers', async () => {
   const endpoint = `http://node-provider.test.local/ethereum-mainnet`;

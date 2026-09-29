@@ -71,7 +71,7 @@ async function latestSummary(
     network === AllNetworks || !KnownNetwork.isNameOfTestnet(network) ? 'mainnet' : 'testnet'
   );
 
-  const { evaluate, pipe1, pull1 } = context.instantiateEvaluator(networkEnv, {
+  const { evaluate, pipe1, pull1, split } = context.instantiateEvaluator(networkEnv, {
     flags: {
       ...context.flags,
       batchingEnabled: true,
@@ -90,21 +90,28 @@ async function latestSummary(
         return [];
       }
 
-      const summary = await Promise.all(
-        selectedContracts.map(async (contract) =>
-          evaluate(
-            pipe1([
-              { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: "latest", network } },
-              (latestBlock) => {
-                const projected = Fallible.must(market.marketMinutelySummary.index.project(
-                  { apiHost, nodeHost, nodeKey, network, contract, block: latestBlock }
-                ));
-                projected.block.timestamp = latestBlock.timestamp;
-                return pull1({ marketMinutelySummary: projected });
-              },
-            ])
-          )
-        )
+      /*
+       * One evaluation per network, not per market. Its markets share the
+       * latest block, read once, and every round of their reads reaches the
+       * node as one batch. A Worker invocation may make only so many
+       * subrequests — 50 on the Free plan, where each call to the node
+       * provider proxy is one — and an evaluation per market made four for
+       * every market: all networks at once took 116.
+       *
+       * Networks stay separate evaluations: within one, the batches of
+       * different networks would go to the node one after another.
+       */
+      const summary = await evaluate(
+        pipe1([
+          { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: "latest", network } },
+          (latestBlock) => split(selectedContracts.map((contract) => {
+            const projected = Fallible.must(market.marketMinutelySummary.index.project(
+              { apiHost, nodeHost, nodeKey, network, contract, block: latestBlock }
+            ));
+            projected.block.timestamp = latestBlock.timestamp;
+            return pull1({ marketMinutelySummary: projected });
+          })),
+        ])
       );
 
       return summary.map(snakeifyCamelObject);
