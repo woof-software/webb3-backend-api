@@ -150,3 +150,6 @@ services = [
 
 [env.production.triggers]
 crons = ["0 * * * *"]
+
+[limits]
+subrequests = 100000
