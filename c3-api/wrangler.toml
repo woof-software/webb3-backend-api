@@ -88,10 +88,10 @@ routes = [
     { pattern = "v3-api-stage.compound.xyz", custom_domain = true },
 ]
 kv_namespaces = [
-    { binding = "kv_testnet", id = "88df4670407e431dab0978649a24bd07" },
-    { binding = "kv_mainnet", id = "d36e7390ae244bbb98321fc8d70ff78d" },
+    { binding = "kv_testnet", id = "f9a99aa9b36a4f84b0bf4988e824aa19" },
+    { binding = "kv_mainnet", id = "2b5b3b5788ad42ea871470474f0221d7" },
     # TODO: replace with the id printed by `npx wrangler kv namespace create kv_registry --env stage`
-    { binding = "kv_registry", id = "42563d31bd8c4221a825e29f0f3609b9" },
+    { binding = "kv_registry", id = "00000000000000000000000000000000" },
 ]
 # [2] TODO: replace with the id printed by `npx wrangler d1 create c3-api-stage`
 d1_databases = [
@@ -150,6 +150,3 @@ services = [
 
 [env.production.triggers]
 crons = ["0 * * * *"]
-
-[limits]
-cpu_ms = 60000

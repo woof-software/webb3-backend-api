@@ -9,15 +9,15 @@ workers_dev = true
 
 [[kv_namespaces]]
 binding = "kv_testnet"
-id = "44c9feb7d9d249e0b92f9efcc5e3e3da"
+id = "88df4670407e431dab0978649a24bd07"
 
 [[kv_namespaces]]
 binding = "kv_mainnet"
-id = "ecebba6ff987426e9b94de40ead51584"
+id = "d36e7390ae244bbb98321fc8d70ff78d"
 
 [[kv_namespaces]]
 binding = "kv_registry"
-id = "caee22653f7f4baf999a1f8facb4bc7c"
+id = "42563d31bd8c4221a825e29f0f3609b9"
 
 [[d1_databases]]
 binding = "APP_DB"
@@ -63,3 +63,6 @@ binding = "node_provider_proxy"
 
 [triggers]
 crons = ["0 * * * *"]
+
+[limits]
+cpu_ms = 60000
