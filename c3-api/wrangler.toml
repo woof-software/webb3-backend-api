@@ -152,4 +152,4 @@ services = [
 crons = ["0 * * * *"]
 
 [limits]
-subrequests = 100000
+subrequests = 1000000
