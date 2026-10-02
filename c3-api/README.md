@@ -101,17 +101,24 @@ What that means for the endpoints:
   `APP_DB`. Governance decodes proposal action targets against the static
   constants and consults the registry only for a target they do not name.
 
-A commit can be imported more than once — an operator forces a new attempt
-to rebuild it — and the tracked ref moves on to new commits. Only the newest
-version of the source is ever left open: when a new candidate is made, every
-draft of the source still importing is closed as `invalid`, whatever its
-commit, and discovery closes any draft older than the newest version it finds.
-The reason is one failed check, `superseded-by-newer-attempt`, added to the
-draft's latest validation attempt with the replacing version and commit in
-its details, so the draft still reports what had failed on it before. A draft
-left open would otherwise be listed as work to review and would stop
-discovery at it. Its reviewed rows are kept: a later attempt of the same
-commit inherits them.
+A commit can be imported more than once — discovery tries again after an
+attempt fails, and an operator can force a new attempt. Once a newer attempt
+of a commit succeeds — validates, or is held for review with every root
+imported — the commit's older attempts still importing are closed as
+`invalid`. Discovery closes any it finds left over, older than the commit's
+newest successful attempt, before it decides what is held. A draft is never
+closed by an attempt that has merely started, so a forced attempt that fails
+leaves the draft before it open and still validatable. The reason is one
+failed check, `superseded-by-newer-attempt`, added to the draft's latest
+validation attempt with the replacing attempt in its details, so the draft
+still reports what had failed on it before. A draft left open would otherwise
+be listed as work to review and would stop discovery at it.
+
+Only attempts of the same commit replace each other. Reviews are inherited
+between attempts of one commit — a later attempt takes what earlier ones
+reviewed, and a newer review of the same market wins — but not across
+commits, so a draft of a commit the tracked ref has moved past is left open:
+validate it to close it.
 
 ## What a request reads
 
