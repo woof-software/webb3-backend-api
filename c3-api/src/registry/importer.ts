@@ -34,6 +34,8 @@ import {
   readSnapshot,
   recordValidationResults,
   snapshotChecksum,
+  supersedeOpenDraftsBy,
+  supersedeStaleDrafts,
   writeMarket,
 } from './repository.js';
 import {
@@ -169,6 +171,19 @@ async function startImport(
     await assertReachableFromRef(source, commitSha);
   }
 
+  /*
+   * Drafts older than the source's newest version are closed before anything
+   * is decided. Otherwise the check below would find such a draft still
+   * importing, call it held for review, and stop there on every discovery —
+   * even once a newer attempt of the same commit had validated. Closing them
+   * is housekeeping: if it fails, this call decides as it did before and the
+   * next discovery tries again.
+   */
+  try {
+    await supersedeStaleDrafts(db, source.repository);
+  } catch (error) {
+    deps.debug?.error(`registry stale drafts not closed`, { error });
+  }
   const attempts = await findAttemptsByCommit(db, source.repository, commitSha);
 
   /*
@@ -523,6 +538,17 @@ async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): P
     versionId = version.id;
     await db.prepare(`UPDATE sync_runs SET registry_version_id = ?1 WHERE id = ?2`)
       .bind(versionId, fence.runId).run();
+    /*
+     * The candidate this run creates replaces every draft of the source still
+     * open — earlier attempts of this commit, and drafts of a commit the
+     * tracked ref has moved past. A failure here must not fail the import it
+     * belongs to; discovery closes whatever is left the next time it runs.
+     */
+    try {
+      await supersedeOpenDraftsBy(db, version, deps.source.repository);
+    } catch (error) {
+      deps.debug?.error(`registry drafts not closed by the new candidate`, { versionId, error });
+    }
   }
 
   const overlays     = await readImportOverlays(db, versionId);

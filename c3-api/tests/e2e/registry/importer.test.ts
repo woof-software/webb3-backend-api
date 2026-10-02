@@ -18,12 +18,15 @@ import {
 } from '../../../src/registry/admin.js';
 import { gitBlobSha } from '../../../src/registry/source/github.js';
 import {
+  SUPERSEDED_CHECK,
+  createCandidate,
   markValidated,
   readSnapshot,
   readUnreviewed,
   readValidationSummary,
   recordValidationResults,
   snapshotChecksum,
+  supersedeOpenDraftsBy,
 } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
@@ -650,6 +653,143 @@ t.test('a request that continues a run refuses what only a new run could do', as
     .bind(started.runId!).first<{ lease_owner: string, lease_generation: number }>();
   t.same(fence, { lease_owner: owner, lease_generation: 7 },
     'and the invocation that holds the run keeps its fence');
+});
+
+/*
+ * Only the newest attempt of a commit is ever finished. A draft an earlier
+ * attempt left importing is closed the moment a newer attempt replaces it,
+ * with a failed check that says so — otherwise it stays open forever, is
+ * listed as work to review, and is what discovery stops at.
+ */
+const statusOf = async (db: D1Database, versionId: string) => db.prepare(
+  `SELECT status FROM registry_versions WHERE id = ?1`
+).bind(versionId).first<string>('status');
+
+const supersededCheckOf = async (db: D1Database, versionId: string) => db.prepare(
+  `SELECT check_name, passed, details FROM validation_results
+   WHERE registry_version_id = ?1 AND check_name = ?2`
+).bind(versionId, SUPERSEDED_CHECK).first<{ check_name: string, passed: number, details: string }>();
+
+t.test('a new attempt closes the draft it replaces', async t => {
+  const db    = await freshDatabase();
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  const first = await runInvocation(deps(db, roots));
+  t.equal(first.held, true, 'the first import of a registry is held for review');
+  t.equal(await statusOf(db, first.versionId!), 'importing');
+
+  const second = await runInvocation(deps(db, roots), { forceNewAttempt: true, reason: 'rebuild' });
+  t.not(second.versionId, first.versionId, 'a forced attempt is a new candidate');
+
+  t.equal(await statusOf(db, first.versionId!), 'invalid', 'and the draft it replaced is closed');
+  const check = await supersededCheckOf(db, first.versionId!);
+  t.equal(check?.passed, 0, 'by a failed check');
+  t.same(JSON.parse(check!.details), { supersededBy: second.versionId, attempt: 2, commit: COMMIT },
+    'that names the attempt which replaced it');
+});
+
+/*
+ * The state an environment is left in by attempts made before drafts were
+ * closed: a newer attempt validated, older ones still importing. Discovery
+ * used to find the newest of those drafts below the validated attempt, call
+ * it held for review, and stop there every day; it now closes what was
+ * replaced and sees the commit as imported.
+ */
+t.test('discovery closes the drafts a validated attempt replaced', async t => {
+  const db = await freshDatabase();
+
+  const make = (attempt: number) => createCandidate(db, {
+    repository:     REPOSITORY,
+    commitSha:      COMMIT,
+    sourceChecksum: 'a'.repeat(64),
+    attempt,
+    createdBy:      'test-seed',
+  });
+  const stale   = [ await make(1), await make(2) ];
+  const current = await make(3);
+  await recordValidationResults(db, current.id, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
+  await markValidated(db, current.id, 'b'.repeat(64));
+
+  const roots  = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+  const result = await runInvocation(deps(db, roots));
+  t.equal(result.outcome, 'no_change', 'the commit is recognised as imported, not as held for review');
+  t.equal(result.versionId, current.id);
+
+  for (const draft of stale) {
+    t.equal(await statusOf(db, draft.id), 'invalid', `attempt ${draft.attempt} is closed`);
+    t.same(JSON.parse((await supersededCheckOf(db, draft.id))!.details), { supersededBy: current.id, attempt: 3, commit: COMMIT });
+  }
+  t.equal(await statusOf(db, current.id), 'validated', 'and the attempt that replaced them is untouched');
+});
+
+t.test('closing a draft twice is not an error', async t => {
+  const db    = await freshDatabase();
+  const draft = await createCandidate(db, {
+    repository: REPOSITORY, commitSha: COMMIT, sourceChecksum: 'a'.repeat(64), attempt: 1, createdBy: 'test-seed',
+  });
+  const newer = await createCandidate(db, {
+    repository: REPOSITORY, commitSha: COMMIT, sourceChecksum: 'a'.repeat(64), attempt: 2, createdBy: 'test-seed',
+  });
+
+  t.same(await supersedeOpenDraftsBy(db, newer, REPOSITORY), [ draft.id ], 'the first call closes it');
+  t.same(await supersedeOpenDraftsBy(db, newer, REPOSITORY), [], 'a second call closes nothing, and does not fail');
+  const checks = await db.prepare(
+    `SELECT COUNT(*) AS n FROM validation_results WHERE registry_version_id = ?1`
+  ).bind(draft.id).first<number>('n');
+  t.equal(checks, 1, 'and the failed check is recorded once');
+  t.equal(await statusOf(db, newer.id), 'importing', 'the replacing version is never closed');
+});
+
+/*
+ * A draft keeps telling an operator what was wrong with it. Closing it adds
+ * one failed check to its latest validation attempt; a new attempt holding
+ * only that check would hide everything that had failed before.
+ */
+t.test('a closed draft keeps reporting what had failed on it', async t => {
+  const db    = await freshDatabase();
+  const draft = await createCandidate(db, {
+    repository: REPOSITORY, commitSha: COMMIT, sourceChecksum: 'a'.repeat(64), attempt: 1, createdBy: 'test-seed',
+  });
+  await recordValidationResults(db, draft.id, 1, [
+    { check_name: 'all-roots-imported', scope: 'global', passed: 0, details: { expected: 29, imported: 28 } },
+    { check_name: 'single-default-market', scope: 'global', passed: 1 },
+  ]);
+  const newer = await createCandidate(db, {
+    repository: REPOSITORY, commitSha: COMMIT, sourceChecksum: 'a'.repeat(64), attempt: 2, createdBy: 'test-seed',
+  });
+  await supersedeOpenDraftsBy(db, newer, REPOSITORY);
+
+  const summary = await readValidationSummary(db, draft.id) as {
+    attempt: number, checks: Array<{ name: string, passed: boolean }>,
+  };
+  t.equal(summary.attempt, 1, 'the latest attempt is still the one the draft was validated in');
+  t.same(
+    summary.checks.filter(check => !check.passed).map(check => check.name).sort(),
+    [ 'all-roots-imported', SUPERSEDED_CHECK ].sort(),
+    'and it reports both what failed before and why the draft was closed',
+  );
+});
+
+/*
+ * Once the tracked ref moves on, a draft of the earlier commit is never
+ * resumed: discovery looks only at the new commit. The new commit's
+ * candidate closes it, or it would stay open — and be reported as work to
+ * review — forever.
+ */
+t.test('a candidate of a new commit closes the drafts of the commit the ref moved past', async t => {
+  const db       = await freshDatabase();
+  const previous = await createCandidate(db, {
+    repository: REPOSITORY, commitSha: 'c'.repeat(40), sourceChecksum: 'a'.repeat(64), attempt: 1, createdBy: 'test-seed',
+  });
+
+  const roots    = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+  const imported = await runInvocation(deps(db, roots));
+  t.ok(imported.versionId, 'the current commit is imported');
+
+  t.equal(await statusOf(db, previous.id), 'invalid', 'and the draft of the earlier commit is closed');
+  t.same(JSON.parse((await supersededCheckOf(db, previous.id))!.details),
+    { supersededBy: imported.versionId, attempt: 1, commit: COMMIT },
+    'naming the candidate, and the commit, that replaced it');
 });
 
 /*
