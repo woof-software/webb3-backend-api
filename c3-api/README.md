@@ -101,6 +101,18 @@ What that means for the endpoints:
   `APP_DB`. Governance decodes proposal action targets against the static
   constants and consults the registry only for a target they do not name.
 
+A commit can be imported more than once — an operator forces a new attempt
+to rebuild it — and the tracked ref moves on to new commits. Only the newest
+version of the source is ever left open: when a new candidate is made, every
+draft of the source still importing is closed as `invalid`, whatever its
+commit, and discovery closes any draft older than the newest version it finds.
+The reason is one failed check, `superseded-by-newer-attempt`, added to the
+draft's latest validation attempt with the replacing version and commit in
+its details, so the draft still reports what had failed on it before. A draft
+left open would otherwise be listed as work to review and would stop
+discovery at it. Its reviewed rows are kept: a later attempt of the same
+commit inherits them.
+
 ## What a request reads
 
 A version never changes once it exists, and only the pointer to the active

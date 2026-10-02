@@ -812,6 +812,14 @@ Query parameters:
 It is a summary per version, never a snapshot: what each was built from and
 what became of it. The markets of one version are read by its id.
 
+Only the newest version of the source stays open. When a new candidate is
+made — or discovery finds a newer version already made — every older version
+still `importing`, of any commit, is closed as `invalid`. The reason is one
+failed check, `superseded-by-newer-attempt`, added to the draft's latest
+validation attempt; its `details` name the replacing version, its attempt,
+and its commit. What was reviewed on the closed draft is kept, and a later
+attempt of the same commit inherits it.
+
 ```sh
 $ curl -s "$API/registry/v1/admin/versions?status=importing" -H "Authorization: Bearer $TOKEN" | jq
 ```
