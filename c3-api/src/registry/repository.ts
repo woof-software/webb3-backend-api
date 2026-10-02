@@ -151,47 +151,50 @@ async function findAttemptsByCommit(
 }
 
 /*
- * Closes the drafts a newer version of the same source has replaced.
+ * Closes the drafts of a commit that a newer, successful attempt of the same
+ * commit has replaced.
  *
- * At any moment only the newest version of a source can still be finished.
- * A run imports only into its own candidate, a new candidate is made only
- * when no run is running, and a draft of a commit the tracked ref has moved
- * past is never resumed. Every older version still importing is therefore a
- * draft nobody will finish — yet it stays open, and an open draft is what an
- * operator is told to review and what discovery stops at. So it is closed as
- * invalid.
+ * Attempts of one commit are numbered in order, and once a newer attempt has
+ * imported every root — and validated, or been held for review — an older
+ * attempt still importing is a draft nobody will finish. It stays open,
+ * though, and an open draft is what an operator is told to review and what
+ * discovery stops at. So it is closed as invalid.
  *
- * The reason is recorded as one failed check, `superseded-by-newer-attempt`,
- * naming the version that replaced it. It is added to the draft's latest
- * validation attempt rather than to a new one, so the draft keeps reporting
- * what had failed on it before; a draft that was never validated gets its
- * first attempt. The draft's reviewed rows stay where they are, and any later
- * attempt of the same commit inherits them (readImportOverlays).
+ * Two limits keep this from discarding work:
  *
- * Each draft is closed in its own batch and only while it is still
- * importing, so two invocations closing the same draft cannot collide: the
- * second changes nothing. Returns the ids this call actually closed.
+ *  - The replacement must have succeeded. A forced attempt that fails leaves
+ *    the draft it was meant to replace open, so that draft can still be
+ *    validated; closing it when the new attempt was merely created would
+ *    leave nothing to validate if that attempt then failed.
+ *  - Only attempts of the same commit are closed. Reviews are inherited
+ *    between attempts of one commit (readImportOverlays) but not across
+ *    commits, so a draft of a commit the tracked ref has moved past may hold
+ *    review work nothing else carries; it stays open until someone validates
+ *    or replaces it, and the status endpoint keeps saying so.
+ *
+ * The reason is one failed check, `superseded-by-newer-attempt`, added to the
+ * draft's latest validation attempt — so the draft still reports what had
+ * failed on it before — naming the attempt that replaced it. A draft that was
+ * never validated gets its first attempt. Each draft is closed in its own
+ * batch and only while it is still importing, so two invocations closing the
+ * same draft cannot collide: the second changes nothing. Returns the ids this
+ * call actually closed.
  */
 const SUPERSEDED_CHECK = 'superseded-by-newer-attempt';
 
-type Replacement = Pick<RegistryVersionRow, 'id' | 'attempt' | 'source_commit_sha'>;
+type Replacement = Pick<RegistryVersionRow, 'id' | 'attempt' | 'source_repository' | 'source_commit_sha'>;
 
-async function supersedeDrafts(
-  db: D1Database,
-  replacement: Replacement,
-  drafts: Array<Pick<RegistryVersionRow, 'id' | 'status'>>,
-): Promise<string[]> {
+async function supersedeEarlierAttempts(db: D1Database, replacement: Replacement): Promise<string[]> {
+  const { results } = await db.prepare(
+    `SELECT id FROM registry_versions
+     WHERE source_repository = ?1 AND source_commit_sha = ?2 AND attempt < ?3 AND status = 'importing'`
+  ).bind(replacement.source_repository.toLowerCase(), replacement.source_commit_sha, replacement.attempt)
+    .all<{ id: string }>();
+
   const createdAt = new Date().toISOString();
-  const details   = JSON.stringify({
-    supersededBy: replacement.id,
-    attempt:      replacement.attempt,
-    commit:       replacement.source_commit_sha,
-  });
+  const details   = JSON.stringify({ supersededBy: replacement.id, attempt: replacement.attempt });
   const closed: string[] = [];
-  for (const draft of drafts) {
-    if (draft.id === replacement.id || draft.status !== 'importing') {
-      continue;
-    }
+  for (const { id } of results ?? []) {
     const [ , update ] = await db.batch([
       db.prepare(
         `INSERT INTO validation_results (
@@ -203,47 +206,47 @@ async function supersedeDrafts(
            FROM validation_results WHERE registry_version_id = ?1
          ) AS latest
          WHERE EXISTS (SELECT 1 FROM registry_versions WHERE id = ?1 AND status = 'importing')`
-      ).bind(draft.id, SUPERSEDED_CHECK, details, createdAt),
-      db.prepare(`UPDATE registry_versions SET status = 'invalid' WHERE id = ?1 AND status = 'importing'`).bind(draft.id),
+      ).bind(id, SUPERSEDED_CHECK, details, createdAt),
+      db.prepare(`UPDATE registry_versions SET status = 'invalid' WHERE id = ?1 AND status = 'importing'`).bind(id),
     ]);
     if (changedRows(update!) === 1) {
-      closed.push(draft.id);
+      closed.push(id);
     }
   }
   return closed;
 }
 
 /*
- * Closes every draft of the source that the version just created replaces,
- * whatever its commit. Called when a new candidate is made.
+ * Closes, for one commit, the drafts older than its newest successful
+ * attempt: one that validated, or one still importing whose run finished
+ * with every root imported (held for review). Discovery calls this before it
+ * decides what is held, so drafts left by attempts made before this rule
+ * existed — or by a call that failed to close them — are closed the next time
+ * the commit is checked. With no successful attempt, nothing is closed.
  */
-async function supersedeOpenDraftsBy(db: D1Database, replacement: Replacement, repository: string): Promise<string[]> {
-  const { results } = await db.prepare(
-    `SELECT id, status FROM registry_versions
-     WHERE source_repository = ?1 AND status = 'importing' AND id <> ?2`
-  ).bind(repository.toLowerCase(), replacement.id).all<Pick<RegistryVersionRow, 'id' | 'status'>>();
-  return supersedeDrafts(db, replacement, results ?? []);
-}
-
-/*
- * Closes every draft of the source older than its newest version. Called by
- * discovery, so drafts left by attempts made before this rule existed — or
- * by a call that failed to close them — are closed the next time the source
- * is checked.
- */
-async function supersedeStaleDrafts(db: D1Database, repository: string): Promise<string[]> {
-  // only the open drafts and the newest version: every discovery runs this, and versions accumulate
-  const { results } = await db.prepare(
-    `SELECT id, status, attempt, source_commit_sha FROM registry_versions
-     WHERE source_repository = ?1
-       AND (status = 'importing' OR id = (
-         SELECT id FROM registry_versions WHERE source_repository = ?1
-         ORDER BY created_at DESC, attempt DESC LIMIT 1
-       ))
-     ORDER BY created_at DESC, attempt DESC`
-  ).bind(repository.toLowerCase()).all<Pick<RegistryVersionRow, 'id' | 'status' | 'attempt' | 'source_commit_sha'>>();
-  const [ newest, ...older ] = results ?? [];
-  return newest === undefined ? [] : supersedeDrafts(db, newest, older);
+async function supersedeStaleAttempts(db: D1Database, repository: string, commitSha: string): Promise<string[]> {
+  const newest = await db.prepare(
+    `SELECT version.id, version.attempt, version.source_repository, version.source_commit_sha
+     FROM registry_versions AS version
+     WHERE version.source_repository = ?1 AND version.source_commit_sha = ?2
+       AND (
+         version.status = 'validated'
+         OR (
+           version.status = 'importing'
+           AND NOT EXISTS (
+             SELECT 1 FROM sync_runs WHERE registry_version_id = version.id AND status = 'running'
+           )
+           AND EXISTS (
+             SELECT 1 FROM sync_runs
+             WHERE registry_version_id = version.id AND status = 'completed'
+               AND completed_count = expected_count
+           )
+         )
+       )
+     ORDER BY version.attempt DESC
+     LIMIT 1`
+  ).bind(repository.toLowerCase(), commitSha).first<Replacement>();
+  return newest === null || newest === undefined ? [] : supersedeEarlierAttempts(db, newest);
 }
 
 /*
@@ -1233,8 +1236,8 @@ export {
   readVersion,
   readVersions,
   SUPERSEDED_CHECK,
-  supersedeOpenDraftsBy,
-  supersedeStaleDrafts,
+  supersedeEarlierAttempts,
+  supersedeStaleAttempts,
   markInvalid,
   markValidated,
   recordValidationResults,

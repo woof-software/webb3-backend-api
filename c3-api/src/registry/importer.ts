@@ -34,8 +34,9 @@ import {
   readSnapshot,
   recordValidationResults,
   snapshotChecksum,
-  supersedeOpenDraftsBy,
-  supersedeStaleDrafts,
+  readVersion,
+  supersedeEarlierAttempts,
+  supersedeStaleAttempts,
   writeMarket,
 } from './repository.js';
 import {
@@ -172,15 +173,15 @@ async function startImport(
   }
 
   /*
-   * Drafts older than the source's newest version are closed before anything
-   * is decided. Otherwise the check below would find such a draft still
-   * importing, call it held for review, and stop there on every discovery —
-   * even once a newer attempt of the same commit had validated. Closing them
-   * is housekeeping: if it fails, this call decides as it did before and the
-   * next discovery tries again.
+   * Drafts of this commit older than its newest successful attempt are
+   * closed before anything is decided. Otherwise the check below would find
+   * such a draft still importing, call it held for review, and stop there on
+   * every discovery — even once a newer attempt of the same commit had
+   * validated. Closing them is housekeeping: if it fails, this call decides
+   * as it did before and the next discovery tries again.
    */
   try {
-    await supersedeStaleDrafts(db, source.repository);
+    await supersedeStaleAttempts(db, source.repository, commitSha);
   } catch (error) {
     deps.debug?.error(`registry stale drafts not closed`, { error });
   }
@@ -343,6 +344,24 @@ async function importMarket(
 }
 
 /*
+ * Closes the drafts of this commit that the attempt just finished replaces.
+ * It runs only when the attempt succeeded, so a forced attempt that fails
+ * leaves the draft it was meant to replace open and still validatable. It is
+ * housekeeping: a failure is logged, never raised, and discovery closes what
+ * is left the next time it checks the commit.
+ */
+async function closeEarlierAttempts(deps: ImporterDeps, versionId: string): Promise<void> {
+  try {
+    const version = await readVersion(deps.db, versionId);
+    if (version !== null) {
+      await supersedeEarlierAttempts(deps.db, version);
+    }
+  } catch (error) {
+    deps.debug?.error(`registry earlier drafts not closed`, { versionId, error });
+  }
+}
+
+/*
  * Assembles what the run imported, validates it, and gives the candidate its
  * terminal status. Validation is fail-closed: a candidate that does not pass
  * completely becomes invalid and keeps its diagnostics.
@@ -397,6 +416,10 @@ async function finishCandidate(
       { status: 'completed', outcome: 'imported', registryVersionId: versionId },
       { now: deps.now },
     );
+    // a held candidate that has every root is a draft at least as good as any earlier one
+    if ((counts?.imported ?? 0) === (counts?.expected_count ?? -1)) {
+      await closeEarlierAttempts(deps, versionId);
+    }
     /*
      * A held candidate is not validated: it is left open for review. Its
      * checks still ran, and a caller told only that the import completed
@@ -439,6 +462,7 @@ async function finishCandidate(
     { status: 'completed', outcome: 'imported', registryVersionId: versionId },
     { now: deps.now },
   );
+  await closeEarlierAttempts(deps, versionId);
   return {
     status: 'completed', outcome: 'imported', runId: fence.runId, versionId, processed: 0,
     ...(closed ? {} : { reason: 'the lease was taken over before the run closed' }),
@@ -538,17 +562,7 @@ async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): P
     versionId = version.id;
     await db.prepare(`UPDATE sync_runs SET registry_version_id = ?1 WHERE id = ?2`)
       .bind(versionId, fence.runId).run();
-    /*
-     * The candidate this run creates replaces every draft of the source still
-     * open — earlier attempts of this commit, and drafts of a commit the
-     * tracked ref has moved past. A failure here must not fail the import it
-     * belongs to; discovery closes whatever is left the next time it runs.
-     */
-    try {
-      await supersedeOpenDraftsBy(db, version, deps.source.repository);
-    } catch (error) {
-      deps.debug?.error(`registry drafts not closed by the new candidate`, { versionId, error });
-    }
+
   }
 
   const overlays     = await readImportOverlays(db, versionId);

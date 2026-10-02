@@ -26,7 +26,7 @@ import {
   readValidationSummary,
   recordValidationResults,
   snapshotChecksum,
-  supersedeOpenDraftsBy,
+  supersedeEarlierAttempts,
 } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
@@ -684,8 +684,8 @@ t.test('a new attempt closes the draft it replaces', async t => {
   t.equal(await statusOf(db, first.versionId!), 'invalid', 'and the draft it replaced is closed');
   const check = await supersededCheckOf(db, first.versionId!);
   t.equal(check?.passed, 0, 'by a failed check');
-  t.same(JSON.parse(check!.details), { supersededBy: second.versionId, attempt: 2, commit: COMMIT },
-    'that names the attempt which replaced it');
+  t.same(JSON.parse(check!.details), { supersededBy: second.versionId, attempt: 2 },
+    'that names the attempt which replaced it, once that attempt has every root');
 });
 
 /*
@@ -717,7 +717,7 @@ t.test('discovery closes the drafts a validated attempt replaced', async t => {
 
   for (const draft of stale) {
     t.equal(await statusOf(db, draft.id), 'invalid', `attempt ${draft.attempt} is closed`);
-    t.same(JSON.parse((await supersededCheckOf(db, draft.id))!.details), { supersededBy: current.id, attempt: 3, commit: COMMIT });
+    t.same(JSON.parse((await supersededCheckOf(db, draft.id))!.details), { supersededBy: current.id, attempt: 3 });
   }
   t.equal(await statusOf(db, current.id), 'validated', 'and the attempt that replaced them is untouched');
 });
@@ -731,8 +731,8 @@ t.test('closing a draft twice is not an error', async t => {
     repository: REPOSITORY, commitSha: COMMIT, sourceChecksum: 'a'.repeat(64), attempt: 2, createdBy: 'test-seed',
   });
 
-  t.same(await supersedeOpenDraftsBy(db, newer, REPOSITORY), [ draft.id ], 'the first call closes it');
-  t.same(await supersedeOpenDraftsBy(db, newer, REPOSITORY), [], 'a second call closes nothing, and does not fail');
+  t.same(await supersedeEarlierAttempts(db, newer), [ draft.id ], 'the first call closes it');
+  t.same(await supersedeEarlierAttempts(db, newer), [], 'a second call closes nothing, and does not fail');
   const checks = await db.prepare(
     `SELECT COUNT(*) AS n FROM validation_results WHERE registry_version_id = ?1`
   ).bind(draft.id).first<number>('n');
@@ -757,7 +757,7 @@ t.test('a closed draft keeps reporting what had failed on it', async t => {
   const newer = await createCandidate(db, {
     repository: REPOSITORY, commitSha: COMMIT, sourceChecksum: 'a'.repeat(64), attempt: 2, createdBy: 'test-seed',
   });
-  await supersedeOpenDraftsBy(db, newer, REPOSITORY);
+  await supersedeEarlierAttempts(db, newer);
 
   const summary = await readValidationSummary(db, draft.id) as {
     attempt: number, checks: Array<{ name: string, passed: boolean }>,
@@ -771,12 +771,12 @@ t.test('a closed draft keeps reporting what had failed on it', async t => {
 });
 
 /*
- * Once the tracked ref moves on, a draft of the earlier commit is never
- * resumed: discovery looks only at the new commit. The new commit's
- * candidate closes it, or it would stay open — and be reported as work to
- * review — forever.
+ * Reviews are inherited between attempts of one commit, not across commits.
+ * A draft of a commit the tracked ref has moved past may hold review work
+ * nothing else carries, so importing the new commit leaves it open: it is for
+ * an operator to validate or replace, and the status keeps saying so.
  */
-t.test('a candidate of a new commit closes the drafts of the commit the ref moved past', async t => {
+t.test('a draft of a commit the ref moved past stays open', async t => {
   const db       = await freshDatabase();
   const previous = await createCandidate(db, {
     repository: REPOSITORY, commitSha: 'c'.repeat(40), sourceChecksum: 'a'.repeat(64), attempt: 1, createdBy: 'test-seed',
@@ -785,11 +785,34 @@ t.test('a candidate of a new commit closes the drafts of the commit the ref move
   const roots    = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
   const imported = await runInvocation(deps(db, roots));
   t.ok(imported.versionId, 'the current commit is imported');
+  t.equal(await statusOf(db, previous.id), 'importing', 'and the draft of the earlier commit is left as it was');
+});
 
-  t.equal(await statusOf(db, previous.id), 'invalid', 'and the draft of the earlier commit is closed');
-  t.same(JSON.parse((await supersededCheckOf(db, previous.id))!.details),
-    { supersededBy: imported.versionId, attempt: 1, commit: COMMIT },
-    'naming the candidate, and the commit, that replaced it');
+/*
+ * A forced attempt replaces the draft before it only once it has succeeded.
+ * Closing the draft when the new attempt was merely created would leave
+ * nothing to validate if that attempt then failed.
+ */
+t.test('a draft stays open when the attempt meant to replace it fails', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const usdcOnly = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+  const withWeth = [ ...usdcOnly, { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) } ];
+
+  const draft = await runInvocation(deps(db, usdcOnly), { holdForReview: true, reason: 'review the new market' });
+  t.equal(draft.held, true, 'a complete draft is held for review');
+
+  // a forced attempt whose second root the chain never answers for
+  let attempt = await runInvocation(deps(db, withWeth, 2), { forceNewAttempt: true, reason: 'rebuild' });
+  t.equal(await statusOf(db, draft.versionId!), 'importing', 'the draft stays open while the new attempt runs');
+  for (let invocation = 0; invocation < 6 && attempt.status === 'running'; invocation++) {
+    attempt = await runInvocation(deps(db, withWeth, 2));
+  }
+  t.equal(attempt.status, 'failed', 'the new attempt fails once its last root runs out of attempts');
+  t.equal(await statusOf(db, attempt.versionId!), 'invalid');
+
+  t.equal(await statusOf(db, draft.versionId!), 'importing', 'and the draft it was meant to replace is still open');
+  t.equal(await supersededCheckOf(db, draft.versionId!), null, 'with nothing recorded against it');
 });
 
 /*
