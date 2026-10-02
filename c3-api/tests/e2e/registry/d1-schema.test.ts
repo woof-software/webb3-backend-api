@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
+import { readTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 import {
   Row,
   applyMigrations,
@@ -55,6 +56,8 @@ const APPLICATION_TABLES = [
   'registry_activations',
   'sync_runs',
   'sync_run_items',
+  'token_policies',
+  'token_policy_events',
 ];
 
 const NOT_IMPORTING = { message: /registry version is not importing/ };
@@ -332,7 +335,8 @@ t.test('migration 0001 creates strict tables and an empty active pointer', async
     'markets_one_default_per_version',
     'markets_slug_per_network',
     'sync_runs_only_one_running',
-  ], 'partial unique indexes exist');
+    'token_policies_strategic',
+  ], 'partial indexes exist');
 
   const added = await db.prepare(
     `SELECT name FROM pragma_table_info('markets') WHERE name = 'reviewed'
@@ -913,4 +917,221 @@ t.test('sync runs keep one running job and consistent checkpoints', async t => {
 
   await run(db, `UPDATE sync_runs SET status = 'completed', outcome = 'no_change', completed_at = ?1, lease_owner = NULL WHERE id = ?2`, NOW, runId);
   await t.resolves(() => insertRow(db, 'sync_runs', syncRun()), 'a new run may start after the previous one completes');
+});
+
+/*
+ * Migration 0004: a token policy is a decision about a token of the active
+ * registry, and the schema keeps its audit complete whatever code writes it.
+ * A policy row is written only beside the event describing that exact change,
+ * events are never edited or deleted, and neither is a policy row.
+ */
+t.test('a token policy is decided for an active token, and every change is audited', async t => {
+  const { APP_DB: db } = await freshEnv();
+  const candidate = await insertCandidate(db, randomUUID(), 1);
+  const token = await db.prepare(`SELECT address FROM tokens WHERE id = ?1`)
+    .bind(candidate.collateralTokenId).first<string>('address');
+
+  type Policy = { chainId?: number, token?: string, value: number, at: string, actor?: string };
+  const event = ({ chainId = 1, token: tokenAddress = token!, value, at, actor = 'test-admin' }: Policy, previous: number | null): Row => ({
+    id:                    randomUUID(),
+    chain_id:              chainId,
+    token_address:         tokenAddress,
+    previous_is_strategic: previous,
+    is_strategic:          value,
+    actor,
+    reason:                'reviewed',
+    created_at:            at,
+  });
+  const policy = ({ chainId = 1, token: tokenAddress = token!, value, at, actor = 'test-admin' }: Policy): Row => ({
+    chain_id:      chainId,
+    token_address: tokenAddress,
+    is_strategic:  value,
+    updated_at:    at,
+    updated_by:    actor,
+  });
+  // the repository's write: the event and the row in one batch, which is one transaction
+  const decide = (change: Policy, previous: number | null) => db.batch([
+    insertStatement(db, 'token_policy_events', event(change, previous)),
+    db.prepare(
+      `INSERT INTO token_policies (chain_id, token_address, is_strategic, updated_at, updated_by)
+       VALUES (?1, ?2, ?3, ?4, ?5)
+       ON CONFLICT (chain_id, token_address) DO UPDATE
+       SET is_strategic = excluded.is_strategic, updated_at = excluded.updated_at, updated_by = excluded.updated_by`
+    ).bind(change.chainId ?? 1, change.token ?? token!, change.value, change.at, change.actor ?? 'test-admin'),
+  ]);
+
+  await t.rejects(() => decide({ value: 1, at: NOW }, null), { message: /token is not in the active registry/ },
+    'nothing is decided while no version is active');
+  t.equal(await count(db, 'token_policy_events'), 0, 'and the refused write leaves no event behind');
+
+  await validate(db, candidate.registry_version_id);
+  await activate(db, candidate.registry_version_id);
+
+  await t.rejects(() => decide({ chainId: 10, value: 1, at: NOW }, null), { message: /token is not in the active registry/ },
+    'a chain the active version does not hold');
+  await t.rejects(() => decide({ token: address('unknown'), value: 1, at: NOW }, null), { message: /token is not in the active registry/ },
+    'a token the active version does not hold');
+  await t.rejects(() => insertRow(db, 'token_policies', policy({ value: 1, at: NOW })), { message: /only with its audit event/ },
+    'a policy row without its event');
+  await t.rejects(() => decide({ value: 1, at: NOW }, 0), { message: /only with its audit event/ },
+    'or with an event that misstates the value it replaces');
+  await t.rejects(() => insertRow(db, 'token_policy_events', event({ value: 0, at: NOW }, null)), CHECK_FAILED,
+    'an event that changes nothing: a token without a row is not strategic');
+
+  await t.resolves(() => decide({ value: 1, at: NOW }, null), 'a decision with its event');
+  await t.resolves(() => decide({ value: 0, at: '2026-09-17T00:00:01.000Z' }, 1), 'and its reversal, which names what it replaced');
+  await t.rejects(() => decide({ value: 1, at: '2026-09-17T00:00:02.000Z' }, null), { message: /only with its audit event/ },
+    'a change must name the decision in force, not the default');
+  await t.rejects(
+    () => run(db, `UPDATE token_policies SET is_strategic = 1, updated_at = ?1`, '2026-09-17T00:00:03.000Z'),
+    { message: /only with its audit event/ },
+    'a direct update has no event to stand beside',
+  );
+  await t.rejects(() => run(db, `UPDATE token_policies SET updated_by = 'someone-else'`), { message: /only with its audit event/ },
+    'and a row is not touched without a change');
+  await t.rejects(() => run(db, `UPDATE token_policies SET token_address = ?1`, address('moved')), { message: /belongs to one token/ },
+    'a policy cannot move to another token');
+  await t.rejects(() => run(db, `DELETE FROM token_policies`), { message: /changed, not deleted/ }, 'a policy is never deleted');
+  await t.rejects(() => run(db, `UPDATE token_policy_events SET reason = 'edited'`), { message: /append-only/ });
+  await t.rejects(() => run(db, `DELETE FROM token_policy_events`), { message: /append-only/ });
+
+  t.same(
+    await db.prepare(`SELECT chain_id, token_address, is_strategic, updated_by FROM token_policies`).all().then(result => result.results),
+    [ { chain_id: 1, token_address: token, is_strategic: 0, updated_by: 'test-admin' } ],
+    'one row holds the decision in force',
+  );
+  t.same(
+    await db.prepare(`SELECT previous_is_strategic, is_strategic FROM token_policy_events ORDER BY created_at`).all().then(result => result.results),
+    [ { previous_is_strategic: null, is_strategic: 1 }, { previous_is_strategic: 1, is_strategic: 0 } ],
+    'and the events hold every change that led to it',
+  );
+
+  /*
+   * An older event describing the same change as the one being written is not
+   * its event: restoring a row to what it was before the latest change would
+   * otherwise pass without a word about why.
+   */
+  await t.resolves(() => decide({ value: 1, at: '2026-09-17T00:00:02.000Z' }, 0), 'a third change');
+  await t.rejects(
+    () => run(db, `UPDATE token_policies SET is_strategic = 0, updated_at = '2026-09-17T00:00:01.000Z'`),
+    { message: /only with its audit event/ },
+    'a change cannot reuse an older event that happens to describe it',
+  );
+  const [ eventId ] = (await db.prepare(`SELECT id FROM token_policy_events ORDER BY rowid LIMIT 1`).all<{ id: string }>()).results ?? [];
+  await t.rejects(
+    () => run(db,
+      `INSERT OR REPLACE INTO token_policy_events (id, chain_id, token_address, previous_is_strategic, is_strategic, actor, reason, created_at)
+       VALUES (?1, 1, ?2, NULL, 1, 'test-admin', 'edited', ?3)`,
+      eventId!.id, token, NOW),
+    { message: /append-only/ },
+    'nor is an event rewritten by replacing it',
+  );
+  await t.rejects(
+    () => run(db,
+      `INSERT OR REPLACE INTO token_policies (chain_id, token_address, is_strategic, updated_at, updated_by)
+       VALUES (1, ?1, 0, '2026-09-17T00:00:01.000Z', 'test-admin')`,
+      token),
+    { message: /only with its audit event/ },
+    'nor can a replace of the row reuse an older event',
+  );
+  await t.rejects(
+    () => run(db,
+      `INSERT OR REPLACE INTO token_policy_events (rowid, id, chain_id, token_address, previous_is_strategic, is_strategic, actor, reason, created_at)
+       VALUES (1, ?1, 1, ?2, NULL, 1, 'test-admin', 'edited', ?3)`,
+      randomUUID(), token, NOW),
+    { message: /append-only/ },
+    'nor is an event replaced through its rowid',
+  );
+  await t.rejects(
+    () => run(db,
+      `INSERT INTO token_policy_events (rowid, id, chain_id, token_address, previous_is_strategic, is_strategic, actor, reason, created_at)
+       VALUES (1000, ?1, 1, ?2, 1, 0, 'test-admin', 'reviewed', ?3)`,
+      randomUUID(), token, NOW),
+    { message: /append-only/ },
+    'and an event takes the next rowid, never one a writer chooses, since history is read in rowid order',
+  );
+  await t.rejects(
+    () => run(db,
+      `INSERT OR REPLACE INTO token_policies (rowid, chain_id, token_address, is_strategic, updated_at, updated_by)
+       VALUES (1, 1, ?1, 1, ?2, 'test-admin')`,
+      address('another'), NOW),
+    { message: /rowid/ },
+    'a policy row has no rowid through which a replace could reach another token\'s row',
+  );
+
+  /*
+   * History is read in the order it was committed. A Worker stamps a request
+   * before it reaches D1, so a change can be stamped earlier than one that
+   * committed before it; the newest change is still the one that set the
+   * decision in force.
+   */
+  await t.resolves(() => decide({ value: 0, at: '2026-09-17T00:00:00.500Z' }, 1), 'a change stamped earlier than the one before it');
+  const history = await readTokenPolicy(db, 1, token as `0x${string}`);
+  t.same(
+    [ history.isStrategic, history.events[0]?.previousIsStrategic, history.events[0]?.isStrategic, history.events[0]?.createdAt ],
+    [ false, true, false, '2026-09-17T00:00:00.500Z' ],
+    'is listed first, as the change that set the decision in force',
+  );
+
+  /*
+   * An expectation states what a token must hold when a write is done.
+   * Inserting one writes nothing; one that does not hold aborts.
+   */
+  await t.resolves(
+    () => run(db, `INSERT INTO token_policy_expectations (chain_id, token_address, is_strategic) VALUES (1, ?1, 0)`, token),
+    'an expectation that holds passes',
+  );
+  t.equal(await count(db, 'token_policy_expectations'), 0, 'and writes nothing');
+  await t.rejects(
+    () => run(db, `INSERT INTO token_policy_expectations (chain_id, token_address, is_strategic) VALUES (1, ?1, 1)`, token),
+    { message: /changed while they were being written/ },
+    'one for another decision aborts',
+  );
+  await t.rejects(
+    () => run(db, `INSERT INTO token_policy_expectations (chain_id, token_address, is_strategic) VALUES (1, ?1, 0)`, address('unknown')),
+    { message: /token is not in the active registry/ },
+    'and so does one for a token the active version does not hold',
+  );
+
+  /*
+   * The membership check runs on a plain UPDATE as well as on the upsert: once
+   * the active version no longer holds the token, a change beside a matching
+   * event is refused, and the event goes with it.
+   */
+  const next = await insertCandidate(db, randomUUID(), 1);
+  await validate(db, next.registry_version_id);
+  await activate(db, next.registry_version_id);
+  const events = await count(db, 'token_policy_events');
+  await t.rejects(
+    () => db.batch([
+      insertStatement(db, 'token_policy_events', event({ value: 1, at: '2026-09-17T00:00:03.000Z' }, 0)),
+      db.prepare(`UPDATE token_policies SET is_strategic = 1, updated_at = ?1, updated_by = 'test-admin'`).bind('2026-09-17T00:00:03.000Z'),
+    ]),
+    { message: /token is not in the active registry/ },
+    'a token the active version no longer holds keeps its decision until a version brings it back',
+  );
+  t.equal(await count(db, 'token_policy_events'), events, 'and the refused change leaves no event');
+
+  // a literal, so the value reaches the column as the integer it is rather than as a bound double
+  await t.rejects(
+    () => run(db,
+      `INSERT INTO token_policy_events (id, chain_id, token_address, previous_is_strategic, is_strategic, actor, reason, created_at)
+       VALUES (?1, 9007199254740992, ?2, 0, 1, 'test-admin', 'reviewed', ?3)`,
+      randomUUID(), token, NOW),
+    CHECK_FAILED,
+    'a chain id past the safe integer range',
+  );
+  const cases: Array<[ string, Row ]> = [
+    [ 'a chain id of zero', { chain_id: 0 } ],
+    [ 'an address that is not lowercase', { token_address: token!.toUpperCase().replace('0X', '0x') } ],
+    [ 'an address that is not hex', { token_address: `0x${'g'.repeat(40)}` } ],
+    [ 'a value that is not a flag', { is_strategic: 2, previous_is_strategic: 0 } ],
+    [ 'a blank reason', { reason: ' ' } ],
+    [ 'an unbounded reason', { reason: 'x'.repeat(1001) } ],
+    [ 'a blank actor', { actor: ' ' } ],
+  ];
+  for (const [ name, overrides ] of cases) {
+    await t.rejects(() => insertRow(db, 'token_policy_events', { ...event({ value: 1, at: NOW }, 0), ...overrides }), CHECK_FAILED, name);
+  }
+  t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
 });

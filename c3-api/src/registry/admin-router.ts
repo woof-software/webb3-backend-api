@@ -1,5 +1,7 @@
 import type { Env } from '../../entrypoint.js';
 
+import { isAddress, normalizeAddress } from '../../lib/model/comet-registry.js';
+
 import { authenticateAdmin } from '../http/bearer-auth.js';
 import { ApiError, methodNotAllowed } from '../http/errors.js';
 import { MAX_BODY_BYTES, jsonResponse, readJsonObject } from '../http/json.js';
@@ -31,6 +33,15 @@ import {
 } from './handlers.js';
 import type { InvocationResult } from './importer.js';
 import { registryFetch, runRegistrySync } from './scheduled.js';
+import {
+  getTokenPolicies,
+  getTokenPolicy,
+  getTokenPolicyExport,
+  patchTokenPolicy,
+  postTokenPolicyApply,
+  postTokenPolicyReview,
+} from './token-handlers.js';
+import type { DecisionList, ListedDecision } from './token-policy-repository.js';
 
 import type * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
@@ -89,6 +100,12 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/proposal$/,                           method: 'GET',  handler: 'proposal',       family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/proposal\/review$/,                   method: 'GET',  handler: 'proposalReview', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/proposal\/apply$/,                    method: 'POST', handler: 'applyProposal',  family: 'overlay' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens$/,                             method: 'GET',  handler: 'tokenPolicies',  family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens\/([^/]+)\/policy$/,            method: 'GET',  handler: 'tokenPolicy',    family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens\/([^/]+)\/policy$/,            method: 'PATCH', handler: 'setTokenPolicy', family: 'policy' },
+  { pattern: /^\/registry\/v1\/admin\/token-policies$/,                                       method: 'GET',  handler: 'exportTokenPolicies', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/token-policies\/review$/,                               method: 'POST', handler: 'reviewTokenPolicies', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/token-policies\/apply$/,                                method: 'POST', handler: 'applyTokenPolicies',  family: 'policy' },
 ] as const;
 
 const MAX_REASON = 1000;
@@ -112,6 +129,21 @@ const MAX_OVERLAYS_PER_REQUEST = 100;
 const MAX_OVERLAYS_BODY_BYTES  = 512 * 1024;
 
 /*
+ * A list of token policies in one request: every token of every network of a
+ * registry fits, with a reason on each row. The list is written as a handful
+ * of statements whatever its length, so the bound is the body, not D1.
+ */
+const MAX_POLICIES_PER_REQUEST = 500;
+const MAX_POLICIES_BODY_BYTES  = 1024 * 1024;
+
+// the bodies larger than an ordinary command, by the route that takes them
+const BODY_BYTES: Partial<Record<string, number>> = {
+  overlays:            MAX_OVERLAYS_BODY_BYTES,
+  reviewTokenPolicies: MAX_POLICIES_BODY_BYTES,
+  applyTokenPolicies:  MAX_POLICIES_BODY_BYTES,
+};
+
+/*
  * A reason is required wherever an operator changes what the registry serves,
  * because the audit row that records the change is only as useful as the
  * reason stored with it.
@@ -121,7 +153,35 @@ function requireReason(body: Record<string, unknown>): string {
   if (typeof(reason) !== 'string' || reason.trim().length === 0 || reason.length > MAX_REASON) {
     throw new ApiError('BAD_REQUEST', `a non-empty reason of at most ${MAX_REASON} characters is required`);
   }
+  /*
+   * SQLite's text functions stop at a NUL, so the audit tables' checks would
+   * read a reason that starts with one as empty and refuse it with a database
+   * error, and one that only contains one would be stored cut short.
+   */
+  if (reason.includes('\u0000')) {
+    throw new ApiError('BAD_REQUEST', `a reason cannot contain a NUL character`);
+  }
   return reason.trim();
+}
+
+/*
+ * An optional reason: absent or null, or a reason as requireReason accepts
+ * one. A problem is collected rather than thrown, so a list reports every
+ * problem of every row at once.
+ */
+function optionalReason(value: unknown, where: string, problems: string[]): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof(value) !== 'string' || value.trim().length === 0 || value.length > MAX_REASON) {
+    problems.push(`${where} must be null or a non-empty string of at most ${MAX_REASON} characters`);
+    return null;
+  }
+  if (value.includes('\u0000')) {
+    problems.push(`${where} cannot contain a NUL character`);
+    return null;
+  }
+  return value.trim();
 }
 
 function requireExactKeys(body: Record<string, unknown>, allowed: string[]): void {
@@ -280,6 +340,80 @@ function overlayDocuments(body: Record<string, unknown>, versionId: string, acto
   return { versionId, actor, reason, networks, markets };
 }
 
+const DECISION_KEYS = [ 'chainId', 'tokenAddress', 'symbol', 'isStrategic', 'reason' ];
+
+/*
+ * The body of `POST /token-policies/review` and `/apply`: a list as the export
+ * answers it, edited. `registryVersion` says where it was exported from and
+ * is not checked, since a decision belongs to no version. Every problem of
+ * every row is reported at once, so a file is fixed in one pass.
+ */
+function decisionList(body: Record<string, unknown>): DecisionList {
+  requireExactKeys(body, [ 'registryVersion', 'reason', 'policies' ]);
+  const problems: string[] = [];
+  const reason = optionalReason(body.reason, 'reason', problems);
+
+  const policies = body.policies;
+  if (!Array.isArray(policies) || policies.length === 0 || policies.length > MAX_POLICIES_PER_REQUEST) {
+    throw new ApiError('BAD_REQUEST', `policies must be a list of 1 to ${MAX_POLICIES_PER_REQUEST} decisions`);
+  }
+
+  const seen = new Map<string, number>();
+  const decisions: ListedDecision[] = [];
+  policies.forEach((entry: unknown, index: number) => {
+    const row = `row ${index + 1}`;
+    if (typeof(entry) !== 'object' || entry === null || Array.isArray(entry)) {
+      problems.push(`${row} must be an object`);
+      return;
+    }
+    const value  = entry as Record<string, unknown>;
+    const before = problems.length;
+
+    const unexpected = Object.keys(value).filter(key => !DECISION_KEYS.includes(key));
+    if (unexpected.length > 0) {
+      problems.push(`${row} has unexpected properties: ${unexpected.sort().join(', ')}`);
+    }
+    const { chainId, tokenAddress, symbol, isStrategic } = value;
+    if (typeof(chainId) !== 'number' || !Number.isSafeInteger(chainId) || chainId <= 0) {
+      problems.push(`${row}: chainId must be a positive integer`);
+    }
+    if (!isAddress(tokenAddress)) {
+      problems.push(`${row}: tokenAddress must be an address`);
+    }
+    if (symbol !== undefined && symbol !== null && typeof(symbol) !== 'string') {
+      problems.push(`${row}: symbol must be null or a string`);
+    }
+    if (typeof(isStrategic) !== 'boolean') {
+      problems.push(`${row}: isStrategic must be a boolean`);
+    }
+    const rowReason = optionalReason(value.reason, `${row}: reason`, problems);
+    if (problems.length > before) {
+      return;
+    }
+
+    const address = normalizeAddress(tokenAddress as string);
+    const key     = `${chainId}:${address}`;
+    const first   = seen.get(key);
+    if (first !== undefined) {
+      problems.push(`${row} repeats row ${first} (chain ${chainId}, ${address})`);
+      return;
+    }
+    seen.set(key, index + 1);
+    decisions.push({
+      chainId:      chainId as number,
+      tokenAddress: address,
+      symbol:       (symbol as string | null | undefined) ?? null,
+      isStrategic:  isStrategic as boolean,
+      reason:       rowReason,
+    });
+  });
+
+  if (problems.length > 0) {
+    throw new ApiError('BAD_REQUEST', `the list of token policies is invalid`, { problems });
+  }
+  return { reason, decisions };
+}
+
 async function routeAdmin(
   request: Request,
   env: Env,
@@ -310,7 +444,7 @@ async function routeAdmin(
   const [ , versionId, second, third ] = route.match!;
   const body = route.method === 'GET'
     ? {}
-    : await readJsonObject(request, { maxBytes: route.handler === 'overlays' ? MAX_OVERLAYS_BODY_BYTES : MAX_BODY_BYTES });
+    : await readJsonObject(request, { maxBytes: BODY_BYTES[route.handler] ?? MAX_BODY_BYTES });
 
   switch (route.handler) {
     case 'status':
@@ -383,7 +517,33 @@ async function routeAdmin(
       }, feedReader(env)));
     case 'overlays':
       return jsonResponse(await replaceOverlays(context.db, overlayDocuments(body, versionId!, context.actor), feedReader(env)));
+    case 'tokenPolicies':
+      // the first capture of a network route is a chain id, not a version id
+      return await getTokenPolicies(context, versionId!);
+    case 'tokenPolicy':
+      return await getTokenPolicy(context, versionId!, second!);
+    case 'setTokenPolicy': {
+      /*
+       * A strategic decision changes which tokens the API offers for
+       * discovery, so it carries a reason like every other decision, and the
+       * audit event stores it beside the actor.
+       */
+      requireExactKeys(body, [ 'isStrategic', 'reason' ]);
+      if (typeof(body.isStrategic) !== 'boolean') {
+        throw new ApiError('BAD_REQUEST', `isStrategic must be a boolean`);
+      }
+      return await patchTokenPolicy(context, versionId!, second!, {
+        isStrategic: body.isStrategic,
+        reason:      requireReason(body),
+      });
+    }
+    case 'exportTokenPolicies':
+      return await getTokenPolicyExport(context);
+    case 'reviewTokenPolicies':
+      return await postTokenPolicyReview(context, decisionList(body));
+    case 'applyTokenPolicies':
+      return await postTokenPolicyApply(context, decisionList(body));
   }
 }
 
-export { MAX_MARKETS_PER_REQUEST, MAX_OVERLAYS_PER_REQUEST, MAX_REASON, ROUTES, routeAdmin, syncFailure };
+export { MAX_MARKETS_PER_REQUEST, MAX_OVERLAYS_PER_REQUEST, MAX_POLICIES_PER_REQUEST, MAX_REASON, ROUTES, routeAdmin, syncFailure };

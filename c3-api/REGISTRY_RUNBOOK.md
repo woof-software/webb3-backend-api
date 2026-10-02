@@ -713,6 +713,127 @@ is the `previousVersionId` in the answer of the activation you are undoing,
 and it is also in the activation history that
 `GET /registry/v1/admin/versions/<the version that is on>` lists.
 
+## Marking a token strategic
+
+A strategic token is shown wherever the app lists tokens, whatever its
+collateral value. Nothing reads the mark yet — the token list that applies it
+comes with a later release — so for now marking a token records the decision
+and changes nothing users see.
+
+The mark belongs to the token itself — its chain and its address — so it
+stays when a newer version is switched on, and comes back if a version drops
+the token and a later one brings it back. You can only mark a token the
+version that is on holds, and every change needs a reason, which is kept with
+who made it.
+
+```sh
+curl -s -X PATCH "$API/registry/v1/admin/networks/1/tokens/0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2/policy" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"isStrategic": true, "reason": "Approved by governance"}' | jq
+```
+
+Postman:
+
+```http
+PATCH {{API}}/registry/v1/admin/networks/1/tokens/0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2/policy
+Authorization: Bearer {{TOKEN}}
+Content-Type: application/json
+
+{"isStrategic": true, "reason": "Approved by governance"}
+```
+
+**You should see** `"changed": true` and the time in `updatedAt`. Sending the
+same request again answers `"changed": false` and records nothing, so it is
+safe to repeat. To take the mark away, send `"isStrategic": false` with a
+reason.
+
+To see every token of a chain with its mark, and one token's history (newest
+change first):
+
+```sh
+curl -s "$API/registry/v1/admin/networks/1/tokens" -H "Authorization: Bearer $TOKEN" \
+  | jq '.tokens[] | select(.isStrategic) | {symbol, address, updatedAt, updatedBy}'
+curl -s "$API/registry/v1/admin/networks/1/tokens/<address>/policy" -H "Authorization: Bearer $TOKEN" | jq .events
+```
+
+Postman:
+
+```http
+GET {{API}}/registry/v1/admin/networks/1/tokens
+Authorization: Bearer {{TOKEN}}
+```
+
+A mark stays when a version that drops its token is switched on: the chain's
+list shows it under `retained`, and the token's history still answers, with
+`"inActiveVersion": false`. It applies again the moment a version that holds
+the token is switched on, so read `retained` before switching such a version
+on, and take a mark away while the token is still served if it should not
+come back.
+
+### A reviewed list of strategic tokens
+
+A list the product team approved is applied in three requests, and you never
+type an address: the first one gives you every token as a file.
+
+**1. Export the tokens.** Every token of every network that is on, with its
+mark, in the form the next two requests take:
+
+```sh
+curl -s "$API/registry/v1/admin/token-policies" -H "Authorization: Bearer $TOKEN" > token-policies.json
+```
+
+Postman:
+
+```http
+GET {{API}}/registry/v1/admin/token-policies
+Authorization: Bearer {{TOKEN}}
+```
+
+(**Save Response → Save to a file**.) Edit the file: set `"isStrategic": true`
+on the approved tokens (or `false` to take a mark away) and write why in the
+`"reason"` at the top. A row may carry its own `"reason"`, which wins. Leave
+every other row as it is; a row that changes nothing needs no reason.
+
+**2. See what it would change** — this writes nothing:
+
+```sh
+curl -s -X POST "$API/registry/v1/admin/token-policies/review" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @token-policies.json \
+  | jq '.summary, (.policies[] | select(.action == "change" or .problem != null))'
+```
+
+Postman:
+
+```http
+POST {{API}}/registry/v1/admin/token-policies/review
+Authorization: Bearer {{TOKEN}}
+Content-Type: application/json
+
+(Body → binary → token-policies.json)
+```
+
+**You should see** `"problems": 0`, and under `change` exactly the tokens the
+list decides, each with what it is now (`current`), what the list wants
+(`requested`) and the reason it will be recorded with. A row with a `problem`
+names a chain or a token the version that is on does not hold, a symbol that
+is not that token's, or a change without a reason; fix the file and review it
+again.
+
+**3. Apply it** — the same file:
+
+```sh
+curl -s -X POST "$API/registry/v1/admin/token-policies/apply" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @token-policies.json | jq .summary
+```
+
+Postman: the same request as step 2, to `…/token-policies/apply`.
+
+**You should see** `"changed"` equal to the number of changes the review
+showed. The list is written in one go: if any row cannot be applied, nothing
+is, and the answer says which rows (`422`). Applying the same file again
+changes nothing, so keep it, and apply it to the next environment the same
+way.
+
 ## Keeping an eye on it
 
 One request tells you whether the registry is well:
@@ -778,6 +899,11 @@ A difference not in it is worth a developer's look before switching on.
 | `CHAIN_REQUEST_FAILED` in the import | The worker cannot reach the node provider proxy | Fix the proxy or its binding; importing again continues where it stopped |
 | `401` | The token is wrong, or is the hash | Use the admin token itself |
 | `429` | More than 30 administrative writes in a minute | Wait a minute |
+| `404` marking a token | The version that is on does not hold that chain or that token | Check the chain id and the address against `GET /registry/v1/admin/networks/<chain>/tokens`; a token only a newer draft holds can be marked once that draft is switched on |
+| `409` marking a token, "left the active registry" | A version without that token was switched on while the change was being written; nothing was written | Check which version is on, and mark the token again if it is still there |
+| `404` "no registry route matches …/token-policies" | The Worker at that address was deployed before token policies | Deploy the release with token policies first |
+| `422` applying a list | Some rows cannot be applied; `details.problems` names each with why; nothing was written | Fix those rows — review shows them in context — and apply again |
+| `409` applying a list, "nothing was written" | A version was switched on, or one of the list's tokens was decided by someone else, while the list was being written | Review the file again, then apply it |
 | `409` writing overlays | The draft is no longer open: it was validated, switched on, or replaced by a newer attempt of its commit (`GET /registry/v1/admin/versions/<id>` says which) | Look for the newest open draft first (`GET /registry/v1/admin/versions?status=importing`) and continue there; start a new attempt (step 1 with `forceNewAttempt`) only if there is none |
 | `409` on apply, naming another digest | The proposal changed since you read it | Read the review again, and apply its digest |
 | `409` on validate, "the import … is still running" | The import has not finished | Send step 1 again until it completes |

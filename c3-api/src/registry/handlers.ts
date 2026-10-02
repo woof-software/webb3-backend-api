@@ -172,9 +172,14 @@ function networkOf(snapshot: RegistrySnapshotV1, chainId: number): NetworkV1 {
   return network;
 }
 
+/*
+ * A chain id is a positive integer JavaScript holds exactly: past
+ * Number.MAX_SAFE_INTEGER, two different ids read as the same number, which
+ * is also the bound the schema puts on every chain id it stores.
+ */
 function chainIdOf(value: string): number {
   const chainId = Number(value);
-  if (!Number.isInteger(chainId) || chainId <= 0) {
+  if (!Number.isSafeInteger(chainId) || chainId <= 0) {
     throw new ApiError('BAD_REQUEST', `${value} is not a chain id`);
   }
   return chainId;

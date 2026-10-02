@@ -436,6 +436,148 @@ type ValidationSummaryV1 = {
 };
 
 /*
+ * Token policies, from migrations/0004_token_policies.sql: the decisions an
+ * administrator makes about a token, kept by chain id and address rather than
+ * on a versioned row, so that they outlive every activation.
+ */
+type TokenPolicyRow = {
+  chain_id:      number,
+  token_address: Address,
+  is_strategic:  number,
+  updated_at:    string,
+  updated_by:    string,
+};
+
+type TokenPolicyEventRow = {
+  id:                    string,
+  chain_id:              number,
+  token_address:         Address,
+  previous_is_strategic: number | null,
+  is_strategic:          number,
+  actor:                 string,
+  reason:                string,
+  created_at:            string,
+};
+
+/*
+ * The decision in force for a token. A token nobody has decided about is not
+ * strategic, and has no time or author to name.
+ */
+type TokenPolicyV1 = {
+  isStrategic: boolean,
+  updatedAt:   string | null,
+  updatedBy:   string | null,
+};
+
+type TokenPolicyEventV1 = {
+  id:                  string,
+  // null where the token had no decision yet, which is not strategic
+  previousIsStrategic: boolean | null,
+  isStrategic:         boolean,
+  actor:               string,
+  reason:              string,
+  createdAt:           string,
+};
+
+/*
+ * Every token of one network of the active version, with the decision in
+ * force for each, and the decisions kept for tokens of the chain the active
+ * version does not hold: each applies again if a version brings its token back.
+ * `inActiveVersion` is false for a chain the active version does not hold at
+ * all, which has no tokens to list but may still have decisions kept.
+ */
+type TokenPoliciesV1 = {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  inActiveVersion: boolean,
+  tokens:          Array<TokenV1 & TokenPolicyV1>,
+  retained:        Array<TokenPolicyV1 & { address: Address }>,
+};
+
+/*
+ * One token's decision, and the changes that led to it, newest committed
+ * first. `inActiveVersion` is false for a decision kept while the active
+ * version does not hold the token, which applies again once one does.
+ */
+type TokenPolicyDetailV1 = TokenPolicyV1 & {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  tokenAddress:    Address,
+  inActiveVersion: boolean,
+  events:          TokenPolicyEventV1[],
+};
+
+/*
+ * The answer to a policy change. `changed` is false when the decision asked
+ * for was already in force, which writes nothing; `updatedAt` is when the
+ * decision in force was made, and null for a token nobody has decided about.
+ */
+type TokenPolicyResultV1 = {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  tokenAddress:    Address,
+  isStrategic:     boolean,
+  changed:         boolean,
+  updatedAt:       string | null,
+};
+
+/*
+ * A list of decisions: what the export answers, and what review and apply
+ * take, so a list is exported, edited and sent back as one file.
+ *
+ * A row that changes a decision needs a reason: its own, or the list's. A row
+ * that leaves its token as it is needs none. `symbol` is there for the person
+ * editing the file; the address decides, and a symbol that is not the token's
+ * is refused as the mistake it usually is. `registryVersion` says where the
+ * list was exported from, and is not checked: a decision belongs to no version.
+ */
+type TokenPolicyDecisionV1 = {
+  chainId:      number,
+  tokenAddress: Address,
+  symbol?:      string | null,
+  isStrategic:  boolean,
+  reason?:      string | null,
+};
+
+type TokenPolicyListV1 = {
+  registryVersion?: VersionRefV1,
+  reason:           string | null,
+  policies:         TokenPolicyDecisionV1[],
+};
+
+// what applying a list would change, row by row, without writing anything
+type TokenPolicyReviewV1 = {
+  registryVersion: VersionRefV1,
+  summary:         { change: number, unchanged: number, problems: number },
+  policies:        Array<{
+    row:          number,
+    chainId:      number,
+    tokenAddress: Address,
+    symbol:       string | null,
+    current:      boolean,
+    requested:    boolean,
+    action:       'change' | 'unchanged',
+    reason:       string | null,
+    problem:      string | null,
+  }>,
+};
+
+// what applying a list wrote: every row, as the transaction that wrote it left it
+type TokenPolicyApplyV1 = {
+  registryVersion: VersionRefV1,
+  summary:         { changed: number, unchanged: number },
+  policies:        Array<{
+    row:          number,
+    chainId:      number,
+    tokenAddress: Address,
+    symbol:       string,
+    isStrategic:  boolean,
+    changed:      boolean,
+    updatedAt:    string | null,
+  }>,
+};
+
+/*
  * What a Comet contract carries when it was materialized from the registry:
  * the version that described it, the market as that version describes it, and
  * the exceptions of its network.
@@ -504,6 +646,17 @@ export type {
   SyncRunRow,
   SyncRunStatus,
   SyncTriggerKind,
+  TokenPoliciesV1,
+  TokenPolicyApplyV1,
+  TokenPolicyDecisionV1,
+  TokenPolicyDetailV1,
+  TokenPolicyEventRow,
+  TokenPolicyEventV1,
+  TokenPolicyListV1,
+  TokenPolicyResultV1,
+  TokenPolicyReviewV1,
+  TokenPolicyRow,
+  TokenPolicyV1,
   TokenRow,
   TokenV1,
   UnwrappedCollateralAssetV1,

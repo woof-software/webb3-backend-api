@@ -40,9 +40,10 @@ migration that has been applied anywhere.
 
 Migrations are numbered in the order they are applied, not by feature:
 `0001` is the Comet registry schema, `0002` marks the markets nobody has
-reviewed yet, and `0003` adds how the frontend lists a market — its slug and
-whether it is institutional — so the Agreements migration that the
-implementation plan calls `0002` is `0004` here.
+reviewed yet, `0003` adds how the frontend lists a market — its slug and
+whether it is institutional — and `0004` stores token policies, which tokens
+an administrator has marked strategic and the audit of every change. The
+Agreements migration takes the next free number.
 
 Apply migrations to the local Miniflare database under `.wrangler/state`:
 ```sh
@@ -260,6 +261,48 @@ configurations, feeds the markets have since moved off, renamed tokens. The
 runbook lists every difference to expect and why
 ([Known differences](./REGISTRY_RUNBOOK.md#known-differences)); anything beyond
 them is worth reading before activating.
+
+# Token Policies
+
+An administrator can mark a token strategic. A strategic token is shown
+wherever tokens are discovered whatever its collateral value; the rule that
+applies it, with the collateral threshold, is served by a later release, and
+until then a policy is decided, audited, and read back through the
+administrative routes ([API.md](./API.md)).
+
+A policy belongs to the token — a chain id and an address — and not to a
+registry version, so it survives every activation; a version that drops the
+token and a later one that brings it back bring its policy back with it. It
+is decided only for a token of the active version, and a token nobody has
+decided about is not strategic, without a row. While a version without the
+token is active, its decision is kept, listed as `retained`, and readable with
+its history. Every change is written in one D1 transaction with an event that
+records the value it replaced, the value it set, the actor and the reason, and
+migration `0004` enforces that in the database: a policy row is written only
+beside its token's newest event, which records that change; events are never
+edited, replaced or deleted, and a policy row is never deleted.
+
+A reviewed list of decisions — the seed — is a file, and nobody writes its
+addresses by hand: the export answers every token of every network of the
+active version with its decision, in exactly the form review and apply take
+back. Mark the tokens the list decides, give the reason once for the list or
+on a row, review the diff, and apply it. Apply writes the whole list in one D1
+transaction, with one event per change, and refuses the whole list, writing
+nothing, if any row names a chain or a token the active version does not
+hold, names a token by a symbol that is not its own, or changes a decision
+without a reason:
+
+```sh
+curl -s "$API/registry/v1/admin/token-policies" -H "Authorization: Bearer $TOKEN" > token-policies.json
+# edit token-policies.json: "isStrategic": true on the approved tokens, and "reason"
+curl -s -X POST "$API/registry/v1/admin/token-policies/review" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @token-policies.json | jq .summary
+curl -s -X POST "$API/registry/v1/admin/token-policies/apply" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @token-policies.json | jq .summary
+```
+
+Applying a list again changes nothing, so the reviewed file can be kept and
+applied to every environment.
 
 # Testing
 

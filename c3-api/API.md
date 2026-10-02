@@ -1090,3 +1090,236 @@ source adds reads as a longer list and one more entry.
   }
 }
 ```
+
+## `PATCH /registry/v1/admin/networks/{chain_id}/tokens/{token_address}/policy`
+### description:
+
+Marks a token strategic, or takes the mark away. The mark is an input of the
+token visibility rule, under which a strategic token is shown wherever tokens
+are discovered whatever its collateral value; no route serves that rule yet,
+so for now a policy is decided and audited here and read back below.
+
+A policy belongs to the token — a chain id and an address — and not to a
+registry version, so it survives every activation, and a version that drops
+the token and a later one that brings it back bring its policy back with it.
+It is decided only for a token of the active version: a chain or a token that
+version does not hold answers `404`, and no active version answers
+`503 REGISTRY_NOT_ACTIVE`. The address may be in any case; it is stored and
+answered lowercase.
+
+The body is exactly a boolean and the reason, which is required and stored
+with the audit event beside the actor:
+
+```json
+{ "isStrategic": true, "reason": "Approved by governance" }
+```
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "chainId": 1,
+  "tokenAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+  "isStrategic": true,
+  "changed": true,
+  "updatedAt": "2026-10-02T09:12:44.512Z"
+}
+```
+
+A token nobody has decided about is not strategic. Asking for the decision
+already in force answers `changed: false`, writes nothing and keeps the time
+the decision was made, so a repeated or retried request is safe; `updatedAt`
+is `null` for a token nobody has ever decided about. A change is committed
+with its audit event before it is answered, and the answer names the version
+it was checked against, in the body and in `X-Registry-Version`. If a version
+without the token is activated while the change is being written, the write
+is rolled back, event and all, and the request answers `409`.
+
+```sh
+$ curl -X PATCH 'localhost:8787/registry/v1/admin/networks/1/tokens/0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2/policy' \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"isStrategic": true, "reason": "Approved by governance"}'
+```
+
+## `GET /registry/v1/admin/networks/{chain_id}/tokens`
+### description:
+
+Every token one network of the active version holds, with the decision in
+force for each: `isStrategic`, and when and by whom it was made, both `null`
+for a token nobody has decided about. It is what a reviewed list of policies
+is compared against before it changes anything.
+
+`retained` lists the decisions kept for tokens of the chain that the active
+version does not hold. Each applies again as soon as a version that holds its
+token is activated, so it is worth reviewing before one is. A chain the active
+version does not hold at all answers with `inActiveVersion: false`, no tokens,
+and what is kept for it; it is `404` only when nothing is.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "chainId": 1,
+  "inActiveVersion": true,
+  "tokens": [
+    {
+      "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "symbol": "WETH",
+      "name": "Wrapped Ether",
+      "decimals": 18,
+      "isStrategic": true,
+      "updatedAt": "2026-10-02T09:12:44.512Z",
+      "updatedBy": "registry-admin:stage"
+    }
+  ],
+  "retained": [
+    {
+      "address": "0x57f5e098cad7a3d1eed53991d4d66c45c9af7812",
+      "isStrategic": true,
+      "updatedAt": "2026-09-30T14:20:11.903Z",
+      "updatedBy": "registry-admin:stage"
+    }
+  ]
+}
+```
+
+## `GET /registry/v1/admin/networks/{chain_id}/tokens/{token_address}/policy`
+### description:
+
+One token's decision and the changes that led to it, at most 100, newest
+first in the order they were committed, so the first is always the change
+that set the decision in force. `previousIsStrategic` is `null` for the first
+decision about a token.
+
+A decision stays readable while the active version does not hold its token,
+with `inActiveVersion: false`; it applies again once a version that holds the
+token is activated. Only a token the active version does not hold and nobody
+has decided about answers `404`.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "chainId": 1,
+  "tokenAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+  "inActiveVersion": true,
+  "isStrategic": false,
+  "updatedAt": "2026-10-02T10:01:07.020Z",
+  "updatedBy": "registry-admin:stage",
+  "events": [
+    {
+      "id": "6f1e0c4e-2a7b-4d0e-9f61-2b8f5d1c9a33",
+      "previousIsStrategic": true,
+      "isStrategic": false,
+      "actor": "registry-admin:stage",
+      "reason": "No longer strategic",
+      "createdAt": "2026-10-02T10:01:07.020Z"
+    },
+    {
+      "id": "0c55b0f3-8b1e-4a54-b3f4-6a0d3c2e7f19",
+      "previousIsStrategic": null,
+      "isStrategic": true,
+      "actor": "registry-admin:stage",
+      "reason": "Approved by governance",
+      "createdAt": "2026-10-02T09:12:44.512Z"
+    }
+  ]
+}
+```
+
+## `GET /registry/v1/admin/token-policies`
+### description:
+
+Every token of every network of the active version with the decision in
+force, as a list review and apply take back: the file an operator edits
+instead of writing addresses by hand. Rows are ordered by chain, then symbol.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "reason": null,
+  "policies": [
+    { "chainId": 1, "tokenAddress": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "symbol": "USDC", "isStrategic": false },
+    { "chainId": 1, "tokenAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "symbol": "WETH", "isStrategic": true }
+  ]
+}
+```
+
+## `POST /registry/v1/admin/token-policies/review`
+### description:
+
+What applying a list would change, row by row, without writing anything. The
+body is a list as the export answers it, edited, of 1 to 500 rows and at most
+1 MiB:
+
+- `policies[]`: `chainId`, `tokenAddress` (any case) and `isStrategic` are
+  required; `symbol` is optional and only checked — a symbol that is not the
+  token's is reported as the mistake it usually is; `reason` is optional.
+- `reason` at the top is the reason for every row that changes and has none of
+  its own. A row that changes a decision needs one or the other; a row that
+  leaves its token as it is needs neither.
+- `registryVersion` says where the list was exported from, and is not checked:
+  a decision belongs to no version.
+
+A malformed body answers `400` with every problem of every row in
+`details.problems`. A well-formed one answers `200`, with each row's
+`problem` in place of refusing:
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "summary": { "change": 1, "unchanged": 96, "problems": 0 },
+  "policies": [
+    {
+      "row": 2,
+      "chainId": 1,
+      "tokenAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "symbol": "WETH",
+      "current": false,
+      "requested": true,
+      "action": "change",
+      "reason": "Initial approved list",
+      "problem": null
+    }
+  ]
+}
+```
+
+A `problem` is one of: a chain or a token the active version does not hold, a
+symbol that names another token, or a change without a reason.
+
+## `POST /registry/v1/admin/token-policies/apply`
+### description:
+
+Applies a list — the same body as review — in one transaction: every decision
+it changes is written with its own audit event, and the transaction requires
+every row, the unchanged ones included, to hold what the list says once it is
+done. A list is applied completely or not at all:
+
+- a list with any `problem` answers `422`, naming each such row in
+  `details.problems`, and writes nothing;
+- a version activated, or a decision of the list changed by someone else,
+  while the list is being written answers `409` and writes nothing.
+
+Applying the same list again changes nothing.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "summary": { "changed": 1, "unchanged": 96 },
+  "policies": [
+    {
+      "row": 2,
+      "chainId": 1,
+      "tokenAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "symbol": "WETH",
+      "isStrategic": true,
+      "changed": true,
+      "updatedAt": "2026-10-02T09:12:44.512Z"
+    }
+  ]
+}
+```
+
+```sh
+$ curl -X POST 'localhost:8787/registry/v1/admin/token-policies/apply' \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    --data @token-policies.json
+```
