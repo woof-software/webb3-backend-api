@@ -1247,7 +1247,7 @@ const Comet_01test1uusdc = Comet(<const>{
   address: "0xAfaCa8573a21231CdD38BF7FF2CeD8Cd47C26599",
   block: {
     number: 26126561,
-    timestamp: 1791207043,
+    timestamp: 1791208067,
   },
 });
 
@@ -1275,8 +1275,8 @@ const Comet_01testusdc = Comet(<const>{
   network: "ethereum-mainnet",
   address: "0x20f48143FDF6c0B01FF05399f85E5Cad55aAd5F4",
   block: {
-    number: 25602729,
-    timestamp: 1784897663,
+    number: 26095566,
+    timestamp: 1790834795,
   },
 });
 
