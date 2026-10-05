@@ -203,6 +203,17 @@ BEGIN
   SELECT RAISE(ABORT, 'token policy events are append-only');
 END;
 
+-- A writer that names rowid -1 itself is the one case the trigger above cannot
+-- tell from an assigned rowid. After the insert the real rowid is known, and
+-- one the table did not assign — never below 1 — is refused, a REPLACE at
+-- that rowid included.
+CREATE TRIGGER token_policy_events_assigned_rowid
+AFTER INSERT ON token_policy_events
+WHEN NEW.rowid < 1
+BEGIN
+  SELECT RAISE(ABORT, 'token policy events are append-only');
+END;
+
 -- What a write of decisions expects to hold once it is done. Inserting into
 -- this view writes nothing: its triggers abort the transaction when a token is
 -- not in the active registry version, or does not hold the decision expected.

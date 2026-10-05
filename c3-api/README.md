@@ -296,13 +296,17 @@ without a reason:
 curl -s "$API/registry/v1/admin/token-policies" -H "Authorization: Bearer $TOKEN" > token-policies.json
 # edit token-policies.json: "isStrategic": true on the approved tokens, and "reason"
 curl -s -X POST "$API/registry/v1/admin/token-policies/review" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @token-policies.json | jq .summary
+  -H 'Content-Type: application/json' --data @token-policies.json | jq 'if .error then .error else .summary end'
 curl -s -X POST "$API/registry/v1/admin/token-policies/apply" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @token-policies.json | jq .summary
+  -H 'Content-Type: application/json' --data @token-policies.json | jq 'if .error then .error else .summary end'
 ```
 
-Applying a list again changes nothing, so the reviewed file can be kept and
-applied to every environment.
+Apply compares the list with the decisions in force when it runs, so review it
+right before applying it. Applying a list again changes nothing. A list
+applies only where the active version holds every token it names, so the file
+kept for other environments is best reduced to the rows the list decides —
+the routes leave every token a list does not name as it is — and reviewed in
+each environment before it is applied there.
 
 # Testing
 

@@ -43,10 +43,12 @@ const checksumOf = (address: string) => address.slice(0, 2) + address.slice(2).t
 
 type ErrorBody = { error: { code: string, message: string, details?: { registryVersion?: { id: string } } } };
 
-async function freshDatabase({ activate }: { activate: boolean }): Promise<{ db: D1Database, versionId: string }> {
+async function freshDatabase(
+  { activate, through }: { activate: boolean, through?: string },
+): Promise<{ db: D1Database, versionId: string }> {
   await server.reset();
   const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db);
+  await applyMigrations(db, undefined, through === undefined ? {} : { through });
   const { versionId } = await seedCandidate(db, snapshot);
   await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
   await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
@@ -225,6 +227,7 @@ t.test('a list of decisions is checked completely before anything is read or wri
   t.ok(JSON.stringify({ policies }).length > 64 * 1024, 'a list past the ordinary 64 KiB');
   const long = await post(REVIEW, { policies });
   t.equal(long.status, 200, 'is read, and reviewed');
+  t.equal((await post(APPLY, { policies })).status, 422, 'and by apply, which refuses it for its rows, not for its size');
 
   t.equal(await written(db), 0, 'none of it wrote anything');
 });
@@ -248,4 +251,23 @@ t.test('the list routes are behind the token, and answer only for an active vers
     t.equal((await response.json() as ErrorBody).error.code, 'REGISTRY_NOT_ACTIVE');
   }
   t.equal(await written(db), 0, 'nothing was written');
+});
+
+/*
+ * A release deployed before its migration finds the token policy tables
+ * missing. That is said, with what to do about it, rather than answered as an
+ * internal error only the logs explain.
+ */
+t.test('a database without the token policy migration says so', async t => {
+  await freshDatabase({ activate: true, through: '0003' });
+
+  for (const [ name, response ] of [
+    [ 'the export',     await server.fetch('/registry/v1/admin/token-policies', { headers: auth }) ],
+    [ 'a policy change', await patch(policyPath(1, WETH), { isStrategic: true, reason: 'approved' }) ],
+  ] as const) {
+    t.equal(response.status, 503, `${name} answers 503`);
+    const body = await response.json() as ErrorBody;
+    t.equal(body.error.code, 'UPSTREAM_UNAVAILABLE');
+    t.match(body.error.message, /apply the D1 migrations/, 'naming the remedy');
+  }
 });

@@ -77,6 +77,15 @@ function asApiError(error: unknown): ApiError | null {
   return new ApiError(ERROR_STATUS[error.code] ?? 'UPSTREAM_UNAVAILABLE', error.message, { code: error.code });
 }
 
+/*
+ * A release that reached an environment before the migrations it needs finds
+ * a table missing. The remedy is known and is an operator's, so it is said,
+ * rather than answered as an internal error only the logs explain.
+ */
+function missingSchema(error: unknown): boolean {
+  return /no such table/i.test(String(error));
+}
+
 function withHeaders(response: Response, headers: Record<string, string>): Response {
   for (const [ name, value ] of Object.entries(headers)) {
     response.headers.set(name, value);
@@ -136,6 +145,14 @@ async function routeRegistry(
         jsonResponse(errorBody(apiError, requestId), { status: apiError.status }),
         { ...cors, ...apiError.headers },
       );
+    }
+    if (missingSchema(error)) {
+      debug.error(`registry route found the database schema behind this release`, { requestId, pathname, error });
+      const unavailable = new ApiError(
+        'UPSTREAM_UNAVAILABLE',
+        `the database is missing tables this release needs: apply the D1 migrations to this environment`,
+      );
+      return withHeaders(jsonResponse(errorBody(unavailable, requestId), { status: unavailable.status }), cors);
     }
     /*
      * Anything else is a bug or an upstream failure this route did not

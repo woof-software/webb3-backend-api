@@ -21,7 +21,12 @@ import {
   recordValidationResults,
   snapshotChecksum,
 } from '../../../src/registry/repository.js';
-import { writeTokenPolicy, writeTokenPolicyList } from '../../../src/registry/token-policy-repository.js';
+import {
+  DecisionList,
+  applyTokenPolicies,
+  writeTokenPolicy,
+  writeTokenPolicyList,
+} from '../../../src/registry/token-policy-repository.js';
 
 import { applyMigrations, foreignKeyViolations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
@@ -30,7 +35,8 @@ import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-
  * Token policies, through the real worker in workerd over local D1: a
  * decision and its audit, idempotency under a race, survival across
  * activations, the database guard against an activation that races a write,
- * and the seed client that applies a reviewed list through the same route.
+ * and a list of decisions exported, reviewed and applied through the
+ * token-policies routes.
  *
  * Refusals of malformed requests are in token-policy-routes.test.ts, which
  * keeps each file's administrative requests well inside the limiter's budget.
@@ -144,6 +150,7 @@ t.test('a decision is set, kept, and reversed, with one audit event per change',
   t.equal(listed.status, 200);
   t.same(listed.body.registryVersion, registryVersion, 'the list names the version it lists');
   t.equal(listed.header('x-registry-version'), versionId, 'in its headers too');
+  t.equal(listed.body.inActiveVersion, true, 'a chain the version holds');
   const mainnet = new Set(snapshot.networks.find(network => network.chainId === 1)!.markets.flatMap(market => [
     market.baseAsset.token.address,
     ...(market.rewardAsset === null ? [] : [ market.rewardAsset.token.address ]),
@@ -254,8 +261,36 @@ t.test('a decision outlives the version it was made under', async t => {
 
   await switchTo(first, 'rollback');
   const restored = await read<TokenPolicyDetailV1>(`/registry/v1/admin/networks/1/tokens/${WUSDM}/policy`);
-  t.same([ restored.status, restored.body.isStrategic, restored.body.updatedAt ], [ 200, true, wusdm.body.updatedAt ],
-    'a version that brings the token back brings its decision back with it');
+  t.same(
+    [ restored.status, restored.body.inActiveVersion, restored.body.isStrategic, restored.body.updatedAt ],
+    [ 200, true, true, wusdm.body.updatedAt ],
+    'a version that brings the token back brings its decision back with it, in force again',
+  );
+  const relisted = await read<TokenPoliciesV1>('/registry/v1/admin/networks/1/tokens');
+  t.same(
+    [ relisted.body.tokens.find(entry => entry.address === WUSDM)?.isStrategic, relisted.body.retained ],
+    [ true, [] ],
+    'listed among the tokens again, and no longer kept apart',
+  );
+});
+
+t.test('a chain the active version drops keeps its decisions, and still lists them', async t => {
+  const env = await freshEnv();
+  const db  = env.APP_DB;
+  await switchTo(await seedValidated(db));
+  const aero = await decide(8453, AERO, { isStrategic: true, reason: 'strategic' });
+  await switchTo(await seedValidated(db, snapshot.networks.filter(network => network.chainId !== 8453), randomUUID()));
+
+  const listed = await read<TokenPoliciesV1>('/registry/v1/admin/networks/8453/tokens');
+  t.equal(listed.status, 200, 'a chain the version does not hold is listed while a decision is kept for it');
+  t.same(
+    [ listed.body.inActiveVersion, listed.body.tokens, listed.body.retained ],
+    [ false, [], [ { address: AERO, isStrategic: true, updatedAt: aero.body.updatedAt, updatedBy: actorOf(env) } ] ],
+    'with no tokens, and the decision it keeps',
+  );
+  const detail = await read<TokenPolicyDetailV1>(`/registry/v1/admin/networks/8453/tokens/${AERO}/policy`);
+  t.same([ detail.status, detail.body.inActiveVersion, detail.body.isStrategic ], [ 200, false, true ],
+    'and the decision stays readable');
 });
 
 /*
@@ -278,6 +313,9 @@ t.test('an activation that drops the token between the read and the write aborts
   await t.rejects(() => writeTokenPolicy(db, { ...change, isStrategic: false }), { code: 'CONFLICT' },
     'a request that would change nothing is refused too, rather than answered for a version that does not hold the token');
 });
+
+const REVIEW = '/registry/v1/admin/token-policies/review';
+const APPLY  = '/registry/v1/admin/token-policies/apply';
 
 async function post<T>(path: string, body: unknown): Promise<Answer<T>> {
   return answerOf<T>(await server.fetch(path, {
@@ -314,7 +352,7 @@ t.test('a list of decisions is exported, reviewed, and applied as one', async t 
   t.same(exported.body.policies.find(row => row.chainId === 1 && row.tokenAddress === USDC),
     { chainId: 1, tokenAddress: USDC, symbol: 'USDC', isStrategic: true }, 'each with the decision in force');
 
-  const untouched = await post<TokenPolicyReviewV1>('/registry/v1/admin/token-policies/review', exported.body);
+  const untouched = await post<TokenPolicyReviewV1>(REVIEW, exported.body);
   t.equal(untouched.status, 200, 'the export is a list review takes back as it is');
   t.same(untouched.body.summary, { change: 0, unchanged: every.length, problems: 0 }, 'and it changes nothing');
 
@@ -328,7 +366,7 @@ t.test('a list of decisions is exported, reviewed, and applied as one', async t 
       : row.chainId === 1    && row.tokenAddress === USDC ? { ...row, isStrategic: false }
       : row),
   };
-  const review = await post<TokenPolicyReviewV1>('/registry/v1/admin/token-policies/review', edited);
+  const review = await post<TokenPolicyReviewV1>(REVIEW, edited);
   t.same(review.body.summary, { change: 3, unchanged: every.length - 3, problems: 0 });
   t.same(
     review.body.policies.filter(row => row.action === 'change').map(row => [ row.symbol, row.current, row.requested, row.reason ]),
@@ -342,7 +380,7 @@ t.test('a list of decisions is exported, reviewed, and applied as one', async t 
   );
   t.equal(await count(db, 'token_policy_events'), 1, 'and writes nothing');
 
-  const applied = await post<TokenPolicyApplyV1>('/registry/v1/admin/token-policies/apply', edited);
+  const applied = await post<TokenPolicyApplyV1>(APPLY, edited);
   t.equal(applied.status, 200);
   t.same(applied.body.summary, { changed: 3, unchanged: every.length - 3 }, 'applying writes exactly the reviewed changes');
   t.equal(applied.header('x-registry-version'), versionId);
@@ -364,7 +402,7 @@ t.test('a list of decisions is exported, reviewed, and applied as one', async t 
     'and the decisions are what the list says',
   );
 
-  const again = await post<TokenPolicyApplyV1>('/registry/v1/admin/token-policies/apply', edited);
+  const again = await post<TokenPolicyApplyV1>(APPLY, edited);
   t.same(again.body.summary, { changed: 0, unchanged: every.length }, 'applying the same list again changes nothing');
   t.equal(await count(db, 'token_policy_events'), 4, 'and records nothing');
   t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
@@ -398,7 +436,7 @@ t.test('a list with any problem is refused whole, and its problems are named row
   t.equal(review.body.summary.problems, 5);
 
   const refused = await post<{ error: { code: string, details: { registryVersion: { id: string }, problems: Array<{ row: number }> } } }>(
-    '/registry/v1/admin/token-policies/apply', list);
+    APPLY, list);
   t.equal(refused.status, 422, 'apply refuses a list with any problem');
   t.same(refused.body.error.details.problems.map(problem => problem.row), [ 2, 3, 4, 5, 6 ], 'naming every row it refuses');
   t.equal(await count(db, 'token_policy_events'), 0, 'and writes nothing, not even the rows that were fine');
@@ -440,4 +478,53 @@ t.test('a list that meets an activation or another decision while it is written 
   );
   t.equal(await count(db, 'token_policy_events'), events, 'none of them wrote anything');
   t.equal(await count(db, 'token_policies', 'token_address = ?1', WETH), 0, 'not even the rows that were fine');
+});
+
+/*
+ * The database a request writes through, with `meanwhile` run once just
+ * before its first batch: after what the request read, and before it writes.
+ */
+function beforeFirstBatch(db: D1Database, meanwhile: () => Promise<unknown>): D1Database {
+  let pending: (() => Promise<unknown>) | null = meanwhile;
+  return new Proxy(db, {
+    get(target, property) {
+      const value = Reflect.get(target, property) as unknown;
+      if (property === 'batch') {
+        return async (statements: D1PreparedStatement[]) => {
+          if (pending !== null) {
+            const run = pending;
+            pending = null;
+            await run();
+          }
+          return await (value as D1Database['batch']).call(target, statements);
+        };
+      }
+      return typeof(value) === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+/*
+ * Between apply's own comparison and its write. A row that comparison found
+ * unchanged is asserted rather than written, so a decision made in that
+ * window aborts the list instead of being reverted by it — with the reason
+ * given once for the whole list, as the runbook has it.
+ */
+t.test('a decision made while a list is being applied aborts the list, rather than being reverted', async t => {
+  const { APP_DB: db } = await freshEnv();
+  await switchTo(await seedValidated(db));
+  const list: DecisionList = {
+    reason:    'initial approved list',
+    decisions: [
+      { chainId: 1, tokenAddress: WETH, symbol: null, isStrategic: true,  reason: null },
+      { chainId: 1, tokenAddress: WBTC, symbol: null, isStrategic: false, reason: null },
+    ],
+  };
+  const racing = beforeFirstBatch(db, () => decide(1, WBTC, { isStrategic: true, reason: 'governance vote 42' }));
+
+  await t.rejects(() => applyTokenPolicies(racing, list, 'test-admin'),
+    { code: 'CONFLICT', message: /changed by someone else while it was being applied; nothing was written/ });
+  t.equal(await count(db, 'token_policies', 'token_address = ?1', WETH), 0, 'nothing of the list is written');
+  t.equal(await db.prepare(`SELECT is_strategic FROM token_policies WHERE token_address = ?1`).bind(WBTC).first<number>('is_strategic'), 1,
+    'and the decision made meanwhile stands');
 });

@@ -565,9 +565,13 @@ async function writeTokenPolicyList(db: D1Database, list: DecisionList, actor: s
 
 /*
  * The administrative command for a list: refuse it whole, before writing
- * anything, if any row cannot be applied, then write it. As for one token,
- * the review first is for a precise refusal; the write checks again inside
- * its own transaction.
+ * anything, if any row cannot be applied, then write it.
+ *
+ * The list is compared with the decisions in force when it is applied, not
+ * when it was reviewed. Only the rows that comparison finds to change are
+ * written. Every other row is stated without a reason, so the write asserts
+ * it rather than writing it: a decision someone makes on such a token between
+ * the comparison and the write aborts the list instead of being reverted.
  */
 async function applyTokenPolicies(db: D1Database, list: DecisionList, actor: string): Promise<TokenPolicyApplyV1> {
   const { registryVersion, rows } = await planDecisions(db, list);
@@ -580,7 +584,9 @@ async function applyTokenPolicies(db: D1Database, list: DecisionList, actor: str
       { problems: problems.map(({ row, chainId, tokenAddress, problem }) => ({ row, chainId, tokenAddress, problem })) },
     );
   }
-  return await writeTokenPolicyList(db, list, actor);
+  const decisions = decisionsOf(list).map((decision, index) =>
+    rows[index]!.action === 'change' ? decision : { ...decision, reason: null });
+  return await writeTokenPolicyList(db, { reason: null, decisions }, actor);
 }
 
 export type { DecisionList, ListedDecision, PolicyChange };

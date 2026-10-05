@@ -1298,7 +1298,13 @@ done. A list is applied completely or not at all:
 - a version activated, or a decision of the list changed by someone else,
   while the list is being written answers `409` and writes nothing.
 
-Applying the same list again changes nothing.
+The list is compared with the decisions in force when it is applied, not when
+it was reviewed, so review it right before applying it: a decision someone
+made in between is changed like any other row the list contradicts, and shows
+in the answer as a change. A row the comparison finds unchanged is not
+written, only checked, so a decision made on that token while the list is
+being written is never reverted by it. Applying the same list again changes
+nothing.
 
 ```json
 {
@@ -1323,3 +1329,7 @@ $ curl -X POST 'localhost:8787/registry/v1/admin/token-policies/apply' \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
     --data @token-policies.json
 ```
+
+Every token policy route answers `503 UPSTREAM_UNAVAILABLE` naming the D1
+migrations when the environment's database does not have migration `0004`
+yet: a release deployed before its migration.

@@ -780,6 +780,7 @@ mark, in the form the next two requests take:
 
 ```sh
 curl -s "$API/registry/v1/admin/token-policies" -H "Authorization: Bearer $TOKEN" > token-policies.json
+jq 'if .error then .error else (.policies | length) end' token-policies.json   # how many tokens, or why not
 ```
 
 Postman:
@@ -792,14 +793,15 @@ Authorization: Bearer {{TOKEN}}
 (**Save Response → Save to a file**.) Edit the file: set `"isStrategic": true`
 on the approved tokens (or `false` to take a mark away) and write why in the
 `"reason"` at the top. A row may carry its own `"reason"`, which wins. Leave
-every other row as it is; a row that changes nothing needs no reason.
+every other row as it is, or delete it: a row that changes nothing needs no
+reason, and a token the list does not name is left as it is.
 
 **2. See what it would change** — this writes nothing:
 
 ```sh
 curl -s -X POST "$API/registry/v1/admin/token-policies/review" -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' --data @token-policies.json \
-  | jq '.summary, (.policies[] | select(.action == "change" or .problem != null))'
+  | jq 'if .error then .error else .summary, (.policies[] | select(.action == "change" or .problem != null)) end'
 ```
 
 Postman:
@@ -809,30 +811,41 @@ POST {{API}}/registry/v1/admin/token-policies/review
 Authorization: Bearer {{TOKEN}}
 Content-Type: application/json
 
-(Body → binary → token-policies.json)
+(Body → raw → JSON, and paste the file)
 ```
+
+Pasting into **raw → JSON** is what sets `Content-Type: application/json`.
+**Body → binary** works too, with that header added by hand; without it the
+API answers `400 the request body must be JSON`.
 
 **You should see** `"problems": 0`, and under `change` exactly the tokens the
 list decides, each with what it is now (`current`), what the list wants
-(`requested`) and the reason it will be recorded with. A row with a `problem`
-names a chain or a token the version that is on does not hold, a symbol that
-is not that token's, or a change without a reason; fix the file and review it
-again.
+(`requested`) and the reason it will be recorded with. A row with a `problem` names a chain or a token the version that
+is on does not hold, a symbol that is not that token's, or a change without a
+reason; fix the file and review it again.
 
-**3. Apply it** — the same file:
+**3. Apply it** — the same file, right after the review:
 
 ```sh
 curl -s -X POST "$API/registry/v1/admin/token-policies/apply" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @token-policies.json | jq .summary
+  -H 'Content-Type: application/json' --data @token-policies.json \
+  | jq 'if .error then .error else .summary end'
 ```
 
 Postman: the same request as step 2, to `…/token-policies/apply`.
 
 **You should see** `"changed"` equal to the number of changes the review
-showed. The list is written in one go: if any row cannot be applied, nothing
-is, and the answer says which rows (`422`). Applying the same file again
-changes nothing, so keep it, and apply it to the next environment the same
-way.
+showed. Apply compares the file with the decisions in force when it runs: if
+the number differs, someone decided one of its tokens after your review, and
+the answer's rows show which. The list is written in one go: if any row
+cannot be applied (`422`, naming the rows), or a version is switched on or
+one of its tokens decided while it is being written (`409`), nothing is
+written. Applying the same file again changes nothing.
+
+To use the list in another environment, keep only the rows it decides: a list
+applies only where the version that is on holds every token it names, and
+another environment's version may not hold one of them. Review it there
+before applying it.
 
 ## Keeping an eye on it
 
@@ -903,7 +916,8 @@ A difference not in it is worth a developer's look before switching on.
 | `409` marking a token, "left the active registry" | A version without that token was switched on while the change was being written; nothing was written | Check which version is on, and mark the token again if it is still there |
 | `404` "no registry route matches …/token-policies" | The Worker at that address was deployed before token policies | Deploy the release with token policies first |
 | `422` applying a list | Some rows cannot be applied; `details.problems` names each with why; nothing was written | Fix those rows — review shows them in context — and apply again |
-| `409` applying a list, "nothing was written" | A version was switched on, or one of the list's tokens was decided by someone else, while the list was being written | Review the file again, then apply it |
+| `409` applying a list, "while it was being applied" | A version was switched on, or one of the list's tokens was decided by someone else, while the list was being written | Review the file again, then apply it |
+| `503` "the database is missing tables this release needs" | The worker was deployed before its D1 migrations — for token policies, `0004` | Apply the migrations to this environment (`npm run d1:migrate:<env>`, or `npx wrangler d1 migrations apply APP_DB --remote -c <config>`) |
 | `409` writing overlays | The draft is no longer open: it was validated, switched on, or replaced by a newer attempt of its commit (`GET /registry/v1/admin/versions/<id>` says which) | Look for the newest open draft first (`GET /registry/v1/admin/versions?status=importing`) and continue there; start a new attempt (step 1 with `forceNewAttempt`) only if there is none |
 | `409` on apply, naming another digest | The proposal changed since you read it | Read the review again, and apply its digest |
 | `409` on validate, "the import … is still running" | The import has not finished | Send step 1 again until it completes |

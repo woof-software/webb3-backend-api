@@ -1050,6 +1050,16 @@ t.test('a token policy is decided for an active token, and every change is audit
     { message: /append-only/ },
     'and an event takes the next rowid, never one a writer chooses, since history is read in rowid order',
   );
+  for (const verb of [ 'INSERT', 'INSERT OR REPLACE' ]) {
+    await t.rejects(
+      () => run(db,
+        `${verb} INTO token_policy_events (rowid, id, chain_id, token_address, previous_is_strategic, is_strategic, actor, reason, created_at)
+         VALUES (-1, ?1, 1, ?2, 1, 0, 'test-admin', 'reviewed', ?3)`,
+        randomUUID(), token, NOW),
+      { message: /append-only/ },
+      `${verb} at rowid -1 included, which a BEFORE trigger cannot tell from a rowid the table assigns`,
+    );
+  }
   await t.rejects(
     () => run(db,
       `INSERT OR REPLACE INTO token_policies (rowid, chain_id, token_address, is_strategic, updated_at, updated_by)

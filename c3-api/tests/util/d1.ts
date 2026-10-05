@@ -16,9 +16,19 @@ type Row = Record<string, SqlValue>;
  * Applies every migration file in name order, as `wrangler d1 migrations
  * apply` does, splitting each file with Wrangler's own trigger-aware splitter.
  * A file runs as one batch, so a failing statement leaves no partial file.
+ *
+ * `through` stops after the migration with that number, which is how a test
+ * reaches a database a release has been deployed to before its migrations.
  */
-async function applyMigrations(db: D1Database, directory: string = MIGRATIONS_DIR): Promise<string[]> {
-  const files = readdirSync(directory).filter(name => name.endsWith('.sql')).sort();
+async function applyMigrations(
+  db: D1Database,
+  directory: string = MIGRATIONS_DIR,
+  { through }: { through?: string } = {},
+): Promise<string[]> {
+  const files = readdirSync(directory)
+    .filter(name => name.endsWith('.sql'))
+    .filter(name => through === undefined || name.slice(0, 4) <= through)
+    .sort();
   for (const file of files) {
     const statements = unstable_splitSqlQuery(readFileSync(join(directory, file), 'utf8'));
     await db.batch(statements.map(statement => db.prepare(statement)));
