@@ -1254,7 +1254,7 @@ const Comet_01test1uusdc = Comet(<const>{
 const market01test1uusdc = <const>[Comet_01test1uusdc];
 
 /*
- * "Institutional Comet" (cinUSDC), the service-patched counterpart of
+ * "The service-patched counterpart of
  * ctest1uUSDCv3 above. Originally declared as ctestUSDCv3 ("Compound TEST Svc
  * Patch USDC"); the proxy has since been upgraded (implementation
  * 0x296c51cf1e2973e8e6af29ea27c797d4e8b41f90) and it now holds liquidity, so
@@ -1273,7 +1273,7 @@ const Comet_01testusdc = Comet(<const>{
     priceFeed: COMP_USD_priceFeed,
   },
   network: "ethereum-mainnet",
-  address: "0xf5a628D53c47fBA2C062cd6F5B6D255cb05645Eb",
+  address: "0x20f48143FDF6c0B01FF05399f85E5Cad55aAd5F4",
   block: {
     number: 25602729,
     timestamp: 1784897663,
