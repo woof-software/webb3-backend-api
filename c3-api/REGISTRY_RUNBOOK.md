@@ -545,7 +545,7 @@ fields below are decided.
 | `isDefault` | The market the website opens first | `false` — exactly one market in the whole registry is the default |
 | `creationBlock` | Where the market's history and indexes start | The block the Comet proxy was deployed in (the explorer's "Contract Creation"). Must be above `0` for a market that is served |
 | `collateralValueQuote` | The unit the market's own price feeds answer in | Call `description()` on the base token's price feed from step 2. `X / USD` → `usd`. `Constant price feed` (WETH, wstETH) or `WBTC / BTC` → `base` |
-| `baseAsset.usdPriceFeedAddress` | The feed that turns the base asset into USD | `null` when the quote is `usd`. When it is `base`, the base asset's USD feed on that chain — for a WETH market, ETH / USD |
+| `baseAsset.usdPriceFeedAddress` | The feed that turns the unit the market's feeds answer in into USD | `null` when the quote is `usd`. When it is `base`, the USD feed of that unit on that chain: ETH / USD for a WETH market, BTC / USD for the WBTC market, whose feeds answer in BTC |
 | `baseAsset.isWrappedNative` | The base token wraps the chain's own token | `true` for WETH on Ethereum and its L2s, WPOL, WMNT, WRON |
 | `capabilities.rewards`, `capabilities.accountRewards`, `rewardPriceFeed` | Rewards | If step 2 shows no reward token, the market has no rewards: both `false`, `rewardPriceFeed` `null`. Otherwise the COMP price feed of that chain, `"quote": "usd"`, as the similar market has it |
 | `capabilities.transactionHistory` | Whether the market appears in users' transaction history | `true` if it should. The market needs a rewards contract, and a right `creationBlock` |
@@ -716,9 +716,10 @@ and it is also in the activation history that
 ## Marking a token strategic
 
 A strategic token is shown wherever the app lists tokens, whatever its
-collateral value. Nothing reads the mark yet — the token list that applies it
-comes with a later release — so for now marking a token records the decision
-and changes nothing users see.
+collateral value. Any other token is shown when its collateral is worth at
+least USD 250,000, or when its value cannot be read. The token list reads the
+mark on every request, so a change is in its next answer; a browser may keep
+an answer for up to 30 seconds.
 
 The mark belongs to the token itself — its chain and its address — so it
 stays when a newer version is switched on, and comes back if a version drops
@@ -847,6 +848,28 @@ applies only where the version that is on holds every token it names, and
 another environment's version may not hold one of them. Review it there
 before applying it.
 
+### What the token list shows
+
+The list is public, so it needs no token:
+
+```sh
+curl -s "$API/registry/v1/networks/1/tokens" \
+  | jq '.block, (.tokens[] | {symbol, collateralValueUsd, collateralValueStatus, isVisible, visibilityReason})'
+```
+
+Postman:
+
+```http
+GET {{API}}/registry/v1/networks/1/tokens
+```
+
+**You should see** `block` with a recent block, and every token with
+`"collateralValueStatus": "fresh"` or `"exception"`. A strategic token says
+`"visibilityReason": "strategic"`; any other is shown by
+`collateral_threshold` or hidden by `below_threshold`. A token that says
+`data_unavailable` is shown because its value could not be established — see
+[When something goes wrong](#when-something-goes-wrong).
+
 ## Keeping an eye on it
 
 One request tells you whether the registry is well:
@@ -918,6 +941,10 @@ A difference not in it is worth a developer's look before switching on.
 | `422` applying a list | Some rows cannot be applied; `details.problems` names each with why; nothing was written | Fix those rows — review shows them in context — and apply again |
 | `409` applying a list, "while it was being applied" | A version was switched on, or one of the list's tokens was decided by someone else, while the list was being written | Review the file again, then apply it |
 | `503` "the database is missing tables this release needs" | The worker was deployed before its D1 migrations — for token policies, `0004` | Apply the migrations to this environment (`npm run d1:migrate:<env>`, or `npx wrangler d1 migrations apply APP_DB --remote -c <config>`) |
+| The token list has `"block": null`, and its collateral tokens are `stale` or `unavailable` | The worker cannot reach the node provider proxy. Tokens no enabled market takes as collateral stay `fresh` `"0"` | Fix the proxy or its binding; the list recovers by itself on the next minute |
+| A token is `unavailable` (`data_unavailable`) while `block` is set | Some of its collateral could not be valued, what could is below the threshold, and no minute of the last 15 valued all of it. The worker's `token_collateral_minute` log line lists each failed position under `failures`, with its market, asset index and reason | `price_reverted`: the feed reverts — the worker also logs `price feed reverted: <feed> read by <Comet>` — see [A market that stopped answering](#a-market-that-stopped-answering). `usd_price_reverted`: the market's base USD feed reverts; change it in the market's overlay. `asset_mismatch`, `feed_mismatch`, `scale_mismatch` or `asset_info_reverted`: the chain no longer describes the market as the version does — import again and switch the new version on. `transport` (counted under `failed` only): the node, as above |
+| Collateral tokens are `stale` or `unavailable` while `block` is set, and there is no `token_collateral_minute` line, only `token_collateral_deadline` with `"phase": "minute"` | The node answered the minute's reads too slowly for a request to wait for them | Nothing to do if it passes: the valuation finishes in the background and the next request of the minute answers from it. If it persists, the node provider proxy is slow — check it |
+| `503` on the token list | No version is on (`REGISTRY_NOT_ACTIVE`), or the database did not answer the token policies (`UPSTREAM_UNAVAILABLE`) | The list cannot say which tokens are strategic without the database; it answers again once D1 does |
 | `409` writing overlays | The draft is no longer open: it was validated, switched on, or replaced by a newer attempt of its commit (`GET /registry/v1/admin/versions/<id>` says which) | Look for the newest open draft first (`GET /registry/v1/admin/versions?status=importing`) and continue there; start a new attempt (step 1 with `forceNewAttempt`) only if there is none |
 | `409` on apply, naming another digest | The proposal changed since you read it | Read the review again, and apply its digest |
 | `409` on validate, "the import … is still running" | The import has not finished | Send step 1 again until it completes |

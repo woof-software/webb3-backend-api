@@ -48,11 +48,14 @@ type RequestCatalog = {
  */
 class RegistryUnavailable extends Error {
   readonly cause: unknown;
+  // nothing is active, or the registry could not be read: a route that answers both differently tells them apart
+  readonly reason: 'not_active' | 'unreadable';
 
-  constructor(message: string, cause?: unknown) {
+  constructor(message: string, reason: 'not_active' | 'unreadable', cause?: unknown) {
     super(message);
-    this.name  = 'RegistryUnavailable';
-    this.cause = cause;
+    this.name   = 'RegistryUnavailable';
+    this.reason = reason;
+    this.cause  = cause;
   }
 }
 
@@ -194,11 +197,11 @@ function requestCatalog(env: Env, debug?: CacheDeps['debug']): RequestCatalog {
           loaded = await activeCatalog(deps);
         } catch (error) {
           pending = null;
-          throw new RegistryUnavailable(`the comet registry could not be read`, error);
+          throw new RegistryUnavailable(`the comet registry could not be read`, 'unreadable', error);
         }
         if (loaded === null) {
           pending = null;
-          throw new RegistryUnavailable(`no comet registry version is active`);
+          throw new RegistryUnavailable(`no comet registry version is active`, 'not_active');
         }
         catalog  = loaded.catalog;
         staleFor = loaded.staleFor;

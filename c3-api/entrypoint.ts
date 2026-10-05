@@ -70,6 +70,11 @@ interface Env extends Flags.Env, ServiceBindings {
   COMET_SYNC_LEASE_SECONDS: string,
   REGISTRY_SNAPSHOT_CACHE_TTL_S: string,
   REGISTRY_STALE_FALLBACK_MAX_S: string,
+  /*
+   * how many minutes back the token list may take a collateral value it could
+   * not read now, from 0 to 30; unset or out of range is 15
+   */
+  TOKEN_COLLATERAL_MAX_STALE_MINUTES?: string,
   // the operator identity recorded in audit rows, never taken from a request
   COMET_REGISTRY_ADMIN_ACTOR?: string,
   // comet registry secrets, never set in wrangler.toml
@@ -123,7 +128,7 @@ const SECURITY_HEADERS: Record<string, string> = {
 };
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, executionContext?: ExecutionContext): Promise<Response> {
     const { pathname } = new URL(request.url);
     /*
      * The registry answers its own preflight, because its administrative
@@ -153,7 +158,12 @@ export default {
     fetch.resetCount();
     const debug = Debug.MakeLogger([]).configure(env);
     const flags = Flags.parse(env);
-    const context: Evaluator.Context = { env, debug, flags };
+    const context: Evaluator.Context = {
+      env,
+      debug,
+      flags,
+      waitUntil: work => executionContext?.waitUntil(work),
+    };
     const response = await route(
       request,
       context,

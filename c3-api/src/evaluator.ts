@@ -22,6 +22,12 @@ interface Context {
   flags: Flags.SomeFlags;
   // a custom cache may be passed in, but typically should not be.
   cache?: Cache.Cache;
+  /*
+   * Keeps work alive past the response, which the runtime otherwise cancels
+   * once the request has answered. Absent outside a request, such as in a
+   * test that calls a handler directly, where nothing is cancelled.
+   */
+  waitUntil?: (work: Promise<unknown>) => void;
 }
 
 /*

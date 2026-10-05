@@ -265,10 +265,10 @@ them is worth reading before activating.
 # Token Policies
 
 An administrator can mark a token strategic. A strategic token is shown
-wherever tokens are discovered whatever its collateral value; the rule that
-applies it, with the collateral threshold, is served by a later release, and
-until then a policy is decided, audited, and read back through the
-administrative routes ([API.md](./API.md)).
+wherever tokens are discovered whatever its collateral value: the token list
+reads the mark on every request ([Token Visibility](#token-visibility)). A
+policy is decided, audited, and read back through the administrative routes
+([API.md](./API.md)).
 
 A policy belongs to the token — a chain id and an address — and not to a
 registry version, so it survives every activation; a version that drops the
@@ -307,6 +307,44 @@ applies only where the active version holds every token it names, so the file
 kept for other environments is best reduced to the rows the list decides —
 the routes leave every token a list does not name as it is — and reviewed in
 each environment before it is applied there.
+
+# Token Visibility
+
+`GET /registry/v1/networks/{chainId}/tokens` lists every token the active
+version serves on a chain and says whether token discovery shows it: a token
+is shown when it is strategic, or when its collateral across the chain's
+enabled markets is worth at least USD 250,000. The value is computed, never
+stored in D1, and compared exactly, in fixed point.
+
+Every collateral position of a chain's enabled markets is valued at the
+chain's latest block in one evaluation — `totalsCollateral` and the feed of
+each, in one batch of reads to the node — and the result is kept as one record
+per chain and minute: in the isolate, and in the network's KV namespace
+(`kv_mainnet`, `kv_testnet`) with an expiry. An isolate computes a minute once
+and writes it to KV, where an isolate that asks afterwards reads it; isolates
+that ask while it is being computed value it as well. Every request still
+reads the latest block. A record is keyed by
+the positions it valued, each named by its Comet's content digest, so an
+activation that changes a market, a feed or a price exception starts afresh,
+and one that changes none of them keeps the records.
+
+The list fails open. A position the node cannot read leaves its token
+`partial`, if what could be read already reaches the threshold; otherwise the
+token takes the newest complete value of the last
+`TOKEN_COLLATERAL_MAX_STALE_MINUTES` (15 by default, 0 to 30, 0 switches it
+off) as `stale`, and without one it is `unavailable` — and shown. A minute
+with transport failures is kept in the isolate only, and computed again after
+10 seconds, or after 60 when no read of the chain succeeded at all.
+
+A request waits for the node 4 seconds at most — for the latest block and the
+minute together — and for KV 1 second, and the route never answers an error
+because of either. A valuation the request stops waiting for is not
+cancelled: it goes on past the answer (`waitUntil`), and the next request of
+the minute answers from it. Two log lines, written as JSON, are what a
+dashboard counts: `token_collateral_minute` for each minute a worker values —
+the positions that failed, by reason, and each one that failed for a reason
+other than transport, by market and asset index — and
+`token_collateral_deadline` for each wait a request gave up on, and on what.
 
 # Testing
 

@@ -20,6 +20,7 @@ import {
   requestCatalog,
 } from './registry/request-catalog.js';
 import { routeRegistry } from './registry/router.js';
+import type * as tokenCollateral from './registry/token-collateral.js';
 
 import type * as Evaluator from './evaluator.js';
 
@@ -33,6 +34,7 @@ type Scope = (
   | accountHandlers.Dependencies
   | governanceHandlers.Dependencies
   | transactionHistoryHandler.Dependencies
+  | tokenCollateral.Dependencies
 );
 
 /*
@@ -213,7 +215,20 @@ async function unsafeRoute(
    * It is dispatched before the four-segment matcher below, which would
    * otherwise claim paths such as /registry/v1/networks/1/markets.
    */
-  const registryResponse = await routeRegistry(request, context.env, context);
+  const registryResponse = await routeRegistry(request, context.env, {
+    debug:     context.debug,
+    registry,
+    waitUntil: context.waitUntil ?? (() => {}),
+    /*
+     * Every collateral read of a chain in one batch, as the market summaries
+     * read theirs. The evaluator of the router's whole scope evaluates the
+     * token list's part of it; the types cannot see that a wider scope serves
+     * a narrower one, so the narrowing is stated here, once.
+     */
+    evaluator: networkEnv => instantiateEvaluator(networkEnv, {
+      flags: { ...context.flags, batchingEnabled: true, evaluatorAlgorithm: 'workingset' },
+    }) as unknown as Evaluator.Implementation<tokenCollateral.Dependencies>,
+  });
   if (registryResponse !== null) {
     return registryResponse;
   }

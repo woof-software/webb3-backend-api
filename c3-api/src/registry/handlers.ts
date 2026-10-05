@@ -11,6 +11,8 @@ import { ApiError } from '../http/errors.js';
 import { jsonResponse } from '../http/json.js';
 
 import type { CachedSnapshot } from './cache.js';
+import type { RequestCatalog } from './request-catalog.js';
+import type { TokenCollateralDeps } from './token-collateral.js';
 import { registryHeaders } from './version-headers.js';
 import {
   activateVersion,
@@ -61,6 +63,13 @@ type RegistryContext = {
    * so it is paid for here instead, while nobody is waiting.
    */
   warm: (versionId: string) => Promise<void>,
+  /*
+   * The registry version of the request as the market routes load it, so the
+   * token list values a chain's markets from the same catalog they use.
+   */
+  catalog: RequestCatalog,
+  // what the token list values collateral with: the node, an evaluator, KV and the clock
+  tokens: TokenCollateralDeps,
 };
 
 const SCHEMA_VERSION = 1;

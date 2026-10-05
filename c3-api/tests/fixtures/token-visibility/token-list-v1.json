@@ -1,0 +1,254 @@
+{
+  "registryVersion": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "checksum": "748b4d56e58efd6f44f94587c0d0ea9e63355b06faebb386a42f5eee7b3c2ba9"
+  },
+  "chainId": 1,
+  "thresholdUsd": "250000",
+  "ruleVersion": 1,
+  "computedAt": "2026-10-05T12:55:25.123Z",
+  "block": {
+    "number": 23500123,
+    "timestamp": 1791204923
+  },
+  "tokens": [
+    {
+      "address": "0xbe9895146f7af43049ca1c1ae358b0541ea49704",
+      "symbol": "cbETH",
+      "name": "Coinbase Wrapped Staked ETH",
+      "decimals": 18,
+      "roles": [
+        "collateral"
+      ],
+      "isStrategic": false,
+      "collateralValueUsd": "250000",
+      "collateralValueStatus": "fresh",
+      "valueAt": "2026-10-05T12:55:11.000Z",
+      "valueBlock": {
+        "number": 23500122,
+        "timestamp": 1791204911
+      },
+      "staleAgeSeconds": 0,
+      "exceptions": [],
+      "isVisible": true,
+      "visibilityReason": "collateral_threshold"
+    },
+    {
+      "address": "0xc00e94cb662c3520282e6f5717214004a7f26888",
+      "symbol": "COMP",
+      "name": "Compound",
+      "decimals": 18,
+      "roles": [
+        "reward",
+        "collateral"
+      ],
+      "isStrategic": true,
+      "collateralValueUsd": "68250",
+      "collateralValueStatus": "fresh",
+      "valueAt": "2026-10-05T12:55:11.000Z",
+      "valueBlock": {
+        "number": 23500122,
+        "timestamp": 1791204911
+      },
+      "staleAgeSeconds": 0,
+      "exceptions": [],
+      "isVisible": true,
+      "visibilityReason": "strategic"
+    },
+    {
+      "address": "0x8236a87084f8b84306f72007f36f2618a5634494",
+      "symbol": "LBTC",
+      "name": "Lombard Staked Bitcoin",
+      "decimals": 8,
+      "roles": [
+        "collateral"
+      ],
+      "isStrategic": false,
+      "collateralValueUsd": "249999.9975",
+      "collateralValueStatus": "stale",
+      "valueAt": "2026-10-05T12:52:11.000Z",
+      "valueBlock": {
+        "number": 23500107,
+        "timestamp": 1791204731
+      },
+      "staleAgeSeconds": 192,
+      "exceptions": [],
+      "isVisible": false,
+      "visibilityReason": "below_threshold"
+    },
+    {
+      "address": "0xf469fbd2abcd6b9de8e169d128226c0fc90a012e",
+      "symbol": "pumpBTC",
+      "name": "pumpBTC",
+      "decimals": 8,
+      "roles": [
+        "collateral"
+      ],
+      "isStrategic": false,
+      "collateralValueUsd": "204894.768",
+      "collateralValueStatus": "exception",
+      "valueAt": "2026-10-05T12:55:11.000Z",
+      "valueBlock": {
+        "number": 23500122,
+        "timestamp": 1791204911
+      },
+      "staleAgeSeconds": 0,
+      "exceptions": [
+        {
+          "kind": "fixed_price",
+          "priceFeedAddress": "0x351a133fd850ea81ed8a782016e308acbaddec91",
+          "provenance": "PumpBTC / BTC exchange-rate feed (cWBTCv3 collateral pumpBTC) reverts since 2026-09-03; last answer from retired aggregator 0x918c6cde1cdd940934820b8fa3a2c8b26a60736c (c3-api b7bb889)",
+          "expiresAt": "2026-12-31T23:00:00.000Z"
+        }
+      ],
+      "isVisible": false,
+      "visibilityReason": "below_threshold"
+    },
+    {
+      "address": "0x18084fba666a33d37592fa2633fd49a74dd93a88",
+      "symbol": "tBTC",
+      "name": "tBTC v2",
+      "decimals": 18,
+      "roles": [
+        "collateral"
+      ],
+      "isStrategic": false,
+      "collateralValueUsd": null,
+      "collateralValueStatus": "unavailable",
+      "valueAt": null,
+      "valueBlock": null,
+      "staleAgeSeconds": null,
+      "exceptions": [],
+      "isVisible": true,
+      "visibilityReason": "data_unavailable"
+    },
+    {
+      "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "symbol": "USDC",
+      "name": "USD Coin",
+      "decimals": 6,
+      "roles": [
+        "base",
+        "collateral"
+      ],
+      "isStrategic": false,
+      "collateralValueUsd": "999940.49997",
+      "collateralValueStatus": "fresh",
+      "valueAt": "2026-10-05T12:55:11.000Z",
+      "valueBlock": {
+        "number": 23500122,
+        "timestamp": 1791204911
+      },
+      "staleAgeSeconds": 0,
+      "exceptions": [],
+      "isVisible": true,
+      "visibilityReason": "collateral_threshold"
+    },
+    {
+      "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+      "symbol": "USDT",
+      "name": "Tether USD",
+      "decimals": 6,
+      "roles": [
+        "base"
+      ],
+      "isStrategic": false,
+      "collateralValueUsd": "0",
+      "collateralValueStatus": "fresh",
+      "valueAt": "2026-10-05T12:55:23.000Z",
+      "valueBlock": {
+        "number": 23500123,
+        "timestamp": 1791204923
+      },
+      "staleAgeSeconds": 0,
+      "exceptions": [],
+      "isVisible": false,
+      "visibilityReason": "below_threshold"
+    },
+    {
+      "address": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "symbol": "WBTC",
+      "name": "Wrapped BTC",
+      "decimals": 8,
+      "roles": [
+        "base"
+      ],
+      "isStrategic": true,
+      "collateralValueUsd": "0",
+      "collateralValueStatus": "fresh",
+      "valueAt": "2026-10-05T12:55:23.000Z",
+      "valueBlock": {
+        "number": 23500123,
+        "timestamp": 1791204923
+      },
+      "staleAgeSeconds": 0,
+      "exceptions": [],
+      "isVisible": true,
+      "visibilityReason": "strategic"
+    },
+    {
+      "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "symbol": "WETH",
+      "name": "Wrapped Ether",
+      "decimals": 18,
+      "roles": [
+        "base",
+        "collateral"
+      ],
+      "isStrategic": false,
+      "collateralValueUsd": "2469288.19602331961380164056090136",
+      "collateralValueStatus": "fresh",
+      "valueAt": "2026-10-05T12:55:11.000Z",
+      "valueBlock": {
+        "number": 23500122,
+        "timestamp": 1791204911
+      },
+      "staleAgeSeconds": 0,
+      "exceptions": [],
+      "isVisible": true,
+      "visibilityReason": "collateral_threshold"
+    },
+    {
+      "address": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "symbol": "wstETH",
+      "name": "Wrapped liquid staked Ether 2.0",
+      "decimals": 18,
+      "roles": [
+        "collateral"
+      ],
+      "isStrategic": false,
+      "collateralValueUsd": "264055",
+      "collateralValueStatus": "partial",
+      "valueAt": "2026-10-05T12:55:11.000Z",
+      "valueBlock": {
+        "number": 23500122,
+        "timestamp": 1791204911
+      },
+      "staleAgeSeconds": 0,
+      "exceptions": [],
+      "isVisible": true,
+      "visibilityReason": "collateral_threshold"
+    },
+    {
+      "address": "0x68749665ff8d2d112fa859aa293f07a622782f38",
+      "symbol": "XAUt",
+      "name": "Tether Gold",
+      "decimals": 6,
+      "roles": [
+        "collateral"
+      ],
+      "isStrategic": false,
+      "collateralValueUsd": "0",
+      "collateralValueStatus": "fresh",
+      "valueAt": "2026-10-05T12:55:23.000Z",
+      "valueBlock": {
+        "number": 23500123,
+        "timestamp": 1791204923
+      },
+      "staleAgeSeconds": 0,
+      "exceptions": [],
+      "isVisible": false,
+      "visibilityReason": "below_threshold"
+    }
+  ]
+}

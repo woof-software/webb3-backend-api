@@ -334,6 +334,19 @@ async function readTokenPolicy(db: D1Database, chainId: number, tokenAddress: Ad
 }
 
 /*
+ * The tokens of a chain an administrator has marked strategic, for the token
+ * list. Unlike the reads above, this one does not resolve the active version:
+ * the list resolves it through the request's catalog, which already names the
+ * version it answers for, and a decision belongs to no version.
+ */
+async function readStrategicTokens(db: D1Database, chainId: number): Promise<Set<Address>> {
+  const { results } = await db.prepare(
+    `SELECT token_address FROM token_policies WHERE chain_id = ?1 AND is_strategic = 1`
+  ).bind(chainId).all<{ token_address: Address }>();
+  return new Set((results ?? []).map(row => row.token_address));
+}
+
+/*
  * Every token one network of the active version holds, with the decision in
  * force for each, and beside them the decisions kept for tokens of the chain
  * that the active version does not hold, each of which applies again if a
@@ -594,6 +607,7 @@ export {
   MAX_POLICY_EVENTS,
   applyTokenPolicies,
   exportTokenPolicies,
+  readStrategicTokens,
   readTokenPolicies,
   readTokenPolicy,
   reviewTokenPolicies,

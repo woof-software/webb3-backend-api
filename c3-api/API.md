@@ -645,10 +645,12 @@ errors, which use one envelope:
 { "error": { "code": "NOT_FOUND", "message": "...", "requestId": "..." } }
 ```
 
-Public reads are cacheable and carry `ETag`, `X-Registry-Version` and
-`X-Registry-Checksum`; they answer `503 REGISTRY_NOT_ACTIVE` when no version
-is active. Administrative routes require `Authorization: Bearer <token>`, are
-rate limited per actor, and answer no CORS headers at all.
+Public reads carry `X-Registry-Version` and `X-Registry-Checksum`, and answer
+`503 REGISTRY_NOT_ACTIVE` when no version is active. Every one of them but the
+token list is cacheable by its version and carries an `ETag`; the token list's
+values change every minute, so it is kept for 30 seconds and carries none.
+Administrative routes require `Authorization: Bearer <token>`, are rate
+limited per actor, and answer no CORS headers at all.
 
 ## `/registry/v1/active`
 ### description:
@@ -677,6 +679,116 @@ The markets of one chain, in the same order the snapshot lists them.
 One market, addressed by its Comet. A `disabled` market answers `404`; a
 `deprecated` one is served, because positions and history in it must stay
 reachable.
+
+## `/registry/v1/networks/{chain_id}/tokens`
+### description:
+
+Every token the active version serves on one chain — the base, reward and
+collateral tokens of its enabled and deprecated markets — with its strategic
+mark, the USD value of its collateral across the chain's enabled markets, and
+whether token discovery shows it. `?visibleOnly=true` lists only the tokens it
+shows; `visibleOnly` is exactly `true` or `false`, and anything else answers
+`400`.
+
+A token is shown when an administrator marked it strategic, or when its
+collateral is worth at least `thresholdUsd`, USD 250,000, compared exactly. A
+token whose value cannot be read is shown as well (`data_unavailable`): not
+knowing what a token is worth is no reason to hide one someone may hold.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "chainId": 1,
+  "thresholdUsd": "250000",
+  "ruleVersion": 1,
+  "computedAt": "2026-10-05T12:00:31.204Z",
+  "block": { "number": 23512345, "timestamp": 1791201623 },
+  "tokens": [
+    {
+      "address": "0xf469fbd2abcd6b9de8e169d128226c0fc90a012e",
+      "symbol": "pumpBTC",
+      "name": "pumpBTC",
+      "decimals": 8,
+      "roles": [ "collateral" ],
+      "isStrategic": false,
+      "collateralValueUsd": "182345.0912",
+      "collateralValueStatus": "exception",
+      "valueAt": "2026-10-05T12:00:23.000Z",
+      "valueBlock": { "number": 23512345, "timestamp": 1791201623 },
+      "staleAgeSeconds": 0,
+      "exceptions": [
+        {
+          "kind": "fixed_price",
+          "priceFeedAddress": "0x351a133fd850ea81ed8a782016e308acbaddec91",
+          "provenance": "PumpBTC / BTC exchange-rate feed (cWBTCv3 collateral pumpBTC) reverts since 2026-09-03; …",
+          "expiresAt": null
+        }
+      ],
+      "isVisible": false,
+      "visibilityReason": "below_threshold"
+    },
+    {
+      "address": "0x68749665ff8d2d112fa859aa293f07a622782f38",
+      "symbol": "XAUt",
+      "name": "Tether Gold",
+      "decimals": 6,
+      "roles": [ "collateral" ],
+      "isStrategic": false,
+      "collateralValueUsd": "1843210.123456",
+      "collateralValueStatus": "fresh",
+      "valueAt": "2026-10-05T12:00:23.000Z",
+      "valueBlock": { "number": 23512345, "timestamp": 1791201623 },
+      "staleAgeSeconds": 0,
+      "exceptions": [],
+      "isVisible": true,
+      "visibilityReason": "collateral_threshold"
+    }
+  ]
+}
+```
+
+Tokens are ordered by symbol, ignoring case, then by address. A value is a
+decimal string with every digit and nothing more — `"1843210.123456"`, `"0"`
+— never a number. It is what the chain's enabled markets hold of the token as
+collateral (`totalsCollateral`), priced by the feed each market reads for it,
+and converted through the base asset's USD feed where the market's feeds
+answer in its base unit. A price exception of the registry applies to a
+collateral's own feed; the conversion is always read as it is. A deprecated
+market's tokens are listed, but what it holds is not counted, and a token no
+enabled market takes as collateral is worth `"0"`. Values cover the
+collateral the active version describes: an asset listed on chain since it
+was imported counts once a version that includes it is switched on.
+
+`collateralValueStatus` says what the value is:
+
+| Status | The value |
+|---|---|
+| `fresh` | Every position of the token, valued at this minute's block |
+| `exception` | The same, but at least one position was priced by a registry price exception — a stated price, or a feed read in place of the one the Comet names; `exceptions` names each |
+| `partial` | Some positions could not be valued at this minute's block, and the ones that could already reach the threshold: a lower bound, with the exceptions those applied |
+| `stale` | Not every position could be valued at this minute's block, and the ones that could fall short of the threshold; this is the newest earlier minute that valued all of them, within the stale window (15 minutes by default), with the exceptions it applied. `staleAgeSeconds` says how much older it is than the latest block |
+| `unavailable` | The same, but no minute in the stale window valued all of them: `collateralValueUsd` is `null` |
+
+`valueAt` and `valueBlock` say which block a token's value was read at: the
+block this minute was valued at, which can be an earlier block of the same
+minute than `block`, or an earlier minute's for a `stale` value. `block` is
+the chain's latest, and is `null` when the node did not answer; a token no
+enabled market takes as collateral is then `"0"` with no block.
+`visibilityReason` is `strategic`, `collateral_threshold`, `below_threshold`
+or `data_unavailable`.
+
+The list answers `200` whatever the node does: a token that cannot be valued
+is a status of that token, never a failure of the list. It answers `404` for a
+chain the active version does not hold, and `503` when no version is active
+or the database cannot be reached for the token policies — without them a
+strategic token would be listed as hidden. It carries
+`Cache-Control: public, max-age=30` and no `ETag`; an answer from a version
+the database could not confirm carries `X-Registry-Stale` and `no-store`
+instead.
+
+```sh
+$ curl 'localhost:8787/registry/v1/networks/1/tokens?visibleOnly=true'
+```
 
 ## `/registry/v1/versions/{version_id}`
 ### description:
@@ -1094,10 +1206,10 @@ source adds reads as a longer list and one more entry.
 ## `PATCH /registry/v1/admin/networks/{chain_id}/tokens/{token_address}/policy`
 ### description:
 
-Marks a token strategic, or takes the mark away. The mark is an input of the
-token visibility rule, under which a strategic token is shown wherever tokens
-are discovered whatever its collateral value; no route serves that rule yet,
-so for now a policy is decided and audited here and read back below.
+Marks a token strategic, or takes the mark away. The token list
+(`/registry/v1/networks/{chain_id}/tokens`) shows a strategic token whatever
+its collateral value, and reads the mark on every request, so a change is in
+its next answer.
 
 A policy belongs to the token — a chain id and an address — and not to a
 registry version, so it survives every activation, and a version that drops

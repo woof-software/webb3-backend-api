@@ -10,6 +10,8 @@ import { activeSnapshot, cacheDepsOf, warmSnapshot } from './cache.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
+import type { RequestCatalog } from './request-catalog.js';
+import { TokenCollateralDeps, maxStaleMinutesOf } from './token-collateral.js';
 
 /*
  * The registry entry point: everything under /registry/v1 is answered here,
@@ -96,7 +98,15 @@ function withHeaders(response: Response, headers: Record<string, string>): Respo
 async function routeRegistry(
   request: Request,
   env: Env,
-  { debug }: { debug: { error: (...parameters: unknown[]) => unknown } },
+  { debug, registry, evaluator, waitUntil }: {
+    debug:     { error: (...parameters: unknown[]) => unknown },
+    // the registry version of the request, shared with every other route that reads it
+    registry:  RequestCatalog,
+    // an evaluator for the token list's collateral reads, batching every read of a chain
+    evaluator: TokenCollateralDeps['evaluator'],
+    // keeps the token list's valuation alive past the answer of the request that started it
+    waitUntil: TokenCollateralDeps['waitUntil'],
+  },
 ): Promise<Response | null> {
   const pathname = new URL(request.url).pathname;
   if (!isRegistryPath(pathname)) {
@@ -127,6 +137,16 @@ async function routeRegistry(
       } catch (error) {
         debug.error(`registry snapshot not warmed`, { versionId, error });
       }
+    },
+    catalog: registry,
+    tokens: {
+      frame:           { apiHost: env.V3_API_HOST, nodeHost: env.NODE_PROXY_HOST, nodeKey: env.NODE_PROXY_KEY },
+      evaluator,
+      kv:              networkEnv => env[`kv_${networkEnv}`],
+      maxStaleMinutes: maxStaleMinutesOf(env),
+      now:             () => new Date(),
+      debug,
+      waitUntil,
     },
   };
 

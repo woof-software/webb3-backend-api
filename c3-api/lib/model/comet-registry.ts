@@ -32,6 +32,14 @@ const SYNC_RUN_STATUSES  = [ 'running', 'failed', 'completed' ] as const;
 const SYNC_OUTCOMES      = [ 'imported', 'no_change' ] as const;
 const SYNC_ITEM_STATUSES = [ 'pending', 'processing', 'completed', 'failed' ] as const;
 
+/*
+ * How the token list valued a token, and why it shows or hides it. `partial`
+ * is a value read from only some of a token's positions that already reaches
+ * the threshold (decision D7 of the TOK-0 audit).
+ */
+const COLLATERAL_VALUE_STATUSES = [ 'fresh', 'exception', 'partial', 'stale', 'unavailable' ] as const;
+const VISIBILITY_REASONS        = [ 'strategic', 'collateral_threshold', 'below_threshold', 'data_unavailable' ] as const;
+
 type ContractRole  = (typeof CONTRACT_ROLES)[number];
 
 /*
@@ -578,6 +586,52 @@ type TokenPolicyApplyV1 = {
 };
 
 /*
+ * The token list: every token the active version serves on one chain, with
+ * its strategic decision, its collateral value in USD across the chain's
+ * enabled markets, and whether discovery shows it.
+ *
+ * Values are decimal strings, never numbers: a value is exact, and a client
+ * that compares or formats it must not lose a digit doing so. Each token says
+ * when its value was read, which may be an earlier minute than the list's own
+ * `block` when the latest could not be read.
+ */
+type CollateralValueStatusV1 = (typeof COLLATERAL_VALUE_STATUSES)[number];
+type VisibilityReasonV1      = (typeof VISIBILITY_REASONS)[number];
+
+type BlockRefV1 = { number: number, timestamp: number };
+
+// a price exception the value applied: what the registry stated in place of reading a feed
+type AppliedPriceExceptionV1 = {
+  kind:             ExceptionKind,
+  priceFeedAddress: Address,
+  provenance:       string,
+  expiresAt:        string | null,
+};
+
+type TokenVisibilityV1 = TokenV1 & {
+  roles:                 AssetRole[],
+  isStrategic:           boolean,
+  collateralValueUsd:    string | null,
+  collateralValueStatus: CollateralValueStatusV1,
+  valueAt:               string | null,
+  valueBlock:            BlockRefV1 | null,
+  staleAgeSeconds:       number | null,
+  exceptions:            AppliedPriceExceptionV1[],
+  isVisible:             boolean,
+  visibilityReason:      VisibilityReasonV1,
+};
+
+type TokenListV1 = {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  thresholdUsd:    string,
+  ruleVersion:     number,
+  computedAt:      string,
+  block:           BlockRefV1 | null,
+  tokens:          TokenVisibilityV1[],
+};
+
+/*
  * What a Comet contract carries when it was materialized from the registry:
  * the version that described it, the market as that version describes it, and
  * the exceptions of its network.
@@ -615,8 +669,11 @@ export type {
   ActivationResultV1,
   Address,
   AssetDisplayOverrideV1,
+  AppliedPriceExceptionV1,
   AssetRole,
   BaseAssetV1,
+  BlockRefV1,
+  CollateralValueStatusV1,
   CollateralAssetV1,
   ContractRole,
   ContractRoleKey,
@@ -647,6 +704,7 @@ export type {
   SyncRunStatus,
   SyncTriggerKind,
   TokenPoliciesV1,
+  TokenListV1,
   TokenPolicyApplyV1,
   TokenPolicyDecisionV1,
   TokenPolicyDetailV1,
@@ -665,12 +723,16 @@ export type {
   ValidationSummaryV1,
   VersionRefV1,
   VersionStatus,
+  VisibilityReasonV1,
+  TokenVisibilityV1,
 };
 
 export {
   checksumAddress,
   ACTIVATION_ACTIONS,
   ASSET_ROLES,
+  COLLATERAL_VALUE_STATUSES,
+  VISIBILITY_REASONS,
   CONTRACT_ROLES,
   CONTRACT_ROLE_KEYS,
   EXCEPTION_KINDS,

@@ -473,7 +473,7 @@ async function expectJsonBody(httpMessage: Request | Response)
      * TODO(jordan): use debug logger instance
      */
     console.warn(`Invalid JSON-RPC response: not JSON`, {
-      url:        httpMessage.url,
+      url:        redactedUrl(httpMessage.url),
       text:       responseText,
       status:     (httpMessage instanceof Response) ? httpMessage.status     : '',
       statusText: (httpMessage instanceof Response) ? httpMessage.statusText : '',
@@ -481,6 +481,21 @@ async function expectJsonBody(httpMessage: Request | Response)
     throw InvalidResponse(`not JSON`, responseText);
   }
   return json;
+}
+
+/*
+ * A node URL as it may be logged: its origin and network only. The node
+ * proxy's key is a segment of the path (nodeEndpoint in eth-constants.ts),
+ * and a log line is read by more people than the key is meant for.
+ */
+function redactedUrl(url: string): string {
+  try {
+    const { origin, pathname } = new URL(url);
+    const network = pathname.split('/')[1] ?? '';
+    return network === '' ? origin : `${origin}/${network}/…`;
+  } catch {
+    return '';
+  }
 }
 
 function InvalidResponse(message: string, cause: object|string) {

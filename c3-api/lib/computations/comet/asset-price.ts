@@ -102,4 +102,4 @@ const assetPrice = implement({
   ]),
 });
 
-export { AssetPrice, assetPrice };
+export { AssetPrice, assetPrice, exceptionFor };
