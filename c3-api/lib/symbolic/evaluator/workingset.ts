@@ -377,9 +377,8 @@ async function step<
         }
         const outcome = await computation.compute(batch, D, name);
         if (Fallible.isFailure(outcome)) {
-          const failure = failureOf(Fallible.unwrap(outcome));
-          this.debug.error(failure.message, { failure: failure.cause });
-          throw failure;
+          // logged once, by whoever answers the failure: evaluate traces it with the state
+          throw failureOf(Fallible.unwrap(outcome));
         }
         const result = Fallible.must(outcome);
         // 2.a. if it's a redex, queue for rewrite into a new work item
@@ -510,9 +509,8 @@ async function step<
         stuck = false;
         const outcome = await computation.compute(context, D, name);
         if (Fallible.isFailure(outcome)) {
-          const failure = failureOf(Fallible.unwrap(outcome));
-          this.debug.error(failure.message, { failure: failure.cause });
-          throw failure;
+          // logged once, by whoever answers the failure: evaluate traces it with the state
+          throw failureOf(Fallible.unwrap(outcome));
         }
         const result = Fallible.must(outcome);
         // 2.a. if it's a redex, queue for rewrite into a new work item

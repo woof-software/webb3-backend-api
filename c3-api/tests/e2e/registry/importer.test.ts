@@ -2,13 +2,18 @@ import t from 'tap';
 
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { format } from 'node:util';
 
 import { createTestHarness } from 'wrangler';
+
+import * as Debug from '../../../lib/debug-log.js';
 
 import type { Env } from '../../../entrypoint.js';
 import type * as jsonRpc from '../../../lib/json-rpc.js';
 import type { RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
+import { cacheDepsOf } from '../../../src/registry/cache.js';
+import { proxyTransport } from '../../../src/registry/enrichment.js';
 import { runInvocation } from '../../../src/registry/importer.js';
 import {
   FeedReader,
@@ -19,6 +24,7 @@ import {
 import { gitBlobSha } from '../../../src/registry/source/github.js';
 import {
   SUPERSEDED_CHECK,
+  activateVersion,
   createCandidate,
   markValidated,
   readSnapshot,
@@ -28,8 +34,10 @@ import {
   snapshotChecksum,
   supersedeEarlierAttempts,
 } from '../../../src/registry/repository.js';
+import { registryStatus } from '../../../src/registry/status.js';
 
 import { applyMigrations } from '../../util/d1.js';
+import { interleaved } from '../../util/interleave.js';
 import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
 
 /*
@@ -144,14 +152,7 @@ async function activateFixture(db: D1Database, source: RegistrySnapshotV1 = snap
   const { versionId } = await seedCandidate(db, source);
   await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
   await markValidated(db, versionId, await snapshotChecksum(source.networks));
-  await db.batch([
-    db.prepare(
-      `INSERT INTO registry_activations (id, registry_version_id, previous_version_id, action, actor, reason, created_at)
-       SELECT ?1, ?2, active_version_id, 'activate', 'test-admin', 'test', ?3 FROM registry_state WHERE singleton_id = 1`
-    ).bind(randomUUID(), versionId, new Date().toISOString()),
-    db.prepare(`UPDATE registry_state SET active_version_id = ?1, updated_at = ?2 WHERE singleton_id = 1`)
-      .bind(versionId, new Date().toISOString()),
-  ]);
+  await activateVersion(db, { versionId, action: 'activate', actor: 'test-admin', reason: 'test' });
   return versionId;
 }
 
@@ -162,8 +163,7 @@ t.test('an import reads the source, the chain, and the reviewed overlay', async 
   const usdcSha = await gitBlobSha(usdcContent);
   const result  = await runInvocation(deps(db, [ { path: USDC_ROOT, content: usdcContent, sha: usdcSha } ]));
 
-  t.equal(result.status, 'completed', 'the run finishes');
-  t.equal(result.outcome, 'imported', 'with a new version');
+  t.equal(result.kind, 'imported', 'the run finishes with a new version');
   t.equal(result.processed, 1, 'having imported one market');
 
   const candidate = await db.prepare(
@@ -216,17 +216,16 @@ t.test('an already imported commit is a no-change outcome', async t => {
   const roots   = [ { path: USDC_ROOT, content: usdcContent, sha: usdcSha } ];
 
   const first = await runInvocation(deps(db, roots));
-  t.equal(first.outcome, 'imported');
+  t.equal(first.kind, 'imported');
 
   // discovery is bounded, so the next invocation does not even ask upstream
   const idle = await runInvocation(deps(db, roots));
-  t.equal(idle.status, 'idle', 'nothing is due');
+  t.equal(idle.kind, 'idle', 'nothing is due');
   t.equal(idle.reason, 'upstream was checked recently');
 
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1`).bind('2020-01-01T00:00:00.000Z').run();
   const unchanged = await runInvocation(deps(db, roots));
-  t.equal(unchanged.status, 'completed');
-  t.equal(unchanged.outcome, 'no_change', 'the same commit is not imported twice');
+  t.equal(unchanged.kind, 'unchanged', 'the same commit is not imported twice');
   t.equal(unchanged.versionId, first.versionId, 'the existing version is reported instead');
 });
 
@@ -240,7 +239,7 @@ t.test('an import continues across invocations', async t => {
   ];
   // one market per invocation, as the Cron configuration bounds it
   const first = await runInvocation(deps(db, roots, 1));
-  t.equal(first.status, 'running', 'the run stays open while roots remain');
+  t.equal(first.kind, 'running', 'the run stays open while roots remain');
   t.equal(first.processed, 1, 'and only the configured number of markets is imported');
 
   const held = await db.prepare(`SELECT lease_owner FROM sync_runs WHERE id = ?1`).bind(first.runId)
@@ -279,11 +278,11 @@ t.test('a root that never imports cannot produce a validated version', async t =
    * but the candidate is missing a market and must not validate.
    */
   let result = await runInvocation(deps(db, roots, 2));
-  for (let invocation = 0; invocation < 10 && result.status === 'running'; invocation++) {
+  for (let invocation = 0; invocation < 10 && result.kind === 'running'; invocation++) {
     result = await runInvocation(deps(db, roots, 2));
   }
 
-  t.equal(result.status, 'failed', 'the run ends as failed');
+  t.equal(result.kind, 'invalid', 'the run ends, and its candidate is invalid');
   const version = await db.prepare(`SELECT status FROM registry_versions WHERE id = ?1`)
     .bind(result.versionId).first<string>('status');
   t.equal(version, 'invalid', 'and the candidate is invalid, not validated');
@@ -293,7 +292,8 @@ t.test('a root that never imports cannot produce a validated version', async t =
      WHERE registry_version_id = ?1 AND passed = 0 AND check_name = 'all-roots-imported'`
   ).bind(result.versionId).first<{ check_name: string, details: string }>();
   t.ok(failed, 'the diagnostic names the incomplete import');
-  t.same(JSON.parse(failed?.details ?? '{}'), { expected: 2, imported: 1 }, 'and says how many roots made it');
+  t.same(JSON.parse(failed?.details ?? '{}'), { expected: 2, imported: 1, missing: [ 'mainnet/weth' ] },
+    'and says which roots never made it');
 
   t.equal(
     await db.prepare(`SELECT COUNT(*) AS n FROM markets WHERE registry_version_id = ?1`)
@@ -327,7 +327,7 @@ t.test('a market nobody has reviewed is imported, but not served', async t => {
   });
 
   const result = await runInvocation(deps(db, [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ]));
-  t.equal(result.status, 'failed', 'this source holds nothing but the new market, so there is no default to validate');
+  t.equal(result.kind, 'invalid', 'this source holds nothing but the new market, so there is no default to validate');
 
   const market = await db.prepare(
     `SELECT deployment_key, status, is_default, reviewed, display_name,
@@ -371,8 +371,9 @@ t.test('the first import of a registry is held for review, then reviewed in plac
   const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
 
   const imported = await runInvocation(deps(db, roots));
-  t.equal(imported.status, 'completed', 'every root is imported');
-  t.equal(imported.held, true, 'and the candidate is held for review');
+  t.equal(imported.kind, 'held', 'every root is imported, and the candidate is held for review');
+  t.match(imported.reason, /^every root is imported; the candidate is held for review; \d+ of its checks failed$/,
+    'which is what its answer says');
 
   const versionId = imported.versionId!;
   const status    = async () => db.prepare(`SELECT status FROM registry_versions WHERE id = ?1`)
@@ -382,15 +383,35 @@ t.test('the first import of a registry is held for review, then reviewed in plac
     'and it says what is left to review');
 
   /*
+   * Until discovery is due, a request has nothing to start and names no
+   * candidate, even one the hourly job has just held: an operator finds that
+   * one through the status (REGISTRY_RUNBOOK.md, "If the hourly job got there
+   * first").
+   */
+  const early = await runInvocation(deps(db, roots), { requestedBy: 'test-admin' });
+  t.equal(early.kind, 'idle', 'a request within the interval has nothing to do');
+  t.equal(early.reason, 'upstream was checked recently');
+  t.equal(early.versionId, undefined, 'and names no candidate');
+
+  /*
    * Once discovery is due again, the same commit is found with a candidate
    * already importing. Starting a new attempt over it would throw away the
    * review in progress, so discovery leaves it alone.
    */
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1`).bind('2020-01-01T00:00:00.000Z').run();
   const again = await runInvocation(deps(db, roots));
-  t.equal(again.status, 'idle', 'a later sync leaves a held candidate alone');
+  t.equal(again.kind, 'idle', 'a later sync leaves a held candidate alone');
   t.match(again.reason, /held for review/, 'and says why');
   t.equal(again.versionId, versionId, 'naming the candidate it is waiting on');
+
+  /*
+   * That was a check of the source like any other, and the interval starts
+   * again from it: while the candidate is held, the hourly job checks the
+   * source once a day, and a request between two of its checks names nothing.
+   */
+  const after = await runInvocation(deps(db, roots), { requestedBy: 'test-admin' });
+  t.equal(after.reason, 'upstream was checked recently', 'the check the job made starts the interval again');
+  t.equal(after.versionId, undefined, 'so a request after it names no candidate either');
 
   const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
   const usdc    = mainnet.markets.find(market => market.deploymentKey === 'usdc')!;
@@ -465,27 +486,44 @@ t.test('a candidate another invocation is importing is not one held for review',
 
   const imported  = await runInvocation(deps(db, roots));
   const versionId = imported.versionId!;
-  t.equal(imported.held, true, 'the first import of a registry is held');
-  t.ok((imported.checksFailed ?? 0) > 0, 'and says how many of its checks failed');
+  t.equal(imported.kind, 'held', 'the first import of a registry is held');
+  t.ok(imported.kind === 'held' && imported.checksFailed > 0, 'and says how many of its checks failed');
   t.match(imported.reason, /checks failed/, 'so an operator is not told only that it completed');
 
   // another invocation, importing into that same candidate, with a live lease
+  const runId = randomUUID();
   await db.prepare(
     `INSERT INTO sync_runs (
        id, source_commit_sha, tracked_ref, registry_version_id, trigger_kind,
-       status, lease_owner, lease_generation, lease_expires_at, expected_count, started_at
-     ) VALUES (?1, ?2, 'main', ?3, 'scheduled', 'running', ?4, 1, ?5, 1, ?6)`
+       status, lease_owner, lease_expires_at, expected_count, started_at
+     ) VALUES (?1, ?2, 'main', ?3, 'scheduled', 'running', ?4, ?5, 1, ?6)`
   ).bind(
-    randomUUID(), COMMIT, versionId, randomUUID(),
+    runId, COMMIT, versionId, randomUUID(),
     new Date(Date.now() + 900_000).toISOString(), new Date().toISOString(),
   ).run();
-  await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1`).bind('2020-01-01T00:00:00.000Z').run();
+
+  /*
+   * Whether discovery is due does not matter, and the source is not asked
+   * for a commit only for the one running slot to refuse it: the run that
+   * holds the lease is what decides the answer.
+   */
+  const asked    = deps(db, roots);
+  const requests: string[] = [];
+  const fetch    = asked.source.fetch;
+  asked.source.fetch = async (url: string) => {
+    requests.push(url);
+    return fetch(url);
+  };
 
   await t.rejects(
-    runInvocation(deps(db, roots)),
+    runInvocation(asked, { requestedBy: 'test-admin' }),
     { code: 'SYNC_ALREADY_RUNNING' },
-    'the caller hears that a sync is running, not that the candidate awaits review',
+    'a person who asks hears that a sync is running, not that the candidate awaits review',
   );
+  const scheduled = await runInvocation(asked);
+  t.same([ scheduled.kind, scheduled.runId, scheduled.versionId ], [ 'idle', runId, versionId ],
+    'the schedule has nothing to do this hour, and names the run that is importing');
+  t.same(requests, [], 'and neither of them asked the source anything');
 });
 
 /*
@@ -540,7 +578,7 @@ t.test('an unfinished import says how many roots are imported and how many are l
   ];
 
   const first = await runInvocation(deps(db, roots, 1));
-  t.equal(first.status, 'running', 'one root of two leaves the run open');
+  t.equal(first.kind, 'running', 'one root of two leaves the run open');
   t.same(
     { expected: first.expected, completed: first.completed, outstanding: first.outstanding },
     { expected: 2, completed: 1, outstanding: 1 },
@@ -553,7 +591,7 @@ t.test('an unfinished import says how many roots are imported and how many are l
    * the invocation made no progress.
    */
   const second = await runInvocation(deps(db, roots, 1));
-  t.equal(second.status, 'running');
+  t.equal(second.kind, 'running');
   t.same(
     { expected: second.expected, completed: second.completed, outstanding: second.outstanding },
     { expected: 2, completed: 1, outstanding: 1 },
@@ -582,7 +620,7 @@ t.test('an interrupted invocation does not spend the budget of the roots it neve
   };
 
   const first = await runInvocation(deps(db, roots, 2));
-  t.equal(first.status, 'running');
+  t.equal(first.kind, 'running');
   t.same(await attemptsOf(first.runId!), { [USDC_ROOT]: 1, [WETH_ROOT]: 0 },
     'the root the chain did not answer for is back where it started');
 
@@ -595,7 +633,7 @@ t.test('an interrupted invocation does not spend the budget of the roots it neve
   for (let invocation = 0; invocation < 5; invocation++) {
     last = await runInvocation(deps(db, roots, 2));
   }
-  t.equal(last.status, 'failed', 'an invocation that imports nothing does spend them, so the run ends');
+  t.equal(last.kind, 'invalid', 'an invocation that imports nothing does spend them, so the run ends');
   t.same(await attemptsOf(first.runId!), { [USDC_ROOT]: 1, [WETH_ROOT]: 5 },
     'and the root that never answered is abandoned after its five attempts');
 });
@@ -614,7 +652,7 @@ t.test('a request that continues a run refuses what only a new run could do', as
   ];
 
   const started = await runInvocation(deps(db, roots, 1));
-  t.equal(started.status, 'running', 'a run is in progress');
+  t.equal(started.kind, 'running', 'a run is in progress');
 
   for (const request of [
     { forceNewAttempt: true, reason: 'rebuild' },
@@ -638,10 +676,11 @@ t.test('a request that continues a run refuses what only a new run could do', as
    * to decide whether to refuse would make the running invocation lose the
    * market it is in the middle of importing.
    */
-  const owner = randomUUID();
+  const owner   = randomUUID();
+  const expires = new Date(Date.now() + 900_000).toISOString();
   await db.prepare(
-    `UPDATE sync_runs SET lease_owner = ?1, lease_generation = 7, lease_expires_at = ?2 WHERE id = ?3`
-  ).bind(owner, new Date(Date.now() + 900_000).toISOString(), started.runId!).run();
+    `UPDATE sync_runs SET lease_owner = ?1, lease_expires_at = ?2 WHERE id = ?3`
+  ).bind(owner, expires, started.runId!).run();
 
   await t.rejects(
     runInvocation(deps(db, roots, 1), { forceNewAttempt: true, reason: 'rebuild' }),
@@ -649,9 +688,9 @@ t.test('a request that continues a run refuses what only a new run could do', as
     'a request for a new run is refused while one is being imported',
   );
 
-  const fence = await db.prepare(`SELECT lease_owner, lease_generation FROM sync_runs WHERE id = ?1`)
-    .bind(started.runId!).first<{ lease_owner: string, lease_generation: number }>();
-  t.same(fence, { lease_owner: owner, lease_generation: 7 },
+  const fence = await db.prepare(`SELECT lease_owner, lease_expires_at FROM sync_runs WHERE id = ?1`)
+    .bind(started.runId!).first<{ lease_owner: string, lease_expires_at: string }>();
+  t.same(fence, { lease_owner: owner, lease_expires_at: expires },
     'and the invocation that holds the run keeps its fence');
 });
 
@@ -675,7 +714,7 @@ t.test('a new attempt closes the draft it replaces', async t => {
   const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
 
   const first = await runInvocation(deps(db, roots));
-  t.equal(first.held, true, 'the first import of a registry is held for review');
+  t.equal(first.kind, 'held', 'the first import of a registry is held for review');
   t.equal(await statusOf(db, first.versionId!), 'importing');
 
   const second = await runInvocation(deps(db, roots), { forceNewAttempt: true, reason: 'rebuild' });
@@ -712,7 +751,7 @@ t.test('discovery closes the drafts a validated attempt replaced', async t => {
 
   const roots  = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
   const result = await runInvocation(deps(db, roots));
-  t.equal(result.outcome, 'no_change', 'the commit is recognised as imported, not as held for review');
+  t.equal(result.kind, 'unchanged', 'the commit is recognised as imported, not as held for review');
   t.equal(result.versionId, current.id);
 
   for (const draft of stale) {
@@ -800,19 +839,103 @@ t.test('a draft stays open when the attempt meant to replace it fails', async t 
   const withWeth = [ ...usdcOnly, { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) } ];
 
   const draft = await runInvocation(deps(db, usdcOnly), { holdForReview: true, reason: 'review the new market' });
-  t.equal(draft.held, true, 'a complete draft is held for review');
+  t.equal(draft.kind, 'held', 'a complete draft is held for review');
 
   // a forced attempt whose second root the chain never answers for
   let attempt = await runInvocation(deps(db, withWeth, 2), { forceNewAttempt: true, reason: 'rebuild' });
   t.equal(await statusOf(db, draft.versionId!), 'importing', 'the draft stays open while the new attempt runs');
-  for (let invocation = 0; invocation < 6 && attempt.status === 'running'; invocation++) {
+  for (let invocation = 0; invocation < 6 && attempt.kind === 'running'; invocation++) {
     attempt = await runInvocation(deps(db, withWeth, 2));
   }
-  t.equal(attempt.status, 'failed', 'the new attempt fails once its last root runs out of attempts');
+  t.equal(attempt.kind, 'invalid', 'the new attempt fails once its last root runs out of attempts');
   t.equal(await statusOf(db, attempt.versionId!), 'invalid');
 
   t.equal(await statusOf(db, draft.versionId!), 'importing', 'and the draft it was meant to replace is still open');
   t.equal(await supersededCheckOf(db, draft.versionId!), null, 'with nothing recorded against it');
+});
+
+/*
+ * The first import is held whatever it brought in, so one that gave a root up
+ * ends as one with every root does: its run completed, its draft open for
+ * review. What tells the two apart is the run's count of roots, which the
+ * status shows beside the draft, and an operator checks it before using the
+ * draft (REGISTRY_RUNBOOK.md, "If the hourly job got there first"). A new
+ * attempt that imports every root then takes the incomplete draft's place.
+ */
+t.test('a first import that gives a root up is held all the same, and the status says so', async t => {
+  const db       = await freshDatabase();
+  const usdcOnly = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+  const withWeth = [ ...usdcOnly, { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) } ];
+
+  // the chain never answers for weth, so the root is given up once its attempts run out
+  let result = await runInvocation(deps(db, withWeth, 2));
+  for (let invocation = 0; invocation < 10 && result.kind === 'running'; invocation++) {
+    result = await runInvocation(deps(db, withWeth, 2));
+  }
+  t.equal(result.kind, 'held', 'the import ends with its draft held, not invalid');
+  t.same([ result.expected, result.completed, result.outstanding ], [ 2, 1, 0 ],
+    'with one root of two imported and none left to attempt');
+  t.match(result.reason, /^the import gave up 1 of its 2 roots; the candidate is held for review, and cannot validate without them; \d+ of its checks failed$/,
+    'and its answer says the root was given up');
+  t.notMatch(result.reason, /every root is imported/, 'never that every root is imported');
+  const draft = result.versionId!;
+
+  const env    = await server.getWorker<Env>().getEnv();
+  const status = await registryStatus(env, cacheDepsOf(env));
+  t.same(status.candidates.importing.map(candidate => candidate.versionId), [ draft ], 'the status lists the draft');
+  t.match(status.sync.lastRun, {
+    status:         'completed',
+    outcome:        'imported',
+    expectedCount:  2,
+    completedCount: 1,
+    failedCount:    1,
+  }, 'and its run as completed, with one root of two imported and the other given up');
+  t.same([ ...status.alerts ].sort(), [ 'candidate-awaiting-review', 'no-active-version' ],
+    'which raises a draft to review, and no failed sync');
+
+  // an attempt with every root: here, a source of the one market the chain answers for
+  const forced = await runInvocation(deps(db, usdcOnly), {
+    forceNewAttempt: true,
+    reason:          'first import',
+    requestedBy:     'test-admin',
+  });
+  t.equal(forced.kind, 'held', 'a new attempt that imports every root is held in its turn');
+  t.equal(await statusOf(db, draft), 'invalid', 'and closes the incomplete draft');
+});
+
+/*
+ * A request to hold the candidate holds it once no root is left to attempt,
+ * as a first import is held: a run that gave roots up leaves its draft open
+ * all the same, and the answer says how many it gave up, since the draft
+ * cannot validate without them (REGISTRY_RUNBOOK.md, "Describing a new
+ * market").
+ */
+t.test('a held attempt that gives a root up is held all the same, and says so', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [
+    { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) },
+    { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) },
+  ];
+
+  // the chain never answers for weth, so the root is given up once its attempts run out
+  let result = await runInvocation(deps(db, roots, 2), {
+    forceNewAttempt: true, holdForReview: true, reason: 'describe 1/weth', requestedBy: 'test-admin',
+  });
+  for (let invocation = 0; invocation < 10 && result.kind === 'running'; invocation++) {
+    result = await runInvocation(deps(db, roots, 2));
+  }
+  t.match(result, { kind: 'held', expected: 2, completed: 1, outstanding: 0, checksFailed: 1 },
+    'the attempt ends with its draft held, one root of two imported and none left to attempt');
+  t.equal(
+    result.reason,
+    'the import gave up 1 of its 2 roots; the candidate is held for review, and cannot validate without them; 1 of its checks failed',
+    'and its answer says the root was given up',
+  );
+  t.equal(await statusOf(db, result.versionId!), 'importing', 'the draft is open for review');
+  const summary = await readValidationSummary(db, result.versionId!);
+  t.same(summary.checks.filter(check => !check.passed).map(check => check.name), [ 'all-roots-imported' ],
+    'and the one check it fails is the root it lacks');
 });
 
 /*
@@ -837,4 +960,591 @@ t.test('one invocation can import the whole source, one attempt per root', async
   t.same((attempts.results ?? []).map(item => item.attempts), [ 1, 0 ],
     'and the root the chain did not answer for kept its budget: the invocation had already imported one, '
       + 'so the failure was the invocation running out, not the root being wrong');
+});
+
+/*
+ * The database and the chain of an invocation that is stopped in the middle
+ * of weth: once it asks the chain about weth's Comet it writes nothing more,
+ * as a deploy, or the time or the CPU a Worker is given, leaves it. Every
+ * other read is answered from the recording.
+ */
+function stoppedOnWeth(db: D1Database) {
+  const weth  = (JSON.parse(wethContent) as { comet: string }).comet.slice(2).toLowerCase();
+  const chain = chainStub();
+  let stopped = false;
+  return {
+    db: new Proxy(db, {
+      get(target, property, receiver) {
+        if (stopped) {
+          throw new Error('the invocation was stopped');
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+      },
+    }),
+    transportFor: () => async (calls: jsonRpc.Call[]) => {
+      if (JSON.stringify(calls).toLowerCase().includes(weth)) {
+        stopped = true;
+        throw new Error('the invocation was stopped');
+      }
+      return chain(calls);
+    },
+  };
+}
+
+/*
+ * An invocation can be stopped in the middle of a root and write nothing
+ * more: a deploy, or the time or the CPU a Worker is given. The invocation
+ * that takes the run over records that attempt as failed, so a root whose
+ * invocations keep stopping on it is retried as any failing root is, given
+ * up after its five attempts and counted among the run's failed roots; and
+ * while it repeats, the status names an import that keeps failing.
+ */
+t.test('a root whose invocations keep stopping on it is failed, retried and given up like any other', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [
+    { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) },
+    { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) },
+  ];
+  const env = await server.getWorker<Env>().getEnv();
+
+  // the hourly invocations: each one is stopped once it reads weth from the chain, and writes nothing more
+  let hour = Date.now();
+  const invocation = async () => {
+    const answer = await runInvocation({
+      ...deps(db, roots),
+      ...stoppedOnWeth(db),
+      now: () => new Date(hour),
+    }).catch(() => null);
+    hour += 3_600_000;
+    return answer;
+  };
+  const wethRoot = () => db.prepare(
+    `SELECT status, attempts, last_error FROM sync_run_items WHERE root_path = ?1`
+  ).bind(WETH_ROOT).first<{ status: string, attempts: number, last_error: string | null }>();
+  // the status half an hour after the last invocation, once its lease has run out
+  const alerts = async () => (await registryStatus(env, { ...cacheDepsOf(env), now: () => new Date(hour - 1_800_000) })).alerts;
+
+  t.equal(await invocation(), null, 'the first invocation imports usdc, and is stopped on weth');
+  t.same(await wethRoot(), { status: 'processing', attempts: 1, last_error: null }, 'which it leaves in progress');
+  t.notOk((await alerts()).includes('sync-failing'), 'one stopped attempt is not yet an import that keeps failing');
+
+  t.equal(await invocation(), null, 'the next invocation is stopped on weth too');
+  t.same(await wethRoot(), { status: 'processing', attempts: 2, last_error: 'the invocation importing this root did not finish' },
+    'having recorded why the attempt before its own failed');
+  t.ok((await alerts()).includes('sync-failing'), 'and the import is one that keeps failing');
+
+  for (let attempt = 3; attempt <= 5; attempt++) {
+    t.equal(await invocation(), null, `invocation ${attempt} is stopped on weth`);
+  }
+  const ended = await invocation();
+  t.match(ended, { kind: 'invalid', expected: 2, completed: 1, outstanding: 0 },
+    'the invocation after the fifth gives weth up, and the candidate fails without it');
+  t.same(await wethRoot(), { status: 'failed', attempts: 5, last_error: 'the invocation importing this root did not finish' },
+    'leaving the root failed, with why');
+  const run = await db.prepare(`SELECT status, completed_count, failed_count FROM sync_runs WHERE id = ?1`)
+    .bind(ended?.runId).first();
+  t.same(run, { status: 'failed', completed_count: 1, failed_count: 1 }, 'and counted among the roots the run gave up');
+});
+
+/*
+ * An invocation can import a root and then be stopped on the next. The root
+ * it imported cleared the run's error, and nothing records the attempt it was
+ * stopped in until another invocation takes the run over; but once its lease
+ * has run out, that attempt is the run's latest, and failed, and the status
+ * counts it so.
+ */
+t.test('an attempt stopped after a root that imported is a failure once its lease has run out', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [
+    { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) },
+    { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) },
+  ];
+  const env    = await server.getWorker<Env>().getEnv();
+  const hour   = Date.now();
+  const alerts = async (at: number) => (await registryStatus(env, { ...cacheDepsOf(env), now: () => new Date(at) })).alerts;
+
+  // the invocations of the first two hours reach no node provider, and each spends an attempt of both roots
+  for (const at of [ hour, hour + 3_600_000 ]) {
+    await runInvocation({
+      ...deps(db, roots),
+      transportFor: () => async () => {
+        throw new Error('the node provider did not answer');
+      },
+      now: () => new Date(at),
+    });
+  }
+  t.ok((await alerts(hour + 3_660_000)).includes('sync-failing'), 'the import keeps failing');
+
+  t.equal(await runInvocation({
+    ...deps(db, roots),
+    ...stoppedOnWeth(db),
+    now: () => new Date(hour + 7_200_000),
+  }).catch(() => null), null, 'the third invocation is stopped on weth');
+  const run   = await db.prepare(`SELECT id, last_error FROM sync_runs WHERE status = 'running'`)
+    .first<{ id: string, last_error: string | null }>();
+  const items = await db.prepare(
+    `SELECT deployment_key, status, attempts FROM sync_run_items WHERE sync_run_id = ?1 ORDER BY root_path`
+  ).bind(run?.id).all();
+  t.same(items.results, [
+    { deployment_key: 'usdc', status: 'completed', attempts: 3 },
+    { deployment_key: 'weth', status: 'processing', attempts: 3 },
+  ], 'having imported usdc first');
+  t.equal(run?.last_error, null, 'which cleared the run\'s error');
+
+  t.notOk((await alerts(hour + 7_260_000)).includes('sync-failing'),
+    'so while its lease runs, the latest attempt recorded is one that succeeded');
+  t.ok((await alerts(hour + 9_000_000)).includes('sync-failing'),
+    'and once it has run out, the attempt at weth is the latest, and failed: the import keeps failing');
+});
+
+/*
+ * Ending a candidate and closing its run are one transaction. A finish the
+ * database refuses leaves both as they were, and the next invocation finishes
+ * them; a candidate never ends under a run that stays open.
+ */
+const failClosingRuns = (db: D1Database) => db.prepare(
+  `CREATE TRIGGER test_closing_fails BEFORE UPDATE OF status ON sync_runs
+   WHEN NEW.status <> 'running'
+   BEGIN SELECT RAISE(ABORT, 'the database stopped answering'); END`
+).run();
+const allowClosingRuns = (db: D1Database) => db.prepare(`DROP TRIGGER test_closing_fails`).run();
+const openRun = (db: D1Database) => db.prepare(
+  `SELECT id, status, registry_version_id FROM sync_runs ORDER BY started_at DESC LIMIT 1`
+).first<{ id: string, status: string, registry_version_id: string }>();
+// the lease of an invocation that failed outright is still held; it is free once it expires
+const afterTheLease = () => new Date(Date.now() + 901_000);
+
+t.test('a candidate ends together with its run, or not at all', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  await failClosingRuns(db);
+  await t.rejects(runInvocation(deps(db, roots)), { message: /the database stopped answering/ });
+  await allowClosingRuns(db);
+
+  const run = await openRun(db);
+  t.equal(run?.status, 'running', 'the run the database refused to close is still open');
+  t.equal(await statusOf(db, run!.registry_version_id), 'importing', 'and its candidate did not end without it');
+
+  const finished = await runInvocation({ ...deps(db, roots), now: afterTheLease });
+  t.same([ finished.kind, finished.versionId ], [ 'imported', run!.registry_version_id ],
+    'the next invocation finishes both');
+  t.equal(await statusOf(db, run!.registry_version_id), 'validated');
+});
+
+/*
+ * A release before this one ended the candidate and closed its run in two
+ * writes, and an invocation interrupted between them left the run open for
+ * good: every later invocation took it, failed to validate an ended
+ * candidate again, and held the lease. Such a run is now closed.
+ */
+t.test('a run left open under a candidate that has already ended is closed', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  await failClosingRuns(db);
+  await t.rejects(runInvocation(deps(db, roots)), { message: /the database stopped answering/ });
+  await allowClosingRuns(db);
+  // what the earlier release had written before it was interrupted: the attempt, and the status it decided
+  const run = (await openRun(db))!;
+  await recordValidationResults(db, run.registry_version_id, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
+  await markValidated(db, run.registry_version_id, await snapshotChecksum(await readSnapshot(db, run.registry_version_id)));
+  const attempts = () => db.prepare(
+    `SELECT MAX(validation_attempt) AS n FROM validation_results WHERE registry_version_id = ?1`
+  ).bind(run.registry_version_id).first<number>('n');
+  const before = await attempts();
+
+  const closed = await runInvocation({ ...deps(db, roots), now: afterTheLease });
+  t.same([ closed.kind, closed.runId ], [ 'imported', run.id ], 'the next invocation closes the run');
+  t.equal((await openRun(db))?.status, 'completed');
+  t.equal(await attempts(), before, 'without validating the ended candidate again');
+});
+
+t.test('an invocation that loses its lease before the candidate ends writes nothing, and says so', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  // another invocation takes the lease over once the last root is in, before the candidate is decided
+  await db.prepare(
+    `CREATE TRIGGER test_taken_over AFTER UPDATE OF status ON sync_run_items
+     WHEN NEW.status = 'completed'
+     BEGIN UPDATE sync_runs SET lease_owner = 'another-invocation' WHERE id = NEW.sync_run_id; END`
+  ).run();
+  const result = await runInvocation(deps(db, roots));
+  await db.prepare(`DROP TRIGGER test_taken_over`).run();
+
+  t.same([ result.kind, result.reason ], [ 'running', 'the lease was taken over' ], 'not completed: nothing was completed');
+  t.equal(await statusOf(db, result.versionId!), 'importing', 'the candidate did not end');
+  t.equal((await openRun(db))?.status, 'running', 'and its run is left to the invocation that took it over');
+  t.equal(
+    await db.prepare(`SELECT COUNT(*) AS n FROM validation_results WHERE registry_version_id = ?1`)
+      .bind(result.versionId).first<number>('n'),
+    0,
+    'not even its checks are recorded: they belong to whoever ends it',
+  );
+});
+
+const usdcFixture = snapshot.networks.find(network => network.chainId === 1)!.markets
+  .find(market => market.deploymentKey === 'usdc')!;
+const rewardFeeds: FeedReader = async () => new Map([ [ REWARD_FEED.address, REWARD_FEED ] ]);
+
+// the reviewed decisions of the fixture's mainnet usdc market, as the market overlay route takes them
+function usdcOverlay(displayName: string = usdcFixture.displayName) {
+  return {
+    displayName,
+    contractName:         usdcFixture.contractName,
+    slug:                 usdcFixture.slug,
+    isInstitutional:      usdcFixture.isInstitutional,
+    isDefault:            usdcFixture.isDefault,
+    status:               usdcFixture.status,
+    creationBlock:        usdcFixture.creationBlock,
+    collateralValueQuote: usdcFixture.collateralValueQuote,
+    capabilities:         usdcFixture.capabilities,
+    baseAsset: {
+      displayName:         usdcFixture.baseAsset.displayName,
+      isWrappedNative:     usdcFixture.baseAsset.isWrappedNative,
+      usdPriceFeedAddress: null,
+    },
+    rewardPriceFeed: { address: REWARD_FEED.address, quote: usdcFixture.rewardAsset!.priceFeedQuote! },
+  };
+}
+
+const runsOf = (db: D1Database) => db.prepare(`SELECT COUNT(*) AS n FROM sync_runs`).first<number>('n');
+
+/*
+ * A request that holds the candidate open is a decision, like naming a commit
+ * or forcing an attempt: it is acted on when it is asked rather than at the
+ * next daily discovery, and the run records that a person asked for it.
+ */
+t.test('a request to hold the candidate is acted on at once, as a manual run', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1`).bind(new Date().toISOString()).run();
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  t.equal((await runInvocation(deps(db, roots))).reason, 'upstream was checked recently', 'routine discovery is not due');
+
+  const held = await runInvocation(deps(db, roots), {
+    holdForReview: true, reason: 'review it before it validates', requestedBy: 'test-admin',
+  });
+  t.equal(held.kind, 'held', 'the request to hold one runs all the same, and holds the candidate it imports');
+  t.same(
+    await db.prepare(`SELECT trigger_kind, hold_for_review, requested_by, reason FROM sync_runs WHERE id = ?1`)
+      .bind(held.runId).first(),
+    { trigger_kind: 'manual', hold_for_review: 1, requested_by: 'test-admin', reason: 'review it before it validates' },
+    'recorded as the manual run it is',
+  );
+});
+
+/*
+ * A version names who asked for the import that created it, as its run does:
+ * the operator of an administrative sync, whatever the request asked for —
+ * an empty one that found discovery due starts a routine run, which the
+ * operator asked for all the same — and the schedule otherwise.
+ */
+t.test('a version is created by whoever asked for its run', async t => {
+  const roots   = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+  const creator = (db: D1Database, versionId: string) =>
+    db.prepare(`SELECT created_by FROM registry_versions WHERE id = ?1`).bind(versionId).first<string>('created_by');
+  const run     = (db: D1Database, runId: string) =>
+    db.prepare(`SELECT trigger_kind, requested_by FROM sync_runs WHERE id = ?1`).bind(runId).first();
+
+  const scheduledDb = await freshDatabase();
+  await activateFixture(scheduledDb);
+  const scheduled = await runInvocation(deps(scheduledDb, roots));
+  t.equal(scheduled.kind, 'imported');
+  t.equal(await creator(scheduledDb, scheduled.versionId!), 'registry-cron', 'the schedule\'s run creates the schedule\'s version');
+
+  const forced = await runInvocation(deps(scheduledDb, roots), {
+    forceNewAttempt: true, reason: 'read the chain again', requestedBy: 'registry-admin:test',
+  });
+  t.equal(forced.kind, 'imported');
+  t.same(await run(scheduledDb, forced.runId!), { trigger_kind: 'manual', requested_by: 'registry-admin:test' });
+  t.equal(await creator(scheduledDb, forced.versionId!), 'registry-admin:test', 'an operator\'s attempt creates the operator\'s');
+
+  const askedDb = await freshDatabase();
+  await activateFixture(askedDb);
+  const asked = await runInvocation(deps(askedDb, roots), { requestedBy: 'registry-admin:test' });
+  t.equal(asked.kind, 'imported');
+  t.same(await run(askedDb, asked.runId!), { trigger_kind: 'scheduled', requested_by: 'registry-admin:test' },
+    'an empty request that found discovery due starts a routine run');
+  t.equal(await creator(askedDb, asked.versionId!), 'registry-admin:test', 'whose version is the operator\'s all the same');
+});
+
+/*
+ * A commit whose newest attempt imported every root and still did not
+ * validate would fail the same way on every retry: the same source, the same
+ * chain, the decisions inherited from the attempt before. Discovery leaves it
+ * alone rather than write another version of it every day; an attempt a
+ * person forces is made all the same.
+ */
+t.test('a commit that imported completely and did not validate is not attempted again by itself', async t => {
+  const db = await freshDatabase();
+  // an active version that has never seen the usdc deployment, so the import holds no default market
+  await activateFixture(db, {
+    ...snapshot,
+    networks: snapshot.networks.map(network => network.chainId !== 1 ? network : {
+      ...network,
+      markets: network.markets
+        .filter(market => market.deploymentKey !== 'usdc')
+        .map(market => market.deploymentKey === 'weth' ? { ...market, isDefault: true } : market),
+    }),
+  });
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  const failed = await runInvocation(deps(db, roots));
+  t.equal(failed.kind, 'invalid', 'the attempt imported its root, and did not validate');
+
+  await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1`).bind('2020-01-01T00:00:00.000Z').run();
+  const again = await runInvocation(deps(db, roots));
+  t.same([ again.kind, again.versionId ], [ 'idle', failed.versionId ], 'discovery does not start another attempt');
+  t.match(again.reason, /attempt 1 of this commit imported every root and is invalid/, 'and says why');
+  t.equal(await runsOf(db), 1, 'no run is created for it');
+  t.not(
+    await db.prepare(`SELECT last_upstream_checked_at FROM registry_state`).first<string>('last_upstream_checked_at'),
+    '2020-01-01T00:00:00.000Z',
+    'though upstream was checked, so the interval starts again',
+  );
+
+  const forced = await runInvocation(deps(db, roots), { forceNewAttempt: true, reason: 'the reviews are fixed' });
+  t.not(forced.versionId, failed.versionId, 'an attempt somebody forces is made');
+  t.equal(await runsOf(db), 2);
+});
+
+/*
+ * An attempt that did not import every root failed on something that can
+ * pass by — a chain that did not answer, or contracts the source names before
+ * they are deployed — so it is tried again: at the next discovery, then two
+ * discoveries after the second attempt, four after the third, instead of a
+ * whole attempt every day. The test runs the schedule itself, an invocation
+ * an hour and a discovery a day, and nothing else moves the time upstream was
+ * last checked: an attempt takes hours, so a wait counted from its end would
+ * always miss the discovery it was meant for.
+ */
+t.test('a commit whose roots did not all import is tried again, each time later', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [
+    { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) },
+    { path: WETH_ROOT, content: wethContent, sha: await gitBlobSha(wethContent) },
+  ];
+  const HOUR  = 3_600_000;
+  const start = Date.now();
+
+  // a week of the hourly Cron; the weth root never answers, so every attempt ends without it
+  const started: number[] = [];
+  const waiting = new Map<number, string | undefined>();
+  for (let hour = 0; hour <= 168; hour++) {
+    const runs   = await runsOf(db);
+    const result = await runInvocation({ ...deps(db, roots, 2), now: () => new Date(start + hour * HOUR) });
+    if (await runsOf(db) !== runs) {
+      started.push(hour);
+    }
+    if (result.kind === 'idle' && result.reason !== 'upstream was checked recently') {
+      waiting.set(hour, result.reason);
+    }
+  }
+
+  t.same(started, [ 0, 24, 72, 168 ], 'attempts start one, two and four daily discoveries apart');
+  t.same([ ...waiting.keys() ], [ 48, 96, 120, 144 ], 'and the discoveries between them leave the commit alone');
+  t.match(waiting.get(48), `tried again after ${new Date(start + 72 * HOUR).toISOString()}`, 'saying when it is tried again');
+  t.match(waiting.get(96), `tried again after ${new Date(start + 168 * HOUR).toISOString()}`);
+});
+
+/*
+ * The candidate and the run's record of it are written in one transaction,
+ * under the run's fence. An invocation that loses the run before it gets there
+ * writes neither: there is no empty draft without a run, which discovery would
+ * otherwise take for one held for review and stop at for good.
+ */
+t.test('an invocation that loses the run before its candidate exists creates none', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  // another invocation takes the run over as soon as it exists
+  await db.prepare(
+    `CREATE TRIGGER test_taken_over AFTER UPDATE OF last_upstream_checked_at ON registry_state
+     BEGIN UPDATE sync_runs SET lease_owner = 'another-invocation' WHERE status = 'running'; END`
+  ).run();
+  const result = await runInvocation(deps(db, roots));
+  await db.prepare(`DROP TRIGGER test_taken_over`).run();
+
+  t.same([ result.kind, result.reason, result.versionId ], [ 'running', 'the lease was taken over', undefined ],
+    'the invocation stops, naming no candidate');
+  t.equal(
+    await db.prepare(`SELECT COUNT(*) AS n FROM registry_versions WHERE source_commit_sha = ?1`).bind(COMMIT).first<number>('n'),
+    0,
+    'and none was created',
+  );
+  t.equal((await openRun(db))?.registry_version_id, null, 'the run creates its own under the invocation that holds it');
+});
+
+/*
+ * What the fence on market writes is for. An invocation stalls in the middle
+ * of a market — a node provider that does not answer — for longer than its
+ * lease. Another one takes the run over, imports the market, finishes the run
+ * and holds the candidate, and an operator reviews the market in place. When
+ * the stalled invocation wakes up, what it read is stale, and writing it would
+ * put back what the review replaced.
+ */
+t.test('a market whose invocation lost the run is not written over a review', async t => {
+  const db    = await freshDatabase();
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+  let versionId: string | undefined;
+
+  const stalling = {
+    ...deps(db, roots),
+    transportFor: () => {
+      const answer = chainStub();
+      return async (calls: jsonRpc.Call[]) => {
+        if (versionId === undefined) {
+          // the lease runs out while the provider does not answer, and another invocation does the work
+          await db.prepare(`UPDATE sync_runs SET lease_expires_at = ?1 WHERE status = 'running'`)
+            .bind('2020-01-01T00:00:00.000Z').run();
+          const finished = await runInvocation(deps(db, roots));
+          versionId = finished.versionId!;
+          await replaceMarketOverlay(db, {
+            versionId, chainId: 1, deploymentKey: 'usdc', actor: 'test-admin', reason: 'review the market',
+            overlay: usdcOverlay('Reviewed USDC'),
+          }, rewardFeeds);
+        }
+        return answer(calls);
+      };
+    },
+  };
+
+  const late = await runInvocation(stalling);
+  t.same([ late.kind, late.reason ], [ 'idle', 'the lease was taken over, and the run has since finished' ],
+    'the stalled invocation says it wrote nothing, and why');
+  t.equal(
+    await db.prepare(`SELECT display_name FROM markets WHERE registry_version_id = ?1 AND deployment_key = 'usdc'`)
+      .bind(versionId).first<string>('display_name'),
+    'Reviewed USDC',
+    'and the review stands',
+  );
+});
+
+/*
+ * A review written while the import is checking its candidate changes rows
+ * the checks have already read. Recording those checks, or the status they
+ * decide, would describe a candidate that no longer exists: a version
+ * validated with a checksum that is not the checksum of its rows.
+ */
+t.test('a candidate reviewed while its import checks it is checked again, not ended', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  const racing = interleaved(db, /INSERT INTO validation_results/, async () => {
+    await replaceMarketOverlay(db, {
+      versionId: (await openRun(db))!.registry_version_id, chainId: 1, deploymentKey: 'usdc',
+      actor: 'test-admin', reason: 'renamed while the import checks it', overlay: usdcOverlay('Renamed meanwhile'),
+    }, rewardFeeds);
+  });
+  const interrupted = await runInvocation({ ...deps(db, roots), db: racing });
+  t.equal(interrupted.kind, 'running', 'the import does not finish');
+  t.match(interrupted.reason, /changed while it was being validated/, 'and says why');
+  t.equal(await statusOf(db, interrupted.versionId!), 'importing', 'the candidate did not end');
+  t.equal(
+    await db.prepare(`SELECT COUNT(*) AS n FROM validation_results WHERE registry_version_id = ?1`)
+      .bind(interrupted.versionId).first<number>('n'),
+    0,
+    'and no checks of the rows it read are recorded',
+  );
+
+  const finished = await runInvocation(deps(db, roots));
+  t.same([ finished.kind, finished.versionId ], [ 'imported', interrupted.versionId ],
+    'the next invocation, released at once, checks it as it now is');
+  const version = await db.prepare(`SELECT status, snapshot_checksum FROM registry_versions WHERE id = ?1`)
+    .bind(finished.versionId).first<{ status: string, snapshot_checksum: string }>();
+  t.equal(version?.status, 'validated');
+  t.equal(version?.snapshot_checksum, await snapshotChecksum(await readSnapshot(db, finished.versionId!)),
+    'with the checksum of the rows it holds');
+});
+
+/*
+ * The overlays an import applies are read for the markets it imports. An
+ * invocation that only has the candidate left to decide reads none of them.
+ */
+t.test('an invocation with no root left to import reads no overlays', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  // the root is imported, and the candidate is not decided: the run is left with nothing but that
+  await failClosingRuns(db);
+  await t.rejects(runInvocation(deps(db, roots)), { message: /the database stopped answering/ });
+  await allowClosingRuns(db);
+
+  const statements: string[] = [];
+  const watched = new Proxy(db, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'prepare') {
+        return (sql: string) => {
+          statements.push(sql);
+          return target.prepare(sql);
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as D1Database;
+
+  const finished = await runInvocation({ ...deps(db, roots), db: watched, now: afterTheLease });
+  t.same([ finished.kind, finished.processed ], [ 'imported', 0 ], 'the invocation decides the candidate');
+  t.ok(statements.some(sql => sql.includes('INSERT INTO validation_results')), 'every statement it prepared is watched');
+  t.notOk(statements.some(sql => sql.includes('WITH sources')), 'and none of them reads an overlay');
+});
+
+/*
+ * D1 keeps a root's failure as its code alone, so the log is what tells a
+ * node proxy that failed from a chain that did. It names the status the proxy
+ * answered and its URL as far as the network, written by the root logger
+ * whatever DEBUG says, and never the proxy key in that URL or what the proxy
+ * answered.
+ */
+t.test('a root the node proxy did not answer for is logged by its status and network, without the key', async t => {
+  const db = await freshDatabase();
+  await activateFixture(db);
+  const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+
+  // what is written to the console, as the console would write it
+  const written: string[] = [];
+  for (const level of [ 'log', 'warn', 'error' ] as const) {
+    const write = console[level];
+    console[level] = (...parameters: unknown[]) => { written.push(format(...parameters)); };
+    t.teardown(() => { console[level] = write; });
+  }
+  const result = await runInvocation({
+    ...deps(db, roots),
+    debug:        Debug.MakeLogger([]).configure({ DEBUG: '' }),
+    transportFor: () => proxyTransport({
+      apiHost:  'v3-api.test',
+      nodeHost: 'node-proxy.test',
+      nodeKey:  'node-proxy-key-0123456789',
+      network:  'ethereum-mainnet',
+      // what the proxy answers when no provider served the calls, with the URL fetch gives a response
+      fetch:    async request => Object.defineProperty(
+        new Response('upstream error', { status: 503 }),
+        'url',
+        { value: request.url },
+      ),
+    }),
+  });
+  t.equal(result.kind, 'running', 'the root is left to try again');
+
+  const logged = written.join('\n');
+  t.match(logged, /registry root failed/);
+  t.match(logged, /CHAIN_REQUEST_FAILED/);
+  t.match(logged, /JSON-RPC request failed: HTTP 503/, 'the log has the status the proxy answered');
+  t.ok(logged.includes(`url: 'https://node-proxy.test/ethereum-mainnet/…'`), 'and the proxy, as far as the network');
+  t.notOk(logged.includes('node-proxy-key'), 'but not the key');
+  t.notOk(logged.includes('upstream error'), 'nor what the proxy answered');
 });

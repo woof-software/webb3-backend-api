@@ -4,9 +4,12 @@ import { randomUUID } from 'node:crypto';
 
 import { createTestHarness } from 'wrangler';
 
+import { registryConfig } from '../../../src/registry/config.js';
+import { activationStatements } from '../../../src/registry/repository.js';
 import type { Env } from '../../../entrypoint.js';
 import {
   Row,
+  applyMigration,
   applyMigrations,
   changedRows,
   foreignKeyViolations,
@@ -222,26 +225,17 @@ async function validate(db: D1Database, versionId: string): Promise<void> {
 }
 
 /*
- * The activation batch from the registry plan: an audit event and the pointer
- * change, each written only when the pointer differs from the target.
+ * The registry's own activation batch: an audit event and the pointer
+ * change, each written only when the pointer differs from the target. It is
+ * sent as it is, without the checks activateVersion makes before it, because
+ * what refuses a version that is not validated has to be the schema.
  */
-function activationStatements(db: D1Database, versionId: string, action: 'activate' | 'rollback'): D1PreparedStatement[] {
-  return [
-    db.prepare(
-      `INSERT INTO registry_activations (id, registry_version_id, previous_version_id, action, actor, reason, created_at)
-       SELECT ?1, ?2, active_version_id, ?3, 'test-admin', 'test', ?4
-       FROM registry_state
-       WHERE singleton_id = 1 AND active_version_id IS NOT ?2`
-    ).bind(randomUUID(), versionId, action, NOW),
-    db.prepare(
-      `UPDATE registry_state SET active_version_id = ?1, updated_at = ?2
-       WHERE singleton_id = 1 AND active_version_id IS NOT ?1`
-    ).bind(versionId, NOW),
-  ];
+function activationBatch(db: D1Database, versionId: string, action: 'activate' | 'rollback' = 'activate'): D1PreparedStatement[] {
+  return activationStatements(db, { activationId: randomUUID(), versionId, action, actor: 'test-admin', reason: 'test', at: NOW });
 }
 
 async function activate(db: D1Database, versionId: string, action: 'activate' | 'rollback' = 'activate'): Promise<number[]> {
-  const results = await db.batch(activationStatements(db, versionId, action));
+  const results = await db.batch(activationBatch(db, versionId, action));
   return results.map(changedRows);
 }
 
@@ -257,6 +251,17 @@ async function count(db: D1Database, table: string, where: string = '1 = 1', ...
 async function run(db: D1Database, sql: string, ...bindings: unknown[]): Promise<D1Result> {
   return db.prepare(sql).bind(...bindings).run();
 }
+
+// the settings the registry reads from the environment, by the names wrangler.toml sets them under
+const REGISTRY_SETTINGS = [
+  'COMET_SOURCE_REPOSITORY',
+  'COMET_SOURCE_REF',
+  'COMET_UPSTREAM_CHECK_INTERVAL_S',
+  'COMET_SYNC_MARKETS_PER_INVOCATION',
+  'COMET_SYNC_LEASE_SECONDS',
+  'REGISTRY_SNAPSHOT_CACHE_TTL_S',
+  'REGISTRY_STALE_FALLBACK_MAX_S',
+] as const;
 
 t.test('the worker boots in workerd with the registry bindings', async t => {
   const env = await freshEnv();
@@ -281,30 +286,19 @@ t.test('the worker boots in workerd with the registry bindings', async t => {
     'and starts no import while upstream was checked recently',
   );
 
-  t.same(
-    {
-      COMET_SOURCE_REPOSITORY:           env.COMET_SOURCE_REPOSITORY,
-      COMET_SOURCE_REF:                  env.COMET_SOURCE_REF,
-      COMET_UPSTREAM_CHECK_INTERVAL_S:   env.COMET_UPSTREAM_CHECK_INTERVAL_S,
-      COMET_SYNC_MARKETS_PER_INVOCATION: env.COMET_SYNC_MARKETS_PER_INVOCATION,
-      COMET_SYNC_LEASE_SECONDS:          env.COMET_SYNC_LEASE_SECONDS,
-      REGISTRY_SNAPSHOT_CACHE_TTL_S:     env.REGISTRY_SNAPSHOT_CACHE_TTL_S,
-      REGISTRY_STALE_FALLBACK_MAX_S:     env.REGISTRY_STALE_FALLBACK_MAX_S,
-    },
-    {
-      COMET_SOURCE_REPOSITORY:           'Compound-Foundation/comet',
-      COMET_SOURCE_REF:                  'main',
-      COMET_UPSTREAM_CHECK_INTERVAL_S:   '86400',
-      COMET_SYNC_MARKETS_PER_INVOCATION: '2',
-      COMET_SYNC_LEASE_SECONDS:          '900',
-      REGISTRY_SNAPSHOT_CACHE_TTL_S:     '300',
-      REGISTRY_STALE_FALLBACK_MAX_S:     '3600',
-    },
-    'registry vars come from wrangler.toml',
-  );
+  /*
+   * wrangler.toml sets every registry setting, and sets it to something the
+   * registry takes. What each value is stays wrangler.toml's to decide.
+   */
+  for (const name of REGISTRY_SETTINGS) {
+    t.notSame(String(env[name] ?? '').trim(), '', `${name} comes from wrangler.toml`);
+  }
+  t.same(registryConfig(env).invalid, [], 'and the registry takes every one of them');
 
   const limited = await env.REGISTRY_ADMIN_RATE_LIMITER.limit({ key: 'registry-admin:test:sync' });
   t.equal(limited.success, true, 'the admin rate limiter is bound');
+  const addressed = await env.REGISTRY_ADMIN_AUTH_RATE_LIMITER.limit({ key: 'registry-admin-auth:test' });
+  t.equal(addressed.success, true, 'and so is the one every admin request spends from before its token is checked');
 
   await env.kv_registry.put('probe', 'registry');
   t.equal(await env.kv_registry.get('probe'), 'registry', 'the registry KV is bound');
@@ -346,6 +340,15 @@ t.test('migration 0001 creates strict tables and an empty active pointer', async
   ).all<{ name: string }>();
   t.same((listing.results ?? []).map(row => row.name), [ 'is_institutional', 'slug' ],
     'migration 0003 adds how the frontend lists a market');
+
+  const unused = await db.prepare(
+    `SELECT name FROM pragma_table_info('sync_runs') WHERE name = 'lease_generation'
+     UNION ALL SELECT name FROM pragma_table_info('sync_run_items') WHERE name IN ('claim_generation', 'root_checksum')
+     UNION ALL SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN (
+       'tokens_network_symbol_lookup', 'market_contracts_role_address_lookup', 'sync_run_items_fence_lookup'
+     )`
+  ).all<{ name: string }>();
+  t.same(unused.results ?? [], [], 'migration 0004 drops the columns and indexes nothing uses');
 
   const state = await db.prepare('SELECT singleton_id, active_version_id FROM registry_state').all();
   t.same(
@@ -579,7 +582,7 @@ t.test('the active pointer only moves between validated versions', async t => {
 
   await t.rejects(
     () => db.batch([
-      activationStatements(db, validB.registry_version_id, 'activate')[0]!,
+      activationBatch(db, validB.registry_version_id)[0]!,
       db.prepare(`UPDATE registry_state SET active_version_id = ?1`).bind(importing.registry_version_id),
     ]),
     { message: /active registry version must be validated/ },
@@ -871,7 +874,6 @@ t.test('sync runs keep one running job and consistent checkpoints', async t => {
     [ 'counts above the expected count', { ...terminal, completed_count: 2, failed_count: 1 } ],
     [ 'explicit SHA without a reason', { ...terminal, tracked_ref: null } ],
     [ 'manual run without an actor', { ...terminal, trigger_kind: 'manual', requested_by: null } ],
-    [ 'non-positive lease generation', { ...terminal, lease_generation: 0 } ],
   ];
   for (const [ name, overrides ] of cases) {
     await t.rejects(() => insertRow(db, 'sync_runs', syncRun(overrides)), CHECK_FAILED, name);
@@ -891,7 +893,6 @@ t.test('sync runs keep one running job and consistent checkpoints', async t => {
     sync_run_id:          runId,
     root_path:            'deployments/mainnet/usdc/roots.json',
     source_blob_sha:      hex('blob', 40),
-    root_checksum:        hex('root', 64),
     upstream_network_key: 'mainnet',
     deployment_key:       'usdc',
     created_at:           NOW,
@@ -913,4 +914,76 @@ t.test('sync runs keep one running job and consistent checkpoints', async t => {
 
   await run(db, `UPDATE sync_runs SET status = 'completed', outcome = 'no_change', completed_at = ?1, lease_owner = NULL WHERE id = ?2`, NOW, runId);
   await t.resolves(() => insertRow(db, 'sync_runs', syncRun()), 'a new run may start after the previous one completes');
+});
+
+/*
+ * Migration 0004 drops columns from tables a deployed release has already
+ * written to, so it has to apply over their rows and keep the rest of them.
+ */
+t.test('migration 0004 keeps the sync history it drops columns from', async t => {
+  await server.reset();
+  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
+  await applyMigrations(db, undefined, { through: '0003' });
+
+  const { registry_version_id: versionId } = await insertCandidate(db);
+  const runId = randomUUID();
+  await insertRow(db, 'sync_runs', {
+    id:                  runId,
+    source_commit_sha:   hex('sync', 40),
+    tracked_ref:         'main',
+    registry_version_id: versionId,
+    trigger_kind:        'scheduled',
+    requested_by:        'registry-cron',
+    status:              'running',
+    lease_owner:         'owner',
+    lease_generation:    3,
+    lease_expires_at:    NOW,
+    expected_count:      1,
+    started_at:          NOW,
+  });
+  await insertRow(db, 'sync_run_items', {
+    id:                   randomUUID(),
+    sync_run_id:          runId,
+    root_path:            'deployments/mainnet/usdc/roots.json',
+    source_blob_sha:      hex('blob', 40),
+    root_checksum:        hex('root', 64),
+    upstream_network_key: 'mainnet',
+    deployment_key:       'usdc',
+    status:               'processing',
+    claim_owner:          'owner',
+    claim_generation:     3,
+    created_at:           NOW,
+    updated_at:           NOW,
+  });
+
+  await applyMigration(db, '0004_registry_unused_schema.sql');
+
+  const runs = await db.prepare(`SELECT * FROM sync_runs`).all();
+  t.same(runs.results, [ {
+    id:                  runId,
+    source_commit_sha:   hex('sync', 40),
+    tracked_ref:         'main',
+    registry_version_id: versionId,
+    trigger_kind:        'scheduled',
+    requested_by:        'registry-cron',
+    reason:              null,
+    status:              'running',
+    outcome:             null,
+    lease_owner:         'owner',
+    lease_expires_at:    NOW,
+    expected_count:      1,
+    completed_count:     0,
+    failed_count:        0,
+    last_error:          null,
+    started_at:          NOW,
+    completed_at:        null,
+    hold_for_review:     0,
+  } ], 'a run keeps everything but its lease generation');
+
+  const items = await db.prepare(`SELECT root_path, status, claim_owner FROM sync_run_items WHERE sync_run_id = ?1`)
+    .bind(runId).all();
+  t.same(items.results, [ { root_path: 'deployments/mainnet/usdc/roots.json', status: 'processing', claim_owner: 'owner' } ],
+    'a checkpoint keeps its claim');
+  t.equal(await count(db, 'tokens'), 2, 'tokens outlive the index nobody read');
+  t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
 });

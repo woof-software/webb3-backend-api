@@ -2,17 +2,21 @@ import t from 'tap';
 
 import * as Eth from '../../../lib/eth-constants.js';
 
-import type { MarketV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
-import { registryOf } from '../../../lib/model/comet-registry.js';
+import type { MarketV1, NetworkV1, PriceExceptionV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
+import { annotationOf, registryOf } from '../../../lib/model/comet-registry.js';
+import type { RawTransactionHistoryItem } from '../../../lib/model/transaction-history/item.js';
 
 import { BigFixnum } from '../../../lib/bigfixnum.js';
-import { isBulker } from '../../../lib/computations/account/enrich-transaction-history-items.js';
-import { tokenSymbol } from '../../../lib/computations/account/raw-transaction-history-items.js';
+import { balanceOf } from '../../../lib/computations/comet/balance-of.js';
+import { borrowBalanceOf } from '../../../lib/computations/comet/borrow-balance-of.js';
+import { enrichTransactionHistoryItem, isBulker } from '../../../lib/computations/account/enrich-transaction-history-items.js';
+import { rawTransactionHistoryItems, tokenSymbol } from '../../../lib/computations/account/raw-transaction-history-items.js';
 import { baseAssetLabel, marketRewards } from '../../../lib/computations/market/market-rewards.js';
 import { usdBasePriceFeedFor } from '../../../lib/computations/rewards/base-price-feed.js';
 import { lookupInWellKnown, withRegistryContracts } from '../../../lib/well-known/contracts/utils.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
+import type { Catalog } from '../../../src/registry/catalog.js';
 import { describeRegistryTargets } from '../../../src/governance-handlers/proposals.js';
 import { describeContractCallForHumans, contractForLocation } from '../../../lib/well-known/contracts/utils.js';
 import { defaultAbiCoder } from '@ethersproject/abi';
@@ -66,7 +70,7 @@ t.test('account rewards are grouped by the rewards contract that holds them', as
   t.equal(groups[0]!.contracts.length, 4, 'and every mainnet market of the fixture is in one group');
 
   for (const group of groups) {
-    const rewards = new Set(group.contracts.map(comet => comet.rewards.contract.address.toLowerCase()));
+    const rewards = new Set(group.contracts.map(comet => comet.rewards?.contract.address.toLowerCase()));
     t.equal(rewards.size, 1, 'each group reads from exactly one CometRewards');
   }
 
@@ -135,6 +139,7 @@ t.test('a cursor issued before the registry is upgraded, not refused', async t =
 
   const upgraded = upgradeLegacyCursor(legacy, streams, catalog.versionId);
   t.equal(upgraded.registryVersionId, catalog.versionId, 'the upgraded cursor carries the version from now on');
+  t.equal(upgraded.upgraded, true, 'and says it was upgraded, so it keeps its networks across later versions');
   const resumed = upgraded.cursors[streamKeyOf(streams[0]!)]!;
   t.equal(resumed.blockNumber, 19_000_000, 'resuming where the old cursor stood');
   t.equal(resumed.transactionHash, '0xabc');
@@ -174,10 +179,6 @@ t.test('the base price feed of a rewards APR follows the unit of the reward feed
   t.equal(usdBasePriceFeedFor(weth), null, 'nor does one whose reward feed is quoted in its base asset');
   t.equal(usdBasePriceFeedFor(wbtc)?.address, '0xf4030086522a5beea4988f8ca5b36dbc97bee88c',
     'a USD reward feed against a base-quoted market converts through the USD feed');
-
-  const staticComet = (Eth.wellKnownContractsByNetwork[MAINNET] as any)['Comet']['cWETHv3'];
-  t.equal(registryOf(staticComet), null, 'a contract from the constants carries no registry description');
-  t.equal(usdBasePriceFeedFor(staticComet), null, 'and says nothing about units');
 });
 
 /*
@@ -194,10 +195,34 @@ t.test('the rewards of a market name its base asset as the review does', async t
   t.equal(renamed.base.asset.symbol, 'USD₮0', 'the token carries its on-chain symbol');
   t.same(baseAssetLabel(renamed), { symbol: 'USDT', description: 'Tether' },
     'the rewards carry the market\'s reviewed name and the base asset\'s reviewed name');
+});
+
+/*
+ * The computations read one kind of market: a Comet the request's catalog
+ * materialized, whose description they read for its units, its labels, its
+ * reward feed and the exceptions of its network. A contract from the
+ * constants has none of that to read, and is refused as the caller's mistake
+ * it would be, rather than computed as if the registry had said nothing.
+ */
+t.test('a computation reads only a Comet the registry materialized', async t => {
+  const usdc = catalog.marketAt(MAINNET, USDC)!.comet;
+  t.equal(annotationOf(usdc), registryOf(usdc), 'a Comet of the catalog carries the description of its market');
+  t.equal(annotationOf(usdc).market.deploymentKey, 'usdc', 'the market it was materialized from');
 
   const staticComet = (Eth.wellKnownContractsByNetwork[MAINNET] as any)['Comet']['cUSDCv3'];
-  t.same(baseAssetLabel(staticComet), { symbol: 'USDC', description: 'USD Coin' },
-    'a contract from the constants keeps what it carries');
+  t.equal(registryOf(staticComet), null, 'a contract from the constants carries none');
+  const refused = /invariant violated: 0x[0-9a-fA-F]{40} is not a Comet the registry materialized/;
+  t.throws(() => annotationOf(staticComet), refused, 'and is refused');
+  t.throws(() => usdBasePriceFeedFor(staticComet), refused, 'by the unit of a rewards APR');
+  t.throws(() => baseAssetLabel(staticComet), refused, 'by the label of its rewards');
+  t.throws(
+    () => marketRewards.key('marketRewards', {
+      apiHost: '', nodeHost: '', nodeKey: '', contract: staticComet, network: MAINNET,
+      block: { number: 19_000_000, timestamp: 1_700_000_000 } as never,
+    }),
+    refused,
+    'and by the rewards of the market, before anything is read',
+  );
 });
 
 /*
@@ -327,6 +352,31 @@ t.test('a materialized market keys its cached computations by its content', asyn
     baseAsset:       { ...market.baseAsset, displayName: 'Circle USD' },
   })));
   t.equal(relisted.marketAt(MAINNET, USDC)!.comet.key(), usdc.key(), 'relabelling a market keeps its cached work');
+
+  /*
+   * Nor are the routes that serve a market, or why an exception was added and
+   * until when it applies, read by any computation. What an exception does to
+   * a price is, on whichever feed of the network a Comet reads at a block.
+   */
+  const recapped = catalogOf(withMarket('usdc', market => ({
+    ...market,
+    capabilities: { rewards: false, accountRewards: false, transactionHistory: false },
+  })));
+  t.equal(recapped.marketAt(MAINNET, USDC)!.comet.key(), usdc.key(), 'turning its capabilities off keeps its cached work');
+
+  const excepted = (change: (exception: PriceExceptionV1) => PriceExceptionV1) => catalogOf({
+    ...snapshot,
+    networks: snapshot.networks.map(network => network.chainId !== 1 ? network : {
+      ...network,
+      priceExceptions: network.priceExceptions.map(change),
+    }),
+  }).marketAt(MAINNET, USDC)!.comet.key();
+  t.equal(excepted(exception => ({ ...exception, provenance: 'reworded' })), usdc.key(),
+    'and so does rewording why an exception was added');
+  t.equal(excepted(exception => ({ ...exception, expiresAt: '2999-01-01T00:00:00.000Z' })), usdc.key(),
+    'or giving it an expiry that has not passed');
+  t.not(excepted(exception => exception.kind !== 'fixed_price' ? exception : { ...exception, price: { ...exception.price, value: '1' } }),
+    usdc.key(), 'while the price an exception states retires it');
 });
 
 /*
@@ -345,8 +395,8 @@ t.test('history is keyed by what its network says, not by the whole version', as
     }),
   });
   t.not(onBase.key(), catalog.key(), 'the version as a whole changed');
-  t.equal(onBase.keyFor(MAINNET), catalog.keyFor(MAINNET), 'but mainnet history keeps its key');
-  t.not(onBase.keyFor('base-mainnet'), catalog.keyFor('base-mainnet'), 'and base history does not');
+  t.equal(onBase.historyKeyFor(MAINNET), catalog.historyKeyFor(MAINNET), 'but mainnet history keeps its key');
+  t.not(onBase.historyKeyFor('base-mainnet'), catalog.historyKeyFor('base-mainnet'), 'and base history does not');
 
   const renamed = catalogOf({
     ...snapshot,
@@ -360,7 +410,120 @@ t.test('history is keyed by what its network says, not by the whole version', as
       },
     }),
   });
-  t.not(renamed.keyFor(MAINNET), catalog.keyFor(MAINNET), 'a token the network renames is a change to its history');
+  t.not(renamed.historyKeyFor(MAINNET), catalog.historyKeyFor(MAINNET), 'a token the network renames is a change to its history');
+});
+
+/*
+ * History reads the tokens an event names, the names the network renames
+ * them to, and each market's contracts and creation block: nothing else a
+ * version says about a market reaches an item. So a new feed, an exception or
+ * a capability keeps every page computed so far — the raw items name their
+ * contracts by address, and the balances enrichment reads are a Comet's at
+ * its base scale — while a symbol or a scale an amount is read at does not.
+ */
+t.test('history is keyed by what it reads of a market, not by everything the market says', async t => {
+  const onMainnet = (change: (market: MarketV1) => MarketV1, network: (network: NetworkV1) => NetworkV1 = same => same) => catalogOf({
+    ...snapshot,
+    networks: snapshot.networks.map(entry => entry.chainId !== 1 ? entry : network({
+      ...entry,
+      markets: entry.markets.map(change),
+    })),
+  });
+  const usdcOnly = (change: (market: MarketV1) => MarketV1) => onMainnet(market => market.deploymentKey === 'usdc' ? change(market) : market);
+
+  const refed     = usdcOnly(market => ({
+    ...market,
+    baseAsset: { ...market.baseAsset, priceFeed: { address: '0x3333333333333333333333333333333333333333', decimals: 8 } },
+  }));
+  const excepted  = onMainnet(market => market, network => ({
+    ...network,
+    priceExceptions: network.priceExceptions.map(exception => ({ ...exception, provenance: 'reworded' })),
+  }));
+  const recapped  = onMainnet(market => ({ ...market, capabilities: { ...market.capabilities, rewards: !market.capabilities.rewards } }));
+  const relisted  = usdcOnly(market => ({ ...market, status: 'deprecated', displayName: 'USDC (old)' }));
+  for (const [ changed, what ] of [
+    [ refed, 'a feed' ], [ excepted, 'an exception' ], [ recapped, 'a capability' ], [ relisted, 'a status or a label' ],
+  ] as const) {
+    t.equal(changed.historyKeyFor(MAINNET), catalog.historyKeyFor(MAINNET), `changing ${what} keeps mainnet history`);
+  }
+
+  const resymboled = usdcOnly(market => ({
+    ...market,
+    baseAsset: { ...market.baseAsset, token: { ...market.baseAsset.token, symbol: 'USDC2' } },
+  }));
+  const rescaled = usdcOnly(market => ({
+    ...market,
+    collateralAssets: market.collateralAssets.map((asset, index) => index !== 0 ? asset : {
+      ...asset,
+      token: { ...asset.token, decimals: asset.token.decimals + 1 },
+    }),
+  }));
+  const rebulked = usdcOnly(market => ({
+    ...market,
+    contracts: { ...market.contracts, bulker: '0x4444444444444444444444444444444444444444' },
+  }));
+  for (const [ changed, what ] of [
+    [ resymboled, 'a token symbol' ], [ rescaled, 'a token scale' ], [ rebulked, 'a bulker' ],
+  ] as const) {
+    t.not(changed.historyKeyFor(MAINNET), catalog.historyKeyFor(MAINNET), `while changing ${what} is new history`);
+  }
+
+  const account = '0x1111111111111111111111111111111111111111';
+  const rawKey  = async (lookup: Catalog) => {
+    const usdc = lookup.marketAt(MAINNET, USDC)!.comet;
+    return rawTransactionHistoryItems.key('rawTransactionHistoryItems', {
+      apiHost: '', nodeHost: '', nodeKey: '', network: MAINNET, accountAddress: account, proxyAddresses: [],
+      blockNumber: 19_000_000, marketContracts: [ usdc ], rewardsContract: usdc.rewards!.contract, catalog: lookup,
+    });
+  };
+  t.not(refed.marketAt(MAINNET, USDC)!.comet.key(), catalog.marketAt(MAINNET, USDC)!.comet.key(),
+    'a new feed is a new market to the computations that price it');
+  t.equal(await rawKey(refed), await rawKey(catalog), 'but the same raw history');
+  t.not(await rawKey(resymboled), await rawKey(catalog), 'unlike a new symbol');
+
+  const balanceKeys = async (lookup: Catalog) => {
+    const context = {
+      apiHost: '', nodeHost: '', nodeKey: '', network: MAINNET, address: account as `0x${string}`,
+      blockNumber: 19_000_000, contract: lookup.marketAt(MAINNET, USDC)!.comet,
+    };
+    return [ await balanceOf.key('balanceOf', context), await borrowBalanceOf.key('borrowBalanceOf', context) ];
+  };
+  t.same(await balanceKeys(refed), await balanceKeys(catalog), 'and the same balances, which enrichment reads');
+  const rebased = usdcOnly(market => ({
+    ...market,
+    baseAsset: { ...market.baseAsset, token: { ...market.baseAsset.token, decimals: 18 } },
+  }));
+  t.notSame(await balanceKeys(rebased), await balanceKeys(catalog), 'unless the base scale they are read at changed');
+
+  /*
+   * An enriched item is kept under the history of its network too: what it
+   * says of a market is what history reads, so it outlives a change to
+   * anything else — in its own network, or in a version that changes another
+   * network alone.
+   */
+  const item: RawTransactionHistoryItem = {
+    network:         MAINNET,
+    blockNumber:     19_000_000,
+    transactionHash: `0x${'ab'.repeat(32)}`,
+    actions:         [],
+  };
+  const enrichedKey = (lookup: Catalog) => enrichTransactionHistoryItem.key('enrichTransactionHistoryItem', {
+    apiHost: '', nodeHost: '', nodeKey: '', network: MAINNET, accountAddress: account, item, catalog: lookup,
+  });
+  const elsewhere = catalogOf({
+    ...snapshot,
+    registryVersion: { ...snapshot.registryVersion, checksum: 'f'.repeat(64) },
+    networks: snapshot.networks.map(network => network.chainId !== 8453 ? network : {
+      ...network,
+      markets: network.markets.map(market => ({ ...market, creationBlock: market.creationBlock + 1 })),
+    }),
+  });
+  for (const [ changed, what ] of [
+    [ refed, 'a feed' ], [ excepted, 'an exception' ], [ recapped, 'a capability' ], [ elsewhere, 'another network' ],
+  ] as const) {
+    t.equal(await enrichedKey(changed), await enrichedKey(catalog), `an enriched item outlives a change to ${what}`);
+  }
+  t.not(await enrichedKey(resymboled), await enrichedKey(catalog), 'but not a new symbol, which it shows');
 });
 
 /*
@@ -390,6 +553,20 @@ t.test('registry markets are merged into the contracts governance decodes agains
     Eth.wellKnownContractsByNetwork,
     'with nothing to merge the constants are passed through untouched',
   );
+
+  /*
+   * A market whose rewards contract pays no token merges no token for it: the
+   * constants of Base name nothing at the zero address, and neither does the
+   * merge.
+   */
+  const unpaid = withRegistryContracts(
+    Eth.wellKnownContractsByNetwork,
+    catalogOf(withMarket('aero', market => ({ ...market, rewardAsset: null }))).markets(),
+  );
+  t.equal(unpaid['base-mainnet']['0x0000000000000000000000000000000000000000'], undefined,
+    'nothing stands in for the token a market does not pay');
+  t.equal(registryOf(unpaid['base-mainnet']['0x784efeb622244d2348d4f2522f8860b96fbece89'])?.deploymentKey, 'aero',
+    'while the market itself is merged');
 });
 
 /*

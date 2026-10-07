@@ -1,5 +1,6 @@
 import t from 'tap';
 
+import * as Eth      from '../../../../lib/eth-constants.js';
 import * as Debug    from '../../../../lib/debug-log.js';
 import * as Flags    from '../../../../lib/flags.js';
 import { BigNumber } from '../../../../lib/bignumber.js';
@@ -167,6 +168,52 @@ t.test('a collateral the registry prices is never read', async t => {
 
   t.strictSame(await evaluate(pull1({ assetPrice: { ...context, assetNumber: 1 } })), reverted, 'any other feed is read');
   t.strictSame(reads, [ COMP ]);
+});
+
+/*
+ * A price is read at the scale the version states for its feed. At a
+ * historical block a Comet may report a feed its market has since moved off,
+ * which the version does not describe: that one is read at eight decimals,
+ * the only scale Comet takes a price feed at. A contract the registry did not
+ * materialize has no version to state either, and is refused.
+ */
+t.test('a price is read at the scale the version states for its feed', async t => {
+  const snapshot = loadRegistrySnapshotFixture();
+  const DESCRIBED = '0x69b50ff403e995d9c4441a303438d9049dac8ccd';
+  const RETIRED   = '0x4444444444444444444444444444444444444444';
+  const rescaled  = catalogOf({
+    ...snapshot,
+    networks: snapshot.networks.map(entry => entry.chainId !== 1 ? entry : {
+      ...entry,
+      markets: entry.markets.map(market => market.deploymentKey !== 'usdt' ? market : {
+        ...market,
+        collateralAssets: market.collateralAssets.map(asset => asset.priceFeed.address !== DESCRIBED ? asset : {
+          ...asset,
+          priceFeed: { ...asset.priceFeed, decimals: 18 },
+        }),
+      }),
+    }),
+  }).marketsOn(network).find(entry => entry.deploymentKey === 'usdt')!.comet;
+
+  const scales: Array<[ string, number ]> = [];
+  const { evaluate, pull1 } = evaluator({
+    assetPrice: comet.assetPrice,
+    assetInfo:  stub(({ assetNumber }) => ({ asset: COMP, scale: 1, priceFeed: assetNumber === 0 ? DESCRIBED : RETIRED })),
+    getPrice:   stub(({ priceFeed }) => { scales.push([ priceFeed.address, priceFeed.decimals ]); return read(one()); }),
+  });
+  const context = { apiHost: '', nodeHost: '', nodeKey: '', network, contract: rescaled, blockNumber: block.number };
+
+  await evaluate(pull1({ assetPrice: { ...context, assetNumber: 0 } }));
+  await evaluate(pull1({ assetPrice: { ...context, assetNumber: 1 } }));
+  t.strictSame(scales, [ [ DESCRIBED, 18 ], [ RETIRED, 8 ] ],
+    'a feed the version describes at its scale, and one it does not at eight decimals');
+
+  const staticComet = Eth.wellKnownContractsByNetwork[network]['Comet']['cUSDTv3'];
+  await t.rejects(
+    evaluate(pull1({ assetPrice: { ...context, contract: staticComet, assetNumber: 0 } })),
+    /is not a Comet the registry materialized/,
+    'and a contract from the constants is refused rather than read at a scale nobody stated',
+  );
 });
 
 /*

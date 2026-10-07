@@ -155,6 +155,35 @@ t.test('a directory is applied in one request, and applying it again changes not
 });
 
 /*
+ * Network documents are keyed by chain id, and a parsed JSON object lists
+ * the keys that are numbers in ascending order, whatever order the text
+ * wrote them in; market keys keep the order they were written in. The body
+ * is written by hand for that reason: an object literal would already have
+ * put the chain ids in order before it was sent.
+ */
+t.test('the answer lists the networks by chain id, then the markets in the order they were sent', async t => {
+  const { versionId } = await freshCandidate();
+  const base   = snapshot.networks.find(network => network.chainId === 8453)!;
+  const scroll = snapshot.networks.find(network => network.chainId === 534352)!;
+
+  const body = `{"reason": "review the directory", `
+    + `"markets": {"1/weth": ${JSON.stringify(marketOverlay('weth'))}, "1/usdc": ${JSON.stringify(marketOverlay('usdc'))}}, `
+    + `"networks": {"534352": ${JSON.stringify(networkOverlay(scroll))}, "1": ${JSON.stringify(networkOverlay(mainnet))}, `
+    + `"8453": ${JSON.stringify(networkOverlay(base))}}}`;
+  const response = await server.fetch(`/registry/v1/admin/versions/${versionId}/overlays`, {
+    method:  'PUT',
+    headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
+    body,
+  });
+  t.equal(response.status, 200);
+  const applied = await response.json() as Applied;
+  t.same(
+    applied.documents.map(({ scopeType, scopeKey }) => [ scopeType, scopeKey ]),
+    [ [ 'network', '1' ], [ 'network', '8453' ], [ 'network', '534352' ], [ 'market', '1/weth' ], [ 'market', '1/usdc' ] ],
+  );
+});
+
+/*
  * The schema allows one default market per version after every statement,
  * not only at the end of a batch. A directory that moves the default names
  * the new default wherever it likes, so every changed market first gives the
@@ -273,10 +302,23 @@ t.test('the route takes a directory and nothing else', async t => {
     [ 'markets that are not an object',       { reason: 'x', markets: [ usdc ] } ],
     [ 'a network key that is not a chain id', { reason: 'x', networks: { ethereum: networkOverlay(mainnet) } } ],
     [ 'a market key without a deployment',    { reason: 'x', markets: { '1': usdc } } ],
-    [ 'one chain written two ways',           { reason: 'x', markets: { '1/usdc': usdc, '01/usdc': usdc } } ],
   ];
   for (const [ what, body ] of refusals) {
     t.equal((await put(versionId, body)).status, 400, `${what} is refused`);
+  }
+
+  /*
+   * A key spells its chain id as a path does, which is how the proposal's
+   * bundle writes it, so no two keys of a document name the same scope: a
+   * chain id written another way is refused as no chain id at all.
+   */
+  for (const [ what, body, key ] of [
+    [ 'a network key',  { reason: 'x', networks: { '0x1': networkOverlay(mainnet) } }, '0x1' ],
+    [ 'a market key',   { reason: 'x', markets: { '1/usdc': usdc, '01/usdc': usdc } }, '01' ],
+  ] as const) {
+    const refused = await put(versionId, body);
+    t.equal(refused.status, 400, `${what} with a chain id written otherwise than in decimal is refused`);
+    t.equal((await refused.json() as { error: { message: string } }).error.message, `${key} is not a chain id`);
   }
 
   t.equal((await put(versionId, { reason: 'x', markets: { '1/usdc': usdc } }, 'not-the-token')).status, 401,

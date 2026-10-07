@@ -1,11 +1,14 @@
 import type { Env } from '../../entrypoint.js';
 
+import { SyncOutcome, parseMarketKey } from '../../lib/model/comet-registry.js';
+
 import { authenticateAdmin } from '../http/bearer-auth.js';
+import { clientOf } from '../http/client-address.js';
 import { ApiError, methodNotAllowed } from '../http/errors.js';
 import { MAX_BODY_BYTES, jsonResponse, readJsonObject } from '../http/json.js';
 
 import { cacheDepsOf } from './cache.js';
-import { proxyTransport, readFeeds } from './enrichment.js';
+import { readFeeds } from './enrichment.js';
 import { registryStatus } from './status.js';
 import {
   FeedReader,
@@ -29,10 +32,9 @@ import {
   postActivation,
   postValidate,
 } from './handlers.js';
+import { isExplicit } from './importer.js';
 import type { InvocationResult } from './importer.js';
-import { registryFetch, runRegistrySync } from './scheduled.js';
-
-import type * as KnownNetwork from '../../lib/well-known/networks/network.js';
+import { runRegistrySync, transportFor } from './scheduled.js';
 
 /*
  * Reads the decimals of the feeds an overlay introduces, through the same
@@ -40,35 +42,26 @@ import type * as KnownNetwork from '../../lib/well-known/networks/network.js';
  * the chain states its scale.
  */
 function feedReader(env: Env): FeedReader {
-  const fetch = registryFetch(env);
+  const transport = transportFor(env);
   return async (network, addresses) => addresses.length === 0
     ? new Map()
-    : readFeeds(
-        proxyTransport({
-          apiHost:  env.V3_API_HOST,
-          nodeHost: env.NODE_PROXY_HOST,
-          nodeKey:  env.NODE_PROXY_KEY,
-          network:  network as KnownNetwork.Name,
-          fetch,
-        }),
-        addresses,
-        network,
-      );
+    : readFeeds(transport(network), addresses, network);
 }
 
 /*
- * The authenticated administrative routes.
+ * The authenticated administrative routes, behind two rate limiters.
  *
- * Every request is authenticated first and rate limited second, so an
- * unauthenticated caller cannot spend any budget at all. The limiter is keyed
- * by the presented credential and the route family rather than by IP: it
+ * The first counts every request under the administrative prefix by the
+ * client's address, before its token is checked or its path matched: a
+ * caller guessing tokens, or paths, pays for every guess. The second counts
+ * an authenticated request by its credential and its route family: it
  * protects the registry from a stuck script or a runaway retry loop, while
  * the D1 sync fence remains the real concurrency authority.
  *
- * Callers sharing one token share one budget. That is a property of the
- * credential, not of the limiter: the environment configures a single token
- * hash, so two operators using it are indistinguishable here and in the audit
- * rows alike. Issuing separate tokens is what would separate them.
+ * Callers sharing one token share the second budget. That is a property of
+ * the credential, not of the limiter: the environment configures a single
+ * token hash, so two operators using it are indistinguishable here and in the
+ * audit rows alike. Issuing separate tokens is what would separate them.
  */
 const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/sync$/,                                                  method: 'POST', handler: 'sync',           family: 'sync' },
@@ -97,8 +90,14 @@ const MAX_REASON = 1000;
  * How many markets one administrative sync imports. The Cron keeps to a
  * small batch because it runs unattended every hour; an operator bringing an
  * environment up wants the whole source in one request, so that is the
- * default here. The ceiling keeps one request inside the subrequest and D1
- * query budget of a single Worker invocation.
+ * default here.
+ *
+ * A market costs seven subrequests — its root from GitHub, three rounds of
+ * reads from the node, three D1 statements or batches — and a run about
+ * thirty besides: the whole source of twenty-nine markets is about 230, and
+ * the ceiling about 380, inside the 10,000 subrequests and 1,000 D1 queries
+ * the Workers Paid plan gives an invocation (README, "Workers Plan") and far
+ * beyond the Free plan's 50.
  */
 const MAX_MARKETS_PER_REQUEST = 50;
 
@@ -132,6 +131,78 @@ function requireExactKeys(body: Record<string, unknown>, allowed: string[]): voi
 }
 
 /*
+ * What a command says it was decided against, where it says it: absent says
+ * nothing, null says there was nothing, and anything else must look like
+ * what it names. A value of the wrong shape is refused rather than ignored,
+ * because ignoring it would drop the very precondition its sender relied on.
+ */
+function optionalExpectation(body: Record<string, unknown>, name: string, shape: RegExp, what: string): { value?: string | null } {
+  const value = body[name];
+  if (value === undefined) {
+    return {};
+  }
+  if (value !== null && (typeof(value) !== 'string' || !shape.test(value))) {
+    throw new ApiError('BAD_REQUEST', `${name} must be null or ${what}`);
+  }
+  return { value };
+}
+
+function expectedDigestOf(body: Record<string, unknown>): { expectedDigest?: string | null } {
+  const { value } = optionalExpectation(body, 'expectedDigest', /^[0-9a-f]{64}$/, 'the 64 hex characters of an overlay digest');
+  return value === undefined ? {} : { expectedDigest: value };
+}
+
+/*
+ * `expectedActiveVersionId` names the version an activation or a rollback is
+ * decided against, so a move made against a version someone else has since
+ * replaced is refused instead of silently undoing theirs.
+ */
+function expectedActiveVersionOf(body: Record<string, unknown>): { expectedActiveVersionId?: string | null } {
+  const { value } = optionalExpectation(body, 'expectedActiveVersionId', /^[0-9A-Za-z-]{1,64}$/, 'a registry version id');
+  return value === undefined ? {} : { expectedActiveVersionId: value };
+}
+
+/*
+ * The period every environment configures for both administrative limiters
+ * (wrangler.toml [3]). A refused caller is told to wait it out: by then its
+ * count has started again, whenever in the period it was refused.
+ */
+const RATE_LIMIT_PERIOD_SECONDS = 60;
+
+// a refusal says which budget ran out, since the two are waited out the same way but spent differently
+function rateLimited(message: string): ApiError {
+  return new ApiError('RATE_LIMITED', message, undefined, { 'Retry-After': String(RATE_LIMIT_PERIOD_SECONDS) });
+}
+
+/*
+ * The key of a request that names no client address. A request through
+ * Cloudflare's edge always has one; a local run and a test may not, and
+ * share this one budget.
+ */
+const NO_ADDRESS = 'no-address';
+
+/*
+ * What every request under the administrative prefix spends first, before
+ * its token is checked and before its path is matched, from the budget of
+ * the address Cloudflare saw it come from (`CF-Connecting-IP`) — of its /64,
+ * for an IPv6 client, which can send from any address of it (clientOf).
+ *
+ * Counting only the requests that fail would not slow guessing down: a right
+ * guess answers 200 and would never be counted. Counting after the match
+ * would leave the paths no route takes, which answer 404, free to enumerate.
+ * An operator and a monitor polling the status fit inside the budget many
+ * times over; a guess at a token at that pace gets nowhere.
+ */
+async function limitAddress(env: Env, request: Request): Promise<void> {
+  const address = request.headers.get('cf-connecting-ip');
+  const key     = `registry-admin-auth:${address === null || address.length === 0 ? NO_ADDRESS : clientOf(address)}`;
+  const allowed = await env.REGISTRY_ADMIN_AUTH_RATE_LIMITER.limit({ key });
+  if (!allowed.success) {
+    throw rateLimited(`too many administrative requests from this address`);
+  }
+}
+
+/*
  * The limiter key names the credential, never the token: `fingerprint` is a
  * prefix of the token's SHA-256, which distinguishes two configured tokens
  * without carrying either one into a key that is logged and counted.
@@ -139,9 +210,12 @@ function requireExactKeys(body: Record<string, unknown>, allowed: string[]): voi
 async function limit(env: Env, fingerprint: string, family: string): Promise<void> {
   const allowed = await env.REGISTRY_ADMIN_RATE_LIMITER.limit({ key: `registry-admin:${fingerprint}:${family}` });
   if (!allowed.success) {
-    throw new ApiError('RATE_LIMITED', `too many administrative requests`);
+    throw rateLimited(`too many ${family} requests with this token`);
   }
 }
+
+// an invocation an administrative sync answers with an error
+type SyncFailure = Extract<InvocationResult, { kind: 'invalid' | 'failed' }>;
 
 /*
  * The error an administrative sync answers with when the invocation failed.
@@ -150,19 +224,44 @@ async function limit(env: Env, fingerprint: string, family: string): Promise<voi
  * the registry has to refuse, such as a commit the tracked ref cannot reach,
  * is the client's to fix. A candidate that failed its checks would fail the
  * same way again, so it is refused with the ids to inspect it by rather than
- * offered as something to retry. Only a source that did not answer is a 503.
+ * offered as something to retry. A database or a source that did not answer
+ * is a 503; a fault never reaches here — it is raised, and answered 500.
  */
-function syncFailure(result: InvocationResult): Error {
-  if (result.error !== undefined) {
-    return result.error;
+function syncFailure(result: SyncFailure): Error {
+  switch (result.kind) {
+    case 'invalid':
+      return new ApiError('UNPROCESSABLE', result.reason, {
+        syncRunId:         result.runId,
+        registryVersionId: result.versionId,
+      });
+    case 'failed':
+      return result.error ?? new ApiError('UPSTREAM_UNAVAILABLE', result.reason);
   }
-  if (result.versionId !== undefined) {
-    return new ApiError('UNPROCESSABLE', result.reason ?? 'the candidate failed validation', {
-      syncRunId:         result.runId ?? null,
-      registryVersionId: result.versionId,
-    });
+}
+
+/*
+ * What an administrative sync answers with when the invocation did not fail:
+ * the run's status, and for one that completed, what it produced. A held
+ * candidate completed its import as one that validated did, and says that it
+ * is held, and how many of its checks failed.
+ */
+function syncAnswer(result: Exclude<InvocationResult, SyncFailure>): {
+  status:        'idle' | 'running' | 'completed',
+  outcome:       SyncOutcome | null,
+  heldForReview: boolean,
+  checksFailed:  number,
+} {
+  switch (result.kind) {
+    case 'idle':
+    case 'running':
+      return { status: result.kind, outcome: null, heldForReview: false, checksFailed: 0 };
+    case 'held':
+      return { status: 'completed', outcome: 'imported', heldForReview: true, checksFailed: result.checksFailed };
+    case 'imported':
+      return { status: 'completed', outcome: 'imported', heldForReview: false, checksFailed: 0 };
+    case 'unchanged':
+      return { status: 'completed', outcome: 'no_change', heldForReview: false, checksFailed: 0 };
   }
-  return new ApiError('UPSTREAM_UNAVAILABLE', result.reason ?? 'the import failed');
 }
 
 /*
@@ -170,12 +269,17 @@ function syncFailure(result: InvocationResult): Error {
  * or force a new attempt, and both require a reason: they are decisions, not
  * routine scheduling.
  *
- * `holdForReview` leaves the candidate open once every root is imported, so
- * a market the source has added can be reviewed in place before anything
- * validates the version. `markets` bounds how much of the source this one
+ * `holdForReview` leaves the candidate open once no root is left to attempt,
+ * so a market the source has added can be reviewed in place before anything
+ * validates the version; a run that gave roots up leaves one that cannot
+ * validate without them. `markets` bounds how much of the source this one
  * request imports.
  */
-async function postSync(env: Env, body: Record<string, unknown>, actor: string): Promise<Response> {
+async function postSync(
+  env: Env,
+  body: Record<string, unknown>,
+  { actor, requestId }: Pick<RegistryContext, 'actor' | 'requestId'>,
+): Promise<Response> {
   requireExactKeys(body, [ 'sourceCommitSha', 'forceNewAttempt', 'holdForReview', 'markets', 'reason' ]);
 
   const sourceCommitSha = body.sourceCommitSha;
@@ -194,27 +298,34 @@ async function postSync(env: Env, body: Record<string, unknown>, actor: string):
   if (typeof(markets) !== 'number' || !Number.isInteger(markets) || markets < 1 || markets > MAX_MARKETS_PER_REQUEST) {
     throw new ApiError('BAD_REQUEST', `markets must be an integer from 1 to ${MAX_MARKETS_PER_REQUEST}`);
   }
-  // holding a candidate open leaves the commit unimported until someone acts on it, which is a decision like the other two
-  const explicit = sourceCommitSha !== undefined || forceNewAttempt === true || holdForReview === true;
-  const reason   = explicit ? requireReason(body) : null;
-
-  const result = await runRegistrySync(env, {
+  const request = {
     ...(sourceCommitSha === undefined ? {} : { sourceCommitSha: sourceCommitSha as string }),
     ...(forceNewAttempt ? { forceNewAttempt: true } : {}),
     ...(holdForReview ? { holdForReview: true } : {}),
-    ...(reason === null ? {} : { reason }),
     markets,
     requestedBy: actor,
-  });
+  };
+  /*
+   * Holding a candidate open leaves the commit unimported until someone acts
+   * on it, which is a decision like the other two. The importer asks the
+   * same question, so what needs a reason here is also what it acts on at
+   * once rather than at the next discovery.
+   */
+  const result = await runRegistrySync(
+    env,
+    isExplicit(request) ? { ...request, reason: requireReason(body) } : request,
+    { requestId },
+  );
 
-  if (result.status === 'failed') {
+  if (result.kind === 'invalid' || result.kind === 'failed') {
     throw syncFailure(result);
   }
+  const { status, outcome, heldForReview, checksFailed } = syncAnswer(result);
   return jsonResponse({
     syncRunId:         result.runId ?? null,
     registryVersionId: result.versionId ?? null,
-    status:            result.status,
-    outcome:           result.outcome ?? null,
+    status,
+    outcome,
     processed:         result.processed,
     /*
      * How far the run has got, so a caller can see that an import which
@@ -224,11 +335,17 @@ async function postSync(env: Env, body: Record<string, unknown>, actor: string):
     expected:          result.expected ?? null,
     completed:         result.completed ?? null,
     outstanding:       result.outstanding ?? null,
-    heldForReview:     result.held === true,
-    checksFailed:      result.checksFailed ?? 0,
+    heldForReview,
+    checksFailed,
     reason:            result.reason ?? null,
-    created:           result.status === 'running' && result.processed === 0,
-  }, { status: 202 });
+  }, {
+    /*
+     * 202 while the import has work left, which a later request continues;
+     * 200 once this request is the answer: the import completed, or there
+     * was nothing to do.
+     */
+    status: status === 'running' ? 202 : 200,
+  });
 }
 
 function documentsOf(value: unknown, name: string): Array<[ string, unknown ]> {
@@ -245,6 +362,10 @@ function documentsOf(value: unknown, name: string): Array<[ string, unknown ]> {
  * The body of `PUT /versions/{id}/overlays`: network overlays keyed by chain
  * id, market overlays keyed by `chainId/deploymentKey`, and the one reason
  * every audit event of the request is stored with.
+ *
+ * A key spells its chain id the one way a path does (chainIdOf), which is
+ * how the proposal's bundle writes it, so a key names its scope as written:
+ * no two keys of one document review the same network or market.
  */
 function overlayDocuments(body: Record<string, unknown>, versionId: string, actor: string): OverlayDocuments {
   requireExactKeys(body, [ 'reason', 'networks', 'markets' ]);
@@ -255,26 +376,16 @@ function overlayDocuments(body: Record<string, unknown>, versionId: string, acto
     overlay,
   }));
   const markets = documentsOf(body.markets, 'markets').map(([ key, overlay ]) => {
-    const separator = key.indexOf('/');
-    const deploymentKey = separator === -1 ? '' : key.slice(separator + 1);
-    if (separator === -1 || deploymentKey.length === 0) {
+    const market = parseMarketKey(key);
+    if (market === null) {
       throw new ApiError('BAD_REQUEST', `${key} must name a market as chainId/deploymentKey`);
     }
-    return { chainId: chainIdOf(key.slice(0, separator)), deploymentKey, overlay };
+    return { chainId: chainIdOf(market.chainId), deploymentKey: market.deploymentKey, overlay };
   });
 
   const count = networks.length + markets.length;
   if (count === 0 || count > MAX_OVERLAYS_PER_REQUEST) {
     throw new ApiError('BAD_REQUEST', `between 1 and ${MAX_OVERLAYS_PER_REQUEST} overlays are required`);
-  }
-  // `1` and `01` are the same chain, so a key names one scope only after it is read
-  const scopes = [
-    ...networks.map(({ chainId }) => `network ${chainId}`),
-    ...markets.map(({ chainId, deploymentKey }) => `market ${chainId}/${deploymentKey}`),
-  ];
-  const repeated = scopes.filter((scope, index) => scopes.indexOf(scope) !== index);
-  if (repeated.length > 0) {
-    throw new ApiError('BAD_REQUEST', `each scope may be reviewed once per request: ${[ ...new Set(repeated) ].join(', ')}`);
   }
 
   return { versionId, actor, reason, networks, markets };
@@ -286,6 +397,9 @@ async function routeAdmin(
   context: RegistryContext,
   pathname: string,
 ): Promise<Response | null> {
+  // every request spends from its address's budget first, a path no route takes among them
+  await limitAddress(env, request);
+
   const matching = ROUTES
     .map(entry => ({ ...entry, match: entry.pattern.exec(pathname) }))
     .filter(({ match }) => match !== null);
@@ -294,8 +408,10 @@ async function routeAdmin(
   }
   /*
    * Authentication comes before anything the answer could tell an anonymous
-   * caller apart by: which administrative paths exist, which verbs they take,
-   * and which versions they name all stay behind the token.
+   * caller apart by: which verbs a path takes, and whether the version it
+   * names exists, stay behind the token. Which paths exist does not — API.md
+   * publishes them — so a path that is none of them answers 404 without a
+   * token being asked for, as any unknown path does.
    */
   const credential = await authenticateAdmin(request, env.COMET_REGISTRY_ADMIN_TOKEN_HASH);
 
@@ -321,7 +437,7 @@ async function routeAdmin(
        */
       return jsonResponse(await registryStatus(env, cacheDepsOf(env, context.debug)));
     case 'sync':
-      return await postSync(env, body, context.actor);
+      return await postSync(env, body, context);
     case 'syncRun':
       return await getSyncRun(context, versionId!);
     case 'versions':
@@ -357,22 +473,23 @@ async function routeAdmin(
       requireExactKeys(body, []);
       return await postValidate(context, versionId!);
     case 'activate':
-      requireExactKeys(body, [ 'reason' ]);
-      return await postActivation(context, versionId!, 'activate', requireReason(body));
+      requireExactKeys(body, [ 'reason', 'expectedActiveVersionId' ]);
+      return await postActivation(context, versionId!, 'activate', requireReason(body), expectedActiveVersionOf(body));
     case 'rollback':
-      requireExactKeys(body, [ 'reason' ]);
-      return await postActivation(context, versionId!, 'rollback', requireReason(body));
+      requireExactKeys(body, [ 'reason', 'expectedActiveVersionId' ]);
+      return await postActivation(context, versionId!, 'rollback', requireReason(body), expectedActiveVersionOf(body));
     case 'networkOverlay':
-      requireExactKeys(body, [ 'reason', 'overlay' ]);
+      requireExactKeys(body, [ 'reason', 'overlay', 'expectedDigest' ]);
       return jsonResponse(await replaceNetworkOverlay(context.db, {
         versionId: versionId!,
         chainId:   chainIdOf(second!),
         overlay:   body.overlay,
         actor:     context.actor,
         reason:    requireReason(body),
+        ...expectedDigestOf(body),
       }, feedReader(env)));
     case 'marketOverlay':
-      requireExactKeys(body, [ 'reason', 'overlay' ]);
+      requireExactKeys(body, [ 'reason', 'overlay', 'expectedDigest' ]);
       return jsonResponse(await replaceMarketOverlay(context.db, {
         versionId:     versionId!,
         chainId:       chainIdOf(second!),
@@ -380,10 +497,11 @@ async function routeAdmin(
         overlay:       body.overlay,
         actor:         context.actor,
         reason:        requireReason(body),
+        ...expectedDigestOf(body),
       }, feedReader(env)));
     case 'overlays':
       return jsonResponse(await replaceOverlays(context.db, overlayDocuments(body, versionId!, context.actor), feedReader(env)));
   }
 }
 
-export { MAX_MARKETS_PER_REQUEST, MAX_OVERLAYS_PER_REQUEST, MAX_REASON, ROUTES, routeAdmin, syncFailure };
+export { routeAdmin, syncAnswer, syncFailure };

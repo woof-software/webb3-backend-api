@@ -274,3 +274,32 @@ t.test('WorkingsetEvaluator: a computation that fails says why', async t => {
     t.equal(untypedError?.cause, payload);
   }
 });
+
+/*
+ * A failure is logged once, by whoever answers it: the router, under the
+ * request's id. Tracing the evaluator (DEBUG=eval) shows it once more, with
+ * the state the evaluation failed in; the step that ran the computation does
+ * not write it a third time.
+ */
+t.test('WorkingsetEvaluator: a computation that fails is not logged by the step that ran it', async t => {
+  const lines: string[] = [];
+  const consoleError = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  t.teardown(() => { console.error = consoleError; });
+
+  type Refuse = Compute.Spec<{ name: 'refuse', expects: number, returns: number }>;
+  const refuse = Compute.Functor<Refuse>({}).implement({
+    version: 1,
+    compute: () => Fallible.Outcome.Of.Failure({
+      type:    'Fetch.InsufficientQuota',
+      error:   new Error('request quota exhausted'),
+      details: { quota: { requested: { subrequests: 1 }, resources: { subrequests: 0 }, allocated: {} } },
+    } as const),
+  });
+  const debug     = Debug.MakeLogger([]).configure({ DEBUG: 'eval' });
+  const evaluator = Workingset.Evaluator<Refuse>({ refuse }, { flags: Flags.parse(process.env), debug });
+
+  await t.rejects(evaluator.evaluate(evaluator.pull1({ refuse: 1 })), /Failure: Fetch.InsufficientQuota/);
+  t.equal(lines.filter(line => line.includes('Failure: Fetch.InsufficientQuota')).length, 1,
+    'the trace names the failure once, beside the state it failed in');
+});

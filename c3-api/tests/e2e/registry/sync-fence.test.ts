@@ -4,11 +4,13 @@ import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
 import { isRegistryError } from '../../../src/registry/errors.js';
+import { Condition, candidateRow, conditioned } from '../../../src/registry/repository.js';
 import {
   Fence,
   MAX_ITEM_ATTEMPTS,
   RootCheckpoint,
   acquireRun,
+  bindCandidate,
   claimItem,
   completeItem,
   dueForDiscovery,
@@ -17,7 +19,6 @@ import {
   pendingItems,
   recordUpstreamCheck,
   releaseLease,
-  renewLease,
   runningRun,
   startRun,
 } from '../../../src/registry/sync.js';
@@ -57,6 +58,11 @@ function clockAt(iso: string) {
   return () => new Date(iso);
 }
 
+// what every commit is given: a committed checkpoint extends the lease by this much
+function lease(iso: string) {
+  return { leaseSeconds: 900, now: clockAt(iso) };
+}
+
 const T0 = '2026-09-18T12:00:00.000Z';
 const T1 = '2026-09-18T12:05:00.000Z';
 const T2 = '2026-09-18T12:20:00.000Z';
@@ -76,8 +82,8 @@ t.test('one import runs at a time', async t => {
   const db    = await freshDatabase();
   const fence = await newRun(db);
 
-  t.equal(fence.generation, 1, 'a new run starts at generation one');
   const run = await runningRun(db);
+  t.equal(run?.lease_owner, fence.owner, 'a new run is created with its lease held by its creator');
   t.equal(run?.id, fence.runId);
   t.equal(run?.expected_count, ROOTS.length, 'every root is checkpointed');
   t.equal(await pendingItems(db, fence.runId), ROOTS.length, 'and starts unprocessed');
@@ -100,25 +106,51 @@ t.test('a lease is taken over only once it expires', async t => {
   const fence = await newRun(db);
 
   t.equal(await acquireRun(db, { leaseSeconds: 900, now: clockAt(T1) }), null, 'a held lease cannot be taken');
-  t.equal(await renewLease(db, fence, { leaseSeconds: 900, now: clockAt(T1) }), true, 'the owner may extend it');
 
-  // T2 is beyond the lease granted at T1
+  // T2 is beyond the lease granted at T0
   const resumed = await acquireRun(db, { leaseSeconds: 900, now: clockAt(T2) });
   t.ok(resumed, 'an expired lease is taken over');
   t.equal(resumed!.runId, fence.runId, 'by resuming the same run');
-  t.equal(resumed!.generation, 2, 'with a higher generation');
+  t.not(resumed!.owner, fence.owner, 'under an owner of its own');
+  t.same(
+    await db.prepare(`SELECT failed_count, last_error FROM sync_runs WHERE id = ?1`).bind(fence.runId).first(),
+    { failed_count: 0, last_error: null },
+    'which records no failure when no root was in progress',
+  );
 
-  t.equal(await renewLease(db, fence, { leaseSeconds: 900, now: clockAt(T2) }), false, 'the replaced invocation cannot renew');
-  t.equal(await claimItem(db, fence, { now: clockAt(T2) }), null, 'nor claim more work');
+  t.equal(await claimItem(db, fence, { now: clockAt(T2) }), null, 'the replaced invocation cannot claim more work');
   t.equal(
     await finishRun(db, fence, { status: 'completed', outcome: 'imported' }, { now: clockAt(T2) }),
     false,
     'nor finish the run it no longer owns',
   );
+  t.equal(await releaseLease(db, fence), false, 'nor release a lease it no longer holds');
 
   t.equal(await releaseLease(db, resumed!), true, 'the current owner may release the lease');
   const released = await acquireRun(db, { leaseSeconds: 900, now: clockAt(T2) });
-  t.equal(released?.generation, 3, 'a released run is resumable at once, without waiting for expiry');
+  t.ok(released, 'a released run is resumable at once, without waiting for expiry');
+  t.not(released!.owner, resumed!.owner, 'and whoever takes it is a new owner again');
+});
+
+/*
+ * An invocation that is getting through its roots keeps the run however many
+ * it has: every checkpoint it commits extends its lease. One stuck on a single
+ * root for longer than a lease loses it.
+ */
+t.test('a committed checkpoint extends the lease', async t => {
+  const db    = await freshDatabase();
+  const fence = await newRun(db);
+
+  const item = await claimItem(db, fence, { now: clockAt(T1) });
+  t.equal(await completeItem(db, fence, { id: item!.id }, lease(T1)), true, 'a root is committed at T1');
+  t.equal(
+    (await runningRun(db))?.lease_expires_at,
+    '2026-09-18T12:20:00.000Z',
+    'and the lease runs a whole lease from then, past the expiry granted at T0',
+  );
+  t.equal(await acquireRun(db, { leaseSeconds: 900, now: clockAt('2026-09-18T12:16:00.000Z') }), null,
+    'so it cannot be taken where the first lease would have expired');
+  t.ok(await claimItem(db, fence, { now: clockAt('2026-09-18T12:16:00.000Z') }), 'and its holder works on');
 });
 
 t.test('roots are claimed once and committed by their claimant', async t => {
@@ -129,18 +161,18 @@ t.test('roots are claimed once and committed by their claimant', async t => {
   t.ok(first, 'a pending root is claimed');
   t.equal(first!.status, 'processing');
   t.equal(first!.attempts, 1, 'the attempt is counted at claim time, so a crash cannot loop forever');
-  t.equal(first!.claim_generation, fence.generation);
+  t.equal(first!.claim_owner, fence.owner, 'and the root names the invocation that claimed it');
 
   const second = await claimItem(db, fence, { now: clockAt(T0) });
   t.not(second!.id, first!.id, 'a second claim returns a different root');
 
   t.equal(
-    await completeItem(db, fence, { id: first!.id, checksum: 'c'.repeat(64) }, { now: clockAt(T0) }),
+    await completeItem(db, fence, { id: first!.id }, lease(T0)),
     true,
     'the claimant commits its result',
   );
   t.equal(
-    await completeItem(db, fence, { id: first!.id, checksum: 'c'.repeat(64) }, { now: clockAt(T0) }),
+    await completeItem(db, fence, { id: first!.id }, lease(T0)),
     false,
     'committing the same root twice changes nothing',
   );
@@ -150,7 +182,7 @@ t.test('roots are claimed once and committed by their claimant', async t => {
   t.equal(run?.failed_count, 0);
 
   t.equal(
-    await failItem(db, fence, { id: second!.id, error: 'price feed did not answer' }, { now: clockAt(T0) }),
+    await failItem(db, fence, { id: second!.id, error: 'price feed did not answer' }, lease(T0)),
     true,
     'a failure is recorded against the run',
   );
@@ -172,7 +204,7 @@ t.test('an expired lease commits nothing, not even a counter', async t => {
    * counter nor the item moves.
    */
   t.equal(
-    await completeItem(db, fence, { id: item!.id, checksum: 'a'.repeat(64) }, { now: clockAt(T2) }),
+    await completeItem(db, fence, { id: item!.id }, lease(T2)),
     false,
     'the commit is refused once the lease has expired',
   );
@@ -193,10 +225,10 @@ t.test('a result from a replaced invocation is discarded', async t => {
 
   // the invocation stalls; a later one takes the run over
   const resumed = await acquireRun(db, { leaseSeconds: 900, now: clockAt(T2) });
-  t.equal(resumed!.generation, 2);
+  t.ok(resumed, 'the run is taken over');
 
   t.equal(
-    await completeItem(db, fence, { id: claimed!.id, checksum: 'd'.repeat(64) }, { now: clockAt(T2) }),
+    await completeItem(db, fence, { id: claimed!.id }, lease(T2)),
     false,
     'the stalled invocation cannot commit its late result',
   );
@@ -215,7 +247,7 @@ t.test('a result from a replaced invocation is discarded', async t => {
       break;
     }
     reclaimed.push({ id: item.id, attempts: item.attempts });
-    await completeItem(db, resumed!, { id: item.id, checksum: 'e'.repeat(64) }, { now: clockAt(T2) });
+    await completeItem(db, resumed!, { id: item.id }, lease(T2));
   }
 
   t.equal(reclaimed.length, ROOTS.length, 'the new owner works through every root');
@@ -226,6 +258,71 @@ t.test('a result from a replaced invocation is discarded', async t => {
   );
   t.same(reclaimed.slice(0, -1).map(item => item.attempts), [ 1, 1 ], 'untouched roots are claimed first');
   t.equal((await runningRun(db))?.completed_count, ROOTS.length, 'and commits them all');
+});
+
+/*
+ * What a root produced is written in the transaction that commits its
+ * checkpoint, under the same condition. A result that arrives after its
+ * invocation lost the run writes nothing — not the checkpoint, and not what
+ * it would have overwritten either.
+ */
+t.test('what a root produced commits with its checkpoint, or not at all', async t => {
+  const db    = await freshDatabase();
+  const fence = await newRun(db);
+  const marker = () => db.prepare(`SELECT updated_at FROM registry_state WHERE singleton_id = 1`).first<string>('updated_at');
+  const writes = (value: string) => (condition: Condition) => [
+    conditioned(db, `UPDATE registry_state SET updated_at = ?1 WHERE singleton_id = 1`, [ value ], condition),
+  ];
+
+  const stale   = await claimItem(db, fence, { now: clockAt(T0) });
+  const resumed = await acquireRun(db, { leaseSeconds: 900, now: clockAt(T2) });
+  const before  = await marker();
+
+  t.equal(
+    await completeItem(db, fence, { id: stale!.id }, { ...lease(T2), writes: writes('written by the replaced invocation') }),
+    false,
+    'the replaced invocation commits nothing',
+  );
+  t.equal(await marker(), before, 'and what it produced is not written either');
+
+  const item = await claimItem(db, resumed!, { now: clockAt(T2) });
+  t.equal(
+    await completeItem(db, resumed!, { id: item!.id }, { ...lease(T2), writes: writes('written by the owner') }),
+    true,
+    'the owner commits its checkpoint',
+  );
+  t.equal(await marker(), 'written by the owner', 'together with what the root produced');
+});
+
+/*
+ * A run's candidate is created and named on the run in one transaction, and
+ * only by the invocation holding the run, only once. An invocation replaced
+ * while it was creating one can neither leave a candidate without a run nor
+ * move the run onto its own.
+ */
+t.test('a run is given its candidate once, by the invocation that holds it', async t => {
+  const db    = await freshDatabase();
+  const fence = await newRun(db);
+  const draft = (attempt: number) => candidateRow({
+    repository:     'Compound-Foundation/comet',
+    commitSha:      COMMIT,
+    sourceChecksum: 'a'.repeat(64),
+    attempt,
+    createdBy:      'registry-cron',
+  });
+  const versions = () => db.prepare(`SELECT COUNT(*) AS n FROM registry_versions`).first<number>('n');
+
+  const replaced = { ...fence, owner: 'a replaced invocation' };
+  t.equal(await bindCandidate(db, replaced, draft(1), { now: clockAt(T0) }), false, 'an invocation that does not hold the run');
+  t.equal(await bindCandidate(db, fence, draft(1), { now: clockAt(T2) }), false, 'or whose lease has run out');
+  t.equal(await versions(), 0, 'creates no candidate');
+
+  const first = draft(1);
+  t.equal(await bindCandidate(db, fence, first, { now: clockAt(T0) }), true, 'the holder creates one');
+  t.equal((await runningRun(db))?.registry_version_id, first.id, 'and the run names it');
+
+  t.equal(await bindCandidate(db, fence, draft(2), { now: clockAt(T0) }), false, 'a run that has one is not given another');
+  t.equal(await versions(), 1, 'and the second is not created at all');
 });
 
 t.test('a root that keeps failing stops being retried', async t => {
@@ -241,7 +338,7 @@ t.test('a root that keeps failing stops being retried', async t => {
       break;
     }
     processed++;
-    await failItem(db, fence, { id: item.id, error: 'unreadable' }, { now: clockAt(T0) });
+    await failItem(db, fence, { id: item.id, error: 'unreadable' }, lease(T0));
   }
   t.equal(processed, MAX_ITEM_ATTEMPTS * ROOTS.length, 'each root is retried up to its bound, then left alone');
   t.equal(await claimItem(db, fence, { now: clockAt(T0) }), null, 'nothing remains claimable');
@@ -264,6 +361,56 @@ t.test('a root that keeps failing stops being retried', async t => {
 });
 
 /*
+ * An invocation stopped in the middle of a root — a deploy, or the time or
+ * the CPU a Worker is given — leaves the root in progress and writes nothing
+ * more. The invocation that takes the run over records that attempt as the
+ * stopped one would have recorded a failure: the root says why, so does the
+ * run, and a root whose last attempt was the one that stopped is given up
+ * and counted, rather than left in progress for good.
+ */
+t.test('a root an invocation left in progress is failed by the invocation that takes the run over', async t => {
+  const db        = await freshDatabase();
+  let fence       = await newRun(db);
+  const ABANDONED = 'the invocation importing this root did not finish';
+  const minutes   = (count: number) => () => new Date(Date.parse(T0) + count * 60_000);
+  const rootOf    = (id: string) => db.prepare(
+    `SELECT status, attempts, last_error, updated_at FROM sync_run_items WHERE id = ?1`
+  ).bind(id).first<{ status: string, attempts: number, last_error: string | null, updated_at: string }>();
+
+  // the invocation claims a root, imports the others, and is stopped before it commits the first
+  const stopped = (await claimItem(db, fence, { now: clockAt(T0) }))!;
+  for (;;) {
+    const item = await claimItem(db, fence, { now: clockAt(T0) });
+    if (item === null) {
+      break;
+    }
+    await completeItem(db, fence, { id: item.id }, lease(T0));
+  }
+
+  // every twenty minutes, past the lease of the one before, an invocation takes the run over and is stopped on the root
+  for (let attempt = 1; attempt < MAX_ITEM_ATTEMPTS; attempt++) {
+    const now = minutes(20 * attempt);
+    fence = (await acquireRun(db, { leaseSeconds: 900, now }))!;
+    t.same(
+      await rootOf(stopped.id),
+      { status: 'failed', attempts: attempt, last_error: ABANDONED, updated_at: now().toISOString() },
+      `attempt ${attempt} is recorded as failed, with why, by the invocation that took the run over`,
+    );
+    t.equal((await claimItem(db, fence, { now }))?.id, stopped.id, 'which tries the root again');
+  }
+
+  const now = minutes(20 * MAX_ITEM_ATTEMPTS);
+  fence = (await acquireRun(db, { leaseSeconds: 900, now }))!;
+  t.match(await rootOf(stopped.id), { status: 'failed', attempts: MAX_ITEM_ATTEMPTS, last_error: ABANDONED },
+    'the last attempt is recorded as failed as well');
+  const run = await runningRun(db);
+  t.same([ run?.completed_count, run?.failed_count, run?.last_error ], [ ROOTS.length - 1, 1, ABANDONED ],
+    'and the root is counted among those the run gave up, with why the run did');
+  t.equal(await pendingItems(db, fence.runId), 0, 'so nothing is left to attempt');
+  t.equal(await claimItem(db, fence, { now }), null, 'and nothing to claim');
+});
+
+/*
  * An attempt is given back when the failure was the invocation's rather than
  * the root's. What must not follow is the same invocation claiming that root
  * again: it looks untouched, it sorts first, and one root would then consume
@@ -276,7 +423,7 @@ t.test('an attempt can be given back, and the root is not claimed again by the s
   const first = await claimItem(db, fence, { now: clockAt(T0) });
   t.equal(first?.attempts, 1, 'claiming spends an attempt');
   await failItem(db, fence, { id: first!.id, error: 'the node provider did not answer' }, {
-    now:           clockAt(T0),
+    ...lease(T0),
     spendsAttempt: false,
   });
 
@@ -307,7 +454,7 @@ t.test('a finished run records what it produced', async t => {
     if (item === null) {
       break;
     }
-    await completeItem(db, fence, { id: item.id, checksum: 'f'.repeat(64) }, { now: clockAt(T0) });
+    await completeItem(db, fence, { id: item.id }, lease(T0));
   }
 
   t.equal(await pendingItems(db, fence.runId), 0, 'every root is checkpointed as done');

@@ -32,20 +32,25 @@ const nodeKey   = 'key';
 const contract  = Eth.wellKnownContractsByNetwork[network]['Comet']['cUSDTv3'];
 const block     = 21_000_000;
 const priceFeed = { address: '0xe3a409ed15cd53afdefdd191ad945cec528a2496' as const, decimals: 8 };
-// getPrice(priceFeed)
-const data      = '0x41976e09000000000000000000000000e3a409ed15cd53afdefdd191ad945cec528a2496';
+
+type Feed = { address: `0x${string}`, decimals: number };
+
+// getPrice(feed)
+function dataOf(feed: Feed): string {
+  return `0x41976e09${feed.address.slice(2).padStart(64, '0')}`;
+}
 
 declare var fetch: mock.Fetch;
 t.before(() => {
   global.fetch = mock.fetch({ passthrough: false });
 });
 
-function answerWith(answer: { result: string } | { error: jsonRpc.Error }) {
+function answerWith(answer: { result: string } | { error: jsonRpc.Error }, feed: Feed = priceFeed) {
   const request: jsonRpc.Request = {
     jsonrpc: '2.0',
     id:      0,
     method:  'eth_call',
-    params:  [ { to: contract.address, data }, `0x${block.toString(16)}` ],
+    params:  [ { to: contract.address, data: dataOf(feed) }, `0x${block.toString(16)}` ],
   };
   mock.rpc.expectPost(fetch, Eth.nodeEndpoint(nodeHost, nodeKey, network), [
     request,
@@ -53,12 +58,21 @@ function answerWith(answer: { result: string } | { error: jsonRpc.Error }) {
   ]);
 }
 
-function read() {
+function read(feed: Feed = priceFeed) {
   const cache = new MemoryCache({}, [ BigNumber.JsonReviver, BigFixnum.JsonReviver ]);
   const { pull1, evaluate } = Evaluator.instantiate<comet.GetPrice>({ ...evm, ...comet }, { cache, debug, flags });
   return evaluate(pull1({
-    getPrice: { apiHost: '', nodeHost, nodeKey, network, contract, blockNumber: block, priceFeed },
+    getPrice: { apiHost: '', nodeHost, nodeKey, network, contract, blockNumber: block, priceFeed: feed },
   }));
+}
+
+// what was written as a warning, for the length of a test
+function captureWarnings(t: { teardown: (fn: () => void) => void }): string[] {
+  const logged: string[] = [];
+  const consoleWarn = console.warn;
+  console.warn = (...args: unknown[]) => { logged.push(args.join(' ')); };
+  t.teardown(() => { console.warn = consoleWarn; });
+  return logged;
 }
 
 t.test('a feed that answers is a price', async t => {
@@ -70,15 +84,37 @@ t.test('a feed that answers is a price', async t => {
   fetch.satisfy(t);
 });
 
+/*
+ * A feed that reverts is an expected degradation — the summary reports the
+ * price it could not read — so it is a warning, which still names the feed
+ * an operator has to price. The line starts with what the runbook alerts on;
+ * the rest of its wording is free to change.
+ */
 t.test('a feed that reverts is an answer, not a failure', async t => {
-  const logged: string[] = [];
-  const consoleError = console.error;
-  console.error = (...args: unknown[]) => { logged.push(args.join(' ')); };
-  t.teardown(() => { console.error = consoleError; });
+  const logged = captureWarnings(t);
 
   answerWith({ error: { code: 3, message: 'execution reverted', data: '0x' } });
   t.strictSame(await read(), { status: 'error', message: 'execution reverted' });
-  t.match(logged, [ /^price feed reverted: 0xe3a409ed15cd53afdefdd191ad945cec528a2496 read by / ], 'and names the feed');
+  t.equal(logged.length, 1, 'it is logged once');
+  t.match(logged[0], /^price feed reverted: /, 'under the prefix the runbook alerts on');
+  t.match(logged[0], priceFeed.address, 'naming the feed');
+  fetch.satisfy(t);
+});
+
+/*
+ * A retired feed is read by every market that prices with it, at every block
+ * a summary reads; a line for each would bury the log. It is named once a
+ * minute instead, for as long as it reverts.
+ */
+t.test('a feed that keeps reverting is named once a minute, not on every read', async t => {
+  const logged = captureWarnings(t);
+  const feed   = { address: '0x00000000000000000000000000000000000000f2' as const, decimals: 8 };
+
+  answerWith({ error: { code: 3, message: 'execution reverted', data: '0x' } }, feed);
+  answerWith({ error: { code: 3, message: 'execution reverted', data: '0x' } }, feed);
+  t.equal((await read(feed)).status, 'error');
+  t.equal((await read(feed)).status, 'error', 'every read answers the revert');
+  t.equal(logged.filter(line => line.includes(feed.address)).length, 1, 'and the feed is named once');
   fetch.satisfy(t);
 });
 

@@ -28,8 +28,14 @@ import '../../shim/node-self.js';
 
 /*
  * The summary of every market, on the real evaluator against a fake node,
- * counting what reaches the node: a Worker on the Free plan may make only 50
- * subrequests, and each request to the node provider proxy is one.
+ * counting what reaches the node. Each request to the node provider proxy is
+ * a subrequest, of which a Worker invocation has a budget (README, "Workers
+ * Plan"), so what the summary of every market costs has to grow with the
+ * networks, not with the markets.
+ *
+ * This is where the batching of that summary is counted, and only here: what
+ * the route asks the node is the cost that matters, however the handler and
+ * the evaluator share the work out between them.
  */
 const flags = Flags.parseWithDefaults(process.env);
 const debug = Debug.MakeLogger([]).configure(process.env);

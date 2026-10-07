@@ -1,20 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
-import type { RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
+import type * as KnownNetwork from '../../lib/well-known/networks/network.js';
+import type { Address, MarketV1, NetworkV1, RegistryComet, RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
 import type { Catalog } from '../../src/registry/catalog.js';
 import { catalogOf } from '../../src/registry/catalog.js';
-import {
-  createCandidate,
-  writeCandidateSnapshot,
-} from '../../src/registry/repository.js';
+import { createCandidate, marketWrites } from '../../src/registry/repository.js';
 
 /*
  * Loads the frozen RegistrySnapshotV1 fixture and seeds it into D1 as an
- * importing candidate. Writing goes through the candidate repository, so
- * tests exercise the same mapping the importer uses rather than a second copy
- * of it. tests/lib/registry/registry-snapshot-v1-fixture.test.ts is what
- * enforces the contract of the file itself.
+ * importing candidate. Writing goes through the writes the importer makes, so
+ * tests exercise the same mapping it uses rather than a second copy of it.
+ * tests/lib/registry/registry-snapshot-v1-fixture.test.ts is what enforces
+ * the contract of the file itself.
  */
 const FIXTURE_PATH = './tests/fixtures/registry/registry-snapshot-v1.json';
 
@@ -31,14 +29,96 @@ function fixtureCatalog(snapshot: RegistrySnapshotV1 = loadRegistrySnapshotFixtu
   return catalogOf(snapshot);
 }
 
+/*
+ * One Comet of the fixture, as the catalog materializes it: the only kind of
+ * Comet a computation is handed, so the one a test of a computation hands it.
+ */
+function fixtureComet(network: KnownNetwork.Name, address: string): RegistryComet {
+  const comet = fixtureCatalog().marketAt(network, address as Address)?.comet;
+  if (comet === undefined) {
+    throw new Error(`the registry fixture has no market at ${address} on ${network}`);
+  }
+  return comet;
+}
+
 function sha256Hex(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+// the rows a snapshot is written as, by table
+type SnapshotCounts = {
+  networks:        number,
+  markets:         number,
+  tokens:          number,
+  contracts:       number,
+  assets:          number,
+  priceExceptions: number,
+};
+
+// every token a market names: its base asset, the token it pays, and its collateral
+function tokensOf(market: MarketV1): string[] {
+  return [
+    market.baseAsset.token.address,
+    ...(market.rewardAsset === null ? [] : [ market.rewardAsset.token.address ]),
+    ...market.collateralAssets.map(asset => asset.token.address),
+  ];
+}
+
+/*
+ * Writes a whole snapshot into an importing candidate, the way an import
+ * writes it: market by market, each network with its first market, and the
+ * tokens of a network once however many of its markets name them. A whole
+ * snapshot is a document someone decided, so every row is written as
+ * reviewed. What it reports is the rows the snapshot describes, which a test
+ * checks the database against.
+ *
+ * A network without markets is refused before anything is written: an import
+ * writes a network only with its first market, so that network would not be
+ * written, and the rows reported would not be the rows the database holds.
+ */
+async function writeCandidateSnapshot(db: D1Database, versionId: string, networks: NetworkV1[]): Promise<SnapshotCounts> {
+  const empty = networks.find(network => network.markets.length === 0);
+  if (empty !== undefined) {
+    throw new Error(`the snapshot's network ${empty.key} has no markets, and an import writes a network only with its first market`);
+  }
+  for (const network of networks) {
+    for (const market of network.markets) {
+      const writes = await marketWrites(db, versionId, { network, market, networkReviewed: true, marketReviewed: true });
+      await db.batch(writes());
+    }
+  }
+  const markets = networks.flatMap(network => network.markets);
+  return {
+    networks:        networks.length,
+    markets:         markets.length,
+    tokens:          networks.reduce((total, network) => total + new Set(network.markets.flatMap(tokensOf)).size, 0),
+    contracts:       markets.reduce((total, market) => total + Object.values(market.contracts).filter(address => address !== null).length, 0),
+    assets:          markets.reduce((total, market) => total + tokensOf(market).length, 0),
+    priceExceptions: networks.reduce((total, network) => total + network.priceExceptions.length, 0),
+  };
+}
+
+/*
+ * Removes the snapshot rows of a candidate, which the triggers allow only
+ * while it is importing.
+ */
+async function clearCandidateSnapshot(db: D1Database, versionId: string): Promise<void> {
+  await db.batch([
+    // assets and contracts follow their markets and networks by cascade
+    db.prepare(`DELETE FROM market_assets WHERE registry_version_id = ?1`).bind(versionId),
+    db.prepare(`DELETE FROM markets WHERE registry_version_id = ?1`).bind(versionId),
+    db.prepare(`DELETE FROM tokens WHERE registry_version_id = ?1`).bind(versionId),
+    db.prepare(`DELETE FROM network_price_exceptions WHERE registry_version_id = ?1`).bind(versionId),
+    db.prepare(`DELETE FROM registry_networks WHERE registry_version_id = ?1`).bind(versionId),
+  ]);
 }
 
 type SeedOptions = {
   // defaults to the fixture's own version id
   versionId?: string,
   attempt?:   number,
+  // defaults to the fixture's own commit, so seeded candidates are attempts of one commit
+  commitSha?: string,
 };
 
 type SeededCandidate = {
@@ -57,7 +137,7 @@ async function seedCandidate(
   const version = await createCandidate(db, {
     versionId,
     repository:     snapshot.registryVersion.sourceRepository,
-    commitSha:      snapshot.registryVersion.sourceCommitSha,
+    commitSha:      options.commitSha ?? snapshot.registryVersion.sourceCommitSha,
     sourceChecksum: sha256Hex(`source:${versionId}`),
     attempt:        options.attempt ?? 1,
     createdBy:      'test-seed',
@@ -94,8 +174,11 @@ async function seedCandidate(
 export type { SeedOptions, SeededCandidate };
 
 export {
+  clearCandidateSnapshot,
   fixtureCatalog,
+  fixtureComet,
   loadRegistrySnapshotFixture,
   seedCandidate,
   sha256Hex,
+  writeCandidateSnapshot,
 };

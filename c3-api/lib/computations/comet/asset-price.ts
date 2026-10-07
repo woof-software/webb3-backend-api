@@ -2,7 +2,7 @@ import { BigFixnum } from '../../bigfixnum.js';
 import * as Compute  from '../../symbolic/computation.js';
 
 import type { Address, PriceExceptionV1, RegistryAnnotation } from '../../model/comet-registry.js';
-import { registryOf } from '../../model/comet-registry.js';
+import { annotationOf } from '../../model/comet-registry.js';
 
 import type { AssetInfo } from './asset-info.js';
 import type { GetPrice, PriceRead } from './get-price.js';
@@ -27,24 +27,26 @@ type AssetPrice = Compute.Spec<{
  * branches on network and feed address compiled into this computation, which
  * meant a deprecated feed could only be handled by shipping a new Worker.
  */
-function exceptionFor(annotation: RegistryAnnotation | null, priceFeed: Address): PriceExceptionV1 | null {
+function exceptionFor(annotation: RegistryAnnotation, priceFeed: Address): PriceExceptionV1 | null {
   const address = priceFeed.toLowerCase();
-  return annotation?.priceExceptions.find(exception => exception.priceFeedAddress === address) ?? null;
+  return annotation.priceExceptions.find(exception => exception.priceFeedAddress === address) ?? null;
 }
 
 /*
- * The scale of that feed, as the registry read it on chain. A feed this
- * version does not describe falls back to eight decimals, which is what every
- * caller assumed before the registry existed.
+ * The scale of that feed, as the registry read it on chain. Every price is
+ * read at it, and a zero price is stated at it.
+ *
+ * A Comet reports the feed it prices an asset with at the block it is asked
+ * at, and at a historical block that may be a feed the market has since moved
+ * off, which the version does not describe. Such a feed is read at eight
+ * decimals: Comet refuses a price feed of any other scale, and it is what
+ * every caller assumed before the registry existed.
  */
 const ASSUMED_DECIMALS = 8;
 
-function decimalsOf(annotation: RegistryAnnotation | null, priceFeed: Address): number {
+function decimalsOf(annotation: RegistryAnnotation, priceFeed: Address): number {
   const address = priceFeed.toLowerCase();
-  const market  = annotation?.market;
-  if (market === undefined) {
-    return ASSUMED_DECIMALS;
-  }
+  const market  = annotation.market;
   const feeds = [
     market.baseAsset.priceFeed,
     ...(market.baseAsset.usdPriceFeed === null ? [] : [ market.baseAsset.usdPriceFeed ]),
@@ -60,7 +62,7 @@ const assetPrice = implement({
   compute: ({ apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network }) => pipe1([
     { assetInfo: { apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network } },
     ({ priceFeed }) => {
-      const annotation = registryOf(contract);
+      const annotation = annotationOf(contract);
       const exception  = exceptionFor(annotation, priceFeed);
 
       if (exception !== null) {
@@ -102,4 +104,4 @@ const assetPrice = implement({
   ]),
 });
 
-export { AssetPrice, assetPrice };
+export { AssetPrice, assetPrice, exceptionFor };

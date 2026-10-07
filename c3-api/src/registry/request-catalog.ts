@@ -2,17 +2,11 @@ import type { Env } from '../../entrypoint.js';
 
 import type { RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
 
+import { ApiError } from '../http/errors.js';
+
 import { Catalog, catalogOf } from './catalog.js';
 import type { CacheDeps } from './cache.js';
-import {
-  activePointer,
-  cacheDepsOf,
-  cachedSnapshot,
-  isUnreachable,
-  noteFallback,
-  snapshotFor,
-  stalePointer,
-} from './cache.js';
+import { RegistryUnavailable, activeSnapshot, cacheDepsOf, isRegistryUnavailable } from './cache.js';
 import { registryHeaders } from './version-headers.js';
 
 /*
@@ -29,7 +23,7 @@ import { registryHeaders } from './version-headers.js';
  * gas price — must not pay a D1 read, nor fail when the registry is empty.
  */
 type RequestCatalog = {
-  // loads the active version, or throws RegistryUnavailable
+  // loads the active version; throws RegistryUnavailable when there is none to serve, and a database fault as it is
   load(): Promise<Catalog>,
   // the version that answered this request, if one was loaded
   loaded(): Catalog | null,
@@ -42,134 +36,42 @@ type RequestCatalog = {
 };
 
 /*
- * There is no active registry version, or D1 did not answer. After the
- * cutover this is a failure, never a fallback: silently answering from the
- * static constants would serve markets that nothing reviewed or activated.
- */
-class RegistryUnavailable extends Error {
-  readonly cause: unknown;
-
-  constructor(message: string, cause?: unknown) {
-    super(message);
-    this.name  = 'RegistryUnavailable';
-    this.cause = cause;
-  }
-}
-
-function isRegistryUnavailable(error: unknown): error is RegistryUnavailable {
-  return error instanceof Error && error.name === 'RegistryUnavailable';
-}
-
-/*
- * The catalog of the version that is on, kept for as long as it is on.
- *
- * A version never changes once it is activated — its rows are frozen, and its
- * checksum says so — and only the pointer can move, which is one statement to
- * read. So an isolate keeps the catalog it built and a request pays the
- * pointer read alone, rather than reading the whole snapshot and building
+ * The catalog of each version this isolate has served, kept for as long as
+ * the snapshot it was built from. The cache hands out one snapshot object per
+ * version for as long as it holds that version, so a request of a hot isolate
+ * pays the pointer read alone, rather than reading the snapshot and building
  * every market's contracts again for an answer that cannot differ.
  *
  * A price exception may expire, and a catalog resolves expiry when it is
- * built, so one is kept only until the next expiry falls due. The database
- * binding is part of the key, because a version id identifies a version of
- * one registry, not of every database an isolate might hold.
+ * built, so one is kept only for as long as it says it stays valid: the
+ * catalog decides that with the same rule it applies exceptions by.
  */
-const active = new WeakMap<D1Database, { versionId: string, catalog: Catalog, until: number | null }>();
-
-// when the next price exception expires, after which a catalog built now would apply a different set
-function nextExpiry(snapshot: RegistrySnapshotV1, now: number): number | null {
-  const due = snapshot.networks
-    .flatMap(network => network.priceExceptions)
-    .map(exception => exception.expiresAt === null ? Number.NaN : Date.parse(exception.expiresAt))
-    .filter(time => Number.isFinite(time) && time > now);
-  return due.length === 0 ? null : Math.min(...due);
-}
+const built = new WeakMap<RegistrySnapshotV1, { catalog: Catalog, until: number | null }>();
 
 // the clock the cache was given, so an injected one decides expiry as well as staleness
 function clockOf(deps: CacheDeps): number {
   return (deps.now?.() ?? new Date()).getTime();
 }
 
-function catalogFrom(deps: CacheDeps, snapshot: RegistrySnapshotV1, now: number): Catalog {
+function catalogFor(snapshot: RegistrySnapshotV1, now: number): Catalog {
+  const kept = built.get(snapshot);
+  if (kept !== undefined && (kept.until === null || now < kept.until)) {
+    return kept.catalog;
+  }
   const catalog = catalogOf(snapshot, new Date(now));
-  active.set(deps.db, { versionId: snapshot.registryVersion.id, catalog, until: nextExpiry(snapshot, now) });
+  built.set(snapshot, { catalog, until: catalog.validUntil });
   return catalog;
 }
 
 /*
- * The catalog of the version that is on.
- *
- * The order is what keeps a hot isolate cheap: read the pointer, which is one
- * D1 statement; if it still names the version this isolate built its catalog
- * from, nothing else is read at all. Only a pointer that moved, or an isolate
- * that has just started, pays the snapshot — from KV where another isolate
- * has already cached it, and from D1 otherwise.
- *
- * When D1 does not answer, the cache may still hold the version it last
- * named. That answer is served rather than failing the request, and the age
- * of it is carried back so the response can say so.
+ * How a route answers a registry it cannot read: 503 either way, with a code
+ * that says which — nothing is active, or the database did not answer. Why it
+ * did not answer is the log's to say, never the client's.
  */
-async function activeCatalog(deps: CacheDeps): Promise<{ catalog: Catalog, staleFor: number | null } | null> {
-  /*
-   * What to answer with when D1 did not answer. The pointer record is read
-   * first and on its own, because an isolate that already holds the catalog
-   * of that version has nothing left to read: an outage is when rebuilding
-   * every market from the cached bytes, on every request, is least
-   * affordable.
-   */
-  const fallback = async (error: unknown) => {
-    if (!isUnreachable(error)) {
-      // the database answered, and what it said is a fault to raise, not to paper over
-      throw error;
-    }
-    const stale = await stalePointer(deps);
-    if (stale === null) {
-      throw error;
-    }
-    const at   = clockOf(deps);
-    const kept = active.get(deps.db);
-    if (kept !== undefined && kept.versionId === stale.pointer.id && (kept.until === null || at < kept.until)) {
-      return { catalog: kept.catalog, staleFor: stale.staleFor };
-    }
-    const snapshot = await cachedSnapshot(deps, stale.pointer);
-    if (snapshot === null) {
-      throw error;
-    }
-    return { catalog: catalogFrom(deps, snapshot, at), staleFor: stale.staleFor };
-  };
-
-  let pointer;
-  try {
-    pointer = await activePointer(deps);
-  } catch (error) {
-    noteFallback(deps, 'pointer', error);
-    return fallback(error);
-  }
-
-  if (pointer === null) {
-    active.delete(deps.db);
-    return null;
-  }
-
-  const now  = clockOf(deps);
-  const kept = active.get(deps.db);
-  if (kept !== undefined && kept.versionId === pointer.id && (kept.until === null || now < kept.until)) {
-    return { catalog: kept.catalog, staleFor: null };
-  }
-
-  let resolved;
-  try {
-    resolved = await snapshotFor(deps, pointer);
-  } catch (error) {
-    noteFallback(deps, 'snapshot', error);
-    return fallback(error);
-  }
-  if (resolved === null) {
-    active.delete(deps.db);
-    return null;
-  }
-
-  return { catalog: catalogFrom(deps, resolved.snapshot, now), staleFor: null };
+function unavailableError(error: RegistryUnavailable): ApiError {
+  return error.reason === 'not_active'
+    ? new ApiError('REGISTRY_NOT_ACTIVE', `No active registry snapshot is available`)
+    : new ApiError('UPSTREAM_UNAVAILABLE', `the comet registry could not be read`);
 }
 
 function requestCatalog(env: Env, debug?: CacheDeps['debug']): RequestCatalog {
@@ -183,26 +85,29 @@ function requestCatalog(env: Env, debug?: CacheDeps['debug']): RequestCatalog {
     staleFor: () => staleFor,
     load() {
       /*
+       * The active version is read as the registry's own routes read it, so a
+       * market route fails as they do: a database that did not answer, with
+       * nothing within the window to fall back on, is RegistryUnavailable,
+       * and one that answered with a fault is raised as it is.
+       *
        * A failed load is not memoized: the promise is cleared so a later
        * handler of the same request can try again, which matters when the
        * first attempt lost a race with a D1 hiccup rather than finding an
        * empty registry.
        */
       pending ??= (async () => {
-        let loaded;
         try {
-          loaded = await activeCatalog(deps);
+          const active = await activeSnapshot(deps);
+          if (active === null) {
+            throw new RegistryUnavailable(`no comet registry version is active`, 'not_active');
+          }
+          catalog  = catalogFor(active.snapshot, clockOf(deps));
+          staleFor = active.staleFor;
+          return catalog;
         } catch (error) {
           pending = null;
-          throw new RegistryUnavailable(`the comet registry could not be read`, error);
+          throw error;
         }
-        if (loaded === null) {
-          pending = null;
-          throw new RegistryUnavailable(`no comet registry version is active`);
-        }
-        catalog  = loaded.catalog;
-        staleFor = loaded.staleFor;
-        return catalog;
       })();
       return pending;
     },
@@ -226,4 +131,4 @@ function catalogHeaders(catalog: Catalog, staleFor: number | null = null): Recor
 }
 
 export type { RequestCatalog };
-export { RegistryUnavailable, catalogHeaders, isRegistryUnavailable, requestCatalog };
+export { RegistryUnavailable, catalogHeaders, isRegistryUnavailable, requestCatalog, unavailableError };

@@ -61,6 +61,16 @@ t.test(`/market/all-networks/all-contracts/summary`, async (t) => {
 
   t.ok(Array.isArray(responseJson));
 
+  // one summary for each market the version serves, and for nothing else
+  const served = registry.snapshot.networks.flatMap(network => network.markets
+    .filter(market => market.status !== 'disabled')
+    .map(market => `${network.chainId}:${market.contracts.comet}`));
+  t.same(
+    responseJson.map(({ chain_id, comet }) => `${chain_id}:${comet.address.toLowerCase()}`).sort(),
+    served.sort(),
+    `the ${served.length} markets the active version serves are summarized`,
+  );
+
   responseJson.forEach((entry) => {
     // check basic formatting of the summary response
     const {

@@ -4,6 +4,7 @@ import {
   Address,
   CONTRACT_ROLES,
   CONTRACT_ROLE_KEYS,
+  MARKET_KEY_SEPARATOR,
   MarketAssetRow,
   MarketContractRow,
   MarketRow,
@@ -15,10 +16,13 @@ import {
   PriceQuote,
   RegistryNetworkRow,
   RegistrySnapshotV1,
+  RegistryTables,
+  RegistryVersionRefV1,
   RegistryVersionRow,
   TokenV1,
   ValidationResultRow,
   ValidationSummaryV1,
+  marketKey,
 } from '../../lib/model/comet-registry.js';
 
 import { RegistryError } from './errors.js';
@@ -28,29 +32,52 @@ import {
   NetworkOverlay,
   parseMarketOverlay,
   parseNetworkOverlay,
+  storedInstant,
 } from './overlay.js';
 import { canonicalJson } from '../../lib/canonical-json.js';
 import { sha256Hex } from '../../lib/hash.js';
 
 /*
- * Writes to the registry tables of APP_DB. The database owns the invariants:
- * the lifecycle, singleton, and append-only triggers of
- * migrations/0001_comet_registry.sql reject anything this module gets wrong,
- * so these functions stay thin and never re-implement those rules.
- *
- * Only candidate writes live here. Snapshot hydration for the public API
- * arrives with the registry API.
+ * Reads and writes of the registry tables of APP_DB: candidates and their
+ * snapshots, validation attempts, overlays, and the active pointer. The
+ * database owns the invariants: the lifecycle, singleton, and append-only
+ * triggers of migrations/0001_comet_registry.sql reject anything this module
+ * gets wrong, so these functions stay thin and never re-implement those rules.
  */
 type SqlValue = string | number | null;
-type Row = Record<string, SqlValue>;
 
 /*
- * D1 executes a batch as one transaction. Statements are chunked so a whole
- * registry version does not arrive as one oversized request; each chunk is
- * atomic, and a failed chunk leaves the version importing, which is a state
- * the next attempt can resume from.
+ * What must still hold when a write applies: an expression for a WHERE
+ * clause, and the values it binds. Its parameters are numbered from `first`,
+ * so it can follow whatever the statement it is added to binds itself.
+ *
+ * D1 rolls a batch back when a statement fails, not when one changes nothing,
+ * so a write that must not apply once something has moved names that in every
+ * statement it is made of.
  */
-const BATCH_SIZE = 100;
+type Condition = {
+  sql:    (first: number) => string,
+  values: SqlValue[],
+};
+
+function both(left: Condition, right: Condition): Condition {
+  return {
+    sql:    first => `(${left.sql(first)}) AND (${right.sql(first + left.values.length)})`,
+    values: [ ...left.values, ...right.values ],
+  };
+}
+
+/*
+ * A statement that applies only while a condition holds. `sql` ends in its own
+ * WHERE clause, a conjunction the condition is added to; its parameters are
+ * numbered from one, and the condition's follow them. Without a condition it
+ * is the statement as written.
+ */
+function conditioned(db: D1Database, sql: string, values: SqlValue[], condition?: Condition): D1PreparedStatement {
+  return condition === undefined
+    ? db.prepare(sql).bind(...values)
+    : db.prepare(`${sql} AND (${condition.sql(values.length + 1)})`).bind(...values, ...condition.values);
+}
 
 type CandidateInput = {
   repository:     string,
@@ -64,7 +91,7 @@ type CandidateInput = {
 
 /*
  * The reviewed overlay of one stored version, keyed by chain id and by
- * `chainId/deploymentKey`, which is how an import looks up the decisions made
+ * market key (marketKey), which is how an import looks up the decisions made
  * for a market it rediscovers.
  */
 type ClonedOverlays = {
@@ -72,27 +99,26 @@ type ClonedOverlays = {
   markets:  Map<string, MarketOverlay>,
 };
 
-type SnapshotCounts = {
-  networks:         number,
-  markets:          number,
-  tokens:           number,
-  contracts:        number,
-  assets:           number,
-  priceExceptions:  number,
-};
-
-function insertStatement(db: D1Database, table: string, row: Row): D1PreparedStatement {
+/*
+ * An INSERT of one row, checked against the row type of its table: a column
+ * the type names cannot be left out and fall back to its default, which for
+ * `reviewed` would record a decision nobody made. With a condition the row is
+ * selected rather than stated, so it is inserted only while the condition
+ * holds.
+ */
+function insertStatement<Table extends keyof RegistryTables>(
+  db: D1Database,
+  table: Table,
+  row: RegistryTables[Table],
+  condition?: Condition,
+): D1PreparedStatement {
   const columns      = Object.keys(row);
-  const placeholders = columns.map((_, index) => `?${index + 1}`);
-  return db
-    .prepare(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`)
-    .bind(...Object.values(row));
-}
-
-async function runInChunks(db: D1Database, statements: D1PreparedStatement[]): Promise<void> {
-  for (let index = 0; index < statements.length; index += BATCH_SIZE) {
-    await db.batch(statements.slice(index, index + BATCH_SIZE));
-  }
+  const values       = Object.values(row) as SqlValue[];
+  const placeholders = columns.map((_, index) => `?${index + 1}`).join(', ');
+  return condition === undefined
+    ? db.prepare(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders})`).bind(...values)
+    : db.prepare(`INSERT INTO ${table} (${columns.join(', ')}) SELECT ${placeholders} WHERE ${condition.sql(values.length + 1)}`)
+        .bind(...values, ...condition.values);
 }
 
 function boolean(value: boolean): number {
@@ -104,8 +130,8 @@ function boolean(value: boolean): number {
  * within them everything except the generated row ids, so importing the same
  * markets twice produces the same value. Row ids are per-write UUIDs; keeping
  * them would make every re-import of unchanged source look like a change.
- * Objects are built in the order the RegistrySnapshotV1 contract fixes, which
- * makes the serialization canonical.
+ * The serialization is canonical JSON, every object's keys sorted, so the
+ * order an object happens to be built in never reaches the checksum.
  */
 async function snapshotChecksum(networks: NetworkV1[]): Promise<string> {
   const semantic = networks.map(network => ({
@@ -113,23 +139,6 @@ async function snapshotChecksum(networks: NetworkV1[]): Promise<string> {
     markets: network.markets.map(({ id: _id, ...market }) => market),
   }));
   return sha256Hex(canonicalJson(semantic));
-}
-
-/*
- * Every import attempt for one source, newest first. The caller decides
- * whether to resume an importing attempt, reuse a validated one, or start a
- * new attempt after an invalid one.
- */
-async function findAttempts(
-  db: D1Database,
-  source: { repository: string, commitSha: string, sourceChecksum: string },
-): Promise<RegistryVersionRow[]> {
-  const { results } = await db.prepare(
-    `SELECT * FROM registry_versions
-     WHERE source_repository = ?1 AND source_commit_sha = ?2 AND source_checksum = ?3
-     ORDER BY attempt DESC`
-  ).bind(source.repository.toLowerCase(), source.commitSha, source.sourceChecksum).all<RegistryVersionRow>();
-  return results ?? [];
 }
 
 /*
@@ -149,6 +158,11 @@ async function findAttemptsByCommit(
   ).bind(repository.toLowerCase(), commitSha).all<RegistryVersionRow>();
   return results ?? [];
 }
+
+// the failed check that closes a draft a newer attempt of its commit replaced
+const SUPERSEDED_CHECK = 'superseded-by-newer-attempt';
+
+type Replacement = Pick<RegistryVersionRow, 'id' | 'attempt' | 'source_repository' | 'source_commit_sha'>;
 
 /*
  * Closes the drafts of a commit that a newer, successful attempt of the same
@@ -180,10 +194,6 @@ async function findAttemptsByCommit(
  * same draft cannot collide: the second changes nothing. Returns the ids this
  * call actually closed.
  */
-const SUPERSEDED_CHECK = 'superseded-by-newer-attempt';
-
-type Replacement = Pick<RegistryVersionRow, 'id' | 'attempt' | 'source_repository' | 'source_commit_sha'>;
-
 async function supersedeEarlierAttempts(db: D1Database, replacement: Replacement): Promise<string[]> {
   const { results } = await db.prepare(
     `SELECT id FROM registry_versions
@@ -250,11 +260,12 @@ async function supersedeStaleAttempts(db: D1Database, repository: string, commit
 }
 
 /*
- * Creates an importing candidate. The repository identifier is stored
- * lowercase, so a casing difference cannot create a second source.
+ * An importing candidate, as the row that records it. The repository
+ * identifier is stored lowercase, so a casing difference cannot create a
+ * second source.
  */
-async function createCandidate(db: D1Database, input: CandidateInput): Promise<RegistryVersionRow> {
-  const version: RegistryVersionRow = {
+function candidateRow(input: CandidateInput): RegistryVersionRow {
+  return {
     id:                input.versionId ?? crypto.randomUUID(),
     source_repository: input.repository.toLowerCase(),
     source_commit_sha: input.commitSha,
@@ -266,23 +277,17 @@ async function createCandidate(db: D1Database, input: CandidateInput): Promise<R
     validated_at:      null,
     created_by:        input.createdBy,
   };
-  await insertStatement(db, 'registry_versions', { ...version }).run();
-  return version;
 }
 
-/*
- * Replaces the snapshot rows of an importing candidate. The triggers reject
- * this for a terminal version, so a caller cannot rewrite history by mistake.
- */
-async function clearCandidateSnapshot(db: D1Database, versionId: string): Promise<void> {
-  await db.batch([
-    // assets and contracts follow their markets and networks by cascade
-    db.prepare(`DELETE FROM market_assets WHERE registry_version_id = ?1`).bind(versionId),
-    db.prepare(`DELETE FROM markets WHERE registry_version_id = ?1`).bind(versionId),
-    db.prepare(`DELETE FROM tokens WHERE registry_version_id = ?1`).bind(versionId),
-    db.prepare(`DELETE FROM network_price_exceptions WHERE registry_version_id = ?1`).bind(versionId),
-    db.prepare(`DELETE FROM registry_networks WHERE registry_version_id = ?1`).bind(versionId),
-  ]);
+// the statement that creates a candidate, for a caller that commits it together with something else
+function candidateStatement(db: D1Database, version: RegistryVersionRow, condition?: Condition): D1PreparedStatement {
+  return insertStatement(db, 'registry_versions', { ...version }, condition);
+}
+
+async function createCandidate(db: D1Database, input: CandidateInput): Promise<RegistryVersionRow> {
+  const version = candidateRow(input);
+  await candidateStatement(db, version).run();
+  return version;
 }
 
 type Scope = { registry_version_id: string, network_id: string };
@@ -292,14 +297,16 @@ type Scope = { registry_version_id: string, network_id: string };
  * written from a reviewed overlay says so; one written for a network or
  * market nobody has reviewed carries the provisional values of
  * provisionalNetworkOverlay and provisionalMarketOverlay, and is not cloned
- * into the next version.
+ * into the next version. Every writer states which it is: there is no side
+ * a row may fall to by default.
  */
 function networkStatement(
   db: D1Database,
   versionId: string,
   networkId: string,
   network: NetworkV1,
-  reviewed: boolean = true,
+  reviewed: boolean,
+  condition?: Condition,
 ): D1PreparedStatement {
   return insertStatement(db, 'registry_networks', {
     id:                   networkId,
@@ -311,10 +318,10 @@ function networkStatement(
     is_testnet:           boolean(network.testnet),
     metadata:             JSON.stringify(network.presentation),
     reviewed:             boolean(reviewed),
-  });
+  }, condition);
 }
 
-function exceptionStatements(db: D1Database, scope: Scope, network: NetworkV1): D1PreparedStatement[] {
+function exceptionStatements(db: D1Database, scope: Scope, network: NetworkV1, condition?: Condition): D1PreparedStatement[] {
   return network.priceExceptions.map(exception => insertStatement(db, 'network_price_exceptions', {
     ...scope,
     price_feed_address:              exception.priceFeedAddress,
@@ -325,23 +332,23 @@ function exceptionStatements(db: D1Database, scope: Scope, network: NetworkV1): 
     replacement_price_feed_decimals: exception.kind === 'deprecated_price_remap' ? exception.replacementPriceFeed.decimals : null,
     provenance:                      exception.provenance,
     expires_at:                      exception.expiresAt,
-  }));
+  }, condition));
 }
 
 /*
  * The rows of one market, given the token ids of its network. Tokens the
- * network does not have yet are created here and reported back, so a caller
- * writing markets one at a time keeps token identity shared across them.
+ * network does not have yet are created here and added to those ids, so the
+ * market's own tokens are written once however many roles they play in it.
  */
 function marketStatements(
   db: D1Database,
   scope: Scope,
   market: MarketV1,
   tokenIds: Map<Address, string>,
-  reviewed: boolean = true,
-): { statements: D1PreparedStatement[], tokens: number, contracts: number, assets: number } {
+  reviewed: boolean,
+  condition?: Condition,
+): D1PreparedStatement[] {
   const statements: D1PreparedStatement[] = [];
-  let tokens = 0;
 
   const tokenId = (token: TokenV1): string => {
     const known = tokenIds.get(token.address);
@@ -350,7 +357,6 @@ function marketStatements(
     }
     const id = crypto.randomUUID();
     tokenIds.set(token.address, id);
-    tokens++;
     statements.push(insertStatement(db, 'tokens', {
       id,
       ...scope,
@@ -358,7 +364,7 @@ function marketStatements(
       symbol:   token.symbol,
       name:     token.name,
       decimals: token.decimals,
-    }));
+    }, condition));
     return id;
   };
 
@@ -380,19 +386,16 @@ function marketStatements(
     transaction_history_enabled: boolean(market.capabilities.transactionHistory),
     collateral_value_quote:      market.collateralValueQuote,
     reviewed:                    boolean(reviewed),
-  }));
+  }, condition));
 
-  let contracts = 0;
   for (const role of CONTRACT_ROLES) {
     const address = market.contracts[CONTRACT_ROLE_KEYS[role]];
     if (address !== null && address !== undefined) {
-      contracts++;
-      statements.push(insertStatement(db, 'market_contracts', { market_id: marketId, role, address }));
+      statements.push(insertStatement(db, 'market_contracts', { market_id: marketId, role, address }, condition));
     }
   }
 
   const { baseAsset, rewardAsset } = market;
-  let assets = 1;
   statements.push(insertStatement(db, 'market_assets', {
     ...scope,
     market_id:               marketId,
@@ -406,147 +409,207 @@ function marketStatements(
     usd_price_feed_decimals: baseAsset.usdPriceFeed?.decimals ?? null,
     display_name:            baseAsset.displayName,
     is_wrapped_native:       boolean(baseAsset.isWrappedNative),
-  }));
+  }, condition));
 
   if (rewardAsset !== null) {
-    assets++;
     statements.push(insertStatement(db, 'market_assets', {
       ...scope,
-      market_id:           marketId,
-      token_id:            tokenId(rewardAsset.token),
-      role:                'reward',
-      asset_index:         null,
-      price_feed_address:  rewardAsset.priceFeed?.address ?? null,
-      price_feed_decimals: rewardAsset.priceFeed?.decimals ?? null,
-      price_feed_quote:    rewardAsset.priceFeedQuote,
-    }));
+      market_id:               marketId,
+      token_id:                tokenId(rewardAsset.token),
+      role:                    'reward',
+      asset_index:             null,
+      price_feed_address:      rewardAsset.priceFeed?.address ?? null,
+      price_feed_decimals:     rewardAsset.priceFeed?.decimals ?? null,
+      price_feed_quote:        rewardAsset.priceFeedQuote,
+      usd_price_feed_address:  null,
+      usd_price_feed_decimals: null,
+      display_name:            null,
+      is_wrapped_native:       null,
+    }, condition));
   }
 
   for (const collateral of market.collateralAssets) {
-    assets++;
     statements.push(insertStatement(db, 'market_assets', {
       ...scope,
-      market_id:           marketId,
-      token_id:            tokenId(collateral.token),
-      role:                'collateral',
-      asset_index:         collateral.assetIndex,
-      price_feed_address:  collateral.priceFeed.address,
-      price_feed_decimals: collateral.priceFeed.decimals,
-    }));
+      market_id:               marketId,
+      token_id:                tokenId(collateral.token),
+      role:                    'collateral',
+      asset_index:             collateral.assetIndex,
+      price_feed_address:      collateral.priceFeed.address,
+      price_feed_decimals:     collateral.priceFeed.decimals,
+      price_feed_quote:        null,
+      usd_price_feed_address:  null,
+      usd_price_feed_decimals: null,
+      display_name:            null,
+      is_wrapped_native:       null,
+    }, condition));
   }
 
-  return { statements, tokens, contracts, assets };
+  return statements;
 }
 
 /*
- * Writes the complete snapshot of an importing candidate: networks, their
- * price exceptions, and each market with its contracts, tokens, and assets.
- * Token identity is shared within a network, so a token referenced by several
- * markets is written once.
+ * One market as an import assembled it, with its network, and whether each
+ * carries decisions someone made rather than provisional ones.
  */
-async function writeCandidateSnapshot(
-  db: D1Database,
-  versionId: string,
-  networks: NetworkV1[],
-): Promise<SnapshotCounts> {
-  const statements: D1PreparedStatement[] = [];
-  const counts: SnapshotCounts = {
-    networks: 0, markets: 0, tokens: 0, contracts: 0, assets: 0, priceExceptions: 0,
-  };
-
-  for (const network of networks) {
-    const networkId = crypto.randomUUID();
-    const scope     = { registry_version_id: versionId, network_id: networkId };
-    counts.networks++;
-    statements.push(networkStatement(db, versionId, networkId, network));
-
-    const exceptions = exceptionStatements(db, scope, network);
-    counts.priceExceptions += exceptions.length;
-    statements.push(...exceptions);
-
-    const tokenIds = new Map<Address, string>();
-    for (const market of network.markets) {
-      const written = marketStatements(db, scope, market, tokenIds);
-      counts.markets++;
-      counts.tokens    += written.tokens;
-      counts.contracts += written.contracts;
-      counts.assets    += written.assets;
-      statements.push(...written.statements);
-    }
-  }
-
-  await runInChunks(db, statements);
-  return counts;
-}
+type ImportedMarket = {
+  network:         NetworkV1,
+  market:          MarketV1,
+  networkReviewed: boolean,
+  marketReviewed:  boolean,
+};
 
 /*
- * Writes one network of a candidate if it is not there yet, and returns its
- * row id. An import discovers a network when it reaches the first market on
- * it, and later markets of the same network find it already written.
+ * The writes of one imported market: its network too where the candidate
+ * does not hold it yet — an import meets a network at its first market — and
+ * every token of the market its network does not already have, so token
+ * identity stays shared with the network's other markets. Every market of a
+ * candidate is inserted through it, the markets of a whole snapshot a test
+ * seeds included.
+ *
+ * They are statements rather than a write, because an import commits a market
+ * in one transaction with the checkpoint that imported it, and every
+ * statement carries that checkpoint's condition: a market whose invocation
+ * lost the run is not written at all, so it cannot overwrite what was
+ * reviewed in the candidate meanwhile, and a market is never in a candidate
+ * without its checkpoint saying so.
+ *
+ * A version has one default market. A market imported as the default while
+ * the candidate already holds another one is refused here, naming both,
+ * rather than by the unique index in the middle of its write, whose message
+ * names neither.
  */
-async function ensureNetwork(
+async function marketWrites(
   db: D1Database,
   versionId: string,
-  network: NetworkV1,
-  reviewed: boolean = true,
-): Promise<string> {
-  const existing = await db.prepare(
-    `SELECT id FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = ?2`
-  ).bind(versionId, network.chainId).first<string>('id');
-  if (existing !== null && existing !== undefined) {
-    return existing;
-  }
-
-  const networkId = crypto.randomUUID();
-  const scope     = { registry_version_id: versionId, network_id: networkId };
-  await db.batch([
-    networkStatement(db, versionId, networkId, network, reviewed),
-    ...exceptionStatements(db, scope, network),
-  ]);
-  return networkId;
-}
-
-/*
- * Writes one market of a candidate, reusing the token rows its network
- * already has. This is the incremental counterpart of writeCandidateSnapshot:
- * an import commits a market as its checkpoint completes, so an interrupted
- * invocation loses nothing.
- */
-async function writeMarket(
-  db: D1Database,
-  versionId: string,
-  networkId: string,
-  market: MarketV1,
-  reviewed: boolean = true,
-): Promise<void> {
-  const known = await db.prepare(
-    `SELECT id, address FROM tokens WHERE registry_version_id = ?1 AND network_id = ?2`
-  ).bind(versionId, networkId).all<{ id: string, address: Address }>();
-
-  const tokenIds = new Map<Address, string>(
-    (known.results ?? []).map(token => [ token.address, token.id ])
-  );
-  const { statements } = marketStatements(
-    db,
-    { registry_version_id: versionId, network_id: networkId },
-    market,
-    tokenIds,
-    reviewed,
-  );
-
-  /*
-   * Writing a market is idempotent: an import that committed a market and
-   * then lost its invocation before the checkpoint is retried, and the retry
-   * must replace the market rather than collide with the deployment key it
-   * already wrote. Contracts and assets follow the market by cascade; tokens
-   * stay, because token identity is shared with the network's other markets.
-   */
-  await db.batch([
+  imported: ImportedMarket,
+): Promise<(condition?: Condition) => D1PreparedStatement[]> {
+  const [ networkRows, tokenRows, defaultRows ] = await db.batch([
+    db.prepare(`SELECT id FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = ?2`)
+      .bind(versionId, imported.network.chainId),
     db.prepare(
-      `DELETE FROM markets WHERE registry_version_id = ?1 AND network_id = ?2 AND deployment_key = ?3`
-    ).bind(versionId, networkId, market.deploymentKey),
-    ...statements,
-  ]);
+      `SELECT token.id, token.address
+       FROM tokens AS token
+       JOIN registry_networks AS network ON network.id = token.network_id
+       WHERE token.registry_version_id = ?1 AND network.chain_id = ?2`
+    ).bind(versionId, imported.network.chainId),
+    db.prepare(
+      `SELECT network.chain_id, market.deployment_key
+       FROM markets AS market
+       JOIN registry_networks AS network ON network.id = market.network_id
+       WHERE market.registry_version_id = ?1 AND market.is_default = 1`
+    ).bind(versionId),
+  ]) as [
+    D1Result<{ id: string }>, D1Result<{ id: string, address: Address }>,
+    D1Result<{ chain_id: number, deployment_key: string }>,
+  ];
+
+  const key   = marketKey(imported.network.chainId, imported.market.deploymentKey);
+  const other = (defaultRows.results ?? [])
+    .map(row => marketKey(row.chain_id, row.deployment_key))
+    .find(market => market !== key);
+  if (imported.market.isDefault && other !== undefined) {
+    throw new RegistryError(
+      'OVERLAY_INVALID',
+      `${key} is the default market by the decisions it inherits, but ${other} already is the default of this `
+        + `version; review which of them opens by default`,
+      key,
+    );
+  }
+
+  const existing  = networkRows.results?.[0]?.id;
+  const networkId = existing ?? crypto.randomUUID();
+  const scope     = { registry_version_id: versionId, network_id: networkId };
+  const tokens    = (tokenRows.results ?? []).map(token => [ token.address, token.id ] as const);
+
+  return condition => [
+    ...(existing !== undefined ? [] : [
+      networkStatement(db, versionId, networkId, imported.network, imported.networkReviewed, condition),
+      ...exceptionStatements(db, scope, imported.network, condition),
+    ]),
+    /*
+     * A market replaces any row of its deployment, so writing one twice
+     * leaves one market rather than a collision with the first. Contracts
+     * and assets follow the market by cascade; tokens stay, because they are
+     * the network's.
+     */
+    conditioned(
+      db,
+      `DELETE FROM markets WHERE registry_version_id = ?1 AND network_id = ?2 AND deployment_key = ?3`,
+      [ versionId, networkId, imported.market.deploymentKey ],
+      condition,
+    ),
+    ...marketStatements(db, scope, imported.market, new Map(tokens), imported.marketReviewed, condition),
+  ];
+}
+
+// an asset row with the token it holds, as both readers select it
+type AssetRowWithToken = MarketAssetRow & { token_address: Address, symbol: string, name: string, decimals: number };
+
+const ASSET_COLUMNS = `asset.*, token.address AS token_address, token.symbol, token.name, token.decimals`;
+
+/*
+ * One stored market as the snapshot shape, from its row, its contracts and
+ * its assets with their tokens. Every reader of a market goes through it, so
+ * a market read on its own is the market the whole version holds.
+ */
+function marketOf(market: MarketRow, contractRows: MarketContractRow[], assets: AssetRowWithToken[]): MarketV1 {
+  const contracts = Object.fromEntries(CONTRACT_ROLES.map(role => [
+    CONTRACT_ROLE_KEYS[role],
+    contractRows.find(contract => contract.role === role)?.address ?? null,
+  ])) as MarketV1['contracts'];
+
+  const tokenOf = (row: AssetRowWithToken): TokenV1 => ({
+    address:  row.token_address,
+    symbol:   row.symbol,
+    name:     row.name,
+    decimals: row.decimals,
+  });
+  const feedOf = (address: Address | null, decimals: number | null) => (
+    address === null || decimals === null ? null : { address, decimals }
+  );
+
+  const base   = assets.find(asset => asset.role === 'base')!;
+  const reward = assets.find(asset => asset.role === 'reward') ?? null;
+
+  return {
+    id:                   market.id,
+    deploymentKey:        market.deployment_key,
+    displayName:          market.display_name,
+    slug:                 market.slug,
+    contractName:         market.contract_name,
+    isDefault:            market.is_default === 1,
+    isInstitutional:      market.is_institutional === 1,
+    status:               market.status,
+    creationBlock:        market.creation_block,
+    collateralValueQuote: market.collateral_value_quote,
+    capabilities: {
+      rewards:            market.rewards_enabled === 1,
+      accountRewards:     market.account_rewards_enabled === 1,
+      transactionHistory: market.transaction_history_enabled === 1,
+    },
+    contracts,
+    baseAsset: {
+      token:           tokenOf(base),
+      displayName:     base.display_name!,
+      isWrappedNative: base.is_wrapped_native === 1,
+      priceFeed:       feedOf(base.price_feed_address, base.price_feed_decimals)!,
+      usdPriceFeed:    feedOf(base.usd_price_feed_address, base.usd_price_feed_decimals),
+    },
+    rewardAsset: reward === null ? null : {
+      token:          tokenOf(reward),
+      priceFeed:      feedOf(reward.price_feed_address, reward.price_feed_decimals),
+      priceFeedQuote: reward.price_feed_quote,
+    },
+    collateralAssets: assets
+      .filter(asset => asset.role === 'collateral')
+      .sort((left, right) => (left.asset_index ?? 0) - (right.asset_index ?? 0))
+      .map(asset => ({
+        assetIndex: asset.asset_index!,
+        token:      tokenOf(asset),
+        priceFeed:  feedOf(asset.price_feed_address, asset.price_feed_decimals)!,
+      })),
+  };
 }
 
 /*
@@ -573,7 +636,7 @@ async function readSnapshot(db: D1Database, versionId: string): Promise<NetworkV
        WHERE market.registry_version_id = ?1`
     ).bind(versionId),
     db.prepare(
-      `SELECT asset.*, token.address AS token_address, token.symbol, token.name, token.decimals
+      `SELECT ${ASSET_COLUMNS}
        FROM market_assets AS asset
        JOIN tokens AS token ON token.id = asset.token_id
        WHERE asset.registry_version_id = ?1
@@ -581,14 +644,14 @@ async function readSnapshot(db: D1Database, versionId: string): Promise<NetworkV
     ).bind(versionId),
   ]) as [
     D1Result<RegistryNetworkRow>, D1Result<NetworkPriceExceptionRow>, D1Result<MarketRow>,
-    D1Result<MarketContractRow>, D1Result<MarketAssetRow & { token_address: Address, symbol: string, name: string, decimals: number }>,
+    D1Result<MarketContractRow>, D1Result<AssetRowWithToken>,
   ];
 
   const contractsByMarket = new Map<string, MarketContractRow[]>();
   for (const row of contractRows.results ?? []) {
     contractsByMarket.set(row.market_id, [ ...(contractsByMarket.get(row.market_id) ?? []), row ]);
   }
-  const assetsByMarket = new Map<string, Array<MarketAssetRow & { token_address: Address, symbol: string, name: string, decimals: number }>>();
+  const assetsByMarket = new Map<string, AssetRowWithToken[]>();
   for (const row of assetRows.results ?? []) {
     assetsByMarket.set(row.market_id, [ ...(assetsByMarket.get(row.market_id) ?? []), row ]);
   }
@@ -597,65 +660,7 @@ async function readSnapshot(db: D1Database, versionId: string): Promise<NetworkV
     const presentation = JSON.parse(network.metadata) as NetworkV1['presentation'];
     const markets = (marketRows.results ?? [])
       .filter(market => market.network_id === network.id)
-      .map(market => {
-        const assets    = assetsByMarket.get(market.id) ?? [];
-        const contracts = Object.fromEntries(CONTRACT_ROLES.map(role => [
-          CONTRACT_ROLE_KEYS[role],
-          (contractsByMarket.get(market.id) ?? []).find(contract => contract.role === role)?.address ?? null,
-        ])) as MarketV1['contracts'];
-
-        const tokenOf = (row: typeof assets[number]): TokenV1 => ({
-          address:  row.token_address,
-          symbol:   row.symbol,
-          name:     row.name,
-          decimals: row.decimals,
-        });
-        const feedOf = (address: Address | null, decimals: number | null) => (
-          address === null || decimals === null ? null : { address, decimals }
-        );
-
-        const base   = assets.find(asset => asset.role === 'base')!;
-        const reward = assets.find(asset => asset.role === 'reward') ?? null;
-
-        return {
-          id:                   market.id,
-          deploymentKey:        market.deployment_key,
-          displayName:          market.display_name,
-          slug:                 market.slug,
-          contractName:         market.contract_name,
-          isDefault:            market.is_default === 1,
-          isInstitutional:      market.is_institutional === 1,
-          status:               market.status,
-          creationBlock:        market.creation_block,
-          collateralValueQuote: market.collateral_value_quote,
-          capabilities: {
-            rewards:            market.rewards_enabled === 1,
-            accountRewards:     market.account_rewards_enabled === 1,
-            transactionHistory: market.transaction_history_enabled === 1,
-          },
-          contracts,
-          baseAsset: {
-            token:           tokenOf(base),
-            displayName:     base.display_name!,
-            isWrappedNative: base.is_wrapped_native === 1,
-            priceFeed:       feedOf(base.price_feed_address, base.price_feed_decimals)!,
-            usdPriceFeed:    feedOf(base.usd_price_feed_address, base.usd_price_feed_decimals),
-          },
-          rewardAsset: reward === null ? null : {
-            token:          tokenOf(reward),
-            priceFeed:      feedOf(reward.price_feed_address, reward.price_feed_decimals),
-            priceFeedQuote: reward.price_feed_quote,
-          },
-          collateralAssets: assets
-            .filter(asset => asset.role === 'collateral')
-            .sort((left, right) => (left.asset_index ?? 0) - (right.asset_index ?? 0))
-            .map(asset => ({
-              assetIndex: asset.asset_index!,
-              token:      tokenOf(asset),
-              priceFeed:  feedOf(asset.price_feed_address, asset.price_feed_decimals)!,
-            })),
-        };
-      });
+      .map(market => marketOf(market, contractsByMarket.get(market.id) ?? [], assetsByMarket.get(market.id) ?? []));
 
     return {
       chainId:     network.chain_id,
@@ -703,6 +708,40 @@ async function readSnapshot(db: D1Database, versionId: string): Promise<NetworkV
 }
 
 /*
+ * One market of a stored version, read on its own: what a caller that needs
+ * a single market reads instead of every row of the version. Each statement
+ * finds the market by its network and deployment key, so the three are one
+ * round trip, and a market the version does not hold is null.
+ */
+async function readMarket(
+  db: D1Database,
+  versionId: string,
+  { chainId, deploymentKey }: { chainId: number, deploymentKey: string },
+): Promise<MarketV1 | null> {
+  const target = `(
+    SELECT market.id FROM markets AS market
+    JOIN registry_networks AS network ON network.id = market.network_id
+    WHERE market.registry_version_id = ?1 AND network.chain_id = ?2 AND market.deployment_key = ?3
+  )`;
+  const [ marketRows, contractRows, assetRows ] = await db.batch([
+    db.prepare(`SELECT * FROM markets WHERE id = ${target}`),
+    db.prepare(`SELECT * FROM market_contracts WHERE market_id = ${target}`),
+    db.prepare(
+      `SELECT ${ASSET_COLUMNS}
+       FROM market_assets AS asset
+       JOIN tokens AS token ON token.id = asset.token_id
+       WHERE asset.market_id = ${target}
+       ORDER BY asset.asset_index`
+    ),
+  ].map(statement => statement.bind(versionId, chainId, deploymentKey))) as [
+    D1Result<MarketRow>, D1Result<MarketContractRow>, D1Result<AssetRowWithToken>,
+  ];
+
+  const market = marketRows.results?.[0];
+  return market === undefined ? null : marketOf(market, contractRows.results ?? [], assetRows.results ?? []);
+}
+
+/*
  * The version a request resolves against, and the snapshot it serves.
  */
 async function readActiveVersionId(db: D1Database): Promise<string | null> {
@@ -719,17 +758,44 @@ async function readActiveVersionId(db: D1Database): Promise<string | null> {
  * still current: the pointer is the only thing that moves, and the checksum
  * with it names the immutable bytes a cache entry may be keyed by. Hydrating
  * the snapshot to learn its checksum would defeat the cache it is read for.
+ * The source the version was imported from comes with it, from the same row,
+ * so everything that names the version in a cached snapshot is checked
+ * against D1 rather than taken from the cache.
  */
-async function readActivePointer(db: D1Database): Promise<VersionRef | null> {
+async function readActivePointer(db: D1Database): Promise<RegistryVersionRefV1 | null> {
   const pointer = await db.prepare(
-    `SELECT version.id AS id, version.snapshot_checksum AS checksum
+    `SELECT version.id AS id, version.source_repository AS sourceRepository,
+            version.source_commit_sha AS sourceCommitSha, version.snapshot_checksum AS checksum
      FROM registry_state AS state
      JOIN registry_versions AS version ON version.id = state.active_version_id
      WHERE state.singleton_id = 1`
-  ).first<{ id: string, checksum: string | null }>();
+  ).first<{ id: string, sourceRepository: string, sourceCommitSha: string, checksum: string | null }>();
   return pointer === null || pointer === undefined || pointer.checksum === null
     ? null
-    : { id: pointer.id, checksum: pointer.checksum };
+    : {
+        id:               pointer.id,
+        sourceRepository: pointer.sourceRepository,
+        sourceCommitSha:  pointer.sourceCommitSha,
+        checksum:         pointer.checksum,
+      };
+}
+
+/*
+ * The validated versions whose bytes are worth keeping cached: the active
+ * one, and every validated version newer than it — what an import validated
+ * and cached for an activation that has not happened yet. With nothing
+ * active, every validated version is a candidate for the first activation.
+ */
+async function readRetainedVersions(db: D1Database): Promise<VersionRef[]> {
+  const { results } = await db.prepare(
+    `SELECT version.id AS id, version.snapshot_checksum AS checksum
+     FROM registry_versions AS version
+     LEFT JOIN registry_state AS state ON state.singleton_id = 1
+     LEFT JOIN registry_versions AS active ON active.id = state.active_version_id
+     WHERE version.status = 'validated' AND version.snapshot_checksum IS NOT NULL
+       AND (active.id IS NULL OR version.id = active.id OR version.created_at > active.created_at)`
+  ).all<VersionRef>();
+  return results ?? [];
 }
 
 /*
@@ -739,13 +805,19 @@ async function readActivePointer(db: D1Database): Promise<VersionRef | null> {
  * them apart; everything else about a version is read by id, so something
  * has to list them. It is bounded and never carries a snapshot: this says
  * which versions exist and what became of them, not what is in them.
+ *
+ * It is read a page at a time. `before` is the last version of the page read
+ * so far, and the next page holds the versions listed after it; `next` is
+ * that version for the page answered here, and null on the last one. The
+ * order is total, so a page boundary never skips or repeats a version.
  */
 async function readVersions(
   db: D1Database,
-  { status, limit }: { status?: string, limit: number },
+  { status, before, limit }: { status?: string, before?: string, limit: number },
 ): Promise<{
   versions:        Array<RegistryVersionRow & { is_active: number }>,
   activeVersionId: string | null,
+  next:            string | null,
 }> {
   /*
    * The pointer travels with the rows rather than being read after them: two
@@ -757,16 +829,22 @@ async function readVersions(
             CASE WHEN state.active_version_id = version.id THEN 1 ELSE 0 END AS is_active
      FROM registry_versions AS version
      LEFT JOIN registry_state AS state ON state.singleton_id = 1
-     WHERE ?1 IS NULL OR version.status = ?1
-     ORDER BY version.created_at DESC, version.attempt DESC
+     LEFT JOIN registry_versions AS anchor ON anchor.id = ?3
+     WHERE (?1 IS NULL OR version.status = ?1)
+       AND (?3 IS NULL OR (version.created_at, version.attempt, version.id) < (anchor.created_at, anchor.attempt, anchor.id))
+     ORDER BY version.created_at DESC, version.attempt DESC, version.id DESC
      LIMIT ?2`
-  ).bind(status ?? null, limit).all<RegistryVersionRow & { is_active: number, active_version_id: string | null }>();
+  ).bind(status ?? null, limit + 1, before ?? null)
+    .all<RegistryVersionRow & { is_active: number, active_version_id: string | null }>();
 
-  const versions = rows.results ?? [];
+  // one row past the page says whether there is another one
+  const listed   = rows.results ?? [];
+  const versions = listed.slice(0, limit);
   return {
     versions,
     // an empty listing carries no row to read it from
     activeVersionId: versions[0]?.active_version_id ?? (versions.length === 0 ? await readActiveVersionId(db) : null),
+    next:            listed.length > limit ? versions[versions.length - 1]!.id : null,
   };
 }
 
@@ -780,8 +858,7 @@ async function readVersion(db: D1Database, versionId: string): Promise<RegistryV
 /*
  * A stored version as the wire contract serves it. Only a validated version
  * has a snapshot checksum, so only a validated version can be served.
- */
-/*
+ *
  * `known` is the version row, where the caller has already read it. The
  * snapshot is hydrated from it either way; passing it in saves a statement
  * for a caller that needed the row first for something else.
@@ -808,17 +885,58 @@ async function readRegistrySnapshot(
 }
 
 /*
- * Moves the active pointer, auditing the change. Both statements carry the
- * same condition, so activating the version that is already active writes
- * neither: it is an idempotent no-op, not a second activation event.
+ * The two writes of a move of the active pointer: the audit event, and the
+ * pointer itself. Both carry the same condition, so activating the version
+ * that is already active writes neither: it is an idempotent no-op, not a
+ * second activation event. `expected`, when given, conditions both as well.
  *
  * The pointer trigger refuses a target that is not validated, and because
  * both statements run in one batch, a refused pointer change rolls back the
  * audit event with it.
  */
+function activationStatements(
+  db: D1Database,
+  move: { activationId: string, versionId: string, action: ActivationAction, actor: string, reason: string, at: string },
+  expected?: Condition,
+): [ D1PreparedStatement, D1PreparedStatement ] {
+  return [
+    conditioned(
+      db,
+      `INSERT INTO registry_activations (id, registry_version_id, previous_version_id, action, actor, reason, created_at)
+       SELECT ?1, ?2, active_version_id, ?3, ?4, ?5, ?6
+       FROM registry_state
+       WHERE singleton_id = 1 AND active_version_id IS NOT ?2`,
+      [ move.activationId, move.versionId, move.action, move.actor, move.reason, move.at ],
+      expected,
+    ),
+    conditioned(
+      db,
+      `UPDATE registry_state SET active_version_id = ?1, updated_at = ?2
+       WHERE singleton_id = 1 AND active_version_id IS NOT ?1`,
+      [ move.versionId, move.at ],
+      expected,
+    ),
+  ];
+}
+
+/*
+ * Moves the active pointer, auditing the change, in the two statements
+ * above: once only, however often it is asked.
+ *
+ * A request may name the version it expects to replace. Both statements then
+ * require it too, so of two moves made against the same version — a rollback
+ * and an activation racing — the later one changes nothing and is refused,
+ * rather than silently undoing the other. Null expects that nothing is on.
+ */
 async function activateVersion(
   db: D1Database,
-  input: { versionId: string, action: ActivationAction, actor: string, reason: string },
+  input: {
+    versionId:                string,
+    action:                   ActivationAction,
+    actor:                    string,
+    reason:                   string,
+    expectedActiveVersionId?: string | null,
+  },
 ): Promise<ActivationResultV1> {
   const version = await readVersion(db, input.versionId);
   if (version === null) {
@@ -834,19 +952,19 @@ async function activateVersion(
 
   const activationId = crypto.randomUUID();
   const timestamp    = new Date().toISOString();
+  const expected: Condition | undefined = input.expectedActiveVersionId === undefined ? undefined : {
+    sql:    first => `active_version_id IS ?${first}`,
+    values: [ input.expectedActiveVersionId ],
+  };
 
-  const [ auditResult, pointerResult ] = await db.batch([
-    db.prepare(
-      `INSERT INTO registry_activations (id, registry_version_id, previous_version_id, action, actor, reason, created_at)
-       SELECT ?1, ?2, active_version_id, ?3, ?4, ?5, ?6
-       FROM registry_state
-       WHERE singleton_id = 1 AND active_version_id IS NOT ?2`
-    ).bind(activationId, input.versionId, input.action, input.actor, input.reason, timestamp),
-    db.prepare(
-      `UPDATE registry_state SET active_version_id = ?1, updated_at = ?2
-       WHERE singleton_id = 1 AND active_version_id IS NOT ?1`
-    ).bind(input.versionId, timestamp),
-  ]);
+  const [ auditResult, pointerResult ] = await db.batch(activationStatements(db, {
+    activationId,
+    versionId: input.versionId,
+    action:    input.action,
+    actor:     input.actor,
+    reason:    input.reason,
+    at:        timestamp,
+  }, expected));
 
   const audited = changedRows(auditResult!);
   const moved   = changedRows(pointerResult!);
@@ -856,6 +974,21 @@ async function activateVersion(
       `the activation audit and the pointer disagree`,
       input.versionId,
     );
+  }
+
+  /*
+   * Nothing moved. The target already being on is the idempotent case; any
+   * other version being on means the expectation no longer held.
+   */
+  if (moved === 0 && input.expectedActiveVersionId !== undefined) {
+    const active = await readActiveVersionId(db);
+    if (active !== input.versionId) {
+      throw new RegistryError(
+        'CANDIDATE_STATE_CONFLICT',
+        `the active version is ${active ?? 'none'}, not ${input.expectedActiveVersionId ?? 'none'} as this ${input.action} expected`,
+        input.versionId,
+      );
+    }
   }
 
   /*
@@ -877,33 +1010,6 @@ async function activateVersion(
     changed:           moved === 1,
     registryVersion:   { id: input.versionId, checksum: version.snapshot_checksum },
   };
-}
-
-/*
- * The latest complete validation attempt of a version, which is the one that
- * decided its status.
- */
-/*
- * The checks one attempt recorded, as they were recorded. Validating a stored
- * candidate carries forward the ones the chain answered, which only the
- * attempt that imported it could have run.
- */
-async function readAttemptChecks(
-  db: D1Database,
-  versionId: string,
-  attempt: number,
-): Promise<Array<{ check_name: string, scope: string, passed: number, details?: Record<string, unknown> }>> {
-  const { results } = await db.prepare(
-    `SELECT check_name, scope, passed, details FROM validation_results
-     WHERE registry_version_id = ?1 AND validation_attempt = ?2`
-  ).bind(versionId, attempt).all<{ check_name: string, scope: string, passed: number, details: string }>();
-
-  return (results ?? []).map(row => ({
-    check_name: row.check_name,
-    scope:      row.scope,
-    passed:     row.passed,
-    ...(row.passed === 1 ? {} : { details: JSON.parse(row.details) as Record<string, unknown> }),
-  }));
 }
 
 async function readValidationSummary(db: D1Database, versionId: string): Promise<ValidationSummaryV1> {
@@ -955,66 +1061,123 @@ async function readActivationHistory(
 }
 
 /*
- * Rebuilds the reviewed overlay of a stored version, so an import inherits
- * the decisions already made for markets it rediscovers. Rows are read back
- * through the overlay parsers, which normalizes them and rejects a version
- * whose stored overlay no longer satisfies the contract.
+ * An expiry as a version stored it. An overlay used to be stored with any
+ * expiry Date.parse accepted, years before 0000 and after 9999 among them;
+ * such a value is read as the instant a Worker reads it as, in the form an
+ * expiry is stored in now, so a version that holds one can still be cloned.
+ * Anything written now is already in that form.
  */
-async function readOverlays(db: D1Database, versionId: string): Promise<ClonedOverlays> {
+function storedExpiry(value: string | null): string | null {
+  const instant = value === null ? Number.NaN : Date.parse(value);
+  return Number.isFinite(instant) ? storedInstant(instant) : value;
+}
+
+// a market's key as SQL computes it from the rows of its network and market: the text marketKey writes
+function marketKeyIn(network: string, market: string): string {
+  return `${network}.chain_id || '${MARKET_KEY_SEPARATOR}' || ${market}.deployment_key`;
+}
+
+/*
+ * Whether a scope's overlay counts for a source: every reviewed one does,
+ * unless the source is read for its edits, and then only the scopes an
+ * overlay was written for in that version, which its audit events name.
+ */
+function countedIn(scopeType: 'network' | 'market', scopeKey: string): string {
+  return `(sources.edited = 0 OR EXISTS (
+    SELECT 1 FROM registry_overlay_events AS event
+    WHERE event.registry_version_id = sources.id AND event.scope_type = '${scopeType}' AND event.scope_key = ${scopeKey}
+  ))`;
+}
+
+/*
+ * The reviewed overlays of the versions `sources` names, merged. `sources` is
+ * the body of a common table expression selecting a version `id`, its
+ * `precedence`, and whether it counts only for what was `edited` in it; a
+ * version of higher precedence overrides a lower one for every network and
+ * market both say something about. It is one batch, so one round trip
+ * however many versions it reads.
+ *
+ * Only what someone reviewed is an overlay. A row written for a network or
+ * market nobody reviewed carries provisional values, and cloning those into
+ * the next version would turn them into decisions nobody made. Rows are read
+ * back through the overlay parsers, which normalizes them and rejects a
+ * version whose stored overlay no longer satisfies the contract.
+ *
+ * A version has one default market, and the versions merged here can each
+ * name another; the default read at the highest precedence is the one kept,
+ * and the market an earlier source made the default is merged as not being
+ * it. Otherwise an import would write two defaults, which the schema refuses,
+ * on every attempt of the commit.
+ */
+async function readOverlaysOf(db: D1Database, sources: string, values: SqlValue[]): Promise<ClonedOverlays> {
+  const from = `WITH sources (id, precedence, edited) AS (${sources})`;
+  const [ networkRows, exceptionRows, marketRows ] = await db.batch([
+    db.prepare(
+      `${from}
+       SELECT sources.id AS version_id, sources.precedence, network.chain_id, network.display_name, network.metadata
+       FROM registry_networks AS network
+       JOIN sources ON sources.id = network.registry_version_id
+       WHERE network.reviewed = 1 AND ${countedIn('network', 'CAST(network.chain_id AS TEXT)')}
+       ORDER BY sources.precedence, network.chain_id`
+    ).bind(...values),
+    db.prepare(
+      `${from}
+       SELECT sources.precedence, network.chain_id AS chain_id, exception.*
+       FROM network_price_exceptions AS exception
+       JOIN registry_networks AS network ON network.id = exception.network_id
+       JOIN sources ON sources.id = exception.registry_version_id
+       WHERE network.reviewed = 1 AND ${countedIn('network', 'CAST(network.chain_id AS TEXT)')}
+       ORDER BY sources.precedence, network.chain_id, exception.price_feed_address`
+    ).bind(...values),
+    db.prepare(
+      `${from}
+       SELECT sources.id AS version_id, sources.precedence, network.chain_id AS chain_id, market.deployment_key,
+              market.display_name, market.slug, market.contract_name, market.is_default, market.is_institutional,
+              market.status, market.creation_block, market.collateral_value_quote,
+              market.rewards_enabled, market.account_rewards_enabled, market.transaction_history_enabled,
+              base.display_name AS base_display_name, base.is_wrapped_native,
+              base.usd_price_feed_address, reward.price_feed_address AS reward_price_feed_address,
+              reward.price_feed_quote AS reward_price_feed_quote
+       FROM markets AS market
+       JOIN registry_networks AS network ON network.id = market.network_id
+       JOIN sources ON sources.id = market.registry_version_id
+       LEFT JOIN market_assets AS base ON base.market_id = market.id AND base.role = 'base'
+       LEFT JOIN market_assets AS reward ON reward.market_id = market.id AND reward.role = 'reward'
+       WHERE market.reviewed = 1 AND ${countedIn('market', marketKeyIn('network', 'market'))}
+       ORDER BY sources.precedence, network.chain_id, market.creation_block, market.deployment_key`
+    ).bind(...values),
+  ]) as [
+    D1Result<{ version_id: string, precedence: number, chain_id: number, display_name: string, metadata: string }>,
+    D1Result<NetworkPriceExceptionRow & { precedence: number, chain_id: number }>,
+    D1Result<{
+      version_id: string, precedence: number, chain_id: number, deployment_key: string,
+      display_name: string, slug: string | null, contract_name: string | null,
+      is_default: number, is_institutional: number, status: MarketStatus, creation_block: number,
+      collateral_value_quote: PriceQuote, rewards_enabled: number, account_rewards_enabled: number,
+      transaction_history_enabled: number, base_display_name: string | null, is_wrapped_native: number | null,
+      usd_price_feed_address: string | null, reward_price_feed_address: string | null,
+      reward_price_feed_quote: PriceQuote | null,
+    }>,
+  ];
+
   /*
-   * Only what someone reviewed is an overlay. A row written for a network or
-   * market nobody reviewed carries provisional values, and cloning those into
-   * the next version would turn them into decisions nobody made.
+   * The exceptions of each network, by the precedence it was read at rather
+   * than by version: the same version can be a source twice, as the active
+   * one and as an earlier attempt, and each reading carries its own.
    */
-  const networkRows = await db.prepare(
-    `SELECT chain_id, canonical_name, upstream_network_key, display_name, is_testnet, metadata
-     FROM registry_networks WHERE registry_version_id = ?1 AND reviewed = 1 ORDER BY chain_id`
-  ).bind(versionId).all<{
-    chain_id: number, canonical_name: string, upstream_network_key: string,
-    display_name: string, is_testnet: number, metadata: string,
-  }>();
-
-  const exceptionRows = await db.prepare(
-    `SELECT network.chain_id AS chain_id, exception.*
-     FROM network_price_exceptions AS exception
-     JOIN registry_networks AS network ON network.id = exception.network_id
-     WHERE exception.registry_version_id = ?1 AND network.reviewed = 1
-     ORDER BY network.chain_id, exception.price_feed_address`
-  ).bind(versionId).all<NetworkPriceExceptionRow & { chain_id: number }>();
-
-  const marketRows = await db.prepare(
-    `SELECT network.chain_id AS chain_id, market.deployment_key, market.display_name, market.slug, market.contract_name,
-            market.is_default, market.is_institutional, market.status, market.creation_block, market.collateral_value_quote,
-            market.rewards_enabled, market.account_rewards_enabled, market.transaction_history_enabled,
-            base.display_name AS base_display_name, base.is_wrapped_native,
-            base.usd_price_feed_address, reward.price_feed_address AS reward_price_feed_address,
-            reward.price_feed_quote AS reward_price_feed_quote
-     FROM markets AS market
-     JOIN registry_networks AS network ON network.id = market.network_id
-     LEFT JOIN market_assets AS base ON base.market_id = market.id AND base.role = 'base'
-     LEFT JOIN market_assets AS reward ON reward.market_id = market.id AND reward.role = 'reward'
-     WHERE market.registry_version_id = ?1 AND market.reviewed = 1
-     ORDER BY network.chain_id, market.creation_block, market.deployment_key`
-  ).bind(versionId).all<{
-    chain_id: number, deployment_key: string, display_name: string, slug: string | null, contract_name: string | null,
-    is_default: number, is_institutional: number, status: MarketStatus, creation_block: number, collateral_value_quote: PriceQuote,
-    rewards_enabled: number, account_rewards_enabled: number, transaction_history_enabled: number,
-    base_display_name: string | null, is_wrapped_native: number | null,
-    usd_price_feed_address: string | null, reward_price_feed_address: string | null,
-    reward_price_feed_quote: PriceQuote | null,
-  }>();
-
-  const exceptionsByChain = new Map<number, unknown[]>();
+  const exceptionsOf = new Map<string, unknown[]>();
   for (const row of exceptionRows.results ?? []) {
-    const shared = { priceFeedAddress: row.price_feed_address, provenance: row.provenance, expiresAt: row.expires_at };
+    const shared = { priceFeedAddress: row.price_feed_address, provenance: row.provenance, expiresAt: storedExpiry(row.expires_at) };
     const exception = row.kind === 'fixed_price'
       ? { kind: row.kind, ...shared, price: { value: row.fixed_price_value, decimals: row.fixed_price_decimals } }
       : row.kind === 'deprecated_price_remap'
         ? { kind: row.kind, ...shared, replacementPriceFeedAddress: row.replacement_price_feed_address }
         : { kind: row.kind, ...shared };
-    exceptionsByChain.set(row.chain_id, [ ...(exceptionsByChain.get(row.chain_id) ?? []), exception ]);
+    const key = `${row.precedence}:${row.chain_id}`;
+    exceptionsOf.set(key, [ ...(exceptionsOf.get(key) ?? []), exception ]);
   }
 
+  // rows arrive in precedence order, so a later version's review replaces an earlier one's
   const networks = new Map<number, NetworkOverlay>();
   for (const row of networkRows.results ?? []) {
     const presentation = JSON.parse(row.metadata) as Record<string, unknown>;
@@ -1022,13 +1185,15 @@ async function readOverlays(db: D1Database, versionId: string): Promise<ClonedOv
       displayName:               row.display_name,
       assetDisplayOverrides:     presentation.assetDisplayOverrides ?? [],
       unwrappedCollateralAssets: presentation.unwrappedCollateralAssets ?? [],
-      priceExceptions:           exceptionsByChain.get(row.chain_id) ?? [],
-    }, `version ${versionId} network ${row.chain_id}`));
+      priceExceptions:           exceptionsOf.get(`${row.precedence}:${row.chain_id}`) ?? [],
+    }, `version ${row.version_id} network ${row.chain_id}`));
   }
 
   const markets = new Map<string, MarketOverlay>();
+  let defaultMarket: string | null = null;
   for (const row of marketRows.results ?? []) {
-    markets.set(`${row.chain_id}/${row.deployment_key}`, parseMarketOverlay({
+    const key     = marketKey(row.chain_id, row.deployment_key);
+    const overlay = parseMarketOverlay({
       displayName:          row.display_name,
       slug:                 row.slug,
       contractName:         row.contract_name,
@@ -1051,10 +1216,34 @@ async function readOverlays(db: D1Database, versionId: string): Promise<ClonedOv
         address: row.reward_price_feed_address,
         quote:   row.reward_price_feed_quote,
       },
-    }, `version ${versionId} market ${row.chain_id}/${row.deployment_key}`));
+    }, `version ${row.version_id} market ${key}`);
+
+    if (overlay.isDefault) {
+      const replaced = defaultMarket === key ? null : defaultMarket;
+      const previous = replaced === null ? undefined : markets.get(replaced);
+      if (replaced !== null && previous !== undefined) {
+        markets.set(replaced, { ...previous, isDefault: false });
+      }
+      defaultMarket = key;
+    } else if (defaultMarket === key) {
+      defaultMarket = null;
+    }
+    markets.set(key, overlay);
   }
 
   return { networks, markets };
+}
+
+// the version that is on, as a source of overlays; none before the first activation
+const ACTIVE_SOURCE = `SELECT active_version_id, 0, 0 FROM registry_state WHERE singleton_id = 1 AND active_version_id IS NOT NULL`;
+
+/*
+ * Rebuilds the reviewed overlay of a stored version: what an overlay write
+ * compares a document with, and what an import inherits from the version it
+ * clones.
+ */
+async function readOverlays(db: D1Database, versionId: string): Promise<ClonedOverlays> {
+  return readOverlaysOf(db, `SELECT ?1, 0, 0`, [ versionId ]);
 }
 
 /*
@@ -1062,13 +1251,7 @@ async function readOverlays(db: D1Database, versionId: string): Promise<ClonedOv
  * has been activated yet, which is the first import.
  */
 async function readActiveOverlays(db: D1Database): Promise<ClonedOverlays> {
-  const activeVersionId = await db
-    .prepare(`SELECT active_version_id FROM registry_state WHERE singleton_id = 1`)
-    .first<string | null>('active_version_id');
-  if (activeVersionId === null || activeVersionId === undefined) {
-    return { networks: new Map(), markets: new Map() };
-  }
-  return readOverlays(db, activeVersionId);
+  return readOverlaysOf(db, ACTIVE_SOURCE, []);
 }
 
 /*
@@ -1081,35 +1264,29 @@ async function readActiveOverlays(db: D1Database): Promise<ClonedOverlays> {
  * than asking for the same review again. A different commit does not: what
  * was reviewed for it and then activated is already the active version.
  *
+ * What an earlier attempt contributes is what was reviewed for it: the
+ * networks and markets an overlay was written for in that attempt. The rest
+ * of its rows are marked reviewed too, but they are copies of the version
+ * that was on when it was imported, and that version may have been replaced
+ * since — by a hotfix, or by a rollback — so they would bring its decisions
+ * back over the ones on now.
+ *
  * Every earlier attempt is read, oldest first, so the newest review of a
  * market wins and one attempt that reviewed nothing — it failed on the chain
  * before anyone saw it — does not lose the review an attempt before it
  * carried.
  */
 async function readImportOverlays(db: D1Database, versionId: string): Promise<ClonedOverlays> {
-  const active  = await readActiveOverlays(db);
-  const earlier = await db.prepare(
-    `SELECT previous.id
-     FROM registry_versions AS current
-     JOIN registry_versions AS previous
-       ON previous.source_repository = current.source_repository
-      AND previous.source_commit_sha = current.source_commit_sha
-      AND previous.attempt < current.attempt
-     WHERE current.id = ?1
-     ORDER BY previous.attempt`
-  ).bind(versionId).all<{ id: string }>();
-
-  const inherited = { networks: new Map(active.networks), markets: new Map(active.markets) };
-  for (const attempt of earlier.results ?? []) {
-    const reviewed = await readOverlays(db, attempt.id);
-    for (const [ chainId, overlay ] of reviewed.networks) {
-      inherited.networks.set(chainId, overlay);
-    }
-    for (const [ key, overlay ] of reviewed.markets) {
-      inherited.markets.set(key, overlay);
-    }
-  }
-  return inherited;
+  return readOverlaysOf(db, `
+    ${ACTIVE_SOURCE}
+    UNION ALL
+    SELECT previous.id, previous.attempt, 1
+    FROM registry_versions AS current
+    JOIN registry_versions AS previous
+      ON previous.source_repository = current.source_repository
+     AND previous.source_commit_sha = current.source_commit_sha
+     AND previous.attempt < current.attempt
+    WHERE current.id = ?1`, [ versionId ]);
 }
 
 /*
@@ -1138,33 +1315,63 @@ async function readUnreviewed(db: D1Database, versionId: string): Promise<{
   return {
     networks: ((networks!.results ?? []) as Array<{ chain_id: number }>).map(row => row.chain_id),
     markets:  ((markets!.results ?? []) as Array<{ chain_id: number, deployment_key: string }>)
-      .map(row => `${row.chain_id}/${row.deployment_key}`),
+      .map(row => marketKey(row.chain_id, row.deployment_key)),
   };
 }
 
+type ResultInput = Pick<ValidationResultRow, 'check_name' | 'scope' | 'passed'> & { details?: unknown };
+
 /*
- * Appends the results of one validation attempt. Results are append-only, so
- * a repeated attempt number for the same check is a programming error rather
- * than an update.
+ * One validation attempt as one statement. Its results travel as a single
+ * JSON document, so an attempt is recorded whole or not at all however many
+ * checks it ran: results are append-only, and part of an attempt would be
+ * read as all of it. With a condition, it is recorded only while that holds.
+ *
+ * A repeated attempt number for the same check is a programming error rather
+ * than an update, and fails on the unique constraint.
  */
+function validationResultsStatement(
+  db: D1Database,
+  versionId: string,
+  attempt: number,
+  results: ResultInput[],
+  createdAt: string,
+  condition?: Condition,
+): D1PreparedStatement {
+  const rows = results.map(result => ({
+    check_name: result.check_name,
+    scope:      result.scope,
+    passed:     result.passed,
+    details:    JSON.stringify(result.details ?? {}),
+  }));
+  return conditioned(
+    db,
+    `INSERT INTO validation_results (
+       registry_version_id, validation_attempt, check_name, scope, passed, details, created_at
+     )
+     SELECT ?1, ?2, json_extract(row.value, '$.check_name'), json_extract(row.value, '$.scope'),
+            json_extract(row.value, '$.passed'), json_extract(row.value, '$.details'), ?3
+     FROM json_each(?4) AS row
+     WHERE row.type = 'object'`,
+    [ versionId, attempt, createdAt, JSON.stringify(rows) ],
+    condition,
+  );
+}
+
+// appends the results of one validation attempt
 async function recordValidationResults(
   db: D1Database,
   versionId: string,
   attempt: number,
-  results: Array<Pick<ValidationResultRow, 'check_name' | 'scope' | 'passed'> & { details?: unknown }>,
+  results: ResultInput[],
 ): Promise<void> {
-  const createdAt = new Date().toISOString();
-  await runInChunks(db, results.map(result => insertStatement(db, 'validation_results', {
-    registry_version_id: versionId,
-    validation_attempt:  attempt,
-    check_name:          result.check_name,
-    scope:               result.scope,
-    passed:              result.passed,
-    details:             JSON.stringify(result.details ?? {}),
-    created_at:          createdAt,
-  })));
+  await validationResultsStatement(db, versionId, attempt, results, new Date().toISOString()).run();
 }
 
+/*
+ * The latest complete validation attempt of a version, which is the one that
+ * decided its status.
+ */
 async function latestValidationAttempt(db: D1Database, versionId: string): Promise<number> {
   const attempt = await db.prepare(
     `SELECT max(validation_attempt) AS attempt FROM validation_results WHERE registry_version_id = ?1`
@@ -1172,24 +1379,92 @@ async function latestValidationAttempt(db: D1Database, versionId: string): Promi
   return attempt ?? 0;
 }
 
+// the checks the latest validation attempt of a version failed
+async function failedChecks(db: D1Database, versionId: string): Promise<string[]> {
+  const { results } = await db.prepare(
+    `SELECT DISTINCT check_name FROM validation_results
+     WHERE registry_version_id = ?1 AND passed = 0
+       AND validation_attempt = (SELECT MAX(validation_attempt) FROM validation_results WHERE registry_version_id = ?1)
+     ORDER BY check_name`
+  ).bind(versionId).all<{ check_name: string }>();
+  return (results ?? []).map(row => row.check_name);
+}
+
 /*
- * Moves a candidate to a terminal status. The transition triggers verify the
- * stored validation results, so a mismatch fails here rather than producing a
- * version that claims to be validated.
+ * Where a candidate stands: its revision, and its latest validation attempt.
+ *
+ * The revision is how many overlay events it has recorded. Every overlay
+ * write records one in the transaction that changes the rows, and events are
+ * never removed, so the count only moves forward, and anything read at one
+ * revision still describes the candidate while the count is the same.
  */
-async function markValidated(db: D1Database, versionId: string, checksum: string): Promise<void> {
-  const result = await db.prepare(
+async function readRevision(db: D1Database, versionId: string): Promise<{ revision: number, attempt: number }> {
+  const row = await db.prepare(
+    `SELECT (SELECT COUNT(*) FROM registry_overlay_events WHERE registry_version_id = ?1) AS revision,
+            (SELECT COALESCE(MAX(validation_attempt), 0) FROM validation_results WHERE registry_version_id = ?1) AS attempt`
+  ).bind(versionId).first<{ revision: number, attempt: number } | null>();
+  return { revision: row?.revision ?? 0, attempt: row?.attempt ?? 0 };
+}
+
+// a candidate as it was read: still importing, and at the revision it was read at
+function unchanged(versionId: string, revision: number): Condition {
+  return {
+    sql: first => `EXISTS (SELECT 1 FROM registry_versions WHERE id = ?${first} AND status = 'importing')
+       AND (SELECT COUNT(*) FROM registry_overlay_events WHERE registry_version_id = ?${first}) = ?${first + 1}`,
+    values: [ versionId, revision ],
+  };
+}
+
+/*
+ * A validation attempt of a candidate has been recorded. A write that belongs
+ * with the attempt — closing the run that imported the candidate — follows it
+ * in the same transaction on this condition, so it applies only if the
+ * attempt did.
+ */
+function recorded(versionId: string, attempt: number): Condition {
+  return {
+    sql: first => `EXISTS (
+      SELECT 1 FROM validation_results WHERE registry_version_id = ?${first} AND validation_attempt = ?${first + 1}
+    )`,
+    values: [ versionId, attempt ],
+  };
+}
+
+/*
+ * A candidate's terminal status as one statement, for a caller that commits
+ * it in one transaction with the validation attempt that decides it. The
+ * transition triggers verify the stored validation results, so a status the
+ * results do not support fails here rather than producing a version that
+ * claims to be validated.
+ */
+function endCandidateStatement(
+  db: D1Database,
+  versionId: string,
+  ending: { status: 'validated', checksum: string } | { status: 'invalid' },
+  at: string,
+  condition?: Condition,
+): D1PreparedStatement {
+  return conditioned(
+    db,
     `UPDATE registry_versions
-     SET status = 'validated', snapshot_checksum = ?1, validated_at = ?2
-     WHERE id = ?3 AND status = 'importing'`
-  ).bind(checksum, new Date().toISOString(), versionId).run();
+     SET status            = ?1,
+         snapshot_checksum = CASE WHEN ?1 = 'validated' THEN ?2 ELSE snapshot_checksum END,
+         validated_at      = CASE WHEN ?1 = 'validated' THEN ?3 ELSE validated_at END
+     WHERE id = ?4 AND status = 'importing'`,
+    [ ending.status, ending.status === 'validated' ? ending.checksum : null, at, versionId ],
+    condition,
+  );
+}
+
+// moves a candidate to a terminal status on its own
+async function markValidated(db: D1Database, versionId: string, checksum: string): Promise<void> {
+  const ending = { status: 'validated', checksum } as const;
+  const result = await endCandidateStatement(db, versionId, ending, new Date().toISOString()).run();
   assertChanged(result, versionId, `the candidate is no longer importing`);
 }
 
 async function markInvalid(db: D1Database, versionId: string): Promise<void> {
-  const result = await db.prepare(
-    `UPDATE registry_versions SET status = 'invalid' WHERE id = ?1 AND status = 'importing'`
-  ).bind(versionId).run();
+  const result = await endCandidateStatement(db, versionId, { status: 'invalid' }, new Date().toISOString()).run();
   assertChanged(result, versionId, `the candidate is no longer importing`);
 }
 
@@ -1197,7 +1472,6 @@ async function markInvalid(db: D1Database, versionId: string): Promise<void> {
  * Rows a statement changed. D1 reports it in `meta.changes`, which the
  * workers-types version this worker resolves does not declare.
  */
-// how many rows a statement changed; workers-types does not type `meta.changes` on every version
 function changedRows(result: D1Result): number {
   return (result as unknown as { meta?: { changes?: number } }).meta?.changes ?? 0;
 }
@@ -1209,38 +1483,46 @@ function assertChanged(result: D1Result, versionId: string, message: string): vo
   }
 }
 
-export type { CandidateInput, ClonedOverlays, SnapshotCounts };
+export type { CandidateInput, ClonedOverlays, Condition, ImportedMarket, ResultInput, SqlValue };
 
 export {
-  readAttemptChecks,
   changedRows,
-  BATCH_SIZE,
   activateVersion,
-  clearCandidateSnapshot,
+  activationStatements,
+  both,
+  candidateRow,
+  candidateStatement,
+  conditioned,
   createCandidate,
-  ensureNetwork,
-  findAttempts,
+  failedChecks,
   findAttemptsByCommit,
+  insertStatement,
+  marketWrites,
   readSnapshot,
   readUnreviewed,
-  writeMarket,
   latestValidationAttempt,
   readActivationHistory,
   readActiveOverlays,
   readActivePointer,
   readActiveVersionId,
   readImportOverlays,
+  readMarket,
   readOverlays,
   readRegistrySnapshot,
+  readRetainedVersions,
+  readRevision,
   readValidationSummary,
   readVersion,
   readVersions,
+  recorded,
   SUPERSEDED_CHECK,
   supersedeEarlierAttempts,
   supersedeStaleAttempts,
+  endCandidateStatement,
   markInvalid,
   markValidated,
   recordValidationResults,
   snapshotChecksum,
-  writeCandidateSnapshot,
+  unchanged,
+  validationResultsStatement,
 };

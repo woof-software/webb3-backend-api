@@ -25,16 +25,13 @@ type RegistryErrorCode = (
   | 'CHAIN_RESPONSE_INVALID'
   | 'CHAIN_CALL_REVERTED'
   | 'CHAIN_CONTRACT_MISSING'
-  | 'CHAIN_MISMATCH'
   // the reviewed overlay is unusable
   | 'OVERLAY_INVALID'
-  | 'OVERLAY_MISSING'
   | 'OVERLAY_FEED_UNREADABLE'
   // the stored candidate is not in the state the caller expected
   | 'CANDIDATE_STATE_CONFLICT'
   // the sync fence refused the work
   | 'SYNC_ALREADY_RUNNING'
-  | 'SYNC_FENCE_INCONSISTENT'
 );
 
 class RegistryError extends Error {
@@ -44,9 +41,13 @@ class RegistryError extends Error {
   /*
    * `scope` names what the failure is about, such as a root path or a
    * network key, and matches the scope recorded in validation_results.
+   *
+   * `cause` is the failure underneath, such as the HTTP status a node
+   * provider answered. Only the logs show it: D1 and the API keep the code
+   * and the message.
    */
-  constructor(code: RegistryErrorCode, message: string, scope: string = 'global') {
-    super(message);
+  constructor(code: RegistryErrorCode, message: string, scope: string = 'global', options: { cause?: unknown } = {}) {
+    super(message, options);
     this.name  = 'RegistryError';
     this.code  = code;
     this.scope = scope;

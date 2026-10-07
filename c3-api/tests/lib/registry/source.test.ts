@@ -116,6 +116,15 @@ t.test('a ref resolves to the commit it points at', async t => {
   const unavailable = config({ [commitsUrl('main')]: { status: 502, body: '{}' } });
   await rejects(() => resolveRef(unavailable.config), 'SOURCE_REQUEST_FAILED');
 
+  /*
+   * A request that threw — a refused connection, a timeout, a Worker out of
+   * subrequests — reads the same in the answer and in D1, so what was thrown
+   * is kept as the cause, which the log shows.
+   */
+  const refused = new Error('connect ECONNREFUSED 140.82.112.6:443');
+  const thrown  = await rejects(() => resolveRef({ ...source, fetch: async () => { throw refused; } }), 'SOURCE_REQUEST_FAILED');
+  t.equal(thrown.cause, refused, 'a request that threw keeps what it threw as its cause');
+
   const garbage = config({ [commitsUrl('main')]: { body: 'not-a-sha' } });
   await rejects(() => resolveRef(garbage.config), 'SOURCE_REF_UNRESOLVED');
 
@@ -123,6 +132,89 @@ t.test('a ref resolves to the commit it points at', async t => {
     const invalid = config({}, { ref });
     await rejects(() => resolveRef(invalid.config), 'SOURCE_CONFIGURATION_INVALID');
   }
+});
+
+/*
+ * A source that does not answer is cut at a deadline, whether it never starts
+ * its answer or stalls in the middle of the body: a hung GitHub must not hold
+ * the import, and the run every other sync waits for, for as long as the
+ * connection stays open. The stubs end as the platform's fetch ends a request
+ * whose signal fires.
+ */
+t.test('a source that does not answer is cut at its deadline', async t => {
+  // Node does not stay up for a deadline's timer alone, as nothing in a Worker has to
+  const alive = setInterval(() => {}, 1_000);
+  t.teardown(() => clearInterval(alive));
+  const source = { repository: REPOSITORY, ref: 'main', timeoutMs: 50 };
+
+  let signal: AbortSignal | null | undefined;
+  await resolveRef({
+    repository: REPOSITORY,
+    ref:        'main',
+    fetch:      async (_: string, init?: RequestInit) => {
+      signal = init?.signal;
+      return new Response(COMMIT_SHA);
+    },
+  });
+  t.ok(signal instanceof AbortSignal && !signal.aborted, 'every request carries a deadline, the default one unless a test sets another');
+
+  const silent = async (_: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+  });
+  const started    = Date.now();
+  const unanswered = await rejects(() => resolveRef({ ...source, fetch: silent }), 'SOURCE_REQUEST_FAILED');
+  t.equal(unanswered.message, 'the comet source did not answer within 0.05 seconds', 'the deadline is what the answer names');
+  t.match(String(unanswered.cause), /abort|time/i, 'and what it cut short is the cause, for the logs');
+  t.ok(Date.now() - started < 5_000, 'at the deadline, not whenever the connection would have closed');
+
+  const stalled = async (_: string, init?: RequestInit) => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"tree": ['));
+      init?.signal?.addEventListener('abort', () => controller.error(init.signal?.reason));
+    },
+  }));
+  const cut = await rejects(() => listRootPaths({ ...source, fetch: stalled }, COMMIT_SHA), 'SOURCE_REQUEST_FAILED');
+  t.equal(cut.message, 'the comet source did not answer within 0.05 seconds', 'an answer whose body stalls is cut by the same deadline');
+});
+
+/*
+ * GitHub refuses a request over its rate limit with 403 or 429, which reads
+ * like any other refusal until its headers are read: the hourly allowance used
+ * up, and until when — and, for a request without a token, that a token is
+ * what raises it — or a burst to wait out. It stays a source that did not
+ * serve the request, worth trying again later.
+ */
+t.test('a refusal over the rate limit says so', async t => {
+  const reset = 1_790_000_000;
+  const until = new Date(reset * 1000).toISOString();
+  const refusing = (status: number, headers: Record<string, string>, token?: string) => ({
+    repository: REPOSITORY,
+    ref:        'main',
+    ...(token === undefined ? {} : { token }),
+    fetch:      async () => new Response('{"message":"API rate limit exceeded for 104.28.0.1"}', { status, headers }),
+  });
+
+  const hourly = await rejects(
+    () => resolveRef(refusing(403, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(reset) })),
+    'SOURCE_REQUEST_FAILED',
+  );
+  t.equal(hourly.message, `the comet source answered 403: its rate limit is used up until ${until}; without COMET_GITHUB_TOKEN it allows 60 requests an hour`,
+    'the hourly allowance, until when, and what raises it');
+  t.notMatch(hourly.message, /104\.28|API rate limit exceeded/, 'and nothing GitHub wrote');
+
+  const tokened = await rejects(
+    () => resolveRef(refusing(429, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(reset) }, 'a-token')),
+    'SOURCE_REQUEST_FAILED',
+  );
+  t.equal(tokened.message, `the comet source answered 429: its rate limit is used up until ${until}`,
+    'a request that carried a token is told when, and nothing about the token');
+
+  const burst = await rejects(() => resolveRef(refusing(403, { 'retry-after': '60' })), 'SOURCE_REQUEST_FAILED');
+  t.equal(burst.message, 'the comet source answered 403: too many requests at once; it asks to wait 60 seconds',
+    'a burst over the secondary limit says how long to wait');
+
+  const other = await rejects(() => resolveRef(refusing(403, { 'x-ratelimit-remaining': '4999' })), 'SOURCE_REQUEST_FAILED');
+  t.equal(other.message, 'the comet source answered 403', 'and any other refusal is its status alone');
 });
 
 t.test('an explicit commit must be reachable from the tracked ref', async t => {
@@ -233,6 +325,22 @@ t.test('a root is parsed only when it matches the pinned object id', async t => 
   );
   t.same(Object.keys(institutional.contracts).sort(), [ 'bulker', 'comet', 'configurator', 'rewards' ]);
   t.same(institutional.otherRoots, {}, 'it declares nothing beyond its four roles');
+});
+
+/*
+ * Every root fixture is the bytes upstream holds, down to its line endings
+ * and the final newline most of them lack: a root is read only when it
+ * hashes to the object id its tree lists. A checkout that converted them
+ * would fail every test that reads one, so .gitattributes keeps it from
+ * touching them.
+ */
+t.test('every root fixture is the upstream bytes its tree lists', async t => {
+  for (const entry of tree.tree) {
+    const [ , network, deployment ] = /^deployments\/([^/]+)\/([^/]+)\/roots\.json$/.exec(entry.path)!;
+    const content = rootContent(`${network}-${deployment}`);
+    t.equal(Buffer.byteLength(content), entry.size, `${entry.path} has the size the tree lists`);
+    t.equal(await gitBlobSha(content), entry.sha, 'and its object id');
+  }
 });
 
 t.test('malformed deployment paths and roots are rejected', async t => {

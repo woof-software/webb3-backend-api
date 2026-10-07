@@ -1,17 +1,19 @@
 import * as Eth          from '../../lib/eth-constants.js';
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
-import { Comet, Contract } from '../../lib/well-known/contracts/types.js';
-
 import type {
   Address,
   AssetDisplayOverrideV1,
   NetworkV1,
-  PriceExceptionV1,
   UnwrappedCollateralAssetV1,
 } from '../../lib/model/comet-registry.js';
+import { marketKey } from '../../lib/model/comet-registry.js';
 import { canonicalJson } from '../../lib/canonical-json.js';
 import { sha256Hex } from '../../lib/hash.js';
+
+import type { OverlayPriceException } from './overlay.js';
+import { staticComets } from './shadow.js';
+import type { CometContract } from './shadow.js';
 
 
 /*
@@ -35,9 +37,9 @@ import { sha256Hex } from '../../lib/hash.js';
 type NetworkName = KnownNetwork.Name;
 
 /*
- * Why one value is what it is, where the general rules REVIEW.md states do
- * not already say so. An open note is one no source could answer: somebody
- * has to decide it before the version can be validated.
+ * Why one value is what it is, where the general rules the review document
+ * states do not already say so. An open note is one no source could answer:
+ * somebody has to decide it before the version can be validated.
  */
 type Note = {
   scope:   string,
@@ -79,7 +81,7 @@ type Presentation = {
 
 type NetworkProposal = Presentation & {
   displayName:     string,
-  priceExceptions: PriceExceptionV1[],
+  priceExceptions: OverlayPriceException[],
 };
 
 /*
@@ -112,6 +114,17 @@ const WITHOUT_REWARDS: NetworkName[] = [ 'scroll-mainnet', 'ronin-mainnet' ];
  */
 const MARKETS_WITHOUT_REWARDS: Partial<Record<NetworkName, string[]>> = {
   'ethereum-mainnet': [ 'ciUSDCv3' ],
+};
+
+/*
+ * The markets whose reward feed prices COMP in their base asset rather than
+ * in USD. Decimals cannot tell: mainnet's COMP / ETH answers with eighteen,
+ * but Linea's with eight, as every COMP / USD feed does. Read from each
+ * feed's description() on chain: "COMP / ETH" and "COMP / ETH price feed".
+ */
+const REWARDS_QUOTED_IN_BASE: Partial<Record<NetworkName, string[]>> = {
+  'ethereum-mainnet': [ 'cWETHv3' ],
+  'linea-mainnet':    [ 'cWETHv3' ],
 };
 
 /*
@@ -154,7 +167,7 @@ const QUOTED_IN_BASE: Partial<Record<NetworkName, string[]>> = {
  * The feeds asset-price.ts refused to read, with the reason each one was
  * added. They become the price exceptions of their network.
  */
-const PRICE_EXCEPTIONS: Partial<Record<NetworkName, PriceExceptionV1[]>> = {
+const PRICE_EXCEPTIONS: Partial<Record<NetworkName, OverlayPriceException[]>> = {
   'ethereum-mainnet': [
     {
       kind:             'fixed_price',
@@ -413,17 +426,6 @@ const NETWORK_NAMES: Partial<Record<NetworkName, string>> = {
 // the market the application opens when nothing else is selected
 const DEFAULT_MARKET = { network: 'ethereum-mainnet' as NetworkName, deploymentKey: 'usdc' };
 
-function staticComets(network: NetworkName): Map<string, Contract> {
-  const contracts = Eth.wellKnownContractsByNetwork[network]?.['Comet'] ?? {};
-  const comets    = new Map<string, Contract>();
-  for (const candidate of Object.values(contracts) as Contract[]) {
-    if (Comet.is(candidate)) {
-      comets.set(candidate.address.toLowerCase(), candidate);
-    }
-  }
-  return comets;
-}
-
 function staticFeed(network: NetworkName, key: string): Address | null {
   const feed = (Eth.wellKnownContractsByNetwork[network] as any)?.['PriceFeed']?.[key];
   return feed === undefined ? null : (feed.address as Address).toLowerCase() as Address;
@@ -452,14 +454,14 @@ function textOf(value: unknown): string | null {
 function marketOverlay(
   network: NetworkName,
   deploymentKey: string,
-  comet: Contract | undefined,
+  comet: CometContract | undefined,
   notes: Note[],
 ): MarketProposal {
   const scope       = `${deploymentKey} on ${network}`;
-  const contractName = comet === undefined ? null : textOf((comet as any).displayName);
-  const baseAsset    = comet === undefined ? null : (comet as any).base.asset;
+  const contractName = comet === undefined ? null : textOf(comet.displayName);
+  const baseAsset    = comet === undefined ? null : comet.base.asset;
   const baseSymbol   = baseAsset === null ? null : textOf(baseAsset.canonicalName);
-  const rewardFeed   = comet === undefined ? null : (comet as any).rewards.priceFeed;
+  const rewardFeed   = comet?.rewards?.priceFeed ?? null;
 
   if (comet === undefined) {
     notes.push({
@@ -492,7 +494,7 @@ function marketOverlay(
   const quotedInBase  = comet !== undefined
     && aliasAddresses(network, QUOTED_IN_BASE[network] ?? []).has(comet.address.toLowerCase());
   const conversionKey = contractName === null ? null : USD_CONVERSIONS[network]?.[contractName] ?? null;
-  const usdFromStatic = comet === undefined ? null : ((comet as any).base.usdPriceFeed?.address as string | undefined) ?? null;
+  const usdFromStatic = comet?.base.usdPriceFeed?.address ?? null;
   const usdOffered    = usdFromStatic !== null
     ? usdFromStatic.toLowerCase() as Address
     : conversionKey === null ? null : staticFeed(network, conversionKey);
@@ -538,13 +540,10 @@ function marketOverlay(
     });
   }
 
-  /*
-   * A reward feed with eighteen decimals prices COMP in the chain's own
-   * asset rather than in USD, which is what the APR computations relied on.
-   */
-  const rewardDecimals = rewardFeed === null ? null : (rewardFeed.decimals as number | undefined) ?? null;
-  const rewardAddress  = rewardFeed === null ? null : (rewardFeed.address as string).toLowerCase() as Address;
-  const baseFeed       = comet === undefined ? null : ((comet as any).base.priceFeed.address as string).toLowerCase();
+  const rewardInBase  = comet !== undefined
+    && aliasAddresses(network, REWARDS_QUOTED_IN_BASE[network] ?? []).has(comet.address.toLowerCase());
+  const rewardAddress = rewardFeed === null ? null : rewardFeed.address.toLowerCase() as Address;
+  const baseFeed       = comet === undefined ? null : comet.base.priceFeed.address.toLowerCase();
   const rewardIsBase   = rewardAddress !== null && rewardAddress === baseFeed;
   // on a network without rewards no reward feed is needed, so there is nothing to decide
   if (rewardIsBase && rewards) {
@@ -564,7 +563,7 @@ function marketOverlay(
     isDefault:            network === DEFAULT_MARKET.network && deploymentKey === DEFAULT_MARKET.deploymentKey,
     isInstitutional:      label?.institutional === true,
     status:               'enabled',
-    creationBlock:        comet === undefined ? 0 : (comet.creation.block.number as number),
+    creationBlock:        comet === undefined ? 0 : comet.creation.block.number,
     collateralValueQuote: quotedInBase ? 'base' : 'usd',
     capabilities: {
       rewards,
@@ -578,7 +577,7 @@ function marketOverlay(
     },
     rewardPriceFeed: rewardAddress === null || rewardIsBase || !rewards
       ? null
-      : { address: rewardAddress, quote: rewardDecimals === 18 ? 'base' : 'usd' },
+      : { address: rewardAddress, quote: rewardInBase ? 'base' : 'usd' },
   };
 }
 
@@ -690,14 +689,14 @@ function displayedAt(override: AssetDisplayOverrideV1): string {
   return override.displayAddress === override.tokenAddress ? 'itself' : code(override.displayAddress);
 }
 
-function describeException(exception: PriceExceptionV1): string {
+function describeException(exception: OverlayPriceException): string {
   switch (exception.kind) {
     case 'zero_price':
       return `priced at zero`;
     case 'fixed_price':
       return `fixed at ${scaled(exception.price.value, exception.price.decimals)}`;
     case 'deprecated_price_remap':
-      return `read from ${code(exception.replacementPriceFeed.address)} instead`;
+      return `read from ${code(exception.replacementPriceFeedAddress)} instead`;
   }
 }
 
@@ -793,7 +792,8 @@ function reviewDocument(generated: Generated, repository: string, digest: string
     `  which the rewards computations skipped by name because no reward feed answers there,`,
     `  and a market whose Comet has no rewards configured.`,
     `- Quote: the unit each Comet's base token feed answers in, read from the chain.`,
-    `- Reward quote: a reward feed with eighteen decimals prices COMP in the base asset.`,
+    `- Reward quote: \`usd\`, except where the reward feed answers in the base asset, read from its`,
+    `  description() on chain: ${Object.entries(REWARDS_QUOTED_IN_BASE).flatMap(([ network, aliases ]) => (aliases ?? []).map(alias => `${alias} on ${network}`)).join(', ')} (COMP / ETH).`,
     `- Wrapped native: the base asset is the wrapped form of the chain's own token.`,
     `- Price exceptions: the feeds asset-price.ts refused to read.`,
     `- Labels — what a market is listed as, its slug and section, and its base asset's name: copied from`,
@@ -829,8 +829,9 @@ function reviewDocument(generated: Generated, repository: string, digest: string
 }
 
 /*
- * The body of `PUT /versions/{id}/overlays`: what the operator reads in
- * REVIEW.md is what that one request applies, all of it or none.
+ * The body of `PUT /versions/{id}/overlays`: what the operator reads in the
+ * review document (`GET /versions/{id}/proposal/review`) is what that one
+ * request applies, all of it or none.
  */
 function bundleOf(generated: Generated): {
   reason:   string,
@@ -841,11 +842,11 @@ function bundleOf(generated: Generated): {
     reason:   generated.reason,
     networks: Object.fromEntries(generated.networks.map(({ chainId, overlay }) => [ String(chainId), overlay ])),
     markets:  Object.fromEntries(generated.markets.map(({ chainId, deploymentKey, overlay }) => [
-      `${chainId}/${deploymentKey}`, overlay,
+      marketKey(chainId, deploymentKey), overlay,
     ])),
   };
 }
 
 
 export type { Generated, MarketProposal, NetworkProposal, Note };
-export { PRICE_EXCEPTIONS, bundleOf, digestOf, marketOverlay, networkOverlay, proposalFor, reviewDocument };
+export { bundleOf, digestOf, marketOverlay, networkOverlay, proposalFor, reviewDocument };
