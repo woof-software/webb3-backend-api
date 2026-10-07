@@ -1,5 +1,5 @@
 import type { PriceFeedV1 } from '../../model/comet-registry.js';
-import { registryOf } from '../../model/comet-registry.js';
+import { annotationOf } from '../../model/comet-registry.js';
 
 import type { Contract } from '../../well-known/contracts/utils.js';
 
@@ -18,12 +18,7 @@ import type { Contract } from '../../well-known/contracts/utils.js';
  * markets by hand.
  */
 function usdBasePriceFeedFor(contract: Contract): PriceFeedV1 | null {
-  const annotation = registryOf(contract);
-  if (annotation === null) {
-    // a contract that did not come from the registry says nothing about units
-    return null;
-  }
-  const market = annotation.market;
+  const market = annotationOf(contract).market;
   return market.rewardAsset?.priceFeedQuote === 'usd' && market.collateralValueQuote === 'base'
     ? market.baseAsset.usdPriceFeed
     : null;

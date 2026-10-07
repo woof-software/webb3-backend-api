@@ -8,7 +8,9 @@ import { BigFixnum } from '../../lib/bigfixnum.js';
 
 import * as KnownNetwork  from '../../lib/well-known/networks/network.js';
 
+import { ApiError } from '../http/errors.js';
 import type { Catalog } from '../registry/catalog.js';
+import { refuseTestnet } from '../testnets.js';
 
 import * as governanceModel from '../../lib/model/governance.js';
 
@@ -69,6 +71,18 @@ function streamKeyOf({ network, rewardsContractAddress }: StreamEvent): string {
   return `${network}|${rewardsContractAddress.toLowerCase()}`;
 }
 
+/*
+ * The streams a cursor reads, as one value two lists of streams can be
+ * compared by: each stream with every market it reads, in no particular
+ * order.
+ */
+function streamsOf(streams: StreamEvent[]): string {
+  return streams
+    .map(stream => `${streamKeyOf(stream)}:${stream.marketContractAddresses.map(address => address.toLowerCase()).sort().join(',')}`)
+    .sort()
+    .join(';');
+}
+
 interface Cursor {
   network: KnownNetwork.Name;
   blockNumber: number;
@@ -79,12 +93,19 @@ interface Cursor {
 
 type CursorPayload = {
   /*
-   * The registry version this page was read against. A cursor is only
-   * meaningful within one version: markets, and the streams they are read
-   * from, are what the version defines. It is optional because cursors issued
-   * before the registry carry none, and those are accepted once and upgraded.
+   * The registry version this page was read against. A cursor is meaningful
+   * for as long as the version that answers reads the same streams, which
+   * are what the version's markets define. It is optional because cursors
+   * issued before the registry carry none, and those are accepted once and
+   * upgraded.
    */
   registryVersionId?: string;
+  /*
+   * Whether the cursor was issued before the registry and upgraded. Such a
+   * session reads the streams on the networks the old cursor had and no
+   * others, so a later version is compared with it on those networks alone.
+   */
+  upgraded?: boolean;
   profilesByAddress: { [key: Eth.Address]: governanceModel.Profile };
   filter: {
     markets: string[];
@@ -148,7 +169,7 @@ function streamEventsOf(catalog: Catalog): StreamEvent[] {
   for (const entry of catalog.markets()) {
     const comet   = entry.market.contracts.comet;
     const rewards = entry.market.contracts.rewards;
-    if (!entry.market.capabilities.transactionHistory || comet === null || rewards === null) {
+    if (!entry.market.capabilities.transactionHistory || rewards === null) {
       continue;
     }
     const stream = { network: entry.network, marketContractAddresses: [ comet ], rewardsContractAddress: rewards };
@@ -179,10 +200,14 @@ function contractsOf(catalog: Catalog, stream: StreamEvent): {
   if (markets.length === 0) {
     throw new Error(`stream ${streamKeyOf(stream)} has no market in the active registry`);
   }
+  // every market of a stream shares one rewards contract, by construction
+  const rewards = markets[0]!.comet.rewards;
+  if (rewards === undefined) {
+    throw new Error(`invariant violated: stream ${streamKeyOf(stream)} reads a market without its rewards contract`);
+  }
   return {
     marketContracts: markets.map(entry => entry.comet),
-    // every market of a stream shares one rewards contract, by construction
-    rewardsContract: markets[0]!.comet.rewards.contract,
+    rewardsContract: rewards.contract,
   };
 }
 
@@ -220,6 +245,9 @@ function getDefiSaverProxyRegistryContract(): { [key: string]: Eth.Contract }{
  * A cursor that carried no explicit `markets[]` filter had the old stream list
  * baked into its networks and contract addresses; the filter is rewritten to
  * the streams the session keeps, which may hold markets the old list did not.
+ *
+ * The upgraded cursor says so, and the session keeps its networks across
+ * later activations as it kept them at the cutover (readsSameStreams).
  */
 function upgradeLegacyCursor(
   payload: CursorPayload,
@@ -250,7 +278,31 @@ function upgradeLegacyCursor(
     ] as string[]),
   };
 
-  return { ...payload, registryVersionId, filter, streamEvents: kept, cursors };
+  return { ...payload, registryVersionId, upgraded: true, filter, streamEvents: kept, cursors };
+}
+
+/*
+ * Whether a cursor's positions still mean what they meant against the
+ * streams a version reads: the version reads the same streams. A cursor
+ * upgraded from before the registry reads only those on the networks it had,
+ * so only those are compared: a stream the version serves on another network
+ * is one that session never joins, and it leaves the session going.
+ */
+function readsSameStreams(payload: CursorPayload, streams: StreamEvent[]): boolean {
+  const networks = new Set<string>(payload.streamEvents.map(stream => stream.network));
+  const read     = payload.upgraded === true
+    ? streams.filter(stream => networks.has(stream.network))
+    : streams;
+  return streamsOf(payload.streamEvents) === streamsOf(read);
+}
+
+// every network a cursor reads, holds a position on, or filters by
+function cursorNetworksOf(payload: CursorPayload): KnownNetwork.Name[] {
+  return [ ...new Set([
+    ...payload.streamEvents.map(stream => stream.network),
+    ...Object.values(payload.cursors).map(cursor => cursor.network),
+    ...payload.filter.networks as KnownNetwork.Name[],
+  ]) ];
 }
 
 // Filter to apply before history items get enriched, if filter it before we can save some API calls in enrichment
@@ -319,7 +371,7 @@ function filterTransactionHistoryItem(
 }
 
 async function getTransactionHistory(
-  { apiHost, nodeHost, nodeKey, accountAddress, queryParams, catalog }: TransactionHistoryRouteData,
+  { apiHost, nodeHost, nodeKey, accountAddress, queryParams, registry }: TransactionHistoryRouteData,
   context: Context,
 ): Promise<Response> {
   // ****************** HELPER FUNCTIONS ******************
@@ -720,6 +772,49 @@ async function getTransactionHistory(
   });
 
   /*
+   * What the request names is checked before the registry is read, as the
+   * market routes check theirs: a market on a network this API does not
+   * know, or named by what is no address, is refused whatever the registry
+   * holds, and so is a market of a testnet, which the registry never imports.
+   */
+  const namedMarkets: Array<{ network: KnownNetwork.Name, address: Eth.Address }> = [];
+  for (const { networkParam, address } of parsedMarkets) {
+    const chainId = parseInt(networkParam);
+
+    if (isNaN(chainId)) {
+      // If network is a number, it is a network id
+      return new Response(`Invalid network id ${networkParam}`, { status: 400 });
+    }
+
+    const network = KnownNetwork.lookup({ chainId });
+    if (Fallible.isFailure(network)) {
+      return new Response(`Invalid network id ${networkParam}`, { status: 400 });
+    }
+    const networkAlias = KnownNetwork.canonicalNameOf(network);
+    // a market of a testnet is refused as the market routes refuse its network
+    refuseTestnet(networkAlias);
+
+    if (!Eth.parseAddress(address)) {
+      return new Response(`Invalid address ${address}`, { status: 400 });
+    }
+    namedMarkets.push({ network: networkAlias, address });
+  }
+
+  /*
+   * A cursor issued before the registry may read a testnet, as a request that
+   * named a testnet market was answered then. Testnets are not served, so the
+   * cursor is refused as such a request is, whatever filter it is sent with,
+   * and before the registry is read.
+   */
+  const storedPayload = cursor === null ? null : Fallible.must(await cache.get<CursorPayload>(cursor));
+  for (const network of storedPayload === null ? [] : cursorNetworksOf(storedPayload)) {
+    refuseTestnet(network);
+  }
+
+  // the one registry version this request resolves its markets against
+  const catalog = await registry.load();
+
+  /*
    * The streams this version serves. A `markets[]` filter narrows which items
    * are kept, not which streams are read: a market is only addressable when
    * the active version describes it and says its history is served.
@@ -728,26 +823,8 @@ async function getTransactionHistory(
 
   const contractAddresses: string[] = [];
   const networks: string[] = [];
-  if (parsedMarkets.length > 0) {
-    for (const m of parsedMarkets) {
-      const { networkParam, address } = m;
-      const chainId = parseInt(networkParam);
-
-      if (isNaN(chainId)) {
-        // If network is a number, it is a network id
-        return new Response(`Invalid network id ${networkParam}`, { status: 400 });
-      }
-
-      const network = KnownNetwork.lookup({ chainId });
-      if (Fallible.isFailure(network)) {
-        return new Response(`Invalid network id ${networkParam}`, { status: 400 });
-      }
-
-      if (!Eth.parseAddress(address)) {
-        return new Response(`Invalid address ${address}`, { status: 400 });
-      }
-
-      const networkAlias = KnownNetwork.canonicalNameOf(network);
+  if (namedMarkets.length > 0) {
+    for (const { network: networkAlias, address } of namedMarkets) {
       if (!networks.includes(networkAlias)) networks.push(networkAlias);
 
       /*
@@ -760,7 +837,7 @@ async function getTransactionHistory(
       const market = catalog.marketAt(networkAlias, address);
       const stream = market === null ? undefined : streamEvents.find(candidate => (
         candidate.network === networkAlias
-          && candidate.marketContractAddresses.includes(market.market.contracts.comet!)
+          && candidate.marketContractAddresses.includes(market.market.contracts.comet)
       ));
       if (market === null || stream === undefined) {
         return new Response(`Invalid market address ${address}`, { status: 400 });
@@ -836,39 +913,39 @@ async function getTransactionHistory(
       )
     ), { status: 200 });
   } else {
-    // Cursor provided, parse cursor
-    const storedPayload = Fallible.must(await cache.get<CursorPayload>(cursor));
+    // Cursor provided, read above
     if (storedPayload === null) {
       return new Response('Cursor is invalid', { status: 400 });
     } else {
       /*
-       * A cursor belongs to one registry version. Its stream keys, market
-       * addresses, and block anchors describe the markets of that version, so
-       * a page read against a different version would silently mix two
-       * descriptions of the same addresses. The client is told to start over
-       * instead.
+       * A cursor holds a position in each stream it reads: a block and a
+       * transaction in the logs of those contracts. The positions stay true
+       * for as long as the version that answers reads the same streams, so a
+       * rollback, a re-import of the same markets, or a new label on one
+       * leaves pagination going; what each page says about its items is the
+       * version that answered that page, which the headers name. A version
+       * that reads other streams leaves the positions meaning nothing, and
+       * the client is told to start over.
        *
        * A cursor issued before the registry carries no version. It is
        * accepted once against the current version and upgraded, so pagination
-       * in progress at the cutover continues rather than breaking.
+       * in progress at the cutover continues rather than breaking; from then
+       * on it reads, and is compared on, the networks it had.
        */
-      const cursorPayload = storedPayload.registryVersionId === catalog.versionId
-        ? storedPayload
-        : storedPayload.registryVersionId === undefined
-          ? upgradeLegacyCursor(storedPayload, streamEvents, catalog.versionId)
+      const cursorPayload = storedPayload.registryVersionId === undefined
+        ? upgradeLegacyCursor(storedPayload, streamEvents, catalog.versionId)
+        : storedPayload.registryVersionId === catalog.versionId || readsSameStreams(storedPayload, streamEvents)
+          ? { ...storedPayload, registryVersionId: catalog.versionId }
           : null;
 
       if (cursorPayload === null) {
-        return new Response(
-          JSON.stringify({
-            error: {
-              code:    'REGISTRY_VERSION_CHANGED',
-              message: 'the market registry changed; restart pagination without a cursor',
-              cursorRegistryVersionId: storedPayload.registryVersionId ?? null,
-              registryVersionId:       catalog.versionId,
-            },
-          }),
-          { status: 409, headers: { 'Content-Type': 'application/json' } },
+        throw new ApiError(
+          'REGISTRY_VERSION_CHANGED',
+          'the markets of the registry changed; restart pagination without a cursor',
+          {
+            cursorRegistryVersionId: storedPayload.registryVersionId ?? null,
+            registryVersionId:       catalog.versionId,
+          },
         );
       }
 

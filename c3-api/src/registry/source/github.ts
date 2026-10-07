@@ -29,6 +29,8 @@ type SourceConfig = {
   ref:        string,
   token?:     string,
   fetch:      RegistryFetch,
+  // how long one request may take, its body included; REQUEST_TIMEOUT_MS unless a test needs less
+  timeoutMs?: number,
 };
 
 type TreeEntry = {
@@ -49,6 +51,16 @@ const REF_PATTERN        = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,99}$/;
 const MAX_TREE_BYTES  = 8 * 1024 * 1024;
 const MAX_TREE_ENTRIES = 50_000;
 const MAX_ROOT_FILES   = 500;
+
+/*
+ * How long one request may take, from asking to the last byte of the answer.
+ * GitHub ends an API request it takes more than ten seconds to process, and
+ * the largest answer, the tree, is a few hundred kilobytes; a request still
+ * open after twice that is not going to be answered. Without a deadline it
+ * would hold the import's run, and every sync that wants it, for as long as
+ * the connection stayed open.
+ */
+const REQUEST_TIMEOUT_MS = 20_000;
 
 const ENCODER = new TextEncoder();
 
@@ -72,12 +84,22 @@ async function gitBlobSha(content: string): Promise<string> {
   return hex(await crypto.subtle.digest('SHA-1', object));
 }
 
+// whether a configured repository names one, as owner/repository
+function isRepository(repository: string): boolean {
+  return REPOSITORY_PATTERN.test(repository);
+}
+
+// whether a configured ref can name a branch, a tag or a commit of it
+function isRef(ref: string): boolean {
+  return REF_PATTERN.test(ref) && !ref.includes('..');
+}
+
 /*
  * GitHub owner and repository names are case-insensitive, so the identifier
  * is stored lowercase: a casing difference must never create a second source.
  */
 function normalizeRepository(repository: string): string {
-  if (!REPOSITORY_PATTERN.test(repository)) {
+  if (!isRepository(repository)) {
     throw new RegistryError(
       'SOURCE_CONFIGURATION_INVALID',
       `COMET_SOURCE_REPOSITORY must be owner/repository`,
@@ -87,7 +109,7 @@ function normalizeRepository(repository: string): string {
 }
 
 function assertRef(ref: string): string {
-  if (!REF_PATTERN.test(ref) || ref.includes('..')) {
+  if (!isRef(ref)) {
     throw new RegistryError('SOURCE_CONFIGURATION_INVALID', `COMET_SOURCE_REF is not a valid git ref`);
   }
   return ref;
@@ -122,32 +144,85 @@ type ReadOptions = {
   missing?: { code: RegistryErrorCode, message: string },
 };
 
+/*
+ * A request the source did not answer: it threw, or its deadline passed
+ * before the answer was whole. What failed underneath — a refused
+ * connection, the deadline, a Worker out of subrequests — is the cause, for
+ * the logs, where it is the only way to tell those apart; D1 and the answer
+ * keep the message, which says when it was the deadline.
+ */
+function unanswered(error: unknown, deadline: AbortSignal, timeout: number, scope: string): RegistryError {
+  const message = deadline.aborted
+    ? `the comet source did not answer within ${timeout / 1000} seconds`
+    : `request to the comet source failed`;
+  return new RegistryError('SOURCE_REQUEST_FAILED', message, scope, { cause: error });
+}
+
+/*
+ * Why the source refused a request, as an operator needs to read it.
+ *
+ * GitHub refuses a request over its rate limit with 403 or 429, which would
+ * otherwise read like any other refusal. The hourly allowance is used up when
+ * `x-ratelimit-remaining` is 0, until the moment `x-ratelimit-reset` names; a
+ * burst over its secondary limit says in `retry-after` how many seconds to
+ * wait. Without a token the allowance is 60 requests an hour per address,
+ * which a Worker shares with others, so the message says when the token is
+ * what is missing.
+ */
+function refusalOf(response: Response, config: SourceConfig): string {
+  const answered = `the comet source answered ${response.status}`;
+  if (response.status !== 403 && response.status !== 429) {
+    return answered;
+  }
+  if (response.headers.get('x-ratelimit-remaining') === '0') {
+    const reset = Number(response.headers.get('x-ratelimit-reset'));
+    return [
+      `${answered}: its rate limit is used up`,
+      Number.isInteger(reset) && reset > 0 ? ` until ${new Date(reset * 1000).toISOString()}` : '',
+      config.token === undefined || config.token.length === 0 ? `; without COMET_GITHUB_TOKEN it allows 60 requests an hour` : '',
+    ].join('');
+  }
+  const wait = Number(response.headers.get('retry-after') ?? '');
+  if (response.headers.has('retry-after') && Number.isInteger(wait) && wait >= 0) {
+    return `${answered}: too many requests at once; it asks to wait ${wait} seconds`;
+  }
+  return answered;
+}
+
 async function read(
   config: SourceConfig,
   url: string,
   { accept, maxBytes, scope, missing }: ReadOptions,
 ): Promise<string> {
+  /*
+   * One deadline for the whole request. The signal ends the answer's body as
+   * well, so an answer whose headers arrive and whose body then stalls is cut
+   * when one that never starts would be.
+   */
+  const timeout  = config.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const deadline = AbortSignal.timeout(timeout);
   let response: Response;
   try {
-    response = await config.fetch(url, { headers: requestHeaders(config, accept) });
-  } catch {
-    throw new RegistryError('SOURCE_REQUEST_FAILED', `request to the comet source failed`, scope);
+    response = await config.fetch(url, { headers: requestHeaders(config, accept), signal: deadline });
+  } catch (error) {
+    throw unanswered(error, deadline, timeout, scope);
   }
   if ((response.status === 404 || response.status === 422) && missing !== undefined) {
     throw new RegistryError(missing.code, missing.message, scope);
   }
   if (!response.ok) {
-    throw new RegistryError(
-      'SOURCE_REQUEST_FAILED',
-      `the comet source answered ${response.status}`,
-      scope,
-    );
+    throw new RegistryError('SOURCE_REQUEST_FAILED', refusalOf(response, config), scope);
   }
   const declared = Number(response.headers.get('content-length') ?? '0');
   if (declared > maxBytes) {
     throw new RegistryError('SOURCE_CONTENT_TOO_LARGE', `response exceeds ${maxBytes} bytes`, scope);
   }
-  const body = await response.text();
+  let body: string;
+  try {
+    body = await response.text();
+  } catch (error) {
+    throw unanswered(error, deadline, timeout, scope);
+  }
   if (ENCODER.encode(body).byteLength > maxBytes) {
     throw new RegistryError('SOURCE_CONTENT_TOO_LARGE', `response exceeds ${maxBytes} bytes`, scope);
   }
@@ -312,11 +387,10 @@ async function readRoot(
 export type { RegistryFetch, SourceConfig };
 
 export {
-  MAX_ROOT_FILES,
-  MAX_TREE_BYTES,
-  MAX_TREE_ENTRIES,
   assertReachableFromRef,
   gitBlobSha,
+  isRef,
+  isRepository,
   listRootPaths,
   normalizeRepository,
   readRoot,

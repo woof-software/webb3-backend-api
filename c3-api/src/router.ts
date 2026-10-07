@@ -12,12 +12,15 @@ import * as transactionHistoryHandler from './transaction-history-handler/transa
 
 import type { Contract } from '../lib/well-known/contracts/types.js';
 
+import { ApiError, failureResponse, isApiError } from './http/errors.js';
+import { refuseTestnet, refuseTestnetsParameter } from './testnets.js';
 import type { Catalog } from './registry/catalog.js';
 import {
   RequestCatalog,
   catalogHeaders,
   isRegistryUnavailable,
   requestCatalog,
+  unavailableError,
 } from './registry/request-catalog.js';
 import { routeRegistry } from './registry/router.js';
 
@@ -42,6 +45,8 @@ type Scope = (
  */
 interface Context extends Evaluator.Context {
   evaluator: Evaluator.Implementation<Scope>;
+  // the id the entrypoint gave the request, which its error answer and the log line about it carry
+  requestId?: string;
 }
 
 /*
@@ -119,7 +124,12 @@ interface TransactionHistoryRouteData {
   nodeKey: string;
   accountAddress: Eth.Address;
   queryParams: URL['searchParams'];
-  catalog: Catalog;
+  /*
+   * The registry, not loaded: the handler refuses a testnet market, or a
+   * cursor that reads one, before it reads the registry, as the market
+   * routes refuse a testnet.
+   */
+  registry: RequestCatalog;
 }
 
 interface AccountRouteData {
@@ -127,7 +137,6 @@ interface AccountRouteData {
   nodeHost: string;
   nodeKey: string;
   account: Eth.Address;
-  testnets: 'include' | 'exclude';
   catalog: Catalog;
 }
 
@@ -162,25 +171,31 @@ async function route(
    * first handler that needs it, and every response whose content depended on
    * it says which version answered.
    */
-  const registry = requestCatalog(context.env, context.debug);
+  const registry  = requestCatalog(context.env, context.debug);
+  // a caller that made no id, such as a test calling the router directly, gets one here
+  const requestId = context.requestId ?? crypto.randomUUID();
   const answer = async (): Promise<Response> => {
     try {
-      return await unsafeRoute(request, context, instantiateEvaluator, registry);
+      return await unsafeRoute(request, { ...context, requestId }, instantiateEvaluator, registry);
     } catch (e: unknown) {
       context.debug.clearDanglingGroups();
-      context.debug.error(e, (e as any).cause);
       /*
-       * A route that needs the registry cannot be answered from anywhere
-       * else: after the cutover there is no static market list to fall back
-       * to, so the request fails while the rest of the API keeps working.
+       * A failure is answered in the envelope every route answers with, under
+       * this request's id. What a handler raised to say something — a market
+       * without rewards, a cursor of another version — says it; a route that
+       * needs the registry cannot be answered from anywhere else, since after
+       * the cutover there is no static market list to fall back to, so it
+       * fails with 503 while the rest of the API keeps working. Anything else
+       * is a 500 that tells the client nothing but the id, while the log
+       * gets the whole of it.
        */
-      if (isRegistryUnavailable(e)) {
-        return new Response(
-          JSON.stringify({ error: `the comet registry is unavailable`, requestId: crypto.randomUUID() }),
-          { status: 503, headers: { 'Content-Type': 'application/json' } },
-        );
-      }
-      return new Response((e as Error).message, { status: 500 });
+      const said = isApiError(e) ? e : isRegistryUnavailable(e) ? unavailableError(e) : null;
+      return failureResponse(said, e, {
+        requestId,
+        pathname: new URL(request.url).pathname,
+        debug:    context.debug,
+        label:    'route',
+      });
     }
   };
 
@@ -287,7 +302,7 @@ async function unsafeRoute(
           nodeKey: context.env.NODE_PROXY_KEY,
           accountAddress,
           queryParams: url.searchParams,
-          catalog: await registry.load(),
+          registry,
         },
         context
       );
@@ -308,21 +323,20 @@ async function unsafeRoute(
           { status: 400 }
         );
       }
-      const queryTestnets = url.searchParams.get('testnets');
-      const testnets = queryTestnets === 'include' ? 'include' : 'exclude';
+      // testnets are not served: asking for them is refused, not answered without them
+      refuseTestnetsParameter(url.searchParams);
       return accountHandlers.rewardsSummary(
         {
           apiHost: context.env.V3_API_HOST,
           nodeHost: context.env.NODE_PROXY_HOST,
           nodeKey: context.env.NODE_PROXY_KEY,
-          testnets,
           account: accountAddress,
           catalog: await registry.load(),
         },
         {
           ...context,
           evaluator: instantiateEvaluator(
-            testnets === 'exclude' ? 'mainnet' : 'testnet',
+            'mainnet',
             {
               flags: {
                 ...context.flags,
@@ -335,9 +349,9 @@ async function unsafeRoute(
       );
     }
     /*
-     * No valid path
+     * No valid path: answered in the envelope, as every other failure is
      */
-    return fallthrough();
+    throw new ApiError('NOT_FOUND', `no route matches ${url.pathname}`);
   }
 
   /*
@@ -360,11 +374,16 @@ async function unsafeRoute(
     return new Response(`Error: Bad network ${networkAlias}`, { status: 400 });
   }
 
-  let testnet = url.searchParams.get('testnet') ?? 'exclude';
+  /*
+   * Which storage the evaluation reads and writes: testnet data is kept apart
+   * from mainnet data. No market route reaches a testnet — one that names a
+   * testnet, or asks for every network with them, is refused below — so only
+   * a governance route evaluates in the testnet storage, for the testnet it
+   * names, and no query string moves a request off the cache every other
+   * request fills.
+   */
   const networkEnvironment = (
-    networkAlias === AllNetworks
-      ? testnet === 'exclude' ? 'mainnet' : 'testnet'
-      : KnownNetwork.isNameOfTestnet(networkAlias) ? 'testnet' : 'mainnet'
+    networkAlias !== AllNetworks && KnownNetwork.isNameOfTestnet(networkAlias) ? 'testnet' : 'mainnet'
   );
 
   const contractSpecifier = rawContractSpecifier === 'all' ? AllContracts : rawContractSpecifier;
@@ -384,6 +403,28 @@ async function unsafeRoute(
 
   if (!isValidResourceAPI(resourceApi)) {
     return new Response(`Error: Not a valid resource API`, { status: 400 });
+  }
+
+  /*
+   * A market path that names no market endpoint is the client's mistake
+   * whatever the registry holds, so it is answered before the registry is
+   * read: a mistyped suffix is a 400 even while the registry is unavailable.
+   */
+  if (resourceApi === 'market' && !isValidMarketEndpointSuffix(strippedEndpointSuffix)) {
+    return new Response(`Error: Not a valid market API endpoint`, { status: 400 });
+  }
+
+  /*
+   * Testnets are not served (testnets.ts): a market route that names one, or
+   * asks for every network with them, is refused before the registry is
+   * read, which has none to answer with.
+   */
+  if (resourceApi === 'market') {
+    if (networkAlias === AllNetworks) {
+      refuseTestnetsParameter(url.searchParams);
+    } else {
+      refuseTestnet(networkAlias);
+    }
   }
 
   /*
@@ -486,10 +527,6 @@ async function unsafeRoute(
     }
     return new Response(`Error: Not a valid governance API endpoint`, { status: 400 });
   }
-}
-
-async function fallthrough() {
-  return new Response('hello, what are you looking for?', { status: 404 });
 }
 
 function isValidResourceAPI(apiRoute: string): apiRoute is ResourceAPI {

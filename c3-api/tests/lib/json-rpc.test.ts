@@ -124,3 +124,102 @@ t.test('a revert is told apart from a node that could not serve the call', async
     t.notOk(jsonRpc.isExecutionReverted(error), JSON.stringify(error));
   }
 });
+
+/*
+ * fetch gives a response the URL it was fetched from; the mock does not, so a
+ * node's answer is given it here.
+ */
+function answerFrom(request: Request, ...response: ConstructorParameters<typeof Response>): Response {
+  return Object.defineProperty(new Response(...response), 'url', { value: request.url });
+}
+
+// what was written to the console, for the length of a test
+function captureConsole(t: { teardown: (fn: () => void) => void }): string[] {
+  const lines: string[] = [];
+  for (const level of [ 'log', 'warn', 'error' ] as const) {
+    const write = console[level];
+    console[level] = (...parameters: unknown[]) => { lines.push(parameters.map(String).join(' ')); };
+    t.teardown(() => { console[level] = write; });
+  }
+  return lines;
+}
+
+/*
+ * The node proxy answers a request it could not serve with a status and a
+ * line of text. The failure says which status, and carries where it came from
+ * only as far as a log may show it: the proxy's key is a segment of the URL.
+ * The library writes nothing itself, so the caller's logger decides where the
+ * failure goes, whatever DEBUG says.
+ */
+t.test('a request the node fails is told by its status, without its key or its answer', async t => {
+  const written  = captureConsole(t);
+  const endpoint = 'https://node-provider.test.local/ethereum-mainnet/node-proxy-key';
+  const call: JsonRpc.Call = { method: 'eth_blockNumber', params: [] };
+  for (const [ status, text ] of [ [ 503, 'upstream error' ], [ 401, 'key not authorized' ] ] as const) {
+    fetch.expect(endpoint, { method: 'POST' }).returns(request => answerFrom(request, text, { status }));
+    const failure = await jsonRpc.postBatch({ endpoint, calls: [ call ] }).then(() => null, (error: Error) => error);
+    t.equal(failure?.message, `JSON-RPC request failed: HTTP ${status}`);
+    t.strictSame(failure?.cause, {
+      url:        'https://node-provider.test.local/ethereum-mainnet/…',
+      status,
+      statusText: '',
+    }, 'the failure carries the origin, the network and the status');
+  }
+  // a single call reads its answer the same way
+  fetch.expect(endpoint, { method: 'POST' }).returns(request => answerFrom(request, 'upstream error', { status: 503 }));
+  await t.rejects(jsonRpc.post({ endpoint, call }), { message: 'JSON-RPC request failed: HTTP 503' });
+  t.strictSame(written, [], 'and nothing is written to the console');
+});
+
+t.test('an answer that is not JSON fails without its body', async t => {
+  const written  = captureConsole(t);
+  const endpoint = 'https://node-provider.test.local/ethereum-mainnet/node-proxy-key';
+  fetch.expect(endpoint, { method: 'POST' })
+    .returns(request => answerFrom(request, '<html>an error page</html>', { status: 200 }));
+  const failure = await jsonRpc.post({ endpoint, call: { method: 'eth_blockNumber', params: [] } })
+    .then(() => null, (error: Error) => error);
+  t.equal(failure?.message, 'Invalid JSON-RPC response: not JSON');
+  t.strictSame(failure?.cause, {
+    url:        'https://node-provider.test.local/ethereum-mainnet/…',
+    status:     200,
+    statusText: '',
+  });
+  t.strictSame(written, [], 'and nothing is written to the console');
+});
+
+/*
+ * A JSON-RPC error can come with an error status. It is still the node's
+ * answer to the call, which the node provider proxy retries or masks call by
+ * call; failing the request for it would fail every other call with it.
+ */
+t.test('a JSON-RPC error answered with an error status is the answer', async t => {
+  const endpoint = 'https://test.local/rpc';
+  const calls: JsonRpc.Call[] = [ { method: 'eth_blockNumber', params: [] }, { method: 'eth_chainId', params: [] } ];
+  const rateLimited = { code: 429, message: 'Your app has exceeded its compute units per second capacity.' };
+  const answers: JsonRpc.Response[] = [
+    { jsonrpc: '2.0', id: 0, result: '0x10' },
+    { jsonrpc: '2.0', id: 1, error: rateLimited },
+  ];
+  fetch.expect(endpoint, { method: 'POST' }).returns(JSON.stringify(answers), { status: 429 });
+  t.strictSame(Fallible.must(await jsonRpc.postBatch({ endpoint, calls })), answers);
+});
+
+/*
+ * A provider's URL has its key where the node proxy has the network, or in
+ * its query: QuickNode leads its path with the token, Alchemy and Infura
+ * follow a version with the key, and Goldsky passes it as a parameter.
+ */
+t.test('a provider URL is told by its origin alone', async t => {
+  const urls = [
+    [ 'https://endpoint-name.quiknode.pro/0123456789abcdef0123456789abcdef01234567/', 'https://endpoint-name.quiknode.pro' ],
+    [ 'https://eth-mainnet.g.alchemy.com/v2/alchemy-key',                            'https://eth-mainnet.g.alchemy.com'  ],
+    [ 'https://mainnet.infura.io/v3/infura-key',                                     'https://mainnet.infura.io'          ],
+    [ 'https://edge.goldsky.com/standard/evm/1?secret=goldsky-key',                  'https://edge.goldsky.com'           ],
+  ] as const;
+  for (const [ endpoint, origin ] of urls) {
+    fetch.expect(endpoint, { method: 'POST' }).returns(request => answerFrom(request, 'bad gateway', { status: 502 }));
+    const failure = await jsonRpc.post({ endpoint, call: { method: 'eth_blockNumber', params: [] } })
+      .then(() => null, (error: Error) => error);
+    t.equal((failure?.cause as { url?: string } | undefined)?.url, origin, endpoint);
+  }
+});

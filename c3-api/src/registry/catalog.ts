@@ -11,45 +11,60 @@ import {
   ERC20,
   PriceFeed,
   StandaloneContract,
+  UntypedContract,
 } from '../../lib/well-known/contracts/types.js';
 
 import {
   Address,
+  AssetDisplayOverrideV1,
   MarketV1,
   NetworkV1,
   PriceExceptionV1,
   PriceFeedV1,
   RegistryAnnotation,
+  RegistryComet,
   RegistrySnapshotV1,
   TokenV1,
   checksumAddress,
-  registryOf,
 } from '../../lib/model/comet-registry.js';
 
 /*
  * The request catalog: one activated snapshot, materialized into the contract
  * objects the existing computations already consume.
  *
- * A computation should not care whether a market came from a static constant
- * or from D1, so the catalog hands out the same `Comet`, `ERC20`, and
- * `PriceFeed` shapes the well-known constants do. What it adds is identity:
- * every lookup is answered from one pinned version, and the version id is
- * available for cache keys, because two versions can describe the same
- * address with different metadata.
+ * The catalog hands out the same `Comet`, `ERC20`, and `PriceFeed` shapes the
+ * well-known constants do, so a computation written against those shapes
+ * reads a market of the registry unchanged. What it adds is the registry's
+ * description of each Comet, which is what a computation reads for anything
+ * the shapes cannot say, and identity: every lookup is answered from one
+ * pinned version, and the version id is available for cache keys, because two
+ * versions can describe the same address with different metadata.
  */
-type RegistryComet = Contract<StandaloneContract<Comet>> & { registry: RegistryAnnotation };
+
+/*
+ * A market of a validated version. Validation refuses one that does not
+ * declare its Comet (comet-contract-declared), so every market the catalog
+ * materializes has one, and is addressed and keyed by it.
+ */
+type ServedMarket = MarketV1 & { contracts: MarketV1['contracts'] & { comet: Address } };
 
 type CatalogMarket = {
   chainId:       number,
   network:       KnownNetwork.Name,
   deploymentKey: string,
-  market:        MarketV1,
+  market:        ServedMarket,
   comet:         RegistryComet,
 };
 
 type Catalog = {
   versionId: string,
   checksum:  string,
+  /*
+   * Until when the catalog describes its version as it applies: the moment
+   * the next price exception it applies expires, or null when none will. A
+   * catalog kept past it would go on applying an exception that has expired.
+   */
+  validUntil: number | null,
   /*
    * What this catalog contributes to a computation's cache key. It is the
    * content checksum, not the version id: re-importing the same markets
@@ -58,12 +73,15 @@ type Catalog = {
    */
   key(): string,
   /*
-   * The same for a computation that reads one network only: the markets it
-   * serves there, by their own keys, and the names the network renames tokens
-   * to. A change on another network, or to how a market is listed, leaves it
-   * alone.
+   * The same for transaction history, which reads one network: what its
+   * items are made of there. That is the tokens the network's markets name,
+   * with the symbol and the scale an amount is read at and the name the
+   * network renames one to, and each market's Comet, rewards contract,
+   * bulker, base token and creation block. A change on another network, or to
+   * anything else about a market — a feed, an exception, a capability, a
+   * label — keeps every page computed so far.
    */
-  keyFor(network: KnownNetwork.Name): string,
+  historyKeyFor(network: KnownNetwork.Name): string,
   /*
    * Markets the API may serve. `enabled` and `deprecated` are readable;
    * `disabled` markets are excluded, because a runtime consumer must not
@@ -71,11 +89,11 @@ type Catalog = {
    */
   markets(): CatalogMarket[],
   discoverable(): CatalogMarket[],
+  // the networks the API serves: those with a market it may resolve
   networks(): NetworkV1[],
   networkOf(network: KnownNetwork.Name): NetworkV1 | null,
   marketAt(network: KnownNetwork.Name, cometAddress: Address): CatalogMarket | null,
   marketsOn(network: KnownNetwork.Name): CatalogMarket[],
-  priceExceptionFor(network: KnownNetwork.Name, priceFeed: Address): PriceExceptionV1 | null,
   defaultMarket(): CatalogMarket | null,
   /*
    * Every token of a version, by network and address: base, collateral, and
@@ -144,8 +162,8 @@ function priceFeed(
 
 /*
  * What identifies a market to a cache: everything the registry says about it
- * that a computation reads, and the exceptions of its network, which decide
- * whether a price is read at all.
+ * that a computation reads, and what the exceptions of its network do to a
+ * price, which decides whether a price is read at all.
  *
  * Left out is what no computation reads, so that changing it does not throw
  * away work that did not depend on it — daily summaries reach back years:
@@ -154,25 +172,44 @@ function priceFeed(
  * - how the website lists the market — its label, slug and section, whether
  *   it opens first — and whether it is served, which decides whether a
  *   computation runs, not what it computes;
+ * - its capabilities, which decide which routes serve it, not what they read;
  * - the contract name, which only governance titles use, uncached;
- * - the base asset's display name.
+ * - the base asset's display name;
+ * - why an exception was added, and until when it applies. An exception that
+ *   expires stops being one of the network's (applicableExceptions), which
+ *   changes the digest when it happens, not when its date is edited.
+ *
+ * Every exception of the network stays in, not only those on the market's
+ * current feeds: a price is read from the feed the Comet names at the block it
+ * is read at, which for a historical block may be one the market has since
+ * moved off.
  *
  * The rewards summary does report the labels, and so keys itself by them.
  */
 function marketDigest(market: MarketV1, priceExceptions: PriceExceptionV1[]): string {
   const {
     id: _id, displayName: _label, slug: _slug, isInstitutional: _section, isDefault: _default,
-    status: _status, contractName: _contract, baseAsset: { displayName: _baseName, ...baseAsset },
+    status: _status, contractName: _contract, capabilities: _capabilities,
+    baseAsset: { displayName: _baseName, ...baseAsset },
     ...identity
   } = market;
-  return keccak256(canonicalJson({ identity: { ...identity, baseAsset }, priceExceptions })).slice(0, 16);
+  const applied = priceExceptions.map(({ provenance: _provenance, expiresAt: _expiresAt, ...exception }) => exception);
+  return keccak256(canonicalJson({ identity: { ...identity, baseAsset }, priceExceptions: applied })).slice(0, 16);
+}
+
+// every market of a validated version passes; this is what says so to the compiler
+function hasComet(market: MarketV1): market is ServedMarket {
+  return market.contracts.comet !== null;
 }
 
 /*
- * One market as the computations see it. A market without a reward feed still
- * has a rewards contract and token, so the shape stays complete; what changes
- * is that its rewards capability is off, and consumers check that rather than
- * inferring it from a missing feed.
+ * One market as the computations see it.
+ *
+ * Its rewards are what the market has, and nothing it does not: the
+ * CometRewards contract where the source declares one, the token it pays
+ * where that contract names one, and the feed that prices the token where
+ * the version states one. A consumer checks for the part it needs, and the
+ * market's capabilities say which of them are usable.
  *
  * The contract keys itself by address and market digest, so two versions that
  * describe the same market share every cached computation of it, and a version
@@ -180,7 +217,7 @@ function marketDigest(market: MarketV1, priceExceptions: PriceExceptionV1[]): st
  */
 function cometOf(
   network: KnownNetwork.Name,
-  market: MarketV1,
+  market: ServedMarket,
   annotation: Omit<RegistryAnnotation, 'digest' | 'market'>,
 ): RegistryComet {
   const block = market.creationBlock;
@@ -192,22 +229,19 @@ function cometOf(
       : { usdPriceFeed: priceFeed(network, market.baseAsset.usdPriceFeed, block) }),
   };
 
-  const rewardToken = market.rewardAsset?.token ?? null;
-  const rewardFeed  = market.rewardAsset?.priceFeed ?? null;
-  const rewards = {
-    asset:     rewardToken === null ? erc20(network, EMPTY_TOKEN, block) : erc20(network, rewardToken, block),
-    contract:  ERC20('CometRewards', {
+  const rewardsContract = market.contracts.rewards;
+  const rewardFeed      = market.rewardAsset?.priceFeed ?? null;
+  const rewards = rewardsContract === null ? undefined : {
+    contract: UntypedContract('CometRewards', {
       network,
-      address:  shown(market.contracts.rewards ?? ZERO_ADDRESS),
-      decimals: 0,
-      block:    { number: block },
-    }) as unknown as Contract<StandaloneContract>,
-    priceFeed: rewardFeed === null
-      ? priceFeed(network, { address: ZERO_ADDRESS, decimals: 8 }, block)
-      : priceFeed(network, rewardFeed, block),
+      address: shown(rewardsContract),
+      block:   { number: block },
+    }),
+    ...(market.rewardAsset === null ? {} : { asset: erc20(network, market.rewardAsset.token, block) }),
+    ...(rewardFeed === null ? {} : { priceFeed: priceFeed(network, rewardFeed, block) }),
   };
 
-  const address = market.contracts.comet ?? ZERO_ADDRESS;
+  const address = market.contracts.comet;
   const digest  = marketDigest(market, annotation.priceExceptions);
   const comet   = Comet({
     network,
@@ -217,7 +251,7 @@ function cometOf(
     aliases:     [] as const,
     block:       { number: block },
     base,
-    rewards,
+    ...(rewards === undefined ? {} : { rewards }),
   });
 
   return Object.assign(comet as unknown as Contract<StandaloneContract<Comet>>, {
@@ -225,12 +259,6 @@ function cometOf(
     key:      () => `${address}@${digest}`,
   });
 }
-
-const ZERO_ADDRESS: Address = '0x0000000000000000000000000000000000000000';
-
-// stands in for a reward token a market does not have, so the contract shape
-// stays uniform; capabilities.rewards is what says whether it is usable
-const EMPTY_TOKEN: TokenV1 = { address: ZERO_ADDRESS, symbol: 'NONE', name: 'No reward token', decimals: 0 };
 
 /*
  * The exceptions of a network that still apply.
@@ -244,19 +272,63 @@ const EMPTY_TOKEN: TokenV1 = { address: ZERO_ADDRESS, symbol: 'NONE', name: 'No 
  */
 function applicableExceptions(exceptions: PriceExceptionV1[], now: number): PriceExceptionV1[] {
   return exceptions.filter(exception => {
-    if (exception.expiresAt === null) {
-      return true;
-    }
-    const expiresAt = Date.parse(exception.expiresAt);
-    /*
-     * Compared as instants, never as strings: an overlay may state an expiry
-     * in any form Date.parse accepts, and "2026-09-21T13:00:00+02:00" sorts
-     * after the same moment written in Z. An expiry that cannot be parsed at
-     * all is treated as expired, because an exception nobody can date is not
-     * one to keep suppressing a live feed with.
-     */
-    return Number.isFinite(expiresAt) && expiresAt > now;
+    const expiresAt = expiryOf(exception);
+    return expiresAt === null || expiresAt > now;
   });
+}
+
+/*
+ * When an exception stops applying, as an instant, or null when it does not
+ * expire. Compared as instants, never as strings: a version stored before
+ * expiries were normalized may state one with an offset, and
+ * "2026-09-21T13:00:00+02:00" sorts after the same moment written in Z. An
+ * expiry that cannot be parsed at all is treated as long past, because an
+ * exception nobody can date is not one to keep suppressing a live feed with.
+ */
+function expiryOf(exception: PriceExceptionV1): number | null {
+  if (exception.expiresAt === null) {
+    return null;
+  }
+  const expiresAt = Date.parse(exception.expiresAt);
+  return Number.isFinite(expiresAt) ? expiresAt : Number.NEGATIVE_INFINITY;
+}
+
+// every token a market names: its base asset, the token it pays, and its collateral
+function tokensOf(market: MarketV1): TokenV1[] {
+  return [
+    market.baseAsset.token,
+    ...(market.rewardAsset === null ? [] : [ market.rewardAsset.token ]),
+    ...market.collateralAssets.map(asset => asset.token),
+  ];
+}
+
+/*
+ * The tokens a network's presentation renames where they keep their own
+ * address; a token presented as the chain's own token is shown, not renamed.
+ */
+function renamesOf(network: NetworkV1): AssetDisplayOverrideV1[] {
+  return network.presentation.assetDisplayOverrides.filter(override => override.displayAddress === override.tokenAddress);
+}
+
+/*
+ * What transaction history reads of one network, as a digest. An item names
+ * a token by address and an amount in its scale, so a token counts by its
+ * address, symbol and decimals, and by the name the network renames it to;
+ * a market counts by the contracts its events and claims come from, the
+ * bulker that makes a transaction a bulk one, its base token, and the block
+ * its history starts at. Nothing else a version says about a market reaches a
+ * history item.
+ */
+function historyKeyOf(network: NetworkV1, served: ServedMarket[]): string {
+  const markets = served
+    .map(market => [
+      market.contracts.comet, market.contracts.rewards, market.contracts.bulker,
+      market.baseAsset.token.address, market.creationBlock,
+    ].join(':'))
+    .sort();
+  const tokens = [ ...new Set(served.flatMap(tokensOf).map(token => `${token.address}:${token.symbol}:${token.decimals}`)) ].sort();
+  const renames = renamesOf(network).map(override => `${override.tokenAddress}=${override.symbol}`).sort();
+  return keccak256(canonicalJson({ markets, tokens, renames })).slice(0, 16);
 }
 
 /*
@@ -278,8 +350,10 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
    */
   const byComet = new Map<string, CatalogMarket>();
   const byNetworkMarkets = new Map<string, CatalogMarket[]>();
-  // the exceptions of each network that have not expired
-  const byException = new Map<string, PriceExceptionV1[]>();
+  // the expiries still to come, each of which changes what the catalog applies
+  const expiries: number[] = [];
+  // what transaction history reads of each network, which its cache key is made of
+  const historyKeys = new Map<string, string>();
 
   for (const network of snapshot.networks) {
     const name = networkName(network);
@@ -287,14 +361,23 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
       // a network this API cannot name is not one it can serve
       continue;
     }
+    /*
+     * A disabled market is not served: the version keeps it for diagnostics,
+     * and nothing the API serves may resolve through it, its tokens included.
+     * A network whose every market is disabled serves nothing — a chain the
+     * source has just added arrives that way, with nothing about it reviewed
+     * — and is not a network the catalog offers.
+     */
+    const served = network.markets.filter(market => market.status !== 'disabled').filter(hasComet);
+    if (served.length === 0) {
+      continue;
+    }
     networks.push(network);
+    historyKeys.set(name, historyKeyOf(network, served));
     const exceptions = applicableExceptions(network.priceExceptions, asOf);
-    byException.set(name, exceptions);
+    expiries.push(...exceptions.map(expiryOf).filter((expiry): expiry is number => expiry !== null));
 
-    for (const market of network.markets) {
-      if (market.status === 'disabled') {
-        continue;
-      }
+    for (const market of served) {
       const comet = cometOf(name, market, {
         versionId:       snapshot.registryVersion.id,
         chainId:         network.chainId,
@@ -309,52 +392,28 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
         comet,
       };
       markets.push(entry);
-      const served = byNetworkMarkets.get(name) ?? [];
-      served.push(entry);
-      byNetworkMarkets.set(name, served);
-      if (market.contracts.comet !== null) {
-        byComet.set(`${name}:${market.contracts.comet}`, entry);
-      }
-
-      /*
-       * A disabled market contributes no tokens either: the version keeps it
-       * for diagnostics, and nothing the API serves may resolve through it.
-       */
-      for (const token of [
-        market.baseAsset.token,
-        ...(market.rewardAsset === null ? [] : [ market.rewardAsset.token ]),
-        ...market.collateralAssets.map(asset => asset.token),
-      ]) {
+      byNetworkMarkets.set(name, [ ...(byNetworkMarkets.get(name) ?? []), entry ]);
+      byComet.set(`${name}:${market.contracts.comet}`, entry);
+      for (const token of tokensOf(market)) {
         tokens.set(`${name}:${token.address}`, token);
       }
-      if (market.contracts.comet !== null) {
-        bases.set(`${name}:${market.contracts.comet}`, market.baseAsset.token);
-      }
+      bases.set(`${name}:${market.contracts.comet}`, market.baseAsset.token);
     }
   }
 
   const byNetwork = new Map<string, NetworkV1>(networks.map(network => [ network.key, network ]));
 
-  const renamed = new Map<string, string>(networks.flatMap(network => network.presentation.assetDisplayOverrides
-    .filter(override => override.displayAddress === override.tokenAddress)
+  const renamed = new Map<string, string>(networks.flatMap(network => renamesOf(network)
     .map(override => [ `${network.key}:${override.tokenAddress}`, override.symbol ] as const)));
 
-  const networkKeys = new Map<string, string>(networks.map(network => {
-    const served  = (byNetworkMarkets.get(network.key as KnownNetwork.Name) ?? []).map(entry => entry.comet.key()).sort();
-    const renames = network.presentation.assetDisplayOverrides
-      .filter(override => override.displayAddress === override.tokenAddress)
-      .map(override => `${override.tokenAddress}=${override.symbol}`)
-      .sort();
-    return [ network.key, keccak256(canonicalJson({ served, renames })).slice(0, 16) ];
-  }));
-
   return {
-    versionId: snapshot.registryVersion.id,
-    checksum:  snapshot.registryVersion.checksum,
-    key:       () => `registry:${snapshot.registryVersion.checksum.slice(0, 16)}`,
-    keyFor:    network => `registry:${network}:${networkKeys.get(network) ?? 'none'}`,
-    markets:   () => markets,
-    networks:  () => networks,
+    versionId:     snapshot.registryVersion.id,
+    checksum:      snapshot.registryVersion.checksum,
+    validUntil:    expiries.length === 0 ? null : Math.min(...expiries),
+    key:           () => `registry:${snapshot.registryVersion.checksum.slice(0, 16)}`,
+    historyKeyFor: network => `registry:${network}:${historyKeys.get(network) ?? 'none'}`,
+    markets:       () => markets,
+    networks:      () => networks,
     tokenAt:     (network, address) => tokens.get(`${network}:${address.toLowerCase()}`) ?? null,
     baseTokenAt: (network, address) => bases.get(`${network}:${address.toLowerCase()}`) ?? null,
     renamedSymbolAt: (network, address) => renamed.get(`${network}:${address.toLowerCase()}`) ?? null,
@@ -363,10 +422,6 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
     networkOf:    network => byNetwork.get(network) ?? null,
     marketsOn:    network => byNetworkMarkets.get(network) ?? [],
     marketAt:     (network, cometAddress) => byComet.get(`${network}:${cometAddress.toLowerCase()}`) ?? null,
-    priceExceptionFor(network, feedAddress) {
-      const feed = feedAddress.toLowerCase();
-      return byException.get(network)?.find(exception => exception.priceFeedAddress === feed) ?? null;
-    },
     /*
      * The default is a market the API offers, so a deprecated one is not it,
      * for the same reason it is not discoverable: the unique index that keeps
@@ -376,5 +431,5 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
   };
 }
 
-export type { Catalog, CatalogMarket, RegistryComet };
-export { ZERO_ADDRESS, catalogOf, marketDigest, registryOf };
+export type { Catalog, CatalogMarket, RegistryComet, ServedMarket };
+export { catalogOf };

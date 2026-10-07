@@ -57,11 +57,28 @@ type MarketOverlay = {
   rewardPriceFeed: { address: Address, quote: PriceQuote } | null,
 };
 
+/*
+ * A price exception as an overlay states it. A remap names the feed to read
+ * instead and never its scale: enrichment reads the decimals from that feed,
+ * so a reviewer cannot state a scale the chain disagrees with, and the wire
+ * shape, which carries them, is assembled once they are read.
+ */
+type OverlayPriceException = (
+  | Exclude<PriceExceptionV1, { kind: 'deprecated_price_remap' }>
+  | {
+      kind:                        'deprecated_price_remap',
+      priceFeedAddress:            Address,
+      replacementPriceFeedAddress: Address,
+      provenance:                  string,
+      expiresAt:                   string | null,
+    }
+);
+
 type NetworkOverlay = {
   displayName:               string,
   assetDisplayOverrides:     AssetDisplayOverrideV1[],
   unwrappedCollateralAssets: UnwrappedCollateralAssetV1[],
-  priceExceptions:           PriceExceptionV1[],
+  priceExceptions:           OverlayPriceException[],
 };
 
 const MAX_TEXT      = 200;
@@ -125,14 +142,58 @@ function array(value: unknown, scope: string): unknown[] {
   return value;
 }
 
+/*
+ * An instant as RFC 3339 writes one: a calendar date, a time of day, and the
+ * offset that places them. Anything looser names a different moment depending
+ * on who reads it — Date.parse takes "1" for the year 2001 and a time without
+ * an offset as the reader's local time, which in a Worker is UTC and in Node
+ * is the machine's zone — and a date the calendar does not have, such as 30
+ * February, is not rolled over into March.
+ */
+const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|[+-](\d{2}):(\d{2}))$/;
+
+function instantOf(value: string): number | null {
+  const match = RFC3339.exec(value);
+  if (match === null) {
+    return null;
+  }
+  const [ year, month, day, hour, minute, second ] = match.slice(1, 7).map(Number) as [ number, number, number, number, number, number ];
+  // setUTCFullYear takes the years 0 to 99 as written, where Date.UTC reads them as 1900 to 1999
+  const stated = new Date(0);
+  stated.setUTCFullYear(year, month - 1, day);
+  stated.setUTCHours(hour, minute, second);
+  const exists = stated.getUTCFullYear() === year && stated.getUTCMonth() === month - 1 && stated.getUTCDate() === day
+    && stated.getUTCHours() === hour && stated.getUTCMinutes() === minute && stated.getUTCSeconds() === second;
+  const offset = match[7] === undefined || (Number(match[7]) <= 23 && Number(match[8]) <= 59);
+  const instant = Date.parse(value.toUpperCase());
+  return exists && offset && Number.isFinite(instant) ? instant : null;
+}
+
+// the first and the last instant RFC 3339 writes in UTC, whose years have four digits
+const FIRST_INSTANT = Date.parse('0000-01-01T00:00:00.000Z');
+const LAST_INSTANT  = Date.parse('9999-12-31T23:59:59.999Z');
+
+/*
+ * An expiry is stored as the UTC instant it names, so two spellings of one
+ * moment are one decision and one digest. What is stored is read back through
+ * this parser, so it has to be an instant RFC 3339 writes in UTC: one past
+ * either end of those years — which an offset can name, and a version stored
+ * before this rule can hold — is stored as the nearest one it writes, which is
+ * just as long past or just as far off.
+ */
+function storedInstant(instant: number): string {
+  return new Date(Math.min(Math.max(instant, FIRST_INSTANT), LAST_INSTANT)).toISOString();
+}
+
 function timestamp(value: unknown, scope: string): string | null {
   if (value === null) {
     return null;
   }
-  if (typeof(value) !== 'string' || Number.isNaN(Date.parse(value))) {
-    fail(`${scope} must be an ISO-8601 timestamp or null`, scope);
+  const instant = typeof(value) === 'string' ? instantOf(value) : null;
+  if (instant === null) {
+    fail(`${scope} must be null or an RFC 3339 timestamp with its offset, such as 2027-01-01T00:00:00Z`, scope);
   }
-  return value;
+  return storedInstant(instant);
 }
 
 function unique<T>(entries: T[], key: (entry: T) => string, scope: string): T[] {
@@ -144,7 +205,7 @@ function unique<T>(entries: T[], key: (entry: T) => string, scope: string): T[] 
   return [ ...entries ].sort((left, right) => key(left) < key(right) ? -1 : key(left) > key(right) ? 1 : 0);
 }
 
-function parsePriceException(value: unknown, scope: string): PriceExceptionV1 {
+function parsePriceException(value: unknown, scope: string): OverlayPriceException {
   const kind = member((value as { kind?: unknown })?.kind, EXCEPTION_KINDS, `${scope}.kind`);
   switch (kind) {
     case 'zero_price': {
@@ -180,17 +241,12 @@ function parsePriceException(value: unknown, scope: string): PriceExceptionV1 {
       if (replaced === replacement) {
         fail(`${scope} remaps a feed onto itself`, scope);
       }
-      /*
-       * The overlay never carries feed decimals: enrichment reads them from
-       * the replacement feed, so a reviewer cannot state a scale the chain
-       * disagrees with. The placeholder is replaced in applyNetworkOverlay.
-       */
       return {
         kind,
-        priceFeedAddress:     replaced,
-        replacementPriceFeed: { address: replacement, decimals: -1 },
-        provenance:           text(entry.provenance, `${scope}.provenance`, { max: MAX_PROVENANCE }),
-        expiresAt:            timestamp(entry.expiresAt, `${scope}.expiresAt`),
+        priceFeedAddress:            replaced,
+        replacementPriceFeedAddress: replacement,
+        provenance:                  text(entry.provenance, `${scope}.provenance`, { max: MAX_PROVENANCE }),
+        expiresAt:                   timestamp(entry.expiresAt, `${scope}.expiresAt`),
       };
     }
   }
@@ -342,9 +398,9 @@ function overlayFeedAddresses(overlay: MarketOverlay): Address[] {
 }
 
 function networkOverlayFeedAddresses(overlay: NetworkOverlay): Address[] {
-  return overlay.priceExceptions
-    .filter(exception => exception.kind === 'deprecated_price_remap')
-    .map(exception => (exception as { replacementPriceFeed: PriceFeedV1 }).replacementPriceFeed.address);
+  return overlay.priceExceptions.flatMap(exception => (
+    exception.kind === 'deprecated_price_remap' ? [ exception.replacementPriceFeedAddress ] : []
+  ));
 }
 
 function feedOf(feeds: Map<Address, PriceFeedV1>, address: Address, scope: string): PriceFeedV1 {
@@ -427,8 +483,14 @@ function applyNetworkOverlay(
       assetDisplayOverrides:     overlay.assetDisplayOverrides,
       unwrappedCollateralAssets: overlay.unwrappedCollateralAssets,
     },
-    priceExceptions: overlay.priceExceptions.map(exception => exception.kind === 'deprecated_price_remap'
-      ? { ...exception, replacementPriceFeed: feedOf(feeds, exception.replacementPriceFeed.address, scope) }
+    priceExceptions: overlay.priceExceptions.map((exception): PriceExceptionV1 => exception.kind === 'deprecated_price_remap'
+      ? {
+          kind:                 exception.kind,
+          priceFeedAddress:     exception.priceFeedAddress,
+          replacementPriceFeed: feedOf(feeds, exception.replacementPriceFeedAddress, scope),
+          provenance:           exception.provenance,
+          expiresAt:            exception.expiresAt,
+        }
       : exception),
     markets: [ ...markets ].sort((left, right) => (
       left.creationBlock - right.creationBlock
@@ -495,7 +557,7 @@ function provisionalNetworkOverlay(canonicalName: string): NetworkOverlay {
   };
 }
 
-export type { MarketOverlay, NetworkOverlay };
+export type { MarketOverlay, NetworkOverlay, OverlayPriceException };
 
 export {
   applyMarketOverlay,
@@ -509,4 +571,5 @@ export {
   parseNetworkOverlay,
   provisionalMarketOverlay,
   provisionalNetworkOverlay,
+  storedInstant,
 };

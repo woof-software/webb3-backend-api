@@ -33,6 +33,14 @@ namespace_id = "4001"
 limit = 30
 period = 60
 
+[[ratelimits]]
+name = "REGISTRY_ADMIN_AUTH_RATE_LIMITER"
+namespace_id = "4002"
+
+[ratelimits.simple]
+limit = 60
+period = 60
+
 [[services]]
 binding = "node_provider_proxy"
 service = "woof-node-provider-proxy"

@@ -21,11 +21,20 @@ function equalsFixedTime(left: string, right: string): boolean {
   return difference === 0;
 }
 
+/*
+ * A 401 names the scheme that would be accepted, as RFC 9110 requires of it,
+ * and says when the token that was presented is the problem (RFC 6750): a
+ * client is told what to send rather than only that it was refused.
+ */
+function unauthorized(message: string, challenge: string): ApiError {
+  return new ApiError('UNAUTHORIZED', message, undefined, { 'WWW-Authenticate': challenge });
+}
+
 function bearerToken(request: Request): string {
   const header = request.headers.get('authorization') ?? '';
   const [ scheme, token ] = header.split(' ');
   if (scheme?.toLowerCase() !== 'bearer' || token === undefined || token.length === 0) {
-    throw new ApiError('UNAUTHORIZED', `a bearer token is required`);
+    throw unauthorized(`a bearer token is required`, 'Bearer');
   }
   return token;
 }
@@ -52,10 +61,10 @@ async function authenticateAdmin(request: Request, tokenHash: string | undefined
   }
   const presented = await sha256Hex(bearerToken(request));
   if (!equalsFixedTime(presented, tokenHash.toLowerCase())) {
-    throw new ApiError('UNAUTHORIZED', `the bearer token is not valid`);
+    throw unauthorized(`the bearer token is not valid`, 'Bearer error="invalid_token"');
   }
   return { fingerprint: presented.slice(0, FINGERPRINT_LENGTH) };
 }
 
 export type { Credential };
-export { authenticateAdmin, bearerToken, equalsFixedTime, sha256Hex };
+export { authenticateAdmin, sha256Hex };

@@ -1,5 +1,7 @@
 import t from 'tap';
 
+import { randomUUID } from 'node:crypto';
+
 import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
@@ -145,4 +147,36 @@ t.test('the apply route takes a digest and a reason, and an open candidate only'
   await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
   await markValidated(db, versionId, await snapshotChecksum(loadRegistrySnapshotFixture().networks));
   t.equal((await apply(versionId, { reason: 'too late', digest })).status, 409, 'a validated version can no longer be changed');
+});
+
+/*
+ * The proposal is the first review of an environment, derived from the
+ * constants. Once a version has been switched on, the decisions live in the
+ * registry and every draft inherits them: applying the proposal to a draft
+ * would put the constants' values back over everything reviewed since — a
+ * renamed market, a disabled one, an exception added — and its review would
+ * call them what the API acts on today.
+ */
+t.test('the proposal is for an environment no version has been switched on in', async t => {
+  const { db, versionId } = await unreviewedCandidate();
+  const { digest } = await (await server.fetch(`/registry/v1/admin/versions/${versionId}/proposal`, { headers: auth })).json() as Proposal;
+
+  const { versionId: on } = await seedCandidate(db, loadRegistrySnapshotFixture(), { versionId: randomUUID(), attempt: 2 });
+  await recordValidationResults(db, on, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
+  await markValidated(db, on, await snapshotChecksum(loadRegistrySnapshotFixture().networks));
+  const activated = await server.fetch(`/registry/v1/admin/versions/${on}/activate`, {
+    method:  'POST',
+    headers: { ...auth, 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ reason: 'the environment is up' }),
+  });
+  t.equal(activated.status, 200, 'a version is switched on');
+
+  for (const route of [ 'proposal', 'proposal/review' ]) {
+    const answer = await server.fetch(`/registry/v1/admin/versions/${versionId}/${route}`, { headers: auth });
+    t.equal(answer.status, 409, `${route} is refused from then on`);
+  }
+  const applied = await apply(versionId, { reason: 'too late', digest });
+  t.equal(applied.status, 409, 'and so is applying it');
+  t.match((await applied.json() as { error: { message: string } }).error.message, /first version/, 'saying what it is for');
+  t.same((await readUnreviewed(db, versionId)).networks, [ 1, 8453, 534352 ], 'with nothing written');
 });

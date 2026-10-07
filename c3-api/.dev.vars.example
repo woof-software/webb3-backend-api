@@ -10,7 +10,9 @@
 
 # node-provider-proxy used for every JSON-RPC call, as
 # https://<NODE_PROXY_HOST>/<network>/<NODE_PROXY_KEY>; the host has no scheme
-# and the key may be empty
+# and the key may be empty. `npm start` reads the chain through the deployed
+# proxy these name; with wrangler.local-proxy.toml, which binds the proxy run
+# on this machine instead, leave them unset (README.md, Getting Started)
 # NODE_PROXY_HOST=
 # NODE_PROXY_KEY=
 
@@ -24,6 +26,14 @@
 # never the token itself
 # COMET_REGISTRY_ADMIN_TOKEN_HASH=
 
-# Optional GitHub token for reading the Comet repository with a higher API
-# rate limit
+# Optional name the registry records as the actor of every administrative
+# change: activations and rollbacks, overlay events, and the syncs it asks
+# for. Unset, it is registry-admin:<ENVIRONMENT>
+# COMET_REGISTRY_ADMIN_ACTOR=
+
+# GitHub token the registry import reads the Comet repository with: optional
+# here, required in stage and production. Without one GitHub allows 60 API
+# requests an hour per address, which a Worker shares with every other Worker
+# leaving Cloudflare through it. A fine-grained token with read-only access
+# to public repositories, and no other permission, is enough
 # COMET_GITHUB_TOKEN=

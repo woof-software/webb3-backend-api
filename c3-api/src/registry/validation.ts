@@ -1,9 +1,21 @@
 import {
   MarketV1,
   NetworkV1,
+  marketKey,
 } from '../../lib/model/comet-registry.js';
 
-import type { MarketEnrichment } from './enrichment.js';
+import { orderNetworks } from './overlay.js';
+import {
+  Condition,
+  both,
+  endCandidateStatement,
+  readRevision,
+  readSnapshot,
+  readUnreviewed,
+  snapshotChecksum,
+  unchanged,
+  validationResultsStatement,
+} from './repository.js';
 
 /*
  * Candidate validation. Every invariant that cannot be expressed as a column
@@ -11,9 +23,11 @@ import type { MarketEnrichment } from './enrichment.js';
  * validated only when the latest attempt passes completely, and an invalid
  * candidate keeps its diagnostics for review.
  *
- * Checks are pure and operate on the assembled snapshot, so the same function
- * decides a scheduled import and answers an operator asking why a candidate
- * failed.
+ * Checks are pure and operate on the stored snapshot, read back from its
+ * rows, so the same pass decides a scheduled import and answers an operator
+ * asking why a candidate failed. What the chain says about a market is not a
+ * check: a market the chain cannot confirm fails its import instead, before
+ * anything about it is written.
  */
 type CheckResult = {
   check_name: string,
@@ -25,22 +39,24 @@ type CheckResult = {
 type CandidateInput = {
   networks: NetworkV1[],
   /*
-   * What the run checkpointed, so a candidate assembled from an incomplete
-   * import cannot validate. A root that exhausted its retries stops being
-   * outstanding work, but the market it describes is still missing.
+   * The roots the run checkpointed, so a candidate assembled from an
+   * incomplete import cannot validate. A root that exhausted its retries
+   * stops being outstanding work, but the market it describes is still
+   * missing.
    */
-  roots?: { expected: number, imported: number },
+  roots?: Array<{ upstreamNetworkKey: string, deploymentKey: string }>,
+  /*
+   * The networks nobody has reviewed, by chain id: those an import wrote for
+   * a chain no version described yet, under its provisional overlay.
+   */
+  unreviewedNetworks?: number[],
 };
 
-type MarketImportInput = {
-  chainId:       number,
-  deploymentKey: string,
-  market:        MarketV1,
-  enrichment:    MarketEnrichment,
-};
+// the check that every root the run checkpointed produced a market
+const ALL_ROOTS_CHECK = 'all-roots-imported';
 
 function marketScope(network: NetworkV1, market: MarketV1): string {
-  return `market:${network.chainId}/${market.deploymentKey}`;
+  return `market:${marketKey(network.chainId, market.deploymentKey)}`;
 }
 
 function check(
@@ -53,53 +69,6 @@ function check(
     ? { check_name, scope, passed: passed ? 1 : 0 }
     : { check_name, scope, passed: 0, details };
 }
-
-/*
- * The checks that need what the chain just said. They run while a market is
- * being imported, because afterwards only the stored rows remain, and
- * comparing those with themselves would assure nothing.
- */
-function validateMarketImport({ chainId, deploymentKey, market, enrichment }: MarketImportInput): CheckResult[] {
-  const scope = `market:${chainId}/${deploymentKey}`;
-  return [
-    /*
-     * A market the registry cannot fully read is not a market it can serve,
-     * so a declared contract without bytecode fails the import rather than
-     * silently dropping the role.
-     */
-    check(
-      'market-contracts-deployed',
-      scope,
-      enrichment.missingContracts.length === 0,
-      { missingContracts: enrichment.missingContracts },
-    ),
-    // the reward token is the one the rewards contract names, not a reviewed one
-    check(
-      'reward-token-matches-chain',
-      scope,
-      (market.rewardAsset?.token.address ?? null) === (enrichment.rewardToken?.address ?? null),
-      { market: market.rewardAsset?.token.address ?? null, chain: enrichment.rewardToken?.address ?? null },
-    ),
-    check(
-      'base-asset-matches-chain',
-      scope,
-      market.baseAsset.token.address === enrichment.baseToken.address
-        && market.baseAsset.priceFeed.address === enrichment.basePriceFeed.address,
-      { market: market.baseAsset.token.address, chain: enrichment.baseToken.address },
-    ),
-  ];
-}
-
-/*
- * The names of those checks. A candidate is validated against its stored rows
- * long after the chain answered, so what the chain said is carried forward
- * from the attempt that heard it rather than dropped.
- */
-const IMPORT_CHECKS = [
-  'market-contracts-deployed',
-  'reward-token-matches-chain',
-  'base-asset-matches-chain',
-] as const;
 
 function validateMarket(network: NetworkV1, market: MarketV1): CheckResult[] {
   const scope   = marketScope(network, market);
@@ -155,6 +124,17 @@ function validateMarket(network: NetworkV1, market: MarketV1): CheckResult[] {
     !market.capabilities.rewards || (reward !== null && reward.priceFeed !== null),
     { rewards: market.capabilities.rewards, priceFeed: reward?.priceFeed ?? null },
   ));
+  /*
+   * What an account is owed is read from the rewards contract, in the token
+   * it pays, and nothing stands in for either where a market lacks it: a
+   * market whose account rewards are served must have both.
+   */
+  results.push(check(
+    'account-rewards-have-token',
+    scope,
+    !market.capabilities.accountRewards || (market.contracts.rewards !== null && reward !== null),
+    { accountRewards: market.capabilities.accountRewards, rewards: market.contracts.rewards, token: reward?.token.address ?? null },
+  ));
 
   const indices = market.collateralAssets.map(asset => asset.assetIndex);
   results.push(check(
@@ -205,11 +185,23 @@ function validateMarket(network: NetworkV1, market: MarketV1): CheckResult[] {
   return results;
 }
 
-function validateNetwork(network: NetworkV1): CheckResult[] {
+function validateNetwork(network: NetworkV1, reviewed: boolean): CheckResult[] {
   const scope   = `network:${network.chainId}`;
   const results: CheckResult[] = [];
 
   results.push(check('network-has-markets', scope, network.markets.length > 0));
+
+  /*
+   * A network that serves a market is offered under its name and its
+   * presentation, so someone has to have decided them: one nobody reviewed
+   * carries the provisional overlay — its canonical name, nothing presented,
+   * no exceptions. A network whose every market is disabled serves nothing
+   * and is not listed, so it needs no decision yet: a chain the source has
+   * just added arrives that way, and does not hold the rest of the version
+   * back.
+   */
+  const served = network.markets.filter(market => market.status !== 'disabled').map(market => market.deploymentKey);
+  results.push(check('served-network-reviewed', scope, reviewed || served.length === 0, { served }));
 
   const deploymentKeys = network.markets.map(market => market.deploymentKey);
   results.push(check(
@@ -244,21 +236,6 @@ function validateNetwork(network: NetworkV1): CheckResult[] {
     { listingKeys: listingKeys.filter((key, index) => listingKeys.indexOf(key) !== index) },
   ));
 
-  /*
-   * A remap must name a feed that answers, which enrichment proves by having
-   * read its decimals. The placeholder decimals of an unresolved remap are
-   * negative.
-   */
-  const unreadable = network.priceExceptions.filter(
-    exception => exception.kind === 'deprecated_price_remap' && exception.replacementPriceFeed.decimals < 0
-  );
-  results.push(check(
-    'price-exception-feeds-readable',
-    scope,
-    unreadable.length === 0,
-    { unreadable: unreadable.map(exception => exception.priceFeedAddress) },
-  ));
-
   // markets are served in this order, so the snapshot must already be sorted
   const ordered = [ ...network.markets ].sort((left, right) => (
     left.creationBlock - right.creationBlock
@@ -277,18 +254,29 @@ function validateNetwork(network: NetworkV1): CheckResult[] {
  * Every check of one candidate. The caller persists the results and uses
  * hasFailures to decide between validated and invalid.
  */
-function validateCandidate({ networks, roots }: CandidateInput): CheckResult[] {
+function validateCandidate({ networks, roots, unreviewedNetworks = [] }: CandidateInput): CheckResult[] {
   const results: CheckResult[] = [];
 
   results.push(check('networks-present', 'global', networks.length > 0));
 
   if (roots !== undefined) {
-    // every root the run discovered must have produced a market
+    /*
+     * Every root the run checkpointed must have produced a market. Roots are
+     * matched with the markets the candidate holds, not counted: a count of
+     * finished checkpoints says what the run did, and only the rows say what
+     * the candidate is.
+     */
+    const held = new Set(networks.flatMap(network => network.markets.map(
+      market => `${network.upstreamKey}/${market.deploymentKey}`,
+    )));
+    const missing = roots
+      .map(root => `${root.upstreamNetworkKey}/${root.deploymentKey}`)
+      .filter(root => !held.has(root));
     results.push(check(
-      'all-roots-imported',
+      ALL_ROOTS_CHECK,
       'global',
-      roots.imported === roots.expected,
-      { expected: roots.expected, imported: roots.imported },
+      missing.length === 0,
+      { expected: roots.length, imported: roots.length - missing.length, missing },
     ));
   }
 
@@ -308,12 +296,12 @@ function validateCandidate({ networks, roots }: CandidateInput): CheckResult[] {
 
   const defaults = networks.flatMap(network => network.markets
     .filter(market => market.isDefault)
-    .map(market => `${network.chainId}/${market.deploymentKey}`));
+    .map(market => marketKey(network.chainId, market.deploymentKey)));
   // exactly one market opens by default across the whole registry
   results.push(check('single-default-market', 'global', defaults.length === 1, { defaults }));
 
   for (const network of networks) {
-    results.push(...validateNetwork(network));
+    results.push(...validateNetwork(network, !unreviewedNetworks.includes(network.chainId)));
     for (const market of network.markets) {
       results.push(...validateMarket(network, market));
     }
@@ -330,12 +318,82 @@ function failures(results: CheckResult[]): CheckResult[] {
   return results.filter(result => result.passed === 0);
 }
 
-export type { CandidateInput, CheckResult, MarketImportInput };
+/*
+ * A stored candidate, checked: every check over its rows, the attempt the
+ * results are to be recorded as, and the revision the candidate was read at.
+ * Nothing is written here; verdictStatements writes it.
+ *
+ * The scheduled import and an operator's validate both decide a candidate
+ * this way, so the two cannot drift apart in what they read or record.
+ */
+type Verdict = {
+  versionId: string,
+  attempt:   number,
+  revision:  number,
+  results:   CheckResult[],
+  // the snapshot checksum, when every check passed
+  checksum:  string | null,
+  // every root the run checkpointed produced a market
+  complete:  boolean,
+};
+
+async function judgeVersion(
+  db: D1Database,
+  versionId: string,
+  roots: NonNullable<CandidateInput['roots']> | null,
+): Promise<Verdict> {
+  // read before the rows, so an overlay written while they are read moves it past them
+  const { revision, attempt } = await readRevision(db, versionId);
+  const [ snapshot, unreviewed ] = await Promise.all([ readSnapshot(db, versionId), readUnreviewed(db, versionId) ]);
+  const networks = orderNetworks(snapshot);
+  const results  = validateCandidate({
+    networks,
+    unreviewedNetworks: unreviewed.networks,
+    ...(roots === null ? {} : { roots }),
+  });
+  return {
+    versionId,
+    attempt:  attempt + 1,
+    revision,
+    results,
+    checksum: hasFailures(results) ? null : await snapshotChecksum(networks),
+    complete: !results.some(result => result.check_name === ALL_ROOTS_CHECK && result.passed === 0),
+  };
+}
+
+/*
+ * What a verdict decides, as statements to commit in one transaction: the
+ * attempt's results and, unless the candidate is held for review, the status
+ * they decide. Both require `when` — that whoever decides it still may — and
+ * the candidate to be at the revision it was checked at: checks of rows an
+ * overlay has since changed are not recorded, and no status is decided by
+ * them.
+ */
+function verdictStatements(
+  db: D1Database,
+  verdict: Verdict,
+  options: { hold: boolean, when: Condition, at: string },
+): D1PreparedStatement[] {
+  const condition = both(options.when, unchanged(verdict.versionId, verdict.revision));
+  return [
+    validationResultsStatement(db, verdict.versionId, verdict.attempt, verdict.results, options.at, condition),
+    ...(options.hold ? [] : [ endCandidateStatement(
+      db,
+      verdict.versionId,
+      verdict.checksum === null ? { status: 'invalid' } : { status: 'validated', checksum: verdict.checksum },
+      options.at,
+      condition,
+    ) ]),
+  ];
+}
+
+export type { CandidateInput, CheckResult, Verdict };
 
 export {
-  IMPORT_CHECKS,
+  ALL_ROOTS_CHECK,
   failures,
   hasFailures,
+  judgeVersion,
   validateCandidate,
-  validateMarketImport,
+  verdictStatements,
 };

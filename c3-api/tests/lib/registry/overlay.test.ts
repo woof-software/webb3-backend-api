@@ -1,6 +1,9 @@
 import t from 'tap';
 
+import type { Address, PriceFeedV1 } from '../../../lib/model/comet-registry.js';
+
 import {
+  applyNetworkOverlay,
   overlayDigest,
   parseMarketOverlay,
   parseNetworkOverlay,
@@ -133,10 +136,33 @@ t.test('a network overlay is normalized and duplicate-free', async t => {
       { kind: 'deprecated_price_remap', priceFeedAddress: FEED, replacementPriceFeedAddress: USD_FEED, provenance: 'governance replaced it', expiresAt: null },
     ],
   });
-  t.equal(
-    remap.priceExceptions[0]!.kind === 'deprecated_price_remap' && remap.priceExceptions[0].replacementPriceFeed.decimals,
-    -1,
-    'a remap carries no decimals: enrichment reads them from the replacement feed',
+  t.same(remap.priceExceptions, [ {
+    kind:                        'deprecated_price_remap',
+    priceFeedAddress:            FEED.toLowerCase(),
+    replacementPriceFeedAddress: USD_FEED.toLowerCase(),
+    provenance:                  'governance replaced it',
+    expiresAt:                   null,
+  } ], 'a remap names the feed to read instead, and no scale: enrichment reads that from the feed');
+
+  /*
+   * The wire shape carries the replacement feed with its decimals, so it is
+   * assembled once they are read, and not before: there is nothing standing
+   * in for a scale nobody read.
+   */
+  const identity = { chainId: 1, key: 'ethereum-mainnet', upstreamKey: 'mainnet', testnet: false };
+  const replacement = USD_FEED.toLowerCase() as Address;
+  const read = new Map<Address, PriceFeedV1>([ [ replacement, { address: replacement, decimals: 8 } ] ]);
+  t.same(applyNetworkOverlay(identity, remap, [], read).priceExceptions, [ {
+    kind:                 'deprecated_price_remap',
+    priceFeedAddress:     FEED.toLowerCase(),
+    replacementPriceFeed: { address: replacement, decimals: 8 },
+    provenance:           'governance replaced it',
+    expiresAt:            null,
+  } ], 'the network carries the replacement feed with the decimals the chain answered');
+  t.throws(
+    () => applyNetworkOverlay(identity, remap, [], new Map()),
+    { code: 'OVERLAY_FEED_UNREADABLE' },
+    'and a network whose replacement feed was not read is not assembled at all',
   );
 
   rejects(
@@ -187,7 +213,7 @@ t.test('a network overlay is normalized and duplicate-free', async t => {
       ...networkOverlay,
       priceExceptions: [ { kind: 'zero_price', priceFeedAddress: FEED, provenance: 'x', expiresAt: 'soon' } ],
     }),
-    /ISO-8601/,
+    /RFC 3339/,
     'a malformed expiry',
   );
   rejects(
@@ -195,6 +221,64 @@ t.test('a network overlay is normalized and duplicate-free', async t => {
     /must be an array/,
     'a non-array pair list',
   );
+});
+
+/*
+ * An expiry decides when a live feed is read again, so it has to name one
+ * moment wherever it is read. Date.parse takes far more than that — "1" is the
+ * year 2001, and a time without an offset is local time in Node and UTC in a
+ * Worker — so only an RFC 3339 instant is accepted, and it is stored as the
+ * UTC instant it names.
+ */
+t.test('an expiry is an instant with its offset, stored in UTC', async t => {
+  const expiring = (expiresAt: unknown) => parseNetworkOverlay({
+    ...networkOverlay,
+    priceExceptions: [ { kind: 'zero_price', priceFeedAddress: FEED, provenance: 'feed reverts', expiresAt } ],
+  });
+
+  t.equal(expiring('2027-01-01T00:00:00Z').priceExceptions[0]!.expiresAt, '2027-01-01T00:00:00.000Z');
+  t.equal(
+    expiring('2026-09-21T13:00:00+02:00').priceExceptions[0]!.expiresAt,
+    '2026-09-21T11:00:00.000Z',
+    'an offset is applied, so the stored value is the moment itself',
+  );
+  t.equal(expiring('2026-09-21t11:00:00.5z').priceExceptions[0]!.expiresAt, '2026-09-21T11:00:00.500Z',
+    'in either case, with fractions of a second');
+  t.equal(expiring(null).priceExceptions[0]!.expiresAt, null, 'and an exception may not expire at all');
+
+  for (const [ value, what ] of [
+    [ '1',                      'a number Date.parse reads as a year' ],
+    [ '2026',                   'a year' ],
+    [ 'Sep 21 2026',            'a date in words' ],
+    [ '2026-09-21',             'a date without a time' ],
+    [ '2026-09-21T12:00:00',    'a time without an offset' ],
+    [ '2026-02-30T00:00:00Z',   'a day the month does not have' ],
+    [ '2026-09-21T24:00:00Z',   'an hour past the last' ],
+    [ '2026-09-21T12:00:00+24:00', 'an offset past a day' ],
+    [ 1790000000000,            'a number' ],
+  ] as const) {
+    rejects(() => expiring(value), /RFC 3339/, what);
+  }
+
+  t.equal(
+    await overlayDigest(expiring('2026-09-21T13:00:00+02:00')),
+    await overlayDigest(expiring('2026-09-21T11:00:00Z')),
+    'two spellings of one moment are one decision',
+  );
+
+  /*
+   * What is stored is read back through this same parser, so it is always an
+   * instant the parser takes: within the years 0000 to 9999 in UTC.
+   */
+  for (const [ value, stored, what ] of [
+    [ '0026-09-21T00:00:00Z',      '0026-09-21T00:00:00.000Z', 'a year before 100 is that year' ],
+    [ '9999-12-31T23:30:00-01:00', '9999-12-31T23:59:59.999Z', 'an offset that carries it past the year 9999 stores the last instant' ],
+    [ '0000-01-01T00:30:00+01:00', '0000-01-01T00:00:00.000Z', 'and one that carries it before the year 0000, the first' ],
+  ] as const) {
+    const expiry = expiring(value).priceExceptions[0]!.expiresAt;
+    t.equal(expiry, stored, what);
+    t.equal(expiring(expiry).priceExceptions[0]!.expiresAt, stored, 'which reads back as itself');
+  }
 });
 
 t.test('the digest identifies an overlay, not its spelling', async t => {

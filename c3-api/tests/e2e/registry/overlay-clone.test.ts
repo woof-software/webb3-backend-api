@@ -16,13 +16,16 @@ import { CONTRACT_ROLES, CONTRACT_ROLE_KEYS } from '../../../lib/model/comet-reg
 
 import { applyMarketOverlay, applyNetworkOverlay, orderNetworks } from '../../../src/registry/overlay.js';
 import {
+  activateVersion,
   readActiveOverlays,
   readImportOverlays,
   readOverlays,
+  readSnapshot,
   recordValidationResults,
   markValidated,
   snapshotChecksum,
 } from '../../../src/registry/repository.js';
+import type { ClonedOverlays } from '../../../src/registry/repository.js';
 import type { MarketEnrichment } from '../../../src/registry/enrichment.js';
 
 import { applyMigrations } from '../../util/d1.js';
@@ -80,7 +83,6 @@ function enrichmentOf(market: MarketV1): MarketEnrichment {
     basePriceFeed:    market.baseAsset.priceFeed,
     rewardToken:      market.rewardAsset?.token ?? null,
     collateralAssets: market.collateralAssets,
-    missingContracts: [],
   };
 }
 
@@ -193,6 +195,34 @@ t.test('cloned overlays rebuild the same snapshot', async t => {
   );
 });
 
+// validates a seeded candidate as it stands and switches it on
+async function activate(db: D1Database, versionId: string): Promise<void> {
+  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
+  await markValidated(db, versionId, await snapshotChecksum(orderNetworks(await readSnapshot(db, versionId))));
+  await activateVersion(db, { versionId, action: 'activate', actor: 'test-admin', reason: 'test' });
+}
+
+/*
+ * What an overlay write records beside the rows it changes: one audit event
+ * per scope it reviewed. An earlier attempt of a commit hands down what such
+ * an event says was reviewed for it, and nothing else.
+ */
+async function reviewedIn(db: D1Database, versionId: string, scopes: Array<[ 'network' | 'market', string ]>): Promise<void> {
+  await db.batch(scopes.map(([ scopeType, scopeKey ]) => db.prepare(
+    `INSERT INTO registry_overlay_events (
+       id, registry_version_id, scope_type, scope_key, previous_digest, new_digest, actor, reason, created_at
+     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'test-admin', 'reviewed', ?6)`
+  ).bind(randomUUID(), versionId, scopeType, scopeKey, 'd'.repeat(64), new Date().toISOString())));
+}
+
+// every network and market a seeded candidate holds, as the scopes an overlay names them by
+function scopesOf(networks: NetworkV1[]): Array<[ 'network' | 'market', string ]> {
+  return networks.flatMap(network => [
+    [ 'network', String(network.chainId) ] as [ 'network', string ],
+    ...network.markets.map(market => [ 'market', `${network.chainId}/${market.deploymentKey}` ] as [ 'market', string ]),
+  ]);
+}
+
 t.test('the active overlay is what an import inherits', async t => {
   const db = await freshDatabase();
 
@@ -203,17 +233,7 @@ t.test('the active overlay is what an import inherits', async t => {
   );
 
   const { versionId } = await seedCandidate(db, snapshot);
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
-  await db.batch([
-    db.prepare(
-      `INSERT INTO registry_activations (id, registry_version_id, previous_version_id, action, actor, reason, created_at)
-       SELECT ?1, ?2, active_version_id, 'activate', 'test-admin', 'test', ?3 FROM registry_state
-       WHERE singleton_id = 1 AND active_version_id IS NOT ?2`
-    ).bind(randomUUID(), versionId, new Date().toISOString()),
-    db.prepare(`UPDATE registry_state SET active_version_id = ?1, updated_at = ?2 WHERE singleton_id = 1`)
-      .bind(versionId, new Date().toISOString()),
-  ]);
+  await activate(db, versionId);
 
   const active = await readActiveOverlays(db);
   t.equal(active.networks.size, snapshot.networks.length, 'the active version supplies network overlays');
@@ -230,11 +250,9 @@ t.test('an attempt inherits what every earlier attempt of the commit reviewed', 
   const db = await freshDatabase();
 
   const first = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 1 });
-  await db.batch([
-    db.prepare(`UPDATE registry_networks SET reviewed = 1 WHERE registry_version_id = ?1`).bind(first.versionId),
-    db.prepare(`UPDATE markets SET reviewed = 1, display_name = 'reviewed first' WHERE registry_version_id = ?1`)
-      .bind(first.versionId),
-  ]);
+  await db.prepare(`UPDATE markets SET display_name = 'reviewed first' WHERE registry_version_id = ?1`)
+    .bind(first.versionId).run();
+  await reviewedIn(db, first.versionId, scopesOf(snapshot.networks));
 
   /*
    * The second attempt failed before it reached the mainnet weth market, so
@@ -246,9 +264,10 @@ t.test('an attempt inherits what every earlier attempt of the commit reviewed', 
       `DELETE FROM markets WHERE registry_version_id = ?1 AND deployment_key = 'weth'`
     ).bind(second.versionId),
     db.prepare(
-      `UPDATE markets SET reviewed = 1, display_name = 'reviewed again' WHERE registry_version_id = ?1`
+      `UPDATE markets SET display_name = 'reviewed again' WHERE registry_version_id = ?1`
     ).bind(second.versionId),
   ]);
+  await reviewedIn(db, second.versionId, scopesOf(snapshot.networks).filter(([ , key ]) => key !== '1/weth'));
 
   const third     = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 3 });
   const inherited = await readImportOverlays(db, third.versionId);
@@ -259,4 +278,117 @@ t.test('an attempt inherits what every earlier attempt of the commit reviewed', 
     'and a market only an earlier attempt reviewed keeps that review');
   t.equal(inherited.networks.get(1)?.displayName, snapshot.networks.find(network => network.chainId === 1)!.displayName,
     'networks are inherited the same way');
+});
+
+/*
+ * An attempt's rows are all marked reviewed, but most of them are copies of
+ * the version that was on when it was imported. That version can be replaced
+ * before the next attempt of the commit — by a hotfix, or by a rollback — and
+ * its copies must not bring the replaced decisions back over the ones on now.
+ * What the attempt hands down is what was reviewed for it.
+ */
+t.test('an attempt hands down what was reviewed for it, not its copies of a version since replaced', async t => {
+  const db = await freshDatabase();
+
+  const before = await seedCandidate(db, snapshot, { versionId: randomUUID(), commitSha: 'b'.repeat(40) });
+  await activate(db, before.versionId);
+
+  // the attempt copied what was on, and a market of it was reviewed in place
+  const first = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 1 });
+  await db.prepare(
+    `UPDATE markets SET display_name = 'WETH, reviewed for the attempt' WHERE registry_version_id = ?1 AND deployment_key = 'weth'`
+  ).bind(first.versionId).run();
+  await reviewedIn(db, first.versionId, [ [ 'market', '1/weth' ] ]);
+
+  // then a hotfix renamed another market of the version that is on
+  const hotfix = await seedCandidate(db, snapshot, { versionId: randomUUID(), commitSha: 'c'.repeat(40) });
+  await db.batch([
+    db.prepare(
+      `UPDATE markets SET display_name = 'USDC, hotfixed' WHERE registry_version_id = ?1 AND deployment_key = 'usdc'
+       AND network_id = (SELECT id FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = 1)`
+    ).bind(hotfix.versionId),
+    db.prepare(`UPDATE registry_networks SET display_name = 'Ethereum, hotfixed' WHERE registry_version_id = ?1 AND chain_id = 1`)
+      .bind(hotfix.versionId),
+  ]);
+  await activate(db, hotfix.versionId);
+
+  const second    = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+  const inherited = await readImportOverlays(db, second.versionId);
+  t.equal(inherited.markets.get('1/usdc')?.displayName, 'USDC, hotfixed',
+    'a market the attempt only copied takes what is on now');
+  t.equal(inherited.networks.get(1)?.displayName, 'Ethereum, hotfixed', 'and so does a network');
+  t.equal(inherited.markets.get('1/weth')?.displayName, 'WETH, reviewed for the attempt',
+    'while what was reviewed for the attempt is handed down over it');
+});
+
+/*
+ * A version has one default market, and the versions an import merges can
+ * each name another: the attempt that moved the default, and a version
+ * switched on since that moved it elsewhere. The merge keeps one, the one
+ * read at the highest precedence, so the import does not write two — which
+ * the schema refuses — on every attempt of the commit.
+ */
+t.test('the overlays an import merges name one default market', async t => {
+  const db = await freshDatabase();
+
+  // an attempt that moved the default from mainnet usdc to mainnet weth
+  const first = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 1 });
+  await db.batch([
+    db.prepare(`UPDATE markets SET is_default = 0 WHERE registry_version_id = ?1`).bind(first.versionId),
+    db.prepare(`UPDATE markets SET is_default = 1 WHERE registry_version_id = ?1 AND deployment_key = 'weth'`)
+      .bind(first.versionId),
+  ]);
+  await reviewedIn(db, first.versionId, [ [ 'market', '1/usdc' ], [ 'market', '1/weth' ] ]);
+
+  // and a version switched on since, whose default is on Scroll
+  const since = await seedCandidate(db, snapshot, { versionId: randomUUID(), commitSha: 'c'.repeat(40) });
+  await db.batch([
+    db.prepare(`UPDATE markets SET is_default = 0 WHERE registry_version_id = ?1`).bind(since.versionId),
+    db.prepare(
+      `UPDATE markets SET is_default = 1 WHERE registry_version_id = ?1
+       AND network_id = (SELECT id FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = 534352)`
+    ).bind(since.versionId),
+  ]);
+  await activate(db, since.versionId);
+
+  const second    = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+  const inherited = await readImportOverlays(db, second.versionId);
+  const defaults  = [ ...inherited.markets ].filter(([ , overlay ]) => overlay.isDefault).map(([ key ]) => key);
+  t.same(defaults, [ '1/weth' ], 'the default the attempt decided is the one kept');
+  t.equal(inherited.markets.get('534352/usdc')?.isDefault, false, 'and the one switched on since is merged as not the default');
+  t.equal(inherited.markets.get('534352/usdc')?.displayName, snapshot.networks.find(network => network.chainId === 534352)!
+    .markets[0]!.displayName, 'with the rest of its decisions as they are');
+});
+
+/*
+ * An expiry used to be stored as it was written, if Date.parse took it, and
+ * Date.parse takes years RFC 3339 does not write. Every import of a commit and
+ * every overlay written to a draft reads the stored overlays first, so a
+ * version holding one has to read back all the same: as the instant it names,
+ * in the years 0000 to 9999.
+ */
+t.test('an expiry stored in an older form is read back as the instant it names', async t => {
+  const db = await freshDatabase();
+  const { versionId } = await seedCandidate(db, snapshot);
+  const [ exception ] = snapshot.networks.find(network => network.chainId === 1)!.priceExceptions;
+  const expiryOf = (overlays: ClonedOverlays) => overlays.networks.get(1)?.priceExceptions
+    .find(entry => entry.priceFeedAddress === exception!.priceFeedAddress)?.expiresAt;
+
+  for (const [ stored, read, what ] of [
+    [ 'Mon, 21 Sep 2026 11:00:00 GMT', '2026-09-21T11:00:00.000Z', 'a date in words' ],
+    [ '2026-09-21T13:00:00+02:00',     '2026-09-21T11:00:00.000Z', 'an instant with an offset' ],
+    [ '0026-09-21T00:00:00Z',          '0026-09-21T00:00:00.000Z', 'a year before 100' ],
+    [ '+275760-09-13T00:00:00Z',       '9999-12-31T23:59:59.999Z', 'a year after 9999, as the last instant RFC 3339 writes' ],
+    [ '-000001-01-01T00:00:00Z',       '0000-01-01T00:00:00.000Z', 'a year before 0000, as the first' ],
+  ] as const) {
+    await db.prepare(
+      `UPDATE network_price_exceptions SET expires_at = ?1 WHERE registry_version_id = ?2 AND price_feed_address = ?3`
+    ).bind(stored, versionId, exception!.priceFeedAddress).run();
+    t.equal(expiryOf(await readOverlays(db, versionId)), read, what);
+  }
+
+  await reviewedIn(db, versionId, [ [ 'network', '1' ] ]);
+  const next = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+  t.equal(expiryOf(await readImportOverlays(db, next.versionId)), '0000-01-01T00:00:00.000Z',
+    'and the next attempt of the commit inherits it, as reviewed for the attempt before');
 });

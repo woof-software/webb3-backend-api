@@ -10,9 +10,10 @@ X-Registry-Version:  8f1e0f3c-3b7a-4e8f-9a1b-1f0f0b9a2c44
 X-Registry-Checksum: 1bd74ebe00d845e0fa5e648b22a2c39e60d9a62bf6c58190320fa01cd9a26a4a
 ```
 
-Endpoints that resolve a market answer `503` when no version is active, and
-`400` for an address the active version does not describe. The registry's own
-endpoints are documented under [Registry v1](#registry-v1).
+Endpoints that resolve a market answer `503` with the code
+`REGISTRY_NOT_ACTIVE` when no version is active, and `400` for an address the
+active version does not describe. The registry's own endpoints are documented
+under [Registry v1](#registry-v1).
 
 When the database cannot be reached, a response may instead be computed from
 the version that was active the last time it could. It then carries its age
@@ -25,7 +26,57 @@ Cache-Control:    no-store
 
 A client that must not act on an older version refuses such a response; one
 that only reads can use it. How long that is allowed is per environment, and
-a `503` is the answer once the window has passed.
+a `503` with the code `UPSTREAM_UNAVAILABLE` is the answer once the window has
+passed. These endpoints and the registry's own fail the same way.
+
+Testnets are not served: the registry imports mainnets only. A request that
+names one is answered `400` in the [envelope](#errors), with the code
+`TESTNET_NOT_SERVED` and a message naming what named it, rather than with
+nothing or with mainnet data. It is refused before the registry is read, so
+it is answered so while no version is active, or the database cannot be
+reached, too:
+
+- a testnet as the `{network}` of a market route, such as
+  `/market/sepolia/all/summary`;
+- `testnets=include` on a route over every network
+  (`/market/all-networks/all-contracts/…`) or on `/account/{address}/rewards`;
+- a testnet market in the `markets[]` of the transaction history, or a cursor
+  of it that reads one.
+
+```json
+{ "error": { "code": "TESTNET_NOT_SERVED", "message": "testnets are not served: ethereum-sepolia", "requestId": "4f6c1a2e-…" } }
+```
+
+Any other value of `testnets` leaves them out, as it always has.
+
+## Errors
+
+An error is answered as JSON in one envelope, whichever endpoint answers it:
+
+```json
+{ "error": { "code": "REGISTRY_NOT_ACTIVE", "message": "No active registry snapshot is available", "requestId": "4f6c1a2e-…" } }
+```
+
+`code` is what a client branches on, `message` is for a person, and
+`requestId` names the request in the worker's log: quote it when you report
+one. Every `5xx`, `401` and `403` answer is logged under it, and so is the
+outcome of every import an administrative sync runs; any other answer says
+all there is to say about it, and is not logged. `details`, when present,
+says more about the failure, such as the version a cursor was issued
+against. A path no endpoint matches is a `404` with the code `NOT_FOUND` —
+but one of four segments or more outside `/registry/v1/` is taken by the
+pattern of the market and governance endpoints,
+`/{resource}/{network}/{contract}/{endpoint}`, and answered as a malformed
+parameter of theirs is (below), with a `400` such as `Error: Bad network …`
+or `Error: Not a valid resource API`.
+
+A `500` is answered with the code `INTERNAL` and the message `the request
+could not be completed`, never with what failed — a database error, or what
+an upstream API such as Tally answered: that is in the log, under the
+`requestId`. A request with a malformed parameter is the exception to the
+envelope: the market, governance and account endpoints still answer it with
+a `400` and a short message, as they always have — a line of plain text, or
+`{"error": "…"}` from some market endpoints.
 
 ## Market status
 
@@ -66,6 +117,25 @@ the feed is active. Only a price feed reports a status this way: a node that
 does not answer, or any other call that reverts, still fails the whole
 request.
 
+## Market labels
+
+The rewards routes — `/market/all-networks/all-contracts/rewards/dapp-data`
+and `/account/{address}/rewards` — name each market by the labels the registry
+gives it: `base_asset.symbol` is the market's label and
+`base_asset.description` its base asset's name — `ETH` and `Ether` for a WETH
+market, `USDC.e` (`USDbC` on Base) and `USD Coin (Bridged)` for bridged USDC,
+`USD₮0` where Tether renamed its token:
+
+```json
+{ "chain_id": 1, "comet": { "address": "0xa175…ae94" }, "base_asset": { "symbol": "ETH", "description": "Ether", … }, … }
+```
+
+The summaries report the token's own on-chain symbol instead (`WETH`). The
+history does too, except where the network renames a token in place: bridged
+USDC is `USDC.e` there, although its `symbol()` answers `USDC`. One token can
+therefore appear under two names across the API, so match a market by
+`chain_id` and `comet.address`, never by its symbol.
+
 ## Pagination
 
 Many endpoints are paginated for convenience. If an endpoint is paginated,
@@ -83,30 +153,51 @@ endpoint and `GET`ting it again.
 ### description:
 
 Point-in-time summary at the current block of various market statistics:
-- Total collateral value (in USD)
-- Total borrow value (in USD)
+- Total collateral, supply and borrow value, in the unit the market's price
+  feeds answer in: USD, or the base asset for a market quoted in it, such as
+  ETH for a WETH market
 - Borrow APR
 - Supply APR
+- Utilization, as the Comet answers it: a fraction scaled by 10^18
+- The base asset's price in USD (`base_usd_price`)
+- What could be priced: `status`, and `collaterals` with each collateral's
+  own status — see [Market status](#market-status)
 
 ```sh
 $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3/summary'
 ```
 ```json
 {
-  "date": "2022-09-12",
-  "timestamp": 1663006848,
-  "total_collateral_value": "736406396.32667881067597418742582842",
-  "total_borrow_value": "291934.5637828698",
+  "chain_id": 1,
+  "comet": {
+    "address": "0xc3d688b66703497daa19211eedff47f25384cdc3"
+  },
+  "status": "success",
   "borrow_apr": "0.024456245200128",
-  "supply_apr": "0.008780799134304"
+  "supply_apr": "0.008780799134304",
+  "total_borrow_value": "291934.5637828698",
+  "total_supply_value": "802511.3150470128",
+  "total_collateral_value": "736406.32667881067597418742582842",
+  "utilization": "363775913612426560",
+  "base_usd_price": "0.99996",
+  "collateral_asset_symbols": [ "COMP", "WBTC", "WETH", "UNI", "LINK" ],
+  "collaterals": [
+    { "address": "0xc00e94Cb662C3520282E6f5717214004A7f26888", "symbol": "COMP", "status": "success" },
+    { "address": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", "symbol": "WBTC", "status": "success" },
+    { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "status": "success" },
+    { "address": "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "symbol": "UNI",  "status": "success" },
+    { "address": "0x514910771AF9Ca656af840dff83E8264EcF986CA", "symbol": "LINK", "status": "success" }
+  ]
 }
 ```
 
 ## `/market/{network}/{address}/historical/summary`
 ### description:
 
-30 days of historical `/summary`s, starting from the current day, sampling
-a single block per-day.
+30 days of historical `/summary`s — two in stage, and one in a local run —
+one block sampled per day, oldest first, up to the most recent day sampled.
+Each day carries the same fields as the summary, and its `date` and
+`timestamp`.
 
 ```sh
 $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3/historical/summary'
@@ -114,21 +205,38 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
 ```json
 [
   {
-    "date": "2022-09-12",
-    "timestamp": 1663006848,
-    "total_collateral_value": "736406396.32667881067597418742582842",
-    "total_borrow_value": "291934.5637828698",
-    "borrow_apr": "0.024456245200128",
-    "supply_apr": "0.008780799134304"
+    "chain_id": 1,
+    "comet": {
+      "address": "0xc3d688b66703497daa19211eedff47f25384cdc3"
+    },
+    "status": "success",
+    "borrow_apr": "0.014999999976144",
+    "supply_apr": "0.0",
+    "total_borrow_value": "0.0",
+    "total_supply_value": "0.0",
+    "total_collateral_value": "0.0",
+    "utilization": "0",
+    "base_usd_price": "1.0",
+    "collateral_asset_symbols": [ "COMP", "WBTC", "WETH", "UNI", "LINK" ],
+    "collaterals": [
+      { "address": "0xc00e94Cb662C3520282E6f5717214004A7f26888", "symbol": "COMP", "status": "success" },
+      ...
+    ],
+    "timestamp": 1660504680,
+    "date": "2022-08-14"
   },
   ...,
   {
-    "date": "2022-08-14",
-    "timestamp": 1660504680,
-    "total_collateral_value": "0.0",
-    "total_borrow_value": "0.0",
-    "borrow_apr": "0.014999999976144",
-    "supply_apr": "0.0"
+    "chain_id": 1,
+    "comet": {
+      "address": "0xc3d688b66703497daa19211eedff47f25384cdc3"
+    },
+    "status": "success",
+    "borrow_apr": "0.024456245200128",
+    "supply_apr": "0.008780799134304",
+    ...,
+    "timestamp": 1663006848,
+    "date": "2022-09-12"
   }
 ]
 ```
@@ -145,8 +253,12 @@ answers `404` rather than a summary, because there is no reward price to
 value its rewards with:
 
 ```json
-{ "error": "Rewards are not available for this market", "code": "REWARDS_NOT_AVAILABLE" }
+{ "error": { "code": "REWARDS_NOT_AVAILABLE", "message": "Rewards are not available for this market", "requestId": "4f6c1a2e-…" } }
 ```
+
+`/market/{network}/{address}/rewards/dapp-data` lists the markets whose
+rewards can be valued and leaves the others out, so for such a market it
+answers an empty list rather than `404`.
 
 ```sh
 $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3/rewards/summary'
@@ -167,8 +279,8 @@ Aggregate of all governance proposals across Governors alpha and bravo.
 
 Query parameters:
 - Pagination: `page_size`, `page_number`
-- `proposal_ids[]=123,...` [optional] - filter proposals to only those
-  having one of the given ids.
+- `proposal_ids=123,124,...` [optional] - filter proposals to only those
+  having one of the given ids, separated by commas in one parameter.
 
 ```sh
 $ curl 'localhost:8787/governance/mainnet/all/proposals'
@@ -544,21 +656,28 @@ Retrieves comet transaction history for a given account address.
 
 Query parameters:
 - `limit` (optional): number of max items to retrieve. Default and max is 15.
-- `markets[]` (optional): array of markets filter to be included in the response. Default is all non-testnet markets. (e.g. filter only Ethereum cUSDCv3 market `markets[]=1_0xc3d688B66703497DAA19211EEdff47f25384cdc3`)
+- `markets[]` (optional): array of markets filter to be included in the response. Default is every market whose history the active version serves. A market of a testnet is refused with `TESTNET_NOT_SERVED`, and so is a cursor that reads one ([The market registry](#the-market-registry)). (e.g. filter only Ethereum cUSDCv3 market `markets[]=1_0xc3d688B66703497DAA19211EEdff47f25384cdc3`)
 - `actions[]` (optional): array of actions to filter transactions by. Default is all actions. (e.g. filter only borrow actions `actions[]=Borrow`)
 - `cursor` (optional): The first response (with no cursor parameter) will return with a cursor value, to pass that cursor value will allow request to get more transaction history further in the past.
 
-A cursor belongs to the registry version it was issued against. If that
-version is no longer the active one, the request answers `409` and the client
+A cursor holds a position in the logs of each market it reads. It stays
+valid across registry versions that read the same markets — a rollback, a new
+import of the same source, a market given a new label — and each page names
+the version that answered it; a cursor issued before the registry reads the
+markets of the networks it had, and only those count for it. A version that
+reads other markets ends it: the request answers `409`, and the client
 restarts pagination without a cursor:
 
 ```json
 {
   "error": {
     "code": "REGISTRY_VERSION_CHANGED",
-    "message": "the market registry changed; restart pagination without a cursor",
-    "cursorRegistryVersionId": "8f1e0f3c-...",
-    "registryVersionId": "b2c4d6e8-..."
+    "message": "the markets of the registry changed; restart pagination without a cursor",
+    "requestId": "4f6c1a2e-...",
+    "details": {
+      "cursorRegistryVersionId": "8f1e0f3c-...",
+      "registryVersionId": "b2c4d6e8-..."
+    }
   }
 }
 ```
@@ -639,16 +758,66 @@ $ curl 'localhost:8787/account/0xcfc50541c3dEaf725ce738EF87Ace2Ad778Ba0C5/transa
 # Registry v1
 
 Everything under `/registry/v1` is answered by the registry, including its
-errors, which use one envelope:
+errors, which use the [envelope](#errors) every endpoint uses:
 
 ```json
-{ "error": { "code": "NOT_FOUND", "message": "...", "requestId": "..." } }
+{ "error": { "code": "CONFLICT", "message": "...", "requestId": "...", "details": { "code": "SYNC_ALREADY_RUNNING" } } }
 ```
 
+`error.code` is the kind of answer: `BAD_REQUEST` (400), `UNAUTHORIZED`
+(401), `FORBIDDEN` (403), `NOT_FOUND` (404), `METHOD_NOT_ALLOWED` (405),
+`CONFLICT` (409), `PAYLOAD_TOO_LARGE` (413), `UNPROCESSABLE` (422),
+`RATE_LIMITED` (429), `REGISTRY_NOT_ACTIVE` (503), `UPSTREAM_UNAVAILABLE` (503)
+and `INTERNAL` (500); the market endpoints add `REWARDS_NOT_AVAILABLE` (404),
+`REGISTRY_VERSION_CHANGED` (409) and `TESTNET_NOT_SERVED` (400), described
+with them. A failure the registry names more precisely — an import, a chain
+read, an overlay — carries its own code in `details.code`, such as
+`SYNC_ALREADY_RUNNING` or `OVERLAY_FEED_UNREADABLE`, under the kind of answer
+it is; a monitor matches `details.code` for those. Besides
+`REGISTRY_NOT_ACTIVE`, only a source or a node provider that did not answer,
+and a database that could not be reached, are a `503`: those are the answers
+worth trying again.
+
 Public reads are cacheable and carry `ETag`, `X-Registry-Version` and
-`X-Registry-Checksum`; they answer `503 REGISTRY_NOT_ACTIVE` when no version
-is active. Administrative routes require `Authorization: Bearer <token>`, are
-rate limited per actor, and answer no CORS headers at all.
+`X-Registry-Checksum`, which a browser can read, and answer `304` to an
+`If-None-Match` that names what they would send. The tags are compared
+weakly, as RFC 9110 has it: `W/"…"`, which is what a browser sends back for a
+response Cloudflare compressed, names the same as the tag itself; `*` names
+any; and a list of tags names what any tag in it names. A header that is none
+of those is answered with the body, and so is every request while an answer
+comes from the cache because the database cannot be reached. They answer
+`503 REGISTRY_NOT_ACTIVE` when no version is active, and
+`503 UPSTREAM_UNAVAILABLE` when the database cannot be reached and no older
+version may be served instead. A path is matched with or without a trailing
+slash.
+
+A `{chain_id}` is written in decimal without a leading zero — `1`, never
+`01`, `0x1`, `1e0` or `1.0` — in every path that takes one and in the keys of
+`PUT …/overlays`, and is at most 9007199254740991; anything else is `400`,
+so that one resource has one URL.
+
+Administrative routes require `Authorization: Bearer <token>` — a `401` names
+the scheme in `WWW-Authenticate` — and answer no CORS headers at all. Every
+administrative request is rate limited twice, reads as well as commands:
+
+- First, before its token is checked or its path is matched, by the address
+  it comes from: 60 a minute for each address — for each /64 of an IPv6
+  one, since a client can send from any address of its /64. Guessing a token,
+  or a path, costs as much as a request with the right one, and once an
+  address has spent its budget the right token is refused from it as well.
+- Then, once it is authenticated, by its token: 30 a minute for each token
+  and each family of routes. Every read shares one budget, so a monitor
+  polling the status spends it with an operator who holds the same token, and
+  each kind of command has one of its own.
+
+Past either budget the answer is `429` `RATE_LIMITED`, saying in
+`Retry-After` how many seconds to wait, and in its message which budget ran
+out: `too many administrative requests from this address`, or
+`too many <family> requests with this token`.
+
+A command's body is at most 64 KiB — 512 KiB for `PUT …/overlays` — and a
+larger one is refused with `413`. A `reason`, wherever a command takes one, is
+at most 1,000 characters, and a longer one is refused with `400`.
 
 ## `/registry/v1/active`
 ### description:
@@ -657,6 +826,11 @@ The whole activated snapshot: networks, their markets, and the presentation
 and price-exception data an application needs to render them. This is the
 bootstrap read; everything below serves parts of the same version.
 
+A `disabled` market is part of the version but is served by no public read,
+and a network whose every market is disabled is not listed at all: a chain
+the source has just added arrives that way, under its canonical name and
+with nothing about it reviewed, until a version decides to offer it.
+
 ```sh
 $ curl 'localhost:8787/registry/v1/active'
 ```
@@ -664,12 +838,14 @@ $ curl 'localhost:8787/registry/v1/active'
 ## `/registry/v1/networks`
 ### description:
 
-The networks of the active version, without their markets.
+The networks of the active version that serve a market, without their
+markets.
 
 ## `/registry/v1/networks/{chain_id}/markets`
 ### description:
 
-The markets of one chain, in the same order the snapshot lists them.
+The markets of one chain that are not `disabled`, in the same order the
+snapshot lists them. A chain the active version does not list answers `404`.
 
 ## `/registry/v1/networks/{chain_id}/markets/{comet_address}`
 ### description:
@@ -682,19 +858,44 @@ reachable.
 ### description:
 
 A validated version by id, so a session that pinned one can refetch exactly
-what it pinned even after another version was activated.
+what it pinned even after another version was activated. It is the same
+representation as `/registry/v1/active` for the same version, with the same
+`ETag`, and a client that sends it back is answered `304` without the
+version being read again.
 
 ## `POST /registry/v1/admin/sync`
 ### description:
 
 Starts or continues an import. `sourceCommitSha` pins an explicit commit,
 `forceNewAttempt` rebuilds an attempt, and `holdForReview` leaves the
-candidate open once every root is imported, so a market the source added can
-be reviewed before the version validates; each of the three is a decision
-rather than routine scheduling, and requires a `reason`. The first import of
-an environment is held regardless. `markets` bounds how many markets this
-request imports, from 1 to 50, and defaults to 50. Answers `202` with the
-run, the version it is importing into, and `heldForReview`.
+candidate open once no root is left to attempt, so a market the source added
+can be reviewed before the version validates (a run that gave roots up leaves
+a draft that cannot validate, as below); each of the three is a decision
+rather than routine scheduling, requires a `reason`, and is acted on when it
+is sent — the daily discovery interval and the retry rules below apply only
+to a request with none of them. The first import of an environment is held
+regardless. `markets` bounds how many markets this request imports, from 1
+to 50, and defaults to 50. Answers with the run, the version it is importing
+into, and `heldForReview`: `202` while the import has work left for a later
+request (`running`), and `200` when this request is the whole answer — the
+import `completed`, or there was nothing to do (`idle`). `idle` says why in
+`reason`: discovery is not due, since the source is checked once per
+interval, or the commit's candidate is held or was rejected, as below. A
+held or rejected candidate is named in `registryVersionId`; discovery that is
+not due names none, even when the hourly job has imported a commit within the
+interval — `GET /registry/v1/admin/status` lists what it made under
+`candidates`: a held draft, such as an environment's first, under
+`importing`, and a version waiting to be switched on under `validated`.
+
+Discovery does not import a commit again by itself once its newest attempt
+imported every root and still ended invalid: the same source, chain and
+decisions would fail the same way. It answers `idle`, naming that attempt in
+`registryVersionId`, and `GET /registry/v1/admin/status` names the commit;
+a request with `forceNewAttempt`, or a new commit on the tracked ref,
+imports it. An attempt that ended invalid because some of its roots never
+imported is tried again — an interval after it started, then two intervals
+after the next one started, four, and at most eight — and until then the
+answer is `idle`, with the time it is tried again in `reason`.
 
 An import is resumable, and one request does not have to finish it. A request
 that leaves work behind answers `running` with how far the run has got:
@@ -709,9 +910,11 @@ failed goes back into the pool and is attempted again by the next request, so
 the count of markets one request processes varies. Send the same request with
 an empty body until the answer says `completed`.
 
-How much one request imports depends on what a single Worker invocation is
-given: locally that is often the whole source, and in a deployed environment
-it is a part of it.
+With `markets` left at its default, one request has the budget for the whole
+source of today: its 29 markets take about 230 of the 10,000 subrequests a
+Worker invocation has on the Workers Paid plan. Such a request answered
+`running` was cut short, most often by a source or a node provider that did
+not answer, or not in time, and the next request continues where it stopped.
 
 A root gets five attempts, after which it is abandoned and the candidate
 cannot validate. Those attempts are for the root being wrong. A request that
@@ -719,42 +922,110 @@ imports some markets and then loses the node provider, or runs out of what a
 Worker is given in one invocation, fails the rest without spending their
 attempts: that failure is about the invocation, not about them. An invocation
 that imports nothing at all does spend them, so a source or a chain that
-answers for nothing ends the run instead of holding it open forever.
+answers for nothing ends the run instead of holding it open forever. An
+invocation stopped outright while it imports a root — by a deploy, or past
+the time or CPU a Worker is given — writes nothing more, and spends that
+root's attempt: the invocation that takes the run over records it as failed,
+as `the invocation importing this root did not finish`.
 
 A commit, an attempt and the decision to hold a candidate all belong to the
 run that was created with them, so a request that would continue an existing
 run and carries `sourceCommitSha`, `forceNewAttempt` or `holdForReview` is
-refused with `409 SYNC_ALREADY_RUNNING` rather than silently ignoring them.
-The same status answers a request sent while another invocation holds the
-run's lease.
+refused with `409`, `details.code` `SYNC_ALREADY_RUNNING`, rather than
+silently ignoring them. The same answer is given, before the source is asked
+anything, to a request sent while another invocation holds the run's lease:
+send it again once that invocation has finished its part.
 
 A held candidate is validated too, so its diagnostics can be read, but keeps
 its `importing` status: `checksFailed` says how many of its checks failed, and
-is `0` for one that would validate as it stands. A candidate another
-invocation is importing into is not one held for review.
+is `0` for one that would validate as it stands. A candidate is held once no
+root is left to attempt, whether or not the run gave roots up. One that did —
+a first import, say, that lost the node provider — answers with `completed`
+below `expected`, and `reason` says how many it gave up: the candidate cannot
+validate without them. A candidate another invocation is importing into is
+not one held for review. An overlay written to a candidate while its import
+is checking it stops that check rather than being decided by it: the answer
+is `running`, and the next request checks the candidate as it then is.
 
 When the import fails, the answer says whether trying again can help. A
-request the registry refuses answers with the status its code maps to — a
-`sourceCommitSha` the tracked ref cannot reach is `422` — and a candidate that
-failed its checks is `422` with `syncRunId` and `registryVersionId` in
-`details`, to read its validation by. Only a source that did not answer is
-`503`.
+request the registry refuses answers with the status its code maps to, and
+the code in `details.code`: a `sourceCommitSha` the tracked ref cannot reach
+is `422` with `SOURCE_COMMIT_UNREACHABLE`, and so is a source that answered
+with something the import cannot use, such as a tree too large to list
+(`SOURCE_TREE_TRUNCATED`) or a file past its size limit
+(`SOURCE_CONTENT_TOO_LARGE`): it would answer the same way again. A candidate
+that failed its checks is `422` with `syncRunId` and `registryVersionId` in
+`details`, to read its validation by. A database that did not answer is
+`503`, and so is GitHub not answering while the import looks for the commit
+— the ref, its tree, or whether the ref reaches a `sourceCommitSha` — with
+`SOURCE_REQUEST_FAILED`: both are worth trying again. So is one of those
+requests that has not answered within 20 seconds, and GitHub refusing one
+over its rate limit, whose message says until when. A market whose own reads
+fail — its root from GitHub, or the chain through the node provider proxy,
+which is given 30 seconds a batch — does not fail the request: its root
+records why (`SOURCE_REQUEST_FAILED`, `CHAIN_REQUEST_FAILED`), the request
+goes on with the next market, and a later request attempts the root again,
+within its five attempts.
+A setting of the environment the import does not take is `422` with
+`SOURCE_CONFIGURATION_INVALID`, naming it. Anything else is a fault — most
+often a database without the migrations the release needs — and answers
+`500 INTERNAL` with a `requestId`; the worker logs it whole as
+`registry sync failed unexpectedly`.
 
 ## `GET /registry/v1/admin/status`
 ### description:
 
 Whether the registry is healthy, in one answer: the active version and who
-switched it on, whether its bytes are cached, when the source was last
-checked, the last import run, and the candidates still open.
+switched it on, whether its bytes are cached (`cache.snapshotCached`) and the
+cache could be read at all (`cache.readable`), when the source was last
+checked, the last import run, the candidates still open, and the registry
+settings the environment sets to something they do not take
+(`configuration.invalid`, by name). A database that cannot be reached answers
+`503 UPSTREAM_UNAVAILABLE`, which a monitor tells apart from a fault, a `500`.
+A daily check of the source that finds nothing to import starts no run: it
+moves `sync.upstreamCheckedAt` alone, and `sync.lastRun` stays the last
+import.
+
+`chainCheck` is the last time the hourly job held a version against the chain:
+`checkedAt` is the hour of the invocation that did, and `versionId` names the
+version. Once a day, at the first hourly invocation of the day (UTC) —
+whatever the import finds, an unchanged commit included, and whether that
+invocation or an administrative sync checked the source — it reads again what
+an import reads from each served market's Comet: the feed of its base asset,
+and each collateral asset with the feed that prices it. The status reports
+what that check found and asks the chain nothing itself:
+
+- `drifts` lists each fact the chain now answers otherwise, with the network,
+  the market (`chainId/deploymentKey`) and its Comet, the asset — the base
+  asset, or a collateral by its index, with its token and symbol — the
+  `field` (`priceFeed`, or `token` for a collateral the chain added, removed
+  or replaced at that index), what the version stores (`stored`), what the
+  chain answers (`current`), and when the chain last answered it so
+  (`seenAt`).
+- `unreadable` lists the networks whose chain did not answer, with why.
+  Nothing new is known about them: a drift found there before stays in
+  `drifts`, with the `seenAt` of the last read that found it, and nothing
+  else is raised for them. They are read again at the next hourly invocation.
+
+A version switched on is checked at the next hourly invocation, within the
+hour. Until then `chainCheck` is still the check of the version before it,
+under that version's `versionId`, and its drifts stay raised. `chainCheck` is
+`null` until a version has been checked. Nothing is changed or switched on
+because of it.
 
 `alerts` is that state reduced to the conditions worth acting on, so a monitor
 can check that it is empty without knowing the registry's rules:
 
 | Alert | Means |
 |---|---|
+| `configuration-invalid` | a registry setting is set to something it does not take — a number that is not a whole number in its range, or a repository or ref that names no source; `configuration.invalid` names each. The import refuses to start while one of its own is invalid, and a read takes the default in its place |
 | `no-active-version` | nothing is activated, so every market route answers `503` |
-| `candidate-awaiting-review` | a draft is open and no import is running: somebody has to review or discard it |
+| `candidate-awaiting-review` | a draft is held for review and no import is running: somebody has to review it and validate it, or discard it |
+| `candidate-awaiting-activation` | a version newer than any ever switched on validated, and is waiting to be — what the scheduled import produces for a new commit; `candidates.validated` lists it. It holds until a version at least that new is switched on |
+| `commit-rejected` | the newest version imported every root of its commit and is invalid, so discovery no longer imports that commit by itself; `sync.rejectedCommit` names it. It holds until a newer version exists — a forced attempt, or a new commit |
+| `chain-drift` | the version on stores a price feed or a collateral asset its market's Comet no longer answers with: governance changed the market on chain after the import, and the source did not move; `chainCheck.drifts` names each. It holds until a check of the version on finds it agrees with the chain — a version imported again with `forceNewAttempt`, which reads the chain anew, switched on, and checked at the next hourly invocation — or the chain changes back. A version switched on is taken to drift as the one before it did until it has been checked, and a network the check could not read keeps the drifts last found there |
 | `last-sync-failed` | the most recent import run ended failed |
+| `sync-failing` | the import that is running keeps failing: the last root it attempted failed, and the roots left failed have spent two attempts or more between them — two roots once, or one root twice. One failure raises nothing, and neither does an attempt given back because the invocation had imported a market before it lost GitHub or the node provider. An attempt whose invocation was stopped in the middle of it — a deploy, or a Worker past its time or CPU — has failed too, once that invocation's lease has run out. Each attempt moves the run, so it is never stalled, and it ends failed only once every root has spent its five attempts |
 | `sync-stalled` | a run says it is running but its lease expired, so no invocation is continuing it |
 | `sync-overdue` | the source has not been checked for more than twice the configured interval |
 | `snapshot-not-cached` | the active version's bytes are not in the cache, so every cold isolate hydrates it from D1 again |
@@ -767,6 +1038,7 @@ $ curl -s "$API/registry/v1/admin/status" -H "Authorization: Bearer $TOKEN" | jq
 {
   "environment": "stage",
   "checkedAt": "2026-09-23T09:12:41.004Z",
+  "configuration": { "invalid": [] },
   "active": {
     "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
     "checksum": "1bd74ebe00d845e0fa5e648b22a2c39e60d9a62bf6c58190320fa01cd9a26a4a",
@@ -774,21 +1046,45 @@ $ curl -s "$API/registry/v1/admin/status" -H "Authorization: Bearer $TOKEN" | jq
     "activatedBy": "registry-admin:stage",
     "ageSeconds": 138518
   },
-  "cache": { "snapshotCached": true, "pointerAgeSeconds": 412 },
+  "cache": { "snapshotCached": true, "pointerAgeSeconds": 412, "readable": true },
   "sync": {
     "lastRun": {
       "id": "0d0b3c4e-1d5c-4f0e-9d0a-2a2f2a9f0b61",
-      "status": "completed", "outcome": "no_change",
-      "startedAt": "2026-09-23T08:00:01.117Z", "completedAt": "2026-09-23T08:00:04.902Z",
-      "ageSeconds": 4116, "failedCount": 0, "expectedCount": 29, "completedCount": 29,
+      "status": "completed", "outcome": "imported",
+      "startedAt": "2026-09-20T22:00:01.117Z", "completedAt": "2026-09-21T12:00:09.528Z",
+      "ageSeconds": 162751, "failedCount": 0, "expectedCount": 29, "completedCount": 29,
       "lastError": null, "leaseExpiresAt": null
     },
-    "upstreamCheckedAt": "2026-09-23T08:00:04.900Z",
-    "upstreamAgeSeconds": 4116,
-    "intervalSeconds": 86400
+    "upstreamCheckedAt": "2026-09-23T00:00:02.315Z",
+    "upstreamAgeSeconds": 33159,
+    "intervalSeconds": 86400,
+    "rejectedCommit": null
   },
-  "candidates": { "importing": [], "invalid": 0 },
+  "candidates": { "importing": [], "validated": [], "invalid": 0 },
+  "chainCheck": {
+    "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
+    "checkedAt": "2026-09-23T00:00:00.000Z",
+    "ageSeconds": 33161,
+    "drifts": [],
+    "unreadable": []
+  },
   "alerts": []
+}
+```
+
+A drift, as `chainCheck.drifts` names it:
+
+```json
+{
+  "chainId": 130,
+  "network": "unichain-mainnet",
+  "market": "130/weth",
+  "comet": "0x6c987dde50db1dcdd32cd4175778c2a291978e2a",
+  "asset": { "role": "collateral", "assetIndex": 5, "token": "0xc3eacf0612346366db554c991d7858716db09f58", "symbol": "rsETH" },
+  "field": "priceFeed",
+  "stored": "0x0090a563c4832e4e519f5f054483519b1a83c8c3",
+  "current": "0x3fb418b74ec30bc3e940221f58a04e16afc6378b",
+  "seenAt": "2026-09-23T00:00:00.000Z"
 }
 ```
 
@@ -796,7 +1092,10 @@ $ curl -s "$API/registry/v1/admin/status" -H "Authorization: Bearer $TOKEN" | jq
 ### description:
 
 One import run and its per-root checkpoints, including why a root failed and
-when the run becomes resumable.
+when the run becomes resumable. `requestedBy` is who started the run —
+`registry-admin:<environment>`, or the `COMET_REGISTRY_ADMIN_ACTOR` the
+environment sets, for an administrative sync, and `registry-cron:<environment>`
+for the hourly job — and `reason` the reason its request gave, if any.
 
 ## `GET /registry/v1/admin/versions`
 ### description:
@@ -808,9 +1107,23 @@ roll back to.
 Query parameters:
 - `status` — [optional] — `importing`, `validated` or `invalid`
 - `limit` — [optional] — [default 20, max 100]
+- `before` — [optional] — a version id: the page starts after that version
 
 It is a summary per version, never a snapshot: what each was built from and
 what became of it. The markets of one version are read by its id.
+
+`createdBy` is who asked for the import that created the version, as its run
+records them in `requestedBy`: the operator for a version an administrative
+sync created — `registry-admin:<environment>`, or the
+`COMET_REGISTRY_ADMIN_ACTOR` the environment sets — whatever its request
+asked for, and `registry-cron:<environment>` for one the hourly job created.
+Why a sync was asked for is kept with its run:
+`GET /registry/v1/admin/sync-runs/{sync_run_id}` answers `requestedBy` and
+`reason`, and the sync's own answer names the run as `syncRunId`.
+
+A listing longer than `limit` is read a page at a time. `next` is the id to
+pass as `before` for the page after this one, and `null` on the last page; a
+`before` that names no version is `404`.
 
 Once a newer attempt of a commit succeeds — validates, or is held for review
 with every root imported — the commit's older attempts still `importing` are
@@ -827,6 +1140,7 @@ $ curl -s "$API/registry/v1/admin/versions?status=importing" -H "Authorization: 
 ```json
 {
   "activeVersionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
+  "next": null,
   "versions": [
     {
       "id": "c0d77dad-b30e-495f-95aa-a9f457b39174",
@@ -852,9 +1166,19 @@ A version with its validation summary and activation history.
 ## `POST /registry/v1/admin/versions/{version_id}/validate`
 ### description:
 
-Re-runs validation over a candidate and records the result. Answers `422`
-when the candidate is invalid, with the checks that decided it, and `409`
-while its import is still running.
+Re-runs validation over a candidate and records the result. A validation
+that ran answers `200` with what it decided: `version.status` is `validated`,
+or `invalid` with the checks that decided it in `summary`. A version that is
+already decided, either way, answers the same again with `changed: false`.
+
+It answers `409` only when it could not run: while the candidate's import is
+still running, or when an overlay was written to the candidate while it was
+being checked — the checks would describe rows it no longer holds, so none of
+them is recorded; validate it again.
+
+```json
+{ "version": { "id": "c0d77dad-…", "status": "invalid", "checksum": null }, "changed": true, "summary": { "attempt": 1, "passed": 41, "failed": 1, "checks": [ … ] } }
+```
 
 It takes no body. Validation decides nothing: it checks the stored candidate
 and records every check it ran, exactly as the scheduled import does
@@ -868,10 +1192,21 @@ Makes a validated version the one the API serves. Requires a `reason`, which
 is stored with the audit event. Activating the version that is already active
 changes nothing.
 
+`expectedActiveVersionId` — [optional] — the version the move is decided
+against, or `null` when nothing is on yet. When it is no longer the version
+that is on, the move is refused with `409` naming the one that is, instead of
+silently undoing a move somebody else made in the meantime. A move whose
+target is already on changes nothing, whatever it expected.
+
+```json
+{ "reason": "switch on the new commit", "expectedActiveVersionId": "d9698ddd-ab86-46bc-a412-c71df7d20414" }
+```
+
 ## `POST /registry/v1/admin/versions/{version_id}/rollback`
 ### description:
 
-The same move in the other direction, recorded as a rollback.
+The same move in the other direction, recorded as a rollback, and taking the
+same `expectedActiveVersionId`.
 
 ## `PUT /registry/v1/admin/versions/{version_id}/networks/{chain_id}/overlay`
 ### description:
@@ -880,10 +1215,50 @@ Replaces the reviewed overlay of one network: display names, asset display
 overrides, unwrapped collateral assets, and price exceptions. An overlay is a
 complete document; a missing key is a missing decision, not a default.
 
+The body is the document as `overlay`, the `reason` its audit event is
+stored with, and — optionally — `expectedDigest`, described below. Any other
+property is refused with `400`:
+
+```json
+{
+  "reason": "describe Base",
+  "overlay": { "displayName": "Base", "assetDisplayOverrides": [], "unwrappedCollateralAssets": [], "priceExceptions": [] },
+  "expectedDigest": null
+}
+```
+
 The overlay is applied to the rows the import wrote, and a network reviewed
 this way stops being listed as unreviewed. A chain the candidate has not
 imported yet answers `404`: the import writes every network it reaches, so
 the answer is to let it continue.
+
+A feed the overlay introduces — a remap's replacement feed — is read on the
+chain for its decimals, unless the version already knows it on that chain.
+A feed the chain answers for, but not with decimals — the read reverts, or
+there is no contract at that address on that chain, which is what a feed of
+another chain usually is — is refused with `422` and `details.code`
+`OVERLAY_FEED_UNREADABLE`, naming the feed: the document has to change. A
+node provider that did not answer is `503`, worth trying again.
+
+A price exception's `expiresAt` is `null`, or an RFC 3339 timestamp with its
+offset, such as `2027-01-01T00:00:00Z`; it is stored as the UTC instant it
+names. A date without a time or an offset is refused with `400`, and so is an
+expiry already past, which would apply to nothing — unless the network already
+holds that exception exactly as sent: the overlay is replaced whole, so an
+exception that has expired since it was written is sent again with every other
+change to the network, and is kept.
+
+The answer names the overlay the scope now holds by its `digest`.
+`expectedDigest` — [optional] — is the digest of the overlay the document was
+decided against, or `null` for a scope nobody has reviewed: when the scope
+holds another one, the document is refused with `409`, with the current
+digest in `details`, rather than silently undoing a change made since. A
+write that another write to the same candidate lands in the middle of is
+refused with `409` too; read again and resend.
+
+```json
+{ "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414", "changed": true, "overlayEventId": "0d0f3f7e-...", "digest": "5f0c...", "snapshotChecksum": null }
+```
 
 ## `PUT /registry/v1/admin/versions/{version_id}/markets/{chain_id}/{deployment_key}/overlay`
 ### description:
@@ -892,7 +1267,11 @@ The same for one market: its display name, status, capabilities, quote unit,
 USD feed, and reward feed. A market the import wrote without a review is
 disabled until this is applied to it, and
 `GET /registry/v1/admin/versions/{version_id}` lists what is still
-unreviewed.
+unreviewed. It takes the same body, with the market's document as
+`overlay`, answers the market's `digest` and takes `expectedDigest` exactly
+as the network route does, and reads the feeds it introduces — the USD feed
+and the reward feed — the same way. A `rewardPriceFeed` on a market whose
+rewards contract names no reward token is refused with `409`.
 
 It also states how the frontend lists the market. `displayName` is its label,
 `slug` — lowercase letters, digits, dots and hyphens, or `null` — is what the
@@ -901,22 +1280,29 @@ the same network, and `isInstitutional` lists it in the institutional section.
 Within a network, no two markets that are not disabled may answer to the same
 `slug`, or to the same label where they have none; validation refuses a
 version where they do, and a slug another market of the network keeps is
-refused with `409`.
+refused with `409`. So is `isDefault: true` while another market of the
+version is the default: the default moves with both markets in one
+`PUT …/overlays`.
 
 ## `GET /registry/v1/admin/versions/{version_id}/markets/{chain_id}/{deployment_key}/overlay`
 ### description:
 
 The overlay a market of the version carries, in the form the `PUT` above
-takes: read it, change what is different, and send it back with a reason. The
-overlay of a similar market is where describing a new one starts. A market
-nobody has reviewed answers with the provisional decisions its import wrote,
-and `reviewed: false`.
+takes: read it, change what is different in its `overlay`, and send that
+back as the `overlay` of the `PUT` body with a reason — and with the
+answer's `digest` as `expectedDigest`, so a change somebody made in between
+is not undone. The answer itself is not a body the `PUT` takes: sent back
+whole, its other properties are refused with `400`. The overlay of a similar
+market is where describing a new one starts. A market nobody has reviewed
+answers with the provisional decisions its import wrote, `reviewed: false`
+and `digest: null`.
 
 ```json
 {
   "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
   "scope": "8453/usdc",
   "reviewed": true,
+  "digest": "9b2f1c6d0e3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c",
   "overlay": {
     "displayName": "USDC",
     "slug": null,
@@ -942,9 +1328,11 @@ every network and market the first import wrote needs its decisions at once.
 `bundle`.
 
 Network overlays are keyed by chain id and market overlays by
-`chainId/deploymentKey`; each is the same complete document the one-scope
-routes take, decided the same way, and `reason` is stored with every audit
-event the request records. Up to 100 overlays, in a body of up to 512 KiB.
+`chainId/deploymentKey`, the chain id written as a path writes it (`1`, never
+`01`), which is how the proposal's bundle writes it; each is the same
+complete document the one-scope routes take, decided the same way, and
+`reason` is stored with every audit event the request records. Up to 100
+overlays, in a body of up to 512 KiB.
 
 The request is applied all at once or not at all. Every document is parsed
 and every network and market it names is found before anything is written,
@@ -953,7 +1341,9 @@ and the writes are one D1 transaction: a document the parser refuses answers
 naming all of them, with nothing written in either case. A request may move
 the default market or a slug between the markets it names, or swap two slugs,
 in whatever order it names them. Only an importing candidate is
-writable (`409` otherwise).
+writable (`409` otherwise), and a request that another write to the
+candidate lands in the middle of is refused with `409`, with nothing
+written: what it decided was decided against what it read.
 
 ```json
 {
@@ -963,8 +1353,9 @@ writable (`409` otherwise).
 }
 ```
 
-The answer says what each document changed, in the order the request named
-them, and what the candidate still has unreviewed. A document identical to
+The answer says what each document changed — the networks first, by chain
+id, then the markets in the order the request named them — and what the
+candidate still has unreviewed. A document identical to
 what is stored changes nothing and records no event, so sending the same
 directory again is safe.
 
@@ -974,9 +1365,9 @@ directory again is safe.
   "changed": true,
   "snapshotChecksum": null,
   "documents": [
-    { "scopeType": "network", "scopeKey": "1",      "changed": true,  "overlayEventId": "0d0f3f7e-..." },
-    { "scopeType": "market",  "scopeKey": "1/usdc", "changed": true,  "overlayEventId": "5b1c2a90-..." },
-    { "scopeType": "market",  "scopeKey": "1/weth", "changed": false, "overlayEventId": null }
+    { "scopeType": "network", "scopeKey": "1",      "changed": true,  "overlayEventId": "0d0f3f7e-...", "digest": "41c0..." },
+    { "scopeType": "market",  "scopeKey": "1/usdc", "changed": true,  "overlayEventId": "5b1c2a90-...", "digest": "9b2f..." },
+    { "scopeType": "market",  "scopeKey": "1/weth", "changed": false, "overlayEventId": null,           "digest": "e7a4..." }
   ],
   "unreviewed": { "networks": [], "markets": [] }
 }
@@ -992,6 +1383,12 @@ describe, the decisions the API already acts on, and for every network, its
 name, presentation and price exceptions. A market the constants do not
 describe is not proposed; it is listed under `needsDecision`, and stays
 switched off until it is described with the market overlay route.
+
+The proposal is for an environment's first version only. Once any version
+has been activated, the decisions live in the registry and every draft
+inherits them, so applying the constants' values over a draft would undo
+what was reviewed since: the proposal routes, `apply` included, answer
+`409` from then on, and a draft is reviewed with the overlay routes.
 
 `/proposal` answers with the proposal as data: its `digest`, what it leaves
 undecided, and under `bundle` the body `PUT /versions/{version_id}/overlays`
@@ -1028,16 +1425,25 @@ the one flag a check can read; `differences` names every field the two answer
 differently, and `onlyInStatic` / `onlyInRegistry` the markets only one of
 them describes.
 
+`disabledInRegistry` names the markets the constants describe and the
+version holds but switches off. They are neither a difference nor a gap — an
+operator decided not to serve them — so `agrees` does not count them, and a
+disabled market's fields are not compared: its known differences leave
+`differences` with it. A market listed here that is meant to be served is a
+review to fix, however few differences the report shows.
+
 ```json
 {
   "agrees": false,
   "shadow": {
     "versionId": "8f1e0f3c-3b7a-4e8f-9a1b-1f0f0b9a2c44",
     "checksum": "1bd74ebe...",
+    "networks": [ "ethereum-mainnet", "polygon-mainnet", "..." ],
     "staticMarkets": 29,
     "registryMarkets": 29,
     "onlyInStatic": [],
     "onlyInRegistry": [],
+    "disabledInRegistry": [],
     "differences": [
       {
         "scope": "1/wbtc",

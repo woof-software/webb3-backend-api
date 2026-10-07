@@ -40,12 +40,11 @@ function rewardGroups(
 }
 
 async function rewardsSummary(
-  { apiHost, nodeHost, nodeKey, account, testnets, catalog }: AccountRouteData,
+  { apiHost, nodeHost, nodeKey, account, catalog }: AccountRouteData,
   context: Context
 ): Promise<Response> {
-  const allNetworks = KnownNetwork.getNames({
-    includeTestnets: testnets === 'include',
-  });
+  // every mainnet: testnets are not served, and the router refuses a request to include them
+  const allNetworks = KnownNetwork.getNames();
 
   const evaluator = context.evaluator;
 

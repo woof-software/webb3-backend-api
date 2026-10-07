@@ -1,13 +1,18 @@
-import t from 'tap';
+import t, { Test } from 'tap';
 
 import C3Api, { Env } from '../../../entrypoint.js';
 
+import * as Eth from '../../../lib/eth-constants.js';
 import type { RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
+import type * as KnownNetwork from '../../../lib/well-known/networks/network.js';
+
+import { streamEventsOf } from '../../../src/transaction-history-handler/transaction-history-items-handler.js';
 
 import { MemoryKv } from '../../util/kv.js';
+import * as mock from '../../util/mock/mock.js';
 import { makeTestEnv } from '../../util/test-env.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
-import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
+import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 
 import '../../../shim/node-self.js';
 
@@ -16,13 +21,27 @@ import '../../../shim/node-self.js';
  * made: which version answered, what happens when there is none, and what a
  * market address means now that the version decides it.
  *
- * These cases are reachable without a node provider, which is what keeps them
- * runnable anywhere. Everything past resolution needs RPC and lives in the
- * market and transaction-history suites.
+ * Nothing here reaches the network. Every request leaves through a fetch
+ * mock that refuses whatever a test did not say it expects, and the node
+ * provider answers a route that resolved its market as a node that is down
+ * does: what it took to get that far is what is tested. Everything past
+ * resolution lives in the market and transaction-history suites.
  */
 const MAINNET = 'ethereum-mainnet';
 const USDC    = '0xc3d688b66703497daa19211eedff47f25384cdc3';
 const UNKNOWN = '0x1111111111111111111111111111111111111111';
+
+declare var fetch: mock.Fetch;
+const fetchBefore = globalThis.fetch;
+t.beforeEach(() => {
+  globalThis.fetch = mock.fetch({});
+});
+t.afterEach(t => {
+  fetch.satisfy(t);
+});
+t.teardown(() => {
+  globalThis.fetch = fetchBefore;
+});
 
 function envWith(overrides: Partial<Env> = {}): Env {
   return makeTestEnv({ MEMORY_CACHE_SEED: 'registry-consumer-routes', ...overrides });
@@ -32,16 +51,48 @@ async function get(env: Env, path: string): Promise<Response> {
   return C3Api.fetch(new Request(`https://api.test.local${path}`), env);
 }
 
+/*
+ * The next request to the node provider of `network`, the one a route makes
+ * once it has resolved a market there, is answered as by a node that is down.
+ */
+function nodeDown(env: Env, network: KnownNetwork.Name): void {
+  fetch.expect(Eth.nodeEndpoint(env.NODE_PROXY_HOST, env.NODE_PROXY_KEY, network), { method: 'POST' })
+    .returns('node down', { status: 503 });
+}
+
+// what the route logged as an error, for the length of a test
+function captureErrors(t: Test): string[] {
+  const lines: string[] = [];
+  const error = console.error;
+  console.error = (...parameters: unknown[]) => { lines.push(parameters.map(String).join(' ')); };
+  t.teardown(() => { console.error = error; });
+  return lines;
+}
+
+type Envelope = { error: { code: string, message: string, requestId: string, details?: Record<string, unknown> } };
+
+// an error answer is the envelope every route answers with, as JSON
+async function envelopeOf(t: Test, response: Response): Promise<Envelope['error']> {
+  t.match(response.headers.get('content-type'), /^application\/json/, 'the error is JSON');
+  const body = await response.json() as Envelope;
+  t.match(body.error.requestId, /^[0-9a-f-]{36}$/, 'with a request id to correlate with the logs');
+  return body.error;
+}
+
 t.test('a market route says which version answered it', async t => {
   const registry = await activeRegistryDatabase();
   t.teardown(() => registry.dispose());
+  const env    = envWith({ APP_DB: registry.db });
+  const errors = captureErrors(t);
 
-  const response = await get(envWith({ APP_DB: registry.db }), `/market/${MAINNET}/${USDC}/summary`);
+  nodeDown(env, MAINNET);
+  const response = await get(env, `/market/${MAINNET}/${USDC}/summary`);
 
   t.equal(response.headers.get('x-registry-version'), registry.versionId,
     'every response whose content depends on the registry names the version');
   t.equal(response.headers.get('x-registry-checksum'), registry.snapshot.registryVersion.checksum);
-  t.not(response.status, 400, 'a market of the active version resolves');
+  t.equal(response.status, 500, 'a market of the active version resolves, and goes on to read the chain of its network');
+  t.match(errors.join('\n'), /JSON-RPC request failed: HTTP 503/, 'where only the node that is down fails it');
 });
 
 t.test('an address the active version does not describe is not a market', async t => {
@@ -72,14 +123,16 @@ t.test('the rewards summary of a market without rewards says so', async t => {
 
   const response = await get(env, `/market/scroll-mainnet/${scroll.contracts.comet}/rewards/summary`);
   t.equal(response.status, 404, 'its rewards summary is not found');
-  t.same(await response.json(), {
-    error: 'Rewards are not available for this market',
-    code:  'REWARDS_NOT_AVAILABLE',
-  }, 'with a code a client can act on');
+  const error = await envelopeOf(t, response);
+  t.same([ error.code, error.message ], [ 'REWARDS_NOT_AVAILABLE', 'Rewards are not available for this market' ],
+    'with a code a client can act on');
   t.equal(response.headers.get('x-registry-version'), registry.versionId, 'and the version that decided it');
 
+  const errors = captureErrors(t);
+  nodeDown(env, MAINNET);
   const rewarded = await get(env, `/market/${MAINNET}/${USDC}/rewards/summary`);
-  t.not(rewarded.status, 404, 'a market with rewards is not refused');
+  t.equal(rewarded.status, 500, 'a market with rewards is not refused: its summary goes on to read the chain');
+  t.match(errors.join('\n'), /JSON-RPC request failed: HTTP 503/, 'where only the node that is down fails it');
 });
 
 /*
@@ -101,14 +154,38 @@ t.test('without an active version the market and account routes fail explicitly'
   ]) {
     const response = await get(env, path);
     t.equal(response.status, 503, `${path} reports the registry as unavailable`);
-    const body = await response.json() as { error: string, requestId: string };
-    t.match(body.error, /registry is unavailable/);
-    t.match(body.requestId, /^[0-9a-f-]{36}$/, 'with a request id to correlate with the logs');
+    const error = await envelopeOf(t, response);
+    t.equal(error.code, 'REGISTRY_NOT_ACTIVE', 'in the envelope the registry routes answer with, and the same code');
     t.equal(response.headers.get('x-registry-version'), null, 'and no version, because none answered');
   }
 
+  // blocknative's estimates, in gwei, by the confidence the route labels them with
+  fetch.expect(Eth.mainnetGasPriceEndpoint).returns(JSON.stringify({
+    blockPrices: [ {
+      estimatedPrices: [
+        { confidence: 99, price: 40 },
+        { confidence: 95, price: 30 },
+        { confidence: 90, price: 25 },
+        { confidence: 80, price: 20 },
+      ],
+    } ],
+  }));
   const gasPrice = await get(env, '/legacy/mainnet/gas-price');
-  t.not(gasPrice.status, 503, 'a route that needs no registry is unaffected');
+  t.equal(gasPrice.status, 200, 'a route that needs no registry is unaffected');
+  t.same(await gasPrice.json(), {
+    fastest:  { value: '40000000000' },
+    fast:     { value: '30000000000' },
+    average:  { value: '25000000000' },
+    safe_low: { value: '20000000000' },
+  }, 'and answers what it was given');
+
+  /*
+   * A path that names no market endpoint is the client's mistake whatever
+   * the registry holds, so it is answered without reading the registry.
+   */
+  const mistyped = await get(env, `/market/${MAINNET}/${USDC}/sumary`);
+  t.equal(mistyped.status, 400, 'a mistyped endpoint is a 400 even with nothing active');
+  t.match(await mistyped.text(), /Not a valid market API endpoint/);
 });
 
 /*
@@ -176,9 +253,98 @@ t.test('a transaction history cursor from another version is refused', async t =
   );
 
   t.equal(response.status, 409);
-  const body = await response.json() as { error: { code: string, registryVersionId: string, cursorRegistryVersionId: string } };
-  t.equal(body.error.code, 'REGISTRY_VERSION_CHANGED', 'with the code that tells the client to restart pagination');
-  t.equal(body.error.cursorRegistryVersionId, '00000000-0000-4000-8000-00000000dead', 'naming the version the cursor held');
-  t.equal(body.error.registryVersionId, registry.versionId, 'and the version that is active now');
+  const error = await envelopeOf(t, response);
+  t.equal(error.code, 'REGISTRY_VERSION_CHANGED', 'with the code that tells the client to restart pagination');
+  t.same(error.details, {
+    cursorRegistryVersionId: '00000000-0000-4000-8000-00000000dead',
+    registryVersionId:       registry.versionId,
+  }, 'naming the version the cursor held, and the version that is active now');
   t.equal(response.headers.get('x-registry-version'), registry.versionId);
+});
+
+/*
+ * What a cursor holds are positions in the logs of the streams it reads, and
+ * they stay true for as long as the version that answers reads the same
+ * streams: a rollback, or a re-import of the same markets, must not end
+ * every pagination in flight.
+ */
+t.test('a cursor from another version that reads the same streams carries on', async t => {
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+
+  const cursor = 'cursor-from-an-identical-version';
+  const seed   = {
+    [cursor]: {
+      registryVersionId: '00000000-0000-4000-8000-0000000000aa',
+      profilesByAddress: {},
+      // a filter this request does not repeat, which is the first thing checked after the version
+      filter:  { markets: [ `1_${USDC}` ], actions: [], initiatedBy: [], contractAddresses: [], networks: [] },
+      streamEvents: streamEventsOf(fixtureCatalog(registry.snapshot)),
+      cursors: {},
+    },
+  };
+
+  const response = await get(
+    envWith({ APP_DB: registry.db, kv_mainnet: MemoryKv({ seed }) }),
+    `/account/0x420f253087044b8BCf028dd89F8fe83Ba6275E84/transaction_history?cursor=${cursor}`,
+  );
+  t.not(response.status, 409, 'the cursor is not refused for the version it was issued against');
+  t.equal(response.status, 400, 'it is read, and refused only for the filter the request changed');
+  t.match(await response.text(), /different markets filter/);
+});
+
+/*
+ * A cursor upgraded from before the registry reads the streams of the
+ * networks it had at the cutover, and no others. A version that reads the
+ * same streams on those networks leaves it going, whatever it serves on
+ * another network; one that changes them ends it.
+ */
+t.test('a cursor upgraded from before the registry is compared on the networks it reads', async t => {
+  const fixture: RegistrySnapshotV1 = loadRegistrySnapshotFixture();
+  // a version that also serves history on Base, which the cursor never read
+  const snapshot: RegistrySnapshotV1 = {
+    ...fixture,
+    networks: fixture.networks.map(network => network.chainId !== 8453 ? network : {
+      ...network,
+      markets: network.markets.map(market => ({
+        ...market,
+        capabilities: { ...market.capabilities, transactionHistory: true },
+      })),
+    }),
+  };
+  const registry = await activeRegistryDatabase({ snapshot });
+  t.teardown(() => registry.dispose());
+
+  const streams = streamEventsOf(fixtureCatalog(registry.snapshot));
+  t.same([ ...new Set(streams.map(stream => stream.network)) ].sort(), [ 'base-mainnet', MAINNET ],
+    'the version reads history on two networks');
+  const mainnet = streams.filter(stream => stream.network === MAINNET);
+
+  const payload = (overrides: Record<string, unknown>) => ({
+    registryVersionId: '00000000-0000-4000-8000-0000000000bb',
+    profilesByAddress: {},
+    // a filter this request does not repeat, which is the first thing checked after the version
+    filter:  { markets: [ `1_${USDC}` ], actions: [], initiatedBy: [], contractAddresses: [], networks: [] },
+    streamEvents: mainnet,
+    cursors: {},
+    ...overrides,
+  });
+  const seed = {
+    'upgraded':        payload({ upgraded: true }),
+    'of-the-registry': payload({}),
+    'changed':         payload({
+      upgraded:     true,
+      streamEvents: mainnet.map(stream => ({ ...stream, marketContractAddresses: stream.marketContractAddresses.slice(1) })),
+    }),
+  };
+  const env  = envWith({ APP_DB: registry.db, kv_mainnet: MemoryKv({ seed }) });
+  const page = (cursor: string) => get(env, `/account/0x420f253087044b8BCf028dd89F8fe83Ba6275E84/transaction_history?cursor=${cursor}`);
+
+  const upgraded = await page('upgraded');
+  t.equal(upgraded.status, 400, 'a version that reads the same streams on its networks leaves it going');
+  t.match(await upgraded.text(), /different markets filter/, 'refused only for the filter the request changed');
+
+  t.equal((await page('of-the-registry')).status, 409,
+    'while a cursor the registry issued for a version without Base is ended by the one with it');
+  t.equal((await page('changed')).status, 409, 'and a version that reads other streams on its networks ends the upgraded one');
 });

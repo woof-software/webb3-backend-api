@@ -982,15 +982,17 @@ function withRegistryContracts(
   if (markets.length === 0) {
     return wellKnownContracts;
   }
-  const merged: { [network: string]: { [address: string]: any } } = {};
+  const merged = new Map<KnownNetwork.Name, Record<string, Contract>>();
 
   for (const { comet } of markets) {
-    const network = comet.network;
-    merged[network] ??= { ...wellKnownContracts[network] };
-    merged[network]![comet.address.toLowerCase()] = comet;
-    for (const token of [ comet.base.asset, comet.rewards.asset ]) {
+    const contracts = merged.get(comet.network) ?? { ...wellKnownContracts[comet.network] };
+    merged.set(comet.network, contracts);
+    contracts[comet.address.toLowerCase()] = comet;
+    // the reward token is one only where the market pays one
+    const tokens = [ comet.base.asset, ...(comet.rewards?.asset === undefined ? [] : [ comet.rewards.asset ]) ];
+    for (const token of tokens) {
       // a token the constants already name keeps that name
-      merged[network]![token.address.toLowerCase()] ??= token;
+      contracts[token.address.toLowerCase()] ??= token;
     }
   }
 
@@ -998,7 +1000,7 @@ function withRegistryContracts(
    * Every network the version describes, because a proposal executed on
    * mainnet can bridge actions that configure a market on another chain.
    */
-  return { ...wellKnownContracts, ...merged };
+  return { ...wellKnownContracts, ...Object.fromEntries(merged) };
 }
 
 export {

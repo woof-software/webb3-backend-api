@@ -4,12 +4,52 @@ import { ApiError } from './errors.js';
  * Bounded JSON request and response handling.
  *
  * Every administrative body is small, so the reader refuses anything larger
- * rather than buffering whatever a client sends, and it accepts only a JSON
+ * rather than buffering whatever a client sends, and answers that with 413:
+ * the body is not malformed, there is too much of it. It accepts only a JSON
  * object: an array or a bare value is never a valid command.
  */
 const MAX_BODY_BYTES = 64 * 1024;
 
-const ENCODER = new TextEncoder();
+const DECODER = new TextDecoder();
+
+function tooLarge(maxBytes: number): ApiError {
+  return new ApiError('PAYLOAD_TOO_LARGE', `the request body exceeds ${maxBytes} bytes`);
+}
+
+/*
+ * The body as text, read no further than the bound. A chunked body declares
+ * no length, so its bytes are counted as they arrive and the read stops at
+ * the first chunk past the bound, rather than buffering whatever was sent and
+ * measuring it afterwards.
+ */
+async function boundedText(request: Request, maxBytes: number): Promise<string> {
+  if (request.body === null) {
+    return '';
+  }
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    const chunk = value as Uint8Array;
+    received += chunk.byteLength;
+    if (received > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw tooLarge(maxBytes);
+    }
+    chunks.push(chunk);
+  }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return DECODER.decode(bytes);
+}
 
 async function readJsonObject(
   request: Request,
@@ -20,15 +60,13 @@ async function readJsonObject(
     throw new ApiError('BAD_REQUEST', `the request body must be JSON`);
   }
 
+  // a declared length past the bound is refused before a byte of it is read
   const declared = Number(request.headers.get('content-length') ?? '0');
   if (Number.isFinite(declared) && declared > maxBytes) {
-    throw new ApiError('BAD_REQUEST', `the request body exceeds ${maxBytes} bytes`);
+    throw tooLarge(maxBytes);
   }
 
-  const body = await request.text();
-  if (ENCODER.encode(body).byteLength > maxBytes) {
-    throw new ApiError('BAD_REQUEST', `the request body exceeds ${maxBytes} bytes`);
-  }
+  const body = await boundedText(request, maxBytes);
   // an absent body is an empty command, which several admin routes accept
   if (body.trim().length === 0) {
     return {};

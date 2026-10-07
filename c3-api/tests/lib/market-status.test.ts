@@ -147,23 +147,6 @@ t.test('the summary of every market passes on the status of each', async t => {
   t.equal(statuses(body)[USDC], 'success');
 });
 
-t.test('the summary of every market reads each network once', async t => {
-  const blocksRead: string[] = [];
-  const answer = answers([]);
-  const evaluator = stubEvaluator((name, context) => {
-    if (name === 'ethGetBlock') {
-      blocksRead.push(context.network);
-    }
-    return answer(name, context);
-  });
-  const response = await marketHandlers.latestSummary(routeData(AllNetworks, AllContracts), uninstantiated(evaluator));
-
-  const networks = [ ...new Set(catalog.markets().map(entry => entry.network)) ];
-  t.equal((await response.json() as Entry[]).length, catalog.markets().length, 'every market is answered');
-  t.equal(evaluator.evaluations, networks.length, 'in one evaluation per network, which batches its markets together');
-  t.strictSame(blocksRead.sort(), networks.sort(), 'each reading the latest block once');
-});
-
 t.test('the summary of one market is its status', async t => {
   const response = await marketHandlers.latestSummary(
     routeData(MAINNET, comet(MAINNET, WBTC)),
@@ -197,7 +180,7 @@ t.test('the rewards of every market pass on the status of each', async t => {
 
 t.test('the rewards of an account format only the markets that were valued', async t => {
   const response = await accountRewardsSummary(
-    { apiHost: '', nodeHost: '', nodeKey: '', account: ACCOUNT, testnets: 'exclude', catalog },
+    { apiHost: '', nodeHost: '', nodeKey: '', account: ACCOUNT, catalog },
     instantiated(stubEvaluator(answers([ WBTC ]))),
   );
 

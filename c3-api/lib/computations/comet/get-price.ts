@@ -25,6 +25,32 @@ type GetPrice = abiFunction.Spec<{
   returns: PriceRead,
 }>;
 
+/*
+ * When this isolate last reported each feed that reverts, by network and
+ * feed.
+ *
+ * A retired feed is an expected degradation — the summary reports the price
+ * it could not read beside the ones it could — so the line is a warning. It
+ * is read by every market that prices with it, at every block a summary
+ * reads, and a line for each would bury everything else in the log: one a
+ * minute per feed still names it for as long as it reverts, which is what an
+ * operator looks for and what an alert matches.
+ */
+const reported = new Map<string, number>();
+
+const REPORT_EVERY_MS = 60_000;
+
+function reportRevert(message: string, feed: Eth.Address, comet: Eth.Address, network: string, blockNumber: unknown): void {
+  const key  = `${network}:${feed.toLowerCase()}`;
+  const at   = Date.now();
+  const last = reported.get(key);
+  if (last !== undefined && at - last < REPORT_EVERY_MS) {
+    return;
+  }
+  reported.set(key, at);
+  console.warn(`price feed reverted: ${feed} read by ${comet} on ${network} at block ${blockNumber}: ${message}`);
+}
+
 const { implement } = abiFunction.Functor<GetPrice>({});
 const getPrice = implement({
   // 1: a feed that reverts is answered, not thrown
@@ -39,10 +65,7 @@ const getPrice = implement({
     price:  BigFixnum.from({ decimals, value: u256 }),
   }),
   reverted: ({ message }, { priceFeed, contract, network, blockNumber }) => {
-    console.error(
-      `price feed reverted: ${priceFeed.address} read by ${contract.address} on ${network}`
-      + ` at block ${blockNumber}: ${message}`
-    );
+    reportRevert(message, priceFeed.address, contract.address, network, blockNumber);
     return { status: 'error', message };
   },
 });

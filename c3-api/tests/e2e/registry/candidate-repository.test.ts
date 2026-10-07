@@ -6,21 +6,23 @@ import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
 import { applyMigrations, foreignKeyViolations } from '../../util/d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
-import { isRegistryError } from '../../../src/registry/errors.js';
 import {
   clearCandidateSnapshot,
+  loadRegistrySnapshotFixture,
+  seedCandidate,
+  writeCandidateSnapshot,
+} from '../../util/registry-fixture.js';
+import { isRegistryError } from '../../../src/registry/errors.js';
+import {
   createCandidate,
-  ensureNetwork,
-  findAttempts,
+  findAttemptsByCommit,
   latestValidationAttempt,
+  marketWrites,
   markInvalid,
   readSnapshot,
   markValidated,
   recordValidationResults,
   snapshotChecksum,
-  writeCandidateSnapshot,
-  writeMarket,
 } from '../../../src/registry/repository.js';
 
 /*
@@ -82,14 +84,14 @@ t.test('a candidate records its source identity once per attempt', async t => {
   t.equal(first.snapshot_checksum, null, 'it has no snapshot checksum yet');
 
   // the same source in different casing is the same source, not a second one
-  const attempts = await findAttempts(db, { ...SOURCE, repository: 'COMPOUND-FOUNDATION/comet' });
+  const attempts = await findAttemptsByCommit(db, 'COMPOUND-FOUNDATION/comet', SOURCE.commitSha);
   t.same(attempts.map(version => version.id), [ first.id ], 'the attempt is found case-insensitively');
 
   await rejects(() => candidate(db), /UNIQUE constraint failed/);
 
   const second = await candidate(db, 2);
   t.same(
-    (await findAttempts(db, SOURCE)).map(version => version.attempt),
+    (await findAttemptsByCommit(db, SOURCE.repository, SOURCE.commitSha)).map(version => version.attempt),
     [ 2, 1 ],
     'attempts for one source are listed newest first',
   );
@@ -157,25 +159,54 @@ t.test('the fixture snapshot is written as rows the schema accepts', async t => 
   }, 'the base row carries the reviewed base asset fields');
 });
 
-t.test('a market is written idempotently, so a retried root can succeed', async t => {
+/*
+ * An import writes a network only with its first market, so a snapshot that
+ * names a network without markets cannot be written the way an import writes
+ * it. The writer refuses it before writing any of it, rather than report rows
+ * the database does not hold.
+ */
+t.test('a snapshot with a network that has no markets is refused, and none of it is written', async t => {
+  const db      = await freshDatabase();
+  const version = await candidate(db);
+
+  // a network with markets comes first, so a writer that refused only on reaching the other would have written it
+  const mainnet = networks.find(network => network.chainId === 1)!;
+  const base    = networks.find(network => network.chainId === 8453)!;
+  await rejects(
+    () => writeCandidateSnapshot(db, version.id, [ mainnet, { ...base, markets: [] } ]),
+    /base-mainnet has no markets/,
+  );
+  for (const table of [ 'registry_networks', 'network_price_exceptions', 'markets', 'tokens' ]) {
+    t.equal(await count(db, table), 0, `${table} holds nothing`);
+  }
+});
+
+t.test('a market is written idempotently, with its network the first time', async t => {
   const db      = await freshDatabase();
   const version = await candidate(db);
   const network = networks.find(entry => entry.chainId === 1)!;
   const market  = network.markets.find(entry => entry.deploymentKey === 'usdc')!;
+  const write   = async (written: typeof market) => db.batch((await marketWrites(db, version.id, {
+    network:         { ...network, markets: [] },
+    market:          written,
+    networkReviewed: true,
+    marketReviewed:  true,
+  }))());
 
-  const networkId = await ensureNetwork(db, version.id, { ...network, markets: [] });
-  await writeMarket(db, version.id, networkId, market);
+  await write(market);
+  t.equal(await count(db, 'registry_networks'), 1, 'the first market of a network writes the network');
+  t.equal(
+    await count(db, 'network_price_exceptions'),
+    network.priceExceptions.length,
+    'with its price exceptions',
+  );
 
   /*
-   * An invocation can commit a market and lose its lease before the
-   * checkpoint, so the next one imports that root again. The second write
-   * must replace the first rather than collide with the deployment key it
-   * already wrote.
+   * A market replaces any row of its deployment, so writing it again leaves
+   * one market rather than colliding with the deployment key it already wrote.
    */
-  await t.resolves(
-    () => writeMarket(db, version.id, networkId, { ...market, id: randomUUID() }),
-    'the same market can be written twice',
-  );
+  await t.resolves(() => write({ ...market, id: randomUUID() }), 'the same market can be written twice');
+  t.equal(await count(db, 'registry_networks'), 1, 'and the network it already has is not written again');
   t.equal(await count(db, 'markets'), 1, 'and leaves one row');
   t.equal(
     await count(db, 'market_assets'),
@@ -183,6 +214,37 @@ t.test('a market is written idempotently, so a retried root can succeed', async 
     'with one set of assets, the replaced ones having gone with it',
   );
   t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
+});
+
+/*
+ * A version has one default market, which the schema keeps with a unique
+ * index. A market imported as the default beside another one is refused
+ * before anything is written, naming both, rather than by that index in the
+ * middle of the write, whose message names neither.
+ */
+t.test('a second default market is refused before it is written, naming both', async t => {
+  const db      = await freshDatabase();
+  const version = await candidate(db);
+  const network = networks.find(entry => entry.chainId === 1)!;
+  const usdc    = network.markets.find(entry => entry.deploymentKey === 'usdc')!;
+  const weth    = network.markets.find(entry => entry.deploymentKey === 'weth')!;
+  const writes  = async (market: typeof usdc) => marketWrites(db, version.id, {
+    network:         { ...network, markets: [] },
+    market,
+    networkReviewed: true,
+    marketReviewed:  true,
+  });
+
+  t.ok(usdc.isDefault, 'the fixture opens mainnet usdc by default');
+  await db.batch((await writes(usdc))());
+
+  const refused = await writes({ ...weth, isDefault: true }).then(() => null, (error: unknown) => error);
+  t.ok(isRegistryError(refused) && refused.code === 'OVERLAY_INVALID', 'a second default is the overlay\'s mistake');
+  t.match((refused as Error).message, /1\/weth.*1\/usdc/, 'and names both markets');
+  t.equal(await count(db, 'markets'), 1, 'nothing of it is written');
+
+  await t.resolves(async () => db.batch((await writes({ ...usdc, id: randomUUID() }))()),
+    'while the default written again is still the one default');
 });
 
 t.test('the snapshot checksum reproduces the frozen contract value', async t => {
@@ -248,7 +310,7 @@ t.test('an importing candidate can be rewritten, a terminal one cannot', async t
   t.equal(await latestValidationAttempt(db, version.id), 1, 'the latest attempt is reported');
 
   await markValidated(db, version.id, await snapshotChecksum(networks));
-  const [ validated ] = await findAttempts(db, SOURCE);
+  const [ validated ] = await findAttemptsByCommit(db, SOURCE.repository, SOURCE.commitSha);
   t.equal(validated!.status, 'validated');
   t.equal(validated!.snapshot_checksum, snapshot.registryVersion.checksum);
   t.ok(validated!.validated_at, 'validation is timestamped');

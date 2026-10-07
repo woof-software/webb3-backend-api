@@ -7,6 +7,8 @@ compatibility_date = "2026-06-25"
 compatibility_flags = ["nodejs_compat"]
 # worker will not deploy to *.workers.dev built-in preview/dev environment
 workers_dev = false
+# stage and production run on the Workers Paid plan with its default limits,
+# so no environment sets [limits] (README.md, Workers Plan)
 
 # in the default env, the worker should run locally
 name = "v3-api-local"
@@ -28,10 +30,12 @@ d1_databases = [
     { binding = "APP_DB", database_name = "c3-api-local", database_id = "local:c3-api", migrations_dir = "migrations" },
 ]
 
-# [3] registry admin writes are limited per authenticated actor and route
-# family; every environment needs its own namespace id
+# [3] every registry admin request, reads included, is limited per admin
+# token and route family, and before its token is checked, per client
+# address; every environment needs its own namespace ids
 ratelimits = [
     { name = "REGISTRY_ADMIN_RATE_LIMITER", namespace_id = "1001", simple = { limit = 30, period = 60 } },
+    { name = "REGISTRY_ADMIN_AUTH_RATE_LIMITER", namespace_id = "1002", simple = { limit = 60, period = 60 } },
 ]
 
 # [1] in deployed environments, we need service bindings in order to send
@@ -53,7 +57,10 @@ NODE_PROXY_KEY = "optional-node-proxy-key_XXX"
 BLOCK_NATIVE_API_KEY = "optional-BN-key_XXX"
 FLAGS_ETH_COMPUTATION_INDEX_BIAS = "default"
 # [4] comet registry source, sync, and cache settings; vars are not inherited,
-# so every environment repeats them
+# so every environment repeats them. A number is a whole number, and empty is
+# its default; a value the registry does not take is named by the status as
+# configuration-invalid. Its secrets never go here (.dev.vars.example):
+# COMET_REGISTRY_ADMIN_TOKEN_HASH, and in stage and production COMET_GITHUB_TOKEN
 COMET_SOURCE_REPOSITORY = "Compound-Foundation/comet"
 COMET_SOURCE_REF = "main"
 COMET_UPSTREAM_CHECK_INTERVAL_S = "86400"
@@ -97,9 +104,10 @@ kv_namespaces = [
 d1_databases = [
     { binding = "APP_DB", database_name = "c3-api-stage", database_id = "00000000-0000-0000-0000-000000000000", migrations_dir = "migrations" },
 ]
-# [3] TODO: confirm the namespace id is unused in the Cloudflare account
+# [3] TODO: confirm the namespace ids are unused in the Cloudflare account
 ratelimits = [
     { name = "REGISTRY_ADMIN_RATE_LIMITER", namespace_id = "2001", simple = { limit = 30, period = 60 } },
+    { name = "REGISTRY_ADMIN_AUTH_RATE_LIMITER", namespace_id = "2002", simple = { limit = 60, period = 60 } },
 ]
 services = [
     { binding = "node_provider_proxy", service = "node-provider-v3-api" }
@@ -140,9 +148,10 @@ kv_namespaces = [
 d1_databases = [
     { binding = "APP_DB", database_name = "c3-api-production", database_id = "00000000-0000-0000-0000-000000000000", migrations_dir = "migrations" },
 ]
-# [3] TODO: confirm the namespace id is unused in the Cloudflare account
+# [3] TODO: confirm the namespace ids are unused in the Cloudflare account
 ratelimits = [
     { name = "REGISTRY_ADMIN_RATE_LIMITER", namespace_id = "3001", simple = { limit = 30, period = 60 } },
+    { name = "REGISTRY_ADMIN_AUTH_RATE_LIMITER", namespace_id = "3002", simple = { limit = 60, period = 60 } },
 ]
 services = [
     { binding = "node_provider_proxy", service = "node-provider-v3-api" }

@@ -1,6 +1,5 @@
 import t from 'tap';
 
-import * as Eth      from '../../../../lib/eth-constants.js';
 import { BigNumber } from '../../../../lib/bignumber.js';
 import { BigFixnum } from '../../../../lib/bigfixnum.js';
 
@@ -17,10 +16,12 @@ import * as rewards from '../../../../lib/computations/rewards.js';
 import '../../../../shim/node-self.js';
 
 import { setupTestEnvVars } from '../../../util/setupTestEnvVars.js';
+import { fixtureComet }     from '../../../util/registry-fixture.js';
 
 const network: KnownNetwork.Name = 'ethereum-mainnet';
-const contract = Eth.wellKnownContractsByNetwork[network]['Comet']['cUSDCv3'];
-const rewardsTokenPriceFeed = contract.rewards.priceFeed;
+const contract = fixtureComet(network, '0xc3d688b66703497daa19211eedff47f25384cdc3');
+// the feed the rewards summary route reads the reward token's price from
+const rewardsTokenPriceFeed = contract.rewards!.priceFeed!;
 
 let apiHost = '';
 let nodeHost = '';
