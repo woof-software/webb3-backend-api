@@ -5,7 +5,7 @@ name = "woof-node-provider-proxy"
 compatibility_date = "2026-06-25"
 compatibility_flags = ["nodejs_compat"]
 
-workers_dev = true
+workers_dev = false
 
 keep_vars = true
 
@@ -18,7 +18,7 @@ allowedAppKey = ""
 allowedHosts = []
 
 [vars.settings]
-maskUpstreamErrors = false
+maskUpstreamErrors = true
 retryWithActiveFallback = false
 retryIndividualFailedRpcs = false
 defaultFallbackExpirationTtlSeconds = 60
