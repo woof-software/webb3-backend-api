@@ -310,12 +310,22 @@ function createTransactionAction({
 };
 
 const rawTransactionHistoryItems = implement({
-  // 5: a token the network renames is reported by that name
-  version: 5,
+  // 6: keyed by what history reads, so a change to a feed or an exception keeps the items
+  version: 6,
   index: Index.TransactionHistoryIndex,
-  // the items read one network's markets and tokens, so a change elsewhere keeps them
-  key(name, { catalog, ...context }) {
-    return Key.toKey(name, { ...context, registry: catalog.keyFor(context.network) });
+  /*
+   * The items read one network's markets and tokens, so a change elsewhere
+   * keeps them. The contracts are named by address: their creation blocks
+   * are in the network's history key, and a market's own cache key also
+   * covers its feeds and exceptions, which no item reads.
+   */
+  key(name, { catalog, marketContracts, rewardsContract, ...context }) {
+    return Key.toKey(name, {
+      ...context,
+      marketContracts: marketContracts.map(contract => contract.address.toLowerCase()),
+      rewardsContract: rewardsContract.address.toLowerCase(),
+      registry:        catalog.historyKeyFor(context.network),
+    });
   },
   compute({ 
     accountAddress,

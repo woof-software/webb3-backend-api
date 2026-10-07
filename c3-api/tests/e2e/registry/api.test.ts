@@ -95,6 +95,10 @@ t.test('the bootstrap read serves the active snapshot, or says there is none', a
   t.equal(body.schemaVersion, 1);
   t.equal(body.registryVersion.id, versionId);
   t.same(body.networks, snapshot.networks, 'the payload is the snapshot that was stored');
+
+  const slashed = await server.fetch('/registry/v1/active/');
+  t.equal(slashed.status, 200, 'a trailing slash names the same resource');
+  t.equal(slashed.headers.get('x-registry-version'), versionId);
 });
 
 t.test('a snapshot is cacheable by version and checksum', async t => {
@@ -104,8 +108,8 @@ t.test('a snapshot is cacheable by version and checksum', async t => {
 
   const first = await server.fetch('/registry/v1/active');
   const etag  = first.headers.get('etag');
-  t.match(etag, /^"v1-snapshot-[0-9a-f-]+-[0-9a-f]{64}"$/,
-    'the ETag identifies schema, representation, version, and checksum');
+  t.equal(etag, `"v1-r2-snapshot-${versionId}-${snapshot.registryVersion.checksum}"`,
+    'the ETag identifies schema, revision, representation, version, and checksum');
   t.match(first.headers.get('cache-control'), /max-age=300/, 'with the configured cache lifetime');
 
   /*
@@ -131,8 +135,78 @@ t.test('a snapshot is cacheable by version and checksum', async t => {
   t.equal(repeat.status, 304, 'an unchanged version answers 304');
   t.equal(repeat.headers.get('x-registry-version'), versionId, 'and still names the version');
 
+  // the same bytes by id are the same representation, decided from the version's row alone
+  const pinned = await server.fetch(`/registry/v1/versions/${versionId}`, { headers: { 'If-None-Match': etag! } });
+  t.equal(pinned.status, 304, 'the version read by id accepts the tag of the same bytes');
+  t.equal(pinned.headers.get('etag'), etag);
+
   const stale = await server.fetch('/registry/v1/active', { headers: { 'If-None-Match': '"v1-other-version"' } });
   t.equal(stale.status, 200, 'a different ETag gets the body');
+});
+
+/*
+ * If-None-Match is compared as RFC 9110 has it: weakly, so the tag a browser
+ * sends back for a response Cloudflare compressed — the same tag, marked
+ * weak — names the version as the tag itself does; `*` names any; and a list
+ * names what any tag in it names. What is none of those names nothing.
+ */
+t.test('a conditional read is answered 304 by the weak tag, by a star, and by a list that holds the tag', async t => {
+  const db        = await freshDatabase();
+  const versionId = await seedValidated(db);
+  await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/activate`, { reason: 'activate' }));
+
+  const etag     = (await server.fetch('/registry/v1/active')).headers.get('etag')!;
+  const answered = async (header: string) => (await server.fetch('/registry/v1/active', { headers: { 'If-None-Match': header } })).status;
+
+  for (const [ header, what ] of [
+    [ `W/${etag}`, 'the tag marked weak' ],
+    [ '*', 'a star' ],
+    [ `"v1-other-version", ${etag}`, 'a list that holds the tag' ],
+    [ `W/"v1-other-version", W/${etag}`, 'and one that holds it marked weak' ],
+  ] as const) {
+    t.equal(await answered(header), 304, `${what} is answered 304`);
+  }
+  for (const [ header, what ] of [
+    [ '"v1-other-version", W/"v1-yet-another-version"', 'a list without the tag' ],
+    [ etag.slice(1, -1), 'the tag without its quotes' ],
+    [ `w/${etag}`, 'a weak mark in the wrong case' ],
+  ] as const) {
+    t.equal(await answered(header), 200, `${what} gets the body`);
+  }
+});
+
+/*
+ * A chain id has one spelling in a path: decimal, without a leading zero, and
+ * no larger than a number holds exactly. Anything else is refused rather than
+ * read as the chain it resembles, which would give one resource many URLs,
+ * each cached on its own — on the public routes and the administrative ones.
+ */
+t.test('a chain id in a path is read in its one spelling only', async t => {
+  const db        = await freshDatabase();
+  const versionId = await seedValidated(db);
+  await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/activate`, { reason: 'activate' }));
+  const { versionId: draft } = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+
+  const comet = snapshot.networks.find(network => network.chainId === 1)!.markets[0]!.contracts.comet!;
+  const auth  = { headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` } };
+  const paths = (chainId: string): Array<[ string, { headers?: Record<string, string> } ]> => [
+    [ `/registry/v1/networks/${chainId}/markets`, {} ],
+    [ `/registry/v1/networks/${chainId}/markets/${comet}`, {} ],
+    [ `/registry/v1/admin/versions/${draft}/markets/${chainId}/usdc/overlay`, auth ],
+  ];
+
+  for (const [ path, init ] of paths('1')) {
+    t.equal((await server.fetch(path, init)).status, 200, `${path} reads chain 1`);
+  }
+  for (const spelling of [ '01', '0x1', '1e0', '1.0', '+1', '0x0a', '9007199254740993' ]) {
+    for (const [ path, init ] of paths(spelling)) {
+      const refused = await server.fetch(path, init);
+      t.equal(refused.status, 400, `${path} is refused`);
+      t.equal((await refused.json() as { error: { message: string } }).error.message, `${spelling} is not a chain id`);
+    }
+  }
+  t.equal((await server.fetch('/registry/v1/networks/9007199254740991/markets')).status, 404,
+    'while the largest chain id a number holds exactly is one, of no network here');
 });
 
 t.test('the convenience reads serve the same objects as the snapshot', async t => {
@@ -212,6 +286,84 @@ t.test('a disabled market is not served by any public read', async t => {
     'while the market route already refused it');
 });
 
+/*
+ * A network whose every market is disabled serves nothing. A chain the source
+ * has just added arrives that way — under its canonical name, with nothing
+ * about it reviewed — and the version validates without a decision about it,
+ * but no public read lists it: it would offer a network nobody decided to
+ * offer, with no market to open.
+ */
+t.test('a network that serves no market is not listed by any public read', async t => {
+  const db = await freshDatabase();
+  const { versionId } = await seedCandidate(db, snapshot);
+  await db.batch([
+    db.prepare(
+      `UPDATE markets SET status = 'disabled', is_default = 0, reviewed = 0, rewards_enabled = 0,
+              account_rewards_enabled = 0, transaction_history_enabled = 0
+       WHERE registry_version_id = ?1
+         AND network_id = (SELECT id FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = 534352)`
+    ).bind(versionId),
+    db.prepare(`UPDATE registry_networks SET reviewed = 0, display_name = 'scroll-mainnet' WHERE registry_version_id = ?1 AND chain_id = 534352`)
+      .bind(versionId),
+  ]);
+
+  const validated = await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/validate`, {}));
+  t.equal((await validated.json() as { version: { status: string } }).version.status, 'validated',
+    'a network nobody reviewed that serves nothing does not hold the version back');
+  await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/activate`, { reason: 'activate' }));
+
+  const listed = async (path: string) => ((await (await server.fetch(path)).json()) as { networks: Array<{ chainId: number }> })
+    .networks.map(network => network.chainId);
+  t.same(await listed('/registry/v1/networks'), [ 1, 8453 ], 'the network list leaves it out');
+  t.same(await listed('/registry/v1/active'), [ 1, 8453 ], 'and so does the snapshot read');
+  t.same(await listed(`/registry/v1/versions/${versionId}`), [ 1, 8453 ], 'and the version read by id');
+  t.equal((await server.fetch('/registry/v1/networks/534352/markets')).status, 404, 'its market list is not found');
+
+  /*
+   * A release before this one listed the network for the same version and
+   * checksum, under a tag without the revision. A client holding that copy
+   * is sent the body again rather than told it is still current.
+   */
+  const checksum = (await server.fetch('/registry/v1/active')).headers.get('x-registry-checksum');
+  for (const [ path, representation ] of [
+    [ '/registry/v1/active', 'snapshot' ],
+    [ '/registry/v1/networks', 'networks' ],
+    [ `/registry/v1/versions/${versionId}`, 'snapshot' ],
+  ] as const) {
+    const earlier = await server.fetch(path, { headers: { 'If-None-Match': `"v1-${representation}-${versionId}-${checksum}"` } });
+    t.equal(earlier.status, 200, `${path} does not confirm the copy an earlier release sent`);
+    t.same(
+      ((await earlier.json()) as { networks: Array<{ chainId: number }> }).networks.map(network => network.chainId),
+      [ 1, 8453 ],
+      'and sends the body without the network',
+    );
+  }
+});
+
+/*
+ * A network that serves a market is offered under its name and presentation,
+ * so someone has to have decided them. One nobody reviewed would be offered
+ * under the provisional overlay: its canonical name, with nothing presented.
+ */
+t.test('a network nobody reviewed may not serve a market', async t => {
+  const db = await freshDatabase();
+  const { versionId } = await seedCandidate(db, snapshot);
+  await db.prepare(`UPDATE registry_networks SET reviewed = 0 WHERE registry_version_id = ?1 AND chain_id = 534352`)
+    .bind(versionId).run();
+
+  const response = await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/validate`, {}));
+  const result = await response.json() as {
+    version: { status: string },
+    summary: { checks: Array<{ name: string, scope: string, passed: boolean }> },
+  };
+  t.equal(result.version.status, 'invalid', 'the version does not validate');
+  t.same(
+    result.summary.checks.filter(check => !check.passed).map(check => [ check.name, check.scope ]),
+    [ [ 'served-network-reviewed', 'network:534352' ] ],
+    'and the check that decided it names the network',
+  );
+});
+
 t.test('a retained version can be refetched by id', async t => {
   const db      = await freshDatabase();
   const first   = await seedValidated(db);
@@ -233,11 +385,16 @@ t.test('administrative routes are authenticated and closed to browsers', async t
 
   const anonymous = await server.fetch(`/registry/v1/admin/versions/${versionId}`);
   t.equal(anonymous.status, 401, 'an unauthenticated read is refused');
+  t.equal(anonymous.headers.get('www-authenticate'), 'Bearer', 'naming the scheme it takes');
   t.equal(anonymous.headers.get('access-control-allow-origin'), null, 'and carries no CORS header');
   t.equal(anonymous.headers.get('x-content-type-options'), 'nosniff', 'but keeps the security headers');
 
   const wrongToken = await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/activate`, { reason: 'x' }, 'not-the-token'));
   t.equal(wrongToken.status, 401, 'a wrong token is refused');
+  t.equal(wrongToken.headers.get('www-authenticate'), 'Bearer error="invalid_token"', 'saying that the token is the problem');
+
+  // the administrative paths are published, so one that is none of them is unknown to anybody
+  t.equal((await server.fetch('/registry/v1/admin/nonsense')).status, 404, 'an unknown administrative path is a 404');
 
   const wrongMethod = await server.fetch(`/registry/v1/admin/versions/${versionId}`, {
     method:  'POST',
@@ -307,6 +464,51 @@ t.test('activation and rollback are idempotent and audited', async t => {
     `SELECT action FROM registry_activations ORDER BY rowid`
   ).all<{ action: string }>();
   t.same((history.results ?? []).map(row => row.action), [ 'activate', 'activate', 'rollback' ], 'every change is audited once');
+});
+
+/*
+ * An activation or a rollback may name the version it is decided against. Of
+ * two such moves made against the same version — a rollback and an
+ * activation of something newer, by two people — the later one is refused
+ * rather than silently undoing the other.
+ */
+t.test('a move decided against a version someone has since replaced is refused', async t => {
+  const db    = await freshDatabase();
+  const first = await seedValidated(db);
+  const second = await seedValidated(db, randomUUID());
+  const third  = await seedValidated(db, randomUUID());
+  const move = async (action: string, versionId: string, expected: string | null) => server.fetch(...admin(
+    `/registry/v1/admin/versions/${versionId}/${action}`,
+    { reason: `${action} against ${expected}`, expectedActiveVersionId: expected },
+  ));
+
+  t.equal((await move('activate', first, null)).status, 200, 'the first activation expects nothing to be on');
+  t.equal((await move('activate', second, first)).status, 200, 'and the next one the version it replaces');
+
+  // two operators act on the second version being on: one switches the third on, the other rolls back
+  t.equal((await move('activate', third, second)).status, 200);
+  const rollback = await move('rollback', first, second);
+  t.equal(rollback.status, 409, 'the rollback decided against the second version is refused');
+  t.match((await rollback.json() as { error: { message: string } }).error.message, new RegExp(`active version is ${third}`),
+    'and says what is on now');
+
+  const active = await (await server.fetch('/registry/v1/active')).json() as typeof snapshot;
+  t.equal(active.registryVersion.id, third, 'so the activation it raced is what the registry serves');
+  t.same(
+    ((await db.prepare(`SELECT action FROM registry_activations ORDER BY rowid`).all<{ action: string }>()).results ?? [])
+      .map(row => row.action),
+    [ 'activate', 'activate', 'activate' ],
+    'and only the moves that happened are audited',
+  );
+
+  const repeated = await move('activate', third, second);
+  t.equal(repeated.status, 200, 'a move whose target is already on is the idempotent no-op, whatever it expected');
+  t.equal((await repeated.json() as { changed: boolean }).changed, false);
+
+  const malformed = await server.fetch(...admin(`/registry/v1/admin/versions/${first}/rollback`, {
+    reason: 'x', expectedActiveVersionId: 42,
+  }));
+  t.equal(malformed.status, 400, 'an expectation that names no version is refused, not ignored');
 });
 
 t.test('administrative commands validate their bodies', async t => {
@@ -387,7 +589,7 @@ t.test('an overlay is replaced completely, and only while importing', async t =>
   const applied = await renamed.json() as { changed: boolean, overlayEventId: string, snapshotChecksum: string | null };
   t.equal(applied.changed, true, 'a reviewed change is applied');
   t.ok(applied.overlayEventId, 'with an audit event');
-  t.equal(applied.snapshotChecksum, null, 'and the snapshot checksum is cleared until validation recomputes it');
+  t.equal(applied.snapshotChecksum, null, 'and the draft has no snapshot checksum until validation writes one');
 
   const stored = await db.prepare(
     `SELECT display_name FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = 1`
@@ -471,6 +673,124 @@ t.test('a market overlay reads back in the form it is written in', async t => {
   const wrongMethod = await server.fetch(path, { method: 'POST', headers: auth.headers });
   t.equal(wrongMethod.status, 405);
   t.equal(wrongMethod.headers.get('allow'), 'PUT, GET, OPTIONS', 'the path takes both verbs');
+});
+
+/*
+ * The overlay a market carries can be read, changed and sent back saying
+ * which overlay the change was decided against. A change someone else made
+ * in between is not undone by it: the second write is refused.
+ */
+t.test('a market overlay read and sent back says what it was decided against', async t => {
+  const db = await freshDatabase();
+  const { versionId } = await seedCandidate(db, snapshot);
+  const auth = { headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` } };
+  const path = `/registry/v1/admin/versions/${versionId}/markets/1/usdc/overlay`;
+
+  const read = await (await server.fetch(path, auth)).json() as { digest: string, overlay: Record<string, unknown> };
+  t.match(read.digest, /^[0-9a-f]{64}$/, 'a reviewed market answers the digest of its overlay');
+
+  const renamed = await server.fetch(...put(path, {
+    reason: 'rename it', overlay: { ...read.overlay, displayName: 'USD Coin market' }, expectedDigest: read.digest,
+  }));
+  t.equal(renamed.status, 200, 'a change decided against what is stored is written');
+  const written = await renamed.json() as { changed: boolean, digest: string };
+  t.equal(written.changed, true);
+  t.equal((await (await server.fetch(path, auth)).json() as { digest: string }).digest, written.digest,
+    'and the digest it answers is the one the market is read with next');
+
+  const stale = await server.fetch(...put(path, {
+    reason: 'rename it differently', overlay: { ...read.overlay, displayName: 'USDC market' }, expectedDigest: read.digest,
+  }));
+  t.equal(stale.status, 409, 'a change decided against the overlay it replaced is refused');
+  t.equal(
+    (await stale.json() as { error: { details: { current: Record<string, string> } } }).error.details.current['market 1/usdc'],
+    written.digest,
+    'naming the overlay the market holds now',
+  );
+
+  t.equal((await server.fetch(...put(path, { reason: 'x', overlay: read.overlay, expectedDigest: 'abc' }))).status, 400,
+    'and a digest that is not one is refused rather than ignored');
+
+  await db.prepare(
+    `UPDATE markets SET status = 'disabled', is_default = 0, reviewed = 0 WHERE registry_version_id = ?1 AND deployment_key = 'weth'`
+  ).bind(versionId).run();
+  const unreviewed = await (await server.fetch(`/registry/v1/admin/versions/${versionId}/markets/1/weth/overlay`, auth))
+    .json() as { digest: string | null };
+  t.equal(unreviewed.digest, null, 'a market nobody has reviewed has no reviewed overlay to name');
+});
+
+/*
+ * An expiry decides when a live feed is read again. It is an instant with its
+ * offset, stored as the moment it names; one already past is refused when it
+ * is written, because it would be stored, carried into every later version,
+ * and never once price the feed it names.
+ */
+t.test('a price exception expires at an instant that is still to come', async t => {
+  const db = await freshDatabase();
+  const { versionId } = await seedCandidate(db, snapshot);
+  const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
+  const path    = `/registry/v1/admin/versions/${versionId}/networks/1/overlay`;
+  const expiring = (expiresAt: string) => ({
+    displayName:               mainnet.displayName,
+    assetDisplayOverrides:     mainnet.presentation.assetDisplayOverrides,
+    unwrappedCollateralAssets: mainnet.presentation.unwrappedCollateralAssets,
+    priceExceptions:           mainnet.priceExceptions.map(exception => ({ ...exception, expiresAt })),
+  });
+
+  const loose = await server.fetch(...put(path, { reason: 'x', overlay: expiring('Sep 21 2099') }));
+  t.equal(loose.status, 400, 'a date Date.parse would guess at is refused');
+
+  const past = await server.fetch(...put(path, { reason: 'x', overlay: expiring('2020-01-01T00:00:00Z') }));
+  t.equal(past.status, 400, 'and so is one already past');
+  t.match((await past.json() as { error: { message: string } }).error.message, /already expired/);
+
+  const later = await server.fetch(...put(path, { reason: 'until governance replaces it', overlay: expiring('2099-01-01T02:00:00+02:00') }));
+  t.equal(later.status, 200, 'one still to come is written');
+  const stored = await db.prepare(
+    `SELECT DISTINCT expires_at FROM network_price_exceptions WHERE registry_version_id = ?1`
+  ).bind(versionId).all<{ expires_at: string }>();
+  t.same((stored.results ?? []).map(row => row.expires_at), [ '2099-01-01T00:00:00.000Z' ], 'as the UTC instant it names');
+});
+
+/*
+ * A network overlay is replaced whole, so every change to a network sends its
+ * exceptions again, one that has expired since among them. One the network
+ * holds exactly as it is was decided before and is kept; only an expiry the
+ * document writes has to be still to come.
+ */
+t.test('an exception that has expired since it was written is kept as it is', async t => {
+  const db = await freshDatabase();
+  const { versionId } = await seedCandidate(db, snapshot);
+  const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
+  const [ expired ] = mainnet.priceExceptions;
+  const expiryOf = () => db.prepare(
+    `SELECT expires_at FROM network_price_exceptions WHERE registry_version_id = ?1 AND price_feed_address = ?2`
+  ).bind(versionId, expired!.priceFeedAddress).first<string>('expires_at');
+  await db.prepare(
+    `UPDATE network_price_exceptions SET expires_at = '2020-01-01T00:00:00.000Z'
+     WHERE registry_version_id = ?1 AND price_feed_address = ?2`
+  ).bind(versionId, expired!.priceFeedAddress).run();
+
+  const path = `/registry/v1/admin/versions/${versionId}/networks/1/overlay`;
+  const withExpiry = (expiresAt: string) => ({
+    displayName:               mainnet.displayName,
+    assetDisplayOverrides:     mainnet.presentation.assetDisplayOverrides,
+    unwrappedCollateralAssets: mainnet.presentation.unwrappedCollateralAssets,
+    priceExceptions: [
+      ...mainnet.priceExceptions.map(exception => exception === expired ? { ...exception, expiresAt } : exception),
+      { kind: 'zero_price', priceFeedAddress: '0x00000000000000000000000000000000000000f1', provenance: 'reverts', expiresAt: null },
+    ],
+  });
+
+  const added = await server.fetch(...put(path, { reason: 'price the feed that reverts', overlay: withExpiry('2020-01-01T00:00:00Z') }));
+  t.equal(added.status, 200, 'a new exception is written, with the expired one sent again as it is');
+  t.equal(await expiryOf(), '2020-01-01T00:00:00.000Z', 'which is kept');
+
+  const moved = await server.fetch(...put(path, { reason: 'move the expiry', overlay: withExpiry('2021-01-01T00:00:00Z') }));
+  t.equal(moved.status, 400, 'while an expiry the document changes has to be still to come');
+  t.match((await moved.json() as { error: { message: string } }).error.message,
+    `already expired: ${expired!.priceFeedAddress} at 2021-01-01T00:00:00.000Z`);
+  t.equal(await expiryOf(), '2020-01-01T00:00:00.000Z', 'and nothing is written');
 });
 
 t.test('a market overlay carries the reviewed decisions', async t => {
@@ -612,7 +932,7 @@ t.test('the versions there are can be listed, newest first', async t => {
   const empty = await (await server.fetch('/registry/v1/admin/versions', { headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` } })).json() as {
     activeVersionId: string | null, versions: unknown[],
   };
-  t.same(empty, { activeVersionId: null, versions: [] }, 'an environment with no versions lists none');
+  t.same(empty, { activeVersionId: null, next: null, versions: [] }, 'an environment with no versions lists none');
 
   const active = await seedValidated(db);
   await server.fetch(...admin(`/registry/v1/admin/versions/${active}/activate`, { reason: 'bringing it up' }));
@@ -653,8 +973,25 @@ t.test('the versions there are can be listed, newest first', async t => {
 
   const one = await (await server.fetch('/registry/v1/admin/versions?limit=1', {
     headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` },
-  })).json() as { versions: unknown[] };
+  })).json() as { versions: Array<{ id: string }>, next: string | null };
   t.equal(one.versions.length, 1, 'and is bounded');
+  t.equal(one.next, one.versions[0]!.id, 'naming where the next page starts');
+
+  /*
+   * A listing longer than a page is read page by page: each page names the
+   * version the next one starts after, and the last names none.
+   */
+  const rest = await (await server.fetch(`/registry/v1/admin/versions?limit=1&before=${one.next}`, {
+    headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` },
+  })).json() as { versions: Array<{ id: string }>, next: string | null };
+  t.same([ ...one.versions, ...rest.versions ].map(version => version.id), listed.versions.map(version => version.id),
+    'the pages are the listing, in its order');
+  t.equal(rest.next, null, 'and the last page names no next one');
+  t.equal(
+    (await server.fetch(`/registry/v1/admin/versions?before=${randomUUID()}`, { headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` } })).status,
+    404,
+    'a page cannot start after a version that does not exist',
+  );
 
   for (const query of [ '?status=nonsense', '?limit=0', '?limit=1000', '?limit=half' ]) {
     t.equal(
@@ -674,15 +1011,15 @@ t.test('a sync run reports its checkpoints without its lease owner', async t => 
   await db.prepare(
     `INSERT INTO sync_runs (
        id, source_commit_sha, tracked_ref, trigger_kind, requested_by, status,
-       lease_owner, lease_generation, lease_expires_at, expected_count, started_at
-     ) VALUES (?1, ?2, 'main', 'scheduled', 'registry-cron', 'running', 'secret-owner-token', 1, ?3, 1, ?3)`
+       lease_owner, lease_expires_at, expected_count, started_at
+     ) VALUES (?1, ?2, 'main', 'scheduled', 'registry-cron', 'running', 'secret-owner-token', ?3, 1, ?3)`
   ).bind(runId, 'a'.repeat(40), now).run();
   await db.prepare(
     `INSERT INTO sync_run_items (
-       id, sync_run_id, root_path, source_blob_sha, root_checksum,
-       upstream_network_key, deployment_key, status, attempts, claim_owner, claim_generation, last_error, created_at, updated_at
-     ) VALUES (?1, ?2, 'deployments/mainnet/usdc/roots.json', ?3, ?4, 'mainnet', 'usdc', 'failed', 1, 'secret-owner-token', 1, 'CHAIN_REQUEST_FAILED: a node provider request failed', ?5, ?5)`
-  ).bind(randomUUID(), runId, 'b'.repeat(40), '0'.repeat(64), now).run();
+       id, sync_run_id, root_path, source_blob_sha,
+       upstream_network_key, deployment_key, status, attempts, claim_owner, last_error, created_at, updated_at
+     ) VALUES (?1, ?2, 'deployments/mainnet/usdc/roots.json', ?3, 'mainnet', 'usdc', 'failed', 1, 'secret-owner-token', 'CHAIN_REQUEST_FAILED: a node provider request failed', ?4, ?4)`
+  ).bind(randomUUID(), runId, 'b'.repeat(40), now).run();
 
   const response = await server.fetch(`/registry/v1/admin/sync-runs/${runId}`, {
     headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` },
@@ -708,30 +1045,30 @@ t.test('a sync run reports its checkpoints without its lease owner', async t => 
 });
 
 /*
- * What the chain said about a market can only be checked while it is being
- * imported. Validating the stored candidate afterwards must not lose it: the
- * schema reads the latest attempt alone, so an attempt without those checks
- * would let a candidate the import found wrong become validated.
+ * Validation decides over the stored rows. An earlier attempt is history: a
+ * check it failed is decided again, and nothing it recorded is carried into
+ * the next one — what the chain says about a market is not a check, because a
+ * market the chain cannot confirm fails its import before it is written.
  */
-t.test('validating a candidate again keeps what the import heard from the chain', async t => {
+t.test('validating a candidate again decides it over its rows alone', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
   await recordValidationResults(db, versionId, 1, [
-    { check_name: 'base-asset-matches-chain', scope: 'market:1/usdc', passed: 0, details: { chain: 'another token' } },
-    { check_name: 'single-default-market',    scope: 'global',        passed: 1 },
+    { check_name: 'single-default-market',     scope: 'global',        passed: 0, details: { defaults: [] } },
+    { check_name: 'market-contracts-deployed', scope: 'market:1/usdc', passed: 1 },
   ]);
 
   const response = await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/validate`, {}));
-  t.equal(response.status, 422, 'a candidate the import found wrong cannot be validated');
+  t.equal(response.status, 200, 'the rows hold one default market, so the candidate validates');
   const result = await response.json() as {
     version: { status: string },
-    summary: { attempt: number, failed: number, checks: Array<{ name: string, scope: string, passed: boolean }> },
+    summary: { attempt: number, checks: Array<{ name: string, scope: string, passed: boolean }> },
   };
-  t.equal(result.version.status, 'invalid');
-  t.equal(result.summary.attempt, 2, 'the attempt is a new one');
-  t.ok(
-    result.summary.checks.some(check => check.name === 'base-asset-matches-chain' && !check.passed),
-    'carrying forward the chain check that failed',
+  t.equal(result.version.status, 'validated');
+  t.equal(result.summary.attempt, 2, 'in an attempt of its own');
+  t.notOk(
+    result.summary.checks.some(check => check.name === 'market-contracts-deployed'),
+    'which carries nothing over from the attempt before it',
   );
 });
 
@@ -761,6 +1098,62 @@ t.test('validation can be re-run through the API', async t => {
 });
 
 /*
+ * A validation that ran answers what it decided, invalid as well as valid:
+ * an invalid version is the outcome of the command, not a failure of it, and
+ * validating it again gives the same answer rather than an error.
+ */
+t.test('a candidate that fails its checks is answered as invalid, not as an error', async t => {
+  const db = await freshDatabase();
+  const { versionId } = await seedCandidate(db, snapshot);
+  await db.prepare(`UPDATE markets SET is_default = 0 WHERE registry_version_id = ?1`).bind(versionId).run();
+
+  const first = await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/validate`, {}));
+  t.equal(first.status, 200, 'the validation ran, so it answers 200');
+  const decided = await first.json() as {
+    version: { status: string }, changed: boolean, summary: { failed: number, checks: Array<{ name: string, passed: boolean }> },
+  };
+  t.equal(decided.version.status, 'invalid', 'with the version it decided invalid');
+  t.equal(decided.changed, true);
+  t.ok(decided.summary.checks.some(check => check.name === 'single-default-market' && !check.passed),
+    'and the check that decided it');
+
+  const again = await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/validate`, {}));
+  t.equal(again.status, 200, 'validating it again is the same answer');
+  const repeat = await again.json() as { version: { status: string }, changed: boolean, summary: { failed: number } };
+  t.same([ repeat.version.status, repeat.changed ], [ 'invalid', false ], 'which changes nothing');
+  t.equal(repeat.summary.failed, decided.summary.failed, 'and reports the checks it was decided by');
+});
+
+/*
+ * An administrative sync answers 202 while the import has work left for a
+ * later request, and 200 when this request is the whole answer. A request
+ * sent while another invocation imports is refused before the source is
+ * asked anything: the one running slot would refuse it anyway.
+ */
+t.test('an administrative sync says whether it is the whole answer', async t => {
+  const db = await freshDatabase();
+  await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1`).bind(new Date().toISOString()).run();
+
+  const idle = await server.fetch(...admin('/registry/v1/admin/sync', {}));
+  t.equal(idle.status, 200, 'a request with nothing to do is answered, not accepted for later');
+  t.equal((await idle.json() as { status: string }).status, 'idle');
+
+  // another invocation, importing right now under a live lease
+  await db.prepare(
+    `INSERT INTO sync_runs (
+       id, source_commit_sha, tracked_ref, trigger_kind, requested_by, status,
+       lease_owner, lease_expires_at, expected_count, started_at
+     ) VALUES (?1, ?2, 'main', 'scheduled', 'registry-cron', 'running', ?3, ?4, 1, ?5)`
+  ).bind(randomUUID(), 'a'.repeat(40), randomUUID(), new Date(Date.now() + 900_000).toISOString(), new Date().toISOString()).run();
+
+  const busy = await server.fetch(...admin('/registry/v1/admin/sync', {}));
+  t.equal(busy.status, 409, 'a request while another invocation imports is refused');
+  const { error } = await busy.json() as { error: { code: string, details: { code: string } } };
+  t.same([ error.code, error.details.code ], [ 'CONFLICT', 'SYNC_ALREADY_RUNNING' ],
+    'as a conflict, whose details name the registry\'s own reason');
+});
+
+/*
  * The shadow comparison as an operator reads it: against the active version
  * by default, or against a validated candidate before activating it.
  */
@@ -781,19 +1174,42 @@ t.test('what a candidate changes against the active version is served while it i
   mainnet.markets = mainnet.markets.filter(market => market.deploymentKey !== 'wbtc');
   const weth = mainnet.markets.find(market => market.deploymentKey === 'weth')!;
   weth.creationBlock = weth.creationBlock + 1;
+  // two markets the source added: one already described, one nobody has looked at
+  const usdt  = mainnet.markets.find(market => market.deploymentKey === 'usdt')!;
+  const added = (deploymentKey: string, comet: string, offset: number) => ({
+    ...structuredClone(usdt),
+    deploymentKey,
+    displayName:   deploymentKey.toUpperCase(),
+    isDefault:     false,
+    creationBlock: usdt.creationBlock + offset,
+    contracts:     { ...usdt.contracts, comet: comet as `0x${string}` },
+  });
+  mainnet.markets.push(
+    added('described', '0x6666666666666666666666666666666666666666', 1),
+    added('undescribed', '0x7777777777777777777777777777777777777777', 2),
+  );
   const { versionId } = await seedCandidate(db, next, { versionId: randomUUID(), attempt: 2 });
   await db.prepare(
-    `UPDATE markets SET status = 'disabled', reviewed = 0 WHERE registry_version_id = ?1 AND deployment_key = 'usdt'`
+    `UPDATE markets SET status = 'disabled', reviewed = 0 WHERE registry_version_id = ?1 AND deployment_key IN ('usdt', 'undescribed')`
   ).bind(versionId).run();
 
   const response = await server.fetch(`/registry/v1/admin/versions/${versionId}/changes`, auth);
   t.equal(response.status, 200);
   const changes = await response.json() as {
     status: string, comparedWith: string,
-    markets: { added: unknown[], removed: string[], changed: Array<{ scope: string, field: string, before: unknown, after: unknown }> },
+    markets: {
+      added:   Array<{ scope: string, reviewed: boolean }>,
+      removed: string[],
+      changed: Array<{ scope: string, field: string, before: unknown, after: unknown }>,
+    },
   };
   t.equal(changes.status, 'importing', 'a candidate that still imports is comparable');
   t.equal(changes.comparedWith, activeId, 'against the version that is on');
+  t.same(
+    changes.markets.added.map(({ scope, reviewed }) => ({ scope, reviewed })),
+    [ { scope: '1/described', reviewed: true }, { scope: '1/undescribed', reviewed: false } ],
+    'the markets it adds, each named as the version names it, and whether someone has described it',
+  );
   t.same(changes.markets.removed, [ '1/wbtc' ], 'the market it drops');
   t.same(
     changes.markets.changed.filter(change => change.scope === '1/weth'),

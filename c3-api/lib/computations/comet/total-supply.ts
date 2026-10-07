@@ -1,4 +1,5 @@
 import { BigFixnum }    from '../../bigfixnum.js';
+import * as Eth         from '../../eth-constants.js';
 import * as abiFunction from '../abi-function.js';
 
 import { Comet } from '../../well-known/contracts/types.js';
@@ -20,4 +21,16 @@ const totalSupply = implement({
   },
 });
 
-export { TotalSupply, totalSupply };
+/*
+ * What an amount a Comet reports is read from: the Comet, and the scale of
+ * its base asset, which the parser above reads it at. A balance keyed by this
+ * rather than by the contract's own key does not depend on the rest of what
+ * describes the market — its feeds, its exceptions, its labels — and so
+ * survives a version that changes only those.
+ */
+function cometAmountKey(contract: Eth.Contract): string {
+  const comet = contract.address.toLowerCase();
+  return Comet.is(contract) ? `${comet}:${contract.base.asset.decimals}` : comet;
+}
+
+export { TotalSupply, cometAmountKey, totalSupply };

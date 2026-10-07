@@ -1,8 +1,8 @@
 import t from 'tap';
 
 import type { MarketV1, NetworkV1 } from '../../../lib/model/comet-registry.js';
-import type { MarketEnrichment } from '../../../src/registry/enrichment.js';
-import { failures, hasFailures, validateCandidate, validateMarketImport } from '../../../src/registry/validation.js';
+import { failures, hasFailures, validateCandidate } from '../../../src/registry/validation.js';
+import type { CandidateInput } from '../../../src/registry/validation.js';
 
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 
@@ -14,44 +14,14 @@ import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
  */
 const snapshot = loadRegistrySnapshotFixture();
 
-function enrichmentFor(networks: NetworkV1[]): Map<string, MarketEnrichment> {
-  const enrichment = new Map<string, MarketEnrichment>();
-  for (const network of networks) {
-    for (const market of network.markets) {
-      enrichment.set(`${network.chainId}/${market.deploymentKey}`, {
-        baseToken:        market.baseAsset.token,
-        basePriceFeed:    market.baseAsset.priceFeed,
-        rewardToken:      market.rewardAsset?.token ?? null,
-        collateralAssets: market.collateralAssets,
-        missingContracts: [],
-      });
-    }
-  }
-  return enrichment;
-}
-
 /*
  * Applies one mutation to a copy of the fixture and reports which checks the
  * snapshot pass fails.
  */
-function failingChecks(mutate: (networks: NetworkV1[]) => void): string[] {
+function failingChecks(mutate: (networks: NetworkV1[]) => void, input: Omit<CandidateInput, 'networks'> = {}): string[] {
   const networks = structuredClone(snapshot.networks) as NetworkV1[];
   mutate(networks);
-  return [ ...new Set(failures(validateCandidate({ networks })).map(result => result.check_name)) ].sort();
-}
-
-/*
- * The import-time pass, which compares one assembled market with what the
- * chain answered for it.
- */
-function failingImportChecks(mutate: (market: MarketV1, enrichment: MarketEnrichment) => void): string[] {
-  const networks   = structuredClone(snapshot.networks) as NetworkV1[];
-  const market     = mainnetMarket(networks, 'usdc');
-  const enrichment = enrichmentFor(networks).get('1/usdc')!;
-  mutate(market, enrichment);
-  return failures(validateMarketImport({ chainId: 1, deploymentKey: 'usdc', market, enrichment }))
-    .map(result => result.check_name)
-    .sort();
+  return [ ...new Set(failures(validateCandidate({ ...input, networks })).map(result => result.check_name)) ].sort();
 }
 
 function mainnetMarket(networks: NetworkV1[], deploymentKey: string): MarketV1 {
@@ -116,7 +86,8 @@ t.test('history is served only by a market that names its rewards contract', asy
   t.same(
     failingChecks(networks => {
       const market = mainnetMarket(networks, 'usdc');
-      market.contracts = { ...market.contracts, rewards: null };
+      market.contracts    = { ...market.contracts, rewards: null };
+      market.capabilities = { ...market.capabilities, accountRewards: false };
     }),
     [ 'transaction-history-requires-rewards-contract' ],
     'transaction history without the rewards contract it is read with',
@@ -125,35 +96,82 @@ t.test('history is served only by a market that names its rewards contract', asy
     failingChecks(networks => {
       const market = mainnetMarket(networks, 'usdc');
       market.contracts    = { ...market.contracts, rewards: null };
-      market.capabilities = { ...market.capabilities, transactionHistory: false };
+      market.capabilities = { ...market.capabilities, transactionHistory: false, accountRewards: false };
     }),
     [],
     'while a market that serves no history needs no rewards contract',
   );
 });
 
-t.test('an assembled market must match what the chain answered', async t => {
+/*
+ * What an account is owed is read from the rewards contract, in the token it
+ * pays. A market's contracts carry only what it has — nothing stands in for a
+ * token its rewards contract does not pay — so a market whose account
+ * rewards are served must have both.
+ */
+t.test('account rewards are served only by a market that pays a token, through its rewards contract', async t => {
   t.same(
-    failingImportChecks(() => {}),
+    failingChecks(networks => {
+      const market = mainnetMarket(networks, 'usdc');
+      market.rewardAsset  = null;
+      market.capabilities = { ...market.capabilities, rewards: false };
+    }),
+    [ 'account-rewards-have-token' ],
+    'account rewards of a market whose rewards contract pays no token',
+  );
+  t.same(
+    failingChecks(networks => {
+      const market = mainnetMarket(networks, 'usdc');
+      market.contracts    = { ...market.contracts, rewards: null };
+      market.capabilities = { ...market.capabilities, transactionHistory: false };
+    }),
+    [ 'account-rewards-have-token' ],
+    'or of one without a rewards contract at all',
+  );
+  t.same(
+    failingChecks(networks => {
+      const market = mainnetMarket(networks, 'usdc');
+      market.rewardAsset  = null;
+      market.capabilities = { ...market.capabilities, rewards: false, accountRewards: false };
+    }),
     [],
-    'a market assembled from the chain passes',
+    'while a market that serves none needs neither',
   );
-  t.same(
-    failingImportChecks((_market, enrichment) => { enrichment.rewardToken = null; }),
-    [ 'reward-token-matches-chain' ],
-    'a reward token the chain does not confirm',
-  );
-  t.same(
-    failingImportChecks((_market, enrichment) => { enrichment.missingContracts = [ 'bulker' ]; }),
-    [ 'market-contracts-deployed' ],
-    'a declared contract with no bytecode',
-  );
-  t.same(
-    failingImportChecks((market, enrichment) => { enrichment.baseToken = market.collateralAssets[0]!.token; }),
-    [ 'base-asset-matches-chain' ],
-    'a base asset the Comet does not name',
-  );
+});
 
+/*
+ * A network that serves a market is offered under its name and presentation,
+ * which someone has to have decided. A chain the source has just added
+ * arrives with nothing about it reviewed and every market disabled: it serves
+ * nothing, is not listed, and does not hold the rest of the version back.
+ */
+t.test('a network that serves a market has been reviewed', async t => {
+  const scroll = (networks: NetworkV1[]) => networks.find(network => network.chainId === 534352)!;
+
+  t.same(
+    failingChecks(() => {}, { unreviewedNetworks: [ 534352 ] }),
+    [ 'served-network-reviewed' ],
+    'a network nobody reviewed that serves a market',
+  );
+  t.same(
+    failingChecks(networks => {
+      for (const market of scroll(networks).markets) {
+        market.status = 'deprecated';
+      }
+    }, { unreviewedNetworks: [ 534352 ] }),
+    [ 'served-network-reviewed' ],
+    'a deprecated market is served too',
+  );
+  t.same(
+    failingChecks(networks => {
+      for (const market of scroll(networks).markets) {
+        market.status       = 'disabled';
+        market.capabilities = { rewards: false, accountRewards: false, transactionHistory: false };
+      }
+    }, { unreviewedNetworks: [ 534352 ] }),
+    [],
+    'while a network whose every market is disabled needs no decision yet',
+  );
 });
 
 t.test('malformed collateral is rejected', async t => {
@@ -267,21 +285,6 @@ t.test('registry-wide invariants are enforced', async t => {
     'a network with no markets',
   );
   t.same(
-    failingChecks(networks => {
-      const exception = networks[0]!.priceExceptions.find(entry => entry.kind === 'fixed_price')!;
-      networks[0]!.priceExceptions = [ {
-        kind:                 'deprecated_price_remap',
-        priceFeedAddress:     exception.priceFeedAddress,
-        // decimals stay negative until enrichment reads the replacement feed
-        replacementPriceFeed: { address: '0x'.padEnd(42, 'b') as `0x${string}`, decimals: -1 },
-        provenance:           'replaced by governance',
-        expiresAt:            null,
-      } ];
-    }),
-    [ 'price-exception-feeds-readable' ],
-    'a remap whose replacement feed was never read',
-  );
-  t.same(
     failingChecks(networks => { mainnetMarket(networks, 'usdc').creationBlock = 0; }),
     [ 'creation-block-known' ],
     'a served market with no creation block',
@@ -305,20 +308,43 @@ t.test('registry-wide invariants are enforced', async t => {
   );
 });
 
+/*
+ * The roots a run checkpointed are matched with the markets the candidate
+ * holds, by network and deployment key. A count would say what the run
+ * finished; only the rows say what the candidate is, and a candidate holding
+ * as many markets as the run expected can still be missing one of them.
+ */
 t.test('an incomplete import cannot validate', async t => {
   const networks = snapshot.networks as NetworkV1[];
+  const roots    = networks.flatMap(network => network.markets.map(market => ({
+    upstreamNetworkKey: network.upstreamKey,
+    deploymentKey:      market.deploymentKey,
+  })));
   t.same(
-    failures(validateCandidate({ networks, roots: { expected: 6, imported: 6 } })),
+    failures(validateCandidate({ networks, roots })),
     [],
-    'a candidate holding every discovered root passes',
+    'a candidate holding every checkpointed root passes',
   );
 
-  const incomplete = failures(validateCandidate({ networks, roots: { expected: 7, imported: 6 } }));
+  const incomplete = failures(validateCandidate({
+    networks,
+    roots: [ ...roots, { upstreamNetworkKey: 'mainnet', deploymentKey: 'usds' } ],
+  }));
   t.same(incomplete.map(result => result.check_name), [ 'all-roots-imported' ], 'a missing market fails the candidate');
   t.same(
     incomplete[0]!.details,
-    { expected: 7, imported: 6 },
-    'and the diagnostic says how many roots never made it',
+    { expected: roots.length + 1, imported: roots.length, missing: [ 'mainnet/usds' ] },
+    'and the diagnostic names the roots that never made it',
+  );
+
+  const swapped = failures(validateCandidate({
+    networks,
+    roots: roots.map(root => root.deploymentKey === 'weth' ? { ...root, deploymentKey: 'wsteth' } : root),
+  }));
+  t.same(
+    swapped.map(result => result.details),
+    [ { expected: roots.length, imported: roots.length - 1, missing: [ 'mainnet/wsteth' ] } ],
+    'as many markets as roots is not enough: they have to be the markets the roots name',
   );
 });
 

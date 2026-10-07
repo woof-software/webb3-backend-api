@@ -6,9 +6,13 @@ import * as Debug from './lib/debug-log.js';
 import { route }      from './src/router.js';
 import * as Evaluator from './src/evaluator.js';
 
-import { EXPOSED_HEADERS, isAdminRoute } from './src/http/cors.js';
+import { legacyCorsHeaders } from './src/http/cors.js';
 import { isRegistryPath } from './src/registry/router.js';
-import { runRegistrySync } from './src/registry/scheduled.js';
+import {
+  checkRegistryChain,
+  maintainRegistryCache,
+  runRegistrySync,
+} from './src/registry/scheduled.js';
 
 import * as v2           from './lib/computations/v2.js';
 import * as evm          from './lib/computations/evm.js';
@@ -45,8 +49,10 @@ interface Env extends Flags.Env, ServiceBindings {
   kv_registry:  KVNamespace,
   // application database shared by all D1-backed features
   APP_DB:       D1Database,
-  // registry admin writes, keyed per authenticated actor and route family
+  // every registry admin request, reads included, keyed per admin token and route family
   REGISTRY_ADMIN_RATE_LIMITER: RateLimiter,
+  // every request under the registry admin prefix, before its token is checked, keyed per client address
+  REGISTRY_ADMIN_AUTH_RATE_LIMITER: RateLimiter,
   ENVIRONMENT:  string,
   /*
    * seed for memory cache, useful for testing where we need independent
@@ -72,7 +78,8 @@ interface Env extends Flags.Env, ServiceBindings {
   REGISTRY_STALE_FALLBACK_MAX_S: string,
   /*
    * how many minutes back the token list may take a collateral value it could
-   * not read now, from 0 to 30; unset or out of range is 15
+   * not read now: a whole number from 0 to 30, and anything else, unset
+   * included, is 15
    */
   TOKEN_COLLATERAL_MAX_STALE_MINUTES?: string,
   // the operator identity recorded in audit rows, never taken from a request
@@ -101,21 +108,6 @@ interface Env extends Flags.Env, ServiceBindings {
 export { Env, ServiceBindings };
 
 /*
- * CORS headers shared between the preflight and the main response
- */
-const CORS_HEADERS: Record<string, string> = {
-  'Access-Control-Allow-Origin': '*',
-  /*
-   * Every route that resolves a market names the registry version it was
-   * computed from, and says when that version came from the cache because
-   * the database could not be reached. A browser client can only read those
-   * headers if the response exposes them, and the list is the registry's own
-   * so the two routers cannot drift apart.
-   */
-  'Access-Control-Expose-Headers': EXPOSED_HEADERS,
-};
-
-/*
  * security headers applied to every response, per security team recommendation
  */
 const SECURITY_HEADERS: Record<string, string> = {
@@ -138,20 +130,22 @@ export default {
     if (request.method === 'OPTIONS' && !isRegistryPath(pathname)) {
       return new Response(null, {
         status: 204,
-        headers: {
-          ...CORS_HEADERS,
-          // preflight-only: advertise the methods the API supports
-          'Access-Control-Allow-Methods': 'GET',
-          ...SECURITY_HEADERS,
-        },
+        headers: { ...legacyCorsHeaders({ preflight: true }), ...SECURITY_HEADERS },
       });
     }
+    /*
+     * What one request may spend before the counting fetch and the
+     * computation cache refuse it themselves. No environment sets either
+     * value, so both are unbounded and the platform's budget is the one that
+     * applies: on the Workers Paid plan, 10,000 subrequests an invocation,
+     * which fetches and KV operations count against (README, "Workers Plan").
+     */
     const quota = Quota.initialize({
-      // cache resources: 1000 ops, regardless of reads or writes
+      // cache operations, reads and writes alike: QUOTA_CACHE_OPERATIONS
       ops:    env.QUOTA_CACHE_OPERATIONS ?? Infinity,
       reads:  env.QUOTA_CACHE_OPERATIONS ?? Infinity,
       writes: env.QUOTA_CACHE_OPERATIONS ?? Infinity,
-      // http resources: 1000 subrequests via fetch(..)
+      // subrequests made with fetch(..): QUOTA_SUBREQUESTS
       subrequests: env.QUOTA_SUBREQUESTS ?? Infinity,
     });
     fetch.configure(env, quota);
@@ -164,9 +158,15 @@ export default {
       flags,
       waitUntil: work => executionContext?.waitUntil(work),
     };
+    /*
+     * One id per request, made here: every error answer carries it, and so
+     * does the log line written about it, so a client's report leads to the
+     * line that explains it.
+     */
+    const requestId = crypto.randomUUID();
     const response = await route(
       request,
-      context,
+      { ...context, requestId },
       Evaluator.preInstantiate(quota, context, {
         ...evm.applyIndexBias(
           Flags.defaults(flags).ethComputationIndexBias,
@@ -184,13 +184,14 @@ export default {
       }),
     );
     /*
-     * Security headers apply everywhere. The wildcard CORS header does not:
-     * an authenticated administrative write must not be readable by a script
-     * on any origin, so those routes keep the headers their own router set.
+     * Security headers apply everywhere. CORS headers are set by the router
+     * that answered: a registry path keeps the ones the registry set — none on
+     * an administrative route, whose authenticated writes no script on any
+     * origin may read — and every other path takes the legacy routes' here.
      */
-    const headers = isAdminRoute(pathname)
+    const headers = isRegistryPath(pathname)
       ? SECURITY_HEADERS
-      : { ...CORS_HEADERS, ...SECURITY_HEADERS };
+      : { ...legacyCorsHeaders(), ...SECURITY_HEADERS };
     for (const [name, value] of Object.entries(headers)) {
       response.headers.set(name, value);
     }
@@ -202,12 +203,35 @@ export default {
    * imports a bounded number of markets and leaves the rest to the next one,
    * resuming from the checkpoints it finds in APP_DB
    */
-  async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env, context: ExecutionContext): Promise<void> {
+    /*
+     * No invocation is run again by the platform: the next one, an hour
+     * later, resumes from the checkpoints, which is the only retry the import
+     * needs.
+     */
+    controller.noRetry();
+    // the bytes of versions nothing is about to serve are removed, beside the import
+    context.waitUntil(maintainRegistryCache(env));
+    /*
+     * The version on is held against the chain beside the import, when it is
+     * due a check (checkRegistryChain), by the hour this invocation was
+     * scheduled for.
+     */
+    context.waitUntil(checkRegistryChain(env, new Date(controller.scheduledTime)));
     /*
      * The import brings its own fetch rather than configuring the shared
-     * request-counting one: it runs past the end of this handler, and a
-     * request arriving meanwhile would reset that counter and quota.
+     * request-counting one: a request arriving while it runs would reset that
+     * counter and quota.
+     *
+     * Its outcome is the invocation's. An import that failed — GitHub not
+     * answering while it looks for the commit, a database that did not
+     * answer, a configuration it refuses — fails the Cron, so the Cron's
+     * metrics and past events show it, rather than a success that only the
+     * log contradicts. A market that failed fails only its root.
      */
-    context.waitUntil(runRegistrySync(env));
+    const result = await runRegistrySync(env);
+    if (result.kind === 'failed') {
+      throw new Error(`registry sync failed: ${result.reason}`);
+    }
   },
 };

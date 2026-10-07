@@ -4,6 +4,7 @@ import type * as KnownNetwork from '../../lib/well-known/networks/network.js';
 import { Comet, Contract, StandaloneContract } from '../../lib/well-known/contracts/types.js';
 
 import type { RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
+import { marketKey } from '../../lib/model/comet-registry.js';
 
 import type { CatalogMarket } from './catalog.js';
 import { catalogOf } from './catalog.js';
@@ -82,7 +83,7 @@ function staticComets(network: KnownNetwork.Name): Map<string, CometContract> {
 }
 
 function compareMarket(entry: CatalogMarket, comet: CometContract): Difference[] {
-  const scope = `${entry.chainId}/${entry.deploymentKey}`;
+  const scope = marketKey(entry.chainId, entry.deploymentKey);
   const differences: Difference[] = [];
   const compare = (field: string, left: unknown, right: unknown) => {
     if (left !== right) {
@@ -108,9 +109,9 @@ function compareMarket(entry: CatalogMarket, comet: CometContract): Difference[]
     lower(comet.base.usdPriceFeed?.address),
     market.baseAsset.usdPriceFeed?.address ?? null,
   );
-  compare('rewards.contract', lower(comet.rewards.contract.address), market.contracts.rewards);
-  compare('rewards.asset', lower(comet.rewards.asset.address), market.rewardAsset?.token.address ?? null);
-  compare('rewards.priceFeed', lower(comet.rewards.priceFeed.address), market.rewardAsset?.priceFeed?.address ?? null);
+  compare('rewards.contract', lower(comet.rewards?.contract.address), market.contracts.rewards);
+  compare('rewards.asset', lower(comet.rewards?.asset?.address), market.rewardAsset?.token.address ?? null);
+  compare('rewards.priceFeed', lower(comet.rewards?.priceFeed?.address), market.rewardAsset?.priceFeed?.address ?? null);
 
   return differences;
 }
@@ -145,7 +146,7 @@ function compareWithStatic(snapshot: RegistrySnapshotV1): ShadowReport {
   for (const network of snapshot.networks) {
     for (const market of network.markets) {
       if (market.status === 'disabled' && market.contracts.comet !== null) {
-        disabled.set(`${network.key}:${market.contracts.comet}`, `${network.chainId}/${market.deploymentKey}`);
+        disabled.set(`${network.key}:${market.contracts.comet}`, marketKey(network.chainId, market.deploymentKey));
       }
     }
   }
@@ -159,12 +160,12 @@ function compareWithStatic(snapshot: RegistrySnapshotV1): ShadowReport {
     const seen = new Set<string>();
     for (const entry of entries) {
       const address = entry.market.contracts.comet;
-      const comet   = address === null ? undefined : comets.get(address);
+      const comet   = comets.get(address);
       if (comet === undefined) {
-        onlyInRegistry.push(`${entry.chainId}/${entry.deploymentKey}`);
+        onlyInRegistry.push(marketKey(entry.chainId, entry.deploymentKey));
         continue;
       }
-      seen.add(address!);
+      seen.add(address);
       differences.push(...compareMarket(entry, comet));
     }
 

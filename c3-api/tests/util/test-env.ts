@@ -33,13 +33,19 @@ function defaultTestEnv(): Env {
     kv_registry:       MemoryKv({}),
     APP_DB:            workerdOnlyBinding('APP_DB'),
     REGISTRY_ADMIN_RATE_LIMITER: workerdOnlyBinding('REGISTRY_ADMIN_RATE_LIMITER'),
+    REGISTRY_ADMIN_AUTH_RATE_LIMITER: workerdOnlyBinding('REGISTRY_ADMIN_AUTH_RATE_LIMITER'),
     COMET_SOURCE_REPOSITORY:           'Compound-Foundation/comet',
     COMET_SOURCE_REF:                  'main',
-    COMET_UPSTREAM_CHECK_INTERVAL_S:   '86400',
-    COMET_SYNC_MARKETS_PER_INVOCATION: '2',
-    COMET_SYNC_LEASE_SECONDS:          '900',
-    REGISTRY_SNAPSHOT_CACHE_TTL_S:     '300',
-    REGISTRY_STALE_FALLBACK_MAX_S:     '3600',
+    /*
+     * Left blank, so the registry takes its own defaults
+     * (src/registry/config.ts) rather than a third copy of the numbers
+     * wrangler.toml sets. A test that needs another value sets it.
+     */
+    COMET_UPSTREAM_CHECK_INTERVAL_S:   '',
+    COMET_SYNC_MARKETS_PER_INVOCATION: '',
+    COMET_SYNC_LEASE_SECONDS:          '',
+    REGISTRY_SNAPSHOT_CACHE_TTL_S:     '',
+    REGISTRY_STALE_FALLBACK_MAX_S:     '',
   };
 }
 

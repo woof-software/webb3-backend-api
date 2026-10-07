@@ -3,21 +3,26 @@ import {
   MarketV1,
   NetworkV1,
   RegistrySnapshotV1,
+  VERSION_STATUSES,
   isAddress,
+  marketKey,
   normalizeAddress,
 } from '../../lib/model/comet-registry.js';
 
+import { matchesIfNoneMatch } from '../http/conditional.js';
 import { ApiError } from '../http/errors.js';
 import { jsonResponse } from '../http/json.js';
 
-import type { CachedSnapshot } from './cache.js';
+import type { CachedSnapshot, PinnedVersion } from './cache.js';
 import type { RequestCatalog } from './request-catalog.js';
 import type { TokenCollateralDeps } from './token-collateral.js';
 import { registryHeaders } from './version-headers.js';
+import type { VersionRef } from './version-headers.js';
 import {
   activateVersion,
   readActivationHistory,
   readActiveVersionId,
+  readMarket,
   readRegistrySnapshot,
   readSnapshot,
   readUnreviewed,
@@ -28,7 +33,7 @@ import {
 import { compareVersions } from './changes.js';
 import { bundleOf, digestOf, proposalFor, reviewDocument } from './bootstrap.js';
 import type { Generated } from './bootstrap.js';
-import { orderNetworks, overlayOfMarket } from './overlay.js';
+import { orderNetworks, overlayDigest, overlayOfMarket, parseMarketOverlay } from './overlay.js';
 import { compareWithStatic } from './shadow.js';
 import { replaceOverlays, validateStoredVersion } from './admin.js';
 import type { FeedReader } from './admin.js';
@@ -45,17 +50,32 @@ import type { FeedReader } from './admin.js';
 type RegistryContext = {
   db:    D1Database,
   actor: string,
-  // where a failure that is not the caller's goes; the routes never return one
-  debug: { error: (...parameters: unknown[]) => unknown },
+  // the id the request is answered under, so a line logged about what it came to can name it
+  requestId: string,
   /*
-   * The active snapshot as the cache resolves it: from KV where the pointer
-   * D1 reports is one it already holds, and from the last good version where
-   * D1 did not answer at all. Every public read of the active version goes
-   * through this, so all of them are cached the same and every stale answer
-   * says so; an administrative read that only needs the active version's id
-   * still asks D1 directly, because it is asking what is true now.
+   * Where a failure that is not the caller's goes, and a degradation the
+   * registry recovered from; the routes never return either.
+   */
+  debug: {
+    error: (...parameters: unknown[]) => unknown,
+    warn:  (...parameters: unknown[]) => unknown,
+  },
+  /*
+   * The active snapshot as the cache resolves it: from this isolate's memory
+   * or from KV where the pointer D1 reports names a version they already
+   * hold, and from the last good version where D1 did not answer at all.
+   * Every public read of the active version goes through this, so all of
+   * them are cached the same and every stale answer says so; an
+   * administrative read that only needs the active version's id still asks
+   * D1 directly, because it is asking what is true now.
    */
   active: () => Promise<CachedSnapshot | null>,
+  /*
+   * A validated version by id, as the cache resolves it: the reference that
+   * names its bytes first, so a client that already holds them is answered
+   * from that alone, and the bytes only when they are sent.
+   */
+  version: (versionId: string) => Promise<PinnedVersion | null>,
   /*
    * Caches the bytes of a version that is not active yet. Serializing a
    * snapshot is the expensive half of answering, and after an activation
@@ -75,35 +95,54 @@ type RegistryContext = {
 const SCHEMA_VERSION = 1;
 
 /*
- * The strong ETag of one representation: schema version, what was asked for,
- * the version id, and its checksum.
+ * The revision of what these routes send for a version. A body is the version
+ * as this release presents it, and a release can change that for a version
+ * that is already active: the one that stopped listing a network with no
+ * served market did. A tag that named the version alone would then confirm,
+ * with a 304, a copy an earlier release sent, for as long as that version
+ * stays active; so a release that changes what a route sends for a version
+ * that already exists moves this on.
+ */
+const REPRESENTATION_REVISION = 2;
+
+/*
+ * The strong ETag of one representation: schema version, the revision of what
+ * is sent, what was asked for, the version id, and its checksum. It needs
+ * nothing but the reference to the version, so a conditional request is
+ * decided before any of its bytes are read.
  *
  * The representation is part of it because these routes serve different
  * bodies from the same version. An ETag that named the version alone would
  * let a conditional request for one route be answered 304 while the client
  * holds another route's body.
  */
-function etagOf(snapshot: RegistrySnapshotV1, representation: string): string {
-  const { id, checksum } = snapshot.registryVersion;
-  return `"v${SCHEMA_VERSION}-${representation}-${id}-${checksum}"`;
+function etagOf({ id, checksum }: VersionRef, representation: string): string {
+  return `"v${SCHEMA_VERSION}-r${REPRESENTATION_REVISION}-${representation}-${id}-${checksum}"`;
 }
 
 function versionHeaders(snapshot: RegistrySnapshotV1): Record<string, string> {
   return registryHeaders(snapshot.registryVersion);
 }
 
+function versionRef(snapshot: RegistrySnapshotV1): VersionRef {
+  return { id: snapshot.registryVersion.id, checksum: snapshot.registryVersion.checksum };
+}
+
 /*
- * A cacheable snapshot response, honoring If-None-Match. The body is
- * immutable for a version, so a matching ETag needs no body at all.
+ * A cacheable snapshot response, honoring If-None-Match as RFC 9110 reads it
+ * (matchesIfNoneMatch): `*`, a list of tags, and the weak form of this tag,
+ * which is what a browser sends back for a response Cloudflare compressed.
+ * The body is immutable for a version, so a matching ETag needs no body at
+ * all, and the body is built only when it is sent.
  */
-function snapshotResponse(
+async function snapshotResponse(
   request: Request,
-  snapshot: RegistrySnapshotV1,
+  ref: VersionRef,
   representation: string,
-  body: unknown,
+  body: () => unknown,
   { maxAge, staleFor }: { maxAge: number, staleFor?: number | null },
-): Response {
-  const etag    = etagOf(snapshot, representation);
+): Promise<Response> {
+  const etag    = etagOf(ref, representation);
   /*
    * A stale answer is the version that was active when D1 last answered, and
    * it must not be stored anywhere: not in a browser, not in a CDN, not under
@@ -112,7 +151,7 @@ function snapshotResponse(
    */
   const stale   = staleFor !== undefined && staleFor !== null;
   const headers = {
-    ...versionHeaders(snapshot),
+    ...registryHeaders(ref),
     'ETag':          etag,
     'Cache-Control': stale ? 'no-store' : `public, max-age=${maxAge}`,
     ...(stale ? { 'X-Registry-Stale': String(staleFor) } : {}),
@@ -122,28 +161,33 @@ function snapshotResponse(
    * holds is still the current one, which is exactly what an answer the
    * database could not verify must not say.
    */
-  if (!stale && request.headers.get('if-none-match') === etag) {
+  if (!stale && matchesIfNoneMatch(request, etag)) {
     return new Response(null, { status: 304, headers });
   }
-  return jsonResponse(body, { headers });
+  return jsonResponse(await body(), { headers });
 }
 
 /*
  * The version as the API serves it: without the markets it refuses to
- * resolve.
+ * resolve, and without the networks that leaves with none.
  *
  * A `disabled` market is part of the stored version, and an operator sees it
  * through the administrative routes, but no public read may offer one: the
  * market routes answer 404 for it and the request catalog does not
  * materialize it, so listing it would advertise something unusable.
+ *
+ * A network whose every market is disabled serves nothing. A chain the
+ * source has just added arrives that way — under its canonical name, with
+ * nothing about it reviewed — and listing it would offer a network nobody
+ * decided to offer. A network whose markets are deprecated is still served,
+ * because positions and history in them must stay reachable.
  */
 function selectable(snapshot: RegistrySnapshotV1): RegistrySnapshotV1 {
   return {
     ...snapshot,
-    networks: snapshot.networks.map(network => ({
-      ...network,
-      markets: network.markets.filter(market => market.status !== 'disabled'),
-    })),
+    networks: snapshot.networks
+      .map(network => ({ ...network, markets: network.markets.filter(market => market.status !== 'disabled') }))
+      .filter(network => network.markets.length > 0),
   };
 }
 
@@ -182,13 +226,17 @@ function networkOf(snapshot: RegistrySnapshotV1, chainId: number): NetworkV1 {
 }
 
 /*
- * A chain id is a positive integer JavaScript holds exactly: past
- * Number.MAX_SAFE_INTEGER, two different ids read as the same number, which
- * is also the bound the schema puts on every chain id it stores.
+ * A chain id has one spelling: decimal digits without a leading zero, no
+ * larger than a number holds exactly, which is also the bound the schema puts
+ * on every chain id it stores. `Number()` alone would read `0x1`, `01`, `1e0`
+ * and `1.0` as chain 1 too, giving one resource many URLs, each cached on its
+ * own. Every chain id a path or a document key carries is read here.
  */
+const CHAIN_ID = /^[1-9][0-9]*$/;
+
 function chainIdOf(value: string): number {
   const chainId = Number(value);
-  if (!Number.isSafeInteger(chainId) || chainId <= 0) {
+  if (!CHAIN_ID.test(value) || !Number.isSafeInteger(chainId)) {
     throw new ApiError('BAD_REQUEST', `${value} is not a chain id`);
   }
   return chainId;
@@ -212,37 +260,33 @@ function marketOf(network: NetworkV1, address: string): MarketV1 {
   return market;
 }
 
-function versionRef(snapshot: RegistrySnapshotV1) {
-  return { id: snapshot.registryVersion.id, checksum: snapshot.registryVersion.checksum };
-}
-
 /*
  * Public reads. The convenience routes serve the same objects and the same
  * order as the bootstrap snapshot; none of them resolves "latest" on its own.
  */
 async function getActive(request: Request, context: RegistryContext, maxAge: number): Promise<Response> {
   const { snapshot, staleFor } = await activeSnapshot(context);
-  return snapshotResponse(request, snapshot, 'snapshot', selectable(snapshot), { maxAge, staleFor });
+  return snapshotResponse(request, versionRef(snapshot), 'snapshot', () => selectable(snapshot), { maxAge, staleFor });
 }
 
 async function getNetworks(request: Request, context: RegistryContext, maxAge: number): Promise<Response> {
   const { snapshot, staleFor } = await activeSnapshot(context);
-  return snapshotResponse(request, snapshot, 'networks', {
+  return snapshotResponse(request, versionRef(snapshot), 'networks', () => ({
     registryVersion: versionRef(snapshot),
     // the summary omits markets, which the market routes serve
-    networks: snapshot.networks.map(({ markets: _markets, ...network }) => network),
-  }, { maxAge, staleFor });
+    networks: selectable(snapshot).networks.map(({ markets: _markets, ...network }) => network),
+  }), { maxAge, staleFor });
 }
 
 async function getMarkets(request: Request, context: RegistryContext, chainId: string, maxAge: number): Promise<Response> {
   const { snapshot, staleFor } = await activeSnapshot(context);
-  const network  = networkOf(snapshot, chainIdOf(chainId));
-  return snapshotResponse(request, snapshot, `markets:${network.chainId}`, {
+  // the same selectability rule the market route and the catalog apply
+  const network  = networkOf(selectable(snapshot), chainIdOf(chainId));
+  return snapshotResponse(request, versionRef(snapshot), `markets:${network.chainId}`, () => ({
     registryVersion: versionRef(snapshot),
     chainId:         network.chainId,
-    // the same selectability rule the market route and the catalog apply
-    markets:         network.markets.filter(market => market.status !== 'disabled'),
-  }, { maxAge, staleFor });
+    markets:         network.markets,
+  }), { maxAge, staleFor });
 }
 
 async function getMarket(
@@ -255,23 +299,35 @@ async function getMarket(
   const { snapshot, staleFor } = await activeSnapshot(context);
   const network  = networkOf(snapshot, chainIdOf(chainId));
   const market   = marketOf(network, cometAddress);
-  return snapshotResponse(request, snapshot, `market:${network.chainId}:${market.contracts.comet}`, {
+  return snapshotResponse(request, versionRef(snapshot), `market:${network.chainId}:${market.contracts.comet}`, () => ({
     registryVersion: versionRef(snapshot),
     chainId:         network.chainId,
     market,
-  }, { maxAge, staleFor });
+  }), { maxAge, staleFor });
 }
 
 /*
  * A retained validated version by id, so a session can refetch the exact
  * snapshot it pinned even after another version was activated.
+ *
+ * It is read through the cache as the active version is: a client that
+ * already holds the version is answered 304 from the version's reference
+ * alone, and the bytes come from this isolate or KV before D1. The route is
+ * anonymous and the active version's id is in every response's headers, so
+ * a request here must not cost D1 a hydration each time it is made.
  */
 async function getVersion(request: Request, context: RegistryContext, versionId: string, maxAge: number): Promise<Response> {
-  const snapshot = await readRegistrySnapshot(context.db, versionId);
-  if (snapshot === null) {
+  const version = await context.version(versionId);
+  if (version === null) {
     throw new ApiError('NOT_FOUND', `no validated registry version with that id`);
   }
-  return snapshotResponse(request, snapshot, 'snapshot', selectable(snapshot), { maxAge });
+  return snapshotResponse(request, version.ref, 'snapshot', async () => {
+    const snapshot = await version.snapshot();
+    if (snapshot === null) {
+      throw new ApiError('NOT_FOUND', `no validated registry version with that id`);
+    }
+    return selectable(snapshot);
+  }, { maxAge });
 }
 
 /*
@@ -286,8 +342,7 @@ async function getVersion(request: Request, context: RegistryContext, versionId:
  * — and never a snapshot: a listing that carried the markets of every version
  * would be the largest response in the API and the least useful one.
  */
-const VERSION_STATUSES = [ 'importing', 'validated', 'invalid' ] as const;
-const MAX_VERSIONS     = 100;
+const MAX_VERSIONS = 100;
 
 async function getVersions(context: RegistryContext, query: URLSearchParams): Promise<Response> {
   const status = query.get('status') ?? undefined;
@@ -301,13 +356,25 @@ async function getVersions(context: RegistryContext, query: URLSearchParams): Pr
     throw new ApiError('BAD_REQUEST', `limit must be an integer from 1 to ${MAX_VERSIONS}`);
   }
 
-  const { versions, activeVersionId } = await readVersions(context.db, {
+  /*
+   * A page past the first starts after the version `before` names: the
+   * `next` of the page before it. A version that does not exist is not a
+   * place in the listing, and is refused rather than answered as its end.
+   */
+  const before = query.get('before') ?? undefined;
+  if (before !== undefined && await readVersion(context.db, before) === null) {
+    throw new ApiError('NOT_FOUND', `before names no registry version`);
+  }
+
+  const { versions, activeVersionId, next } = await readVersions(context.db, {
     ...(status === undefined ? {} : { status }),
+    ...(before === undefined ? {} : { before }),
     limit,
   });
 
   return jsonResponse({
     activeVersionId,
+    next,
     versions: versions.map(version => ({
       id:               version.id,
       status:           version.status,
@@ -328,6 +395,12 @@ async function getVersionDetail(context: RegistryContext, versionId: string): Pr
   if (version === null) {
     throw new ApiError('NOT_FOUND', `no registry version with that id`);
   }
+  // three reads that do not depend on each other, so one round trip of waiting rather than three
+  const [ validation, activations, unreviewed ] = await Promise.all([
+    readValidationSummary(context.db, versionId),
+    readActivationHistory(context.db, versionId),
+    readUnreviewed(context.db, versionId),
+  ]);
   return jsonResponse({
     version: {
       id:               version.id,
@@ -341,15 +414,15 @@ async function getVersionDetail(context: RegistryContext, versionId: string): Pr
       validatedAt:      version.validated_at,
       createdBy:        version.created_by,
     },
-    validation:  await readValidationSummary(context.db, versionId),
-    activations: await readActivationHistory(context.db, versionId),
+    validation,
+    activations,
     /*
      * The networks and markets this version imported that nobody has
      * reviewed: disabled, with every capability off, until someone decides
      * how they are served. For the first version of an environment that is
      * everything; later it is whatever the source has added.
      */
-    unreviewed:  await readUnreviewed(context.db, versionId),
+    unreviewed,
   });
 }
 
@@ -454,21 +527,26 @@ async function getShadow(context: RegistryContext, versionId: string | undefined
  * Without a version that is on, everything the version holds is added.
  */
 async function getChanges(context: RegistryContext, versionId: string): Promise<Response> {
-  const version = await readVersion(context.db, versionId);
+  const [ version, activeId ] = await Promise.all([
+    readVersion(context.db, versionId),
+    readActiveVersionId(context.db),
+  ]);
   if (version === null) {
     throw new ApiError('NOT_FOUND', `no registry version with that id`);
   }
 
-  const activeId   = await readActiveVersionId(context.db);
-  const after      = orderNetworks(await readSnapshot(context.db, versionId));
-  const before     = activeId === null ? null : orderNetworks(await readSnapshot(context.db, activeId));
-  const unreviewed = await readUnreviewed(context.db, versionId);
+  // the two versions and the review state are read side by side, not one after another
+  const [ after, before, unreviewed ] = await Promise.all([
+    readSnapshot(context.db, versionId),
+    activeId === null ? null : readSnapshot(context.db, activeId),
+    readUnreviewed(context.db, versionId),
+  ]);
 
   return jsonResponse({
     versionId,
     status:       version.status,
     comparedWith: activeId,
-    ...compareVersions(before, after, new Set(unreviewed.markets)),
+    ...compareVersions(before === null ? null : orderNetworks(before), orderNetworks(after), new Set(unreviewed.markets)),
   });
 }
 
@@ -476,6 +554,10 @@ async function getChanges(context: RegistryContext, versionId: string): Promise<
  * The overlay of one market of a version, in the form its PUT takes. A market
  * nobody has reviewed answers with the provisional decisions its import
  * wrote, and says so.
+ *
+ * `digest` names the reviewed overlay, the one a PUT's `expectedDigest` is
+ * compared with, and is null for a market nobody has reviewed: a change read
+ * here and sent back with it is refused if the market changed in between.
  */
 async function getMarketOverlay(
   context: RegistryContext,
@@ -483,23 +565,28 @@ async function getMarketOverlay(
   chainId: number,
   deploymentKey: string,
 ): Promise<Response> {
-  const version = await readVersion(context.db, versionId);
+  const scope = marketKey(chainId, deploymentKey);
+  // the one market, not every row of the version, and the version beside it
+  const [ version, market, unreviewed ] = await Promise.all([
+    readVersion(context.db, versionId),
+    readMarket(context.db, versionId, { chainId, deploymentKey }),
+    readUnreviewed(context.db, versionId),
+  ]);
   if (version === null) {
     throw new ApiError('NOT_FOUND', `no registry version with that id`);
   }
-  const scope  = `${chainId}/${deploymentKey}`;
-  const market = (await readSnapshot(context.db, versionId))
-    .find(network => network.chainId === chainId)?.markets
-    .find(entry => entry.deploymentKey === deploymentKey);
-  if (market === undefined) {
+  if (market === null) {
     throw new ApiError('NOT_FOUND', `${scope} is not in this registry version`);
   }
 
+  const overlay  = overlayOfMarket(market);
+  const reviewed = !unreviewed.markets.includes(scope);
   return jsonResponse({
     versionId,
     scope,
-    reviewed: !(await readUnreviewed(context.db, versionId)).markets.includes(scope),
-    overlay:  overlayOfMarket(market),
+    reviewed,
+    digest: reviewed ? await overlayDigest(parseMarketOverlay(overlay, scope)) : null,
+    overlay,
   });
 }
 
@@ -513,9 +600,28 @@ async function proposalOf(
   context: RegistryContext,
   versionId: string,
 ): Promise<{ repository: string, generated: Generated, digest: string }> {
-  const version = await readVersion(context.db, versionId);
+  const [ version, activeId ] = await Promise.all([
+    readVersion(context.db, versionId),
+    readActiveVersionId(context.db),
+  ]);
   if (version === null) {
     throw new ApiError('NOT_FOUND', `no registry version with that id`);
+  }
+  /*
+   * The proposal is the first review of an environment, derived from the
+   * static constants. Once a version has been activated, the decisions live
+   * in the registry and every draft inherits them: applying the proposal to a
+   * draft would put the constants' values back over everything reviewed
+   * since — a renamed market, a disabled one, an exception added — and its
+   * review would call them the values the API acts on today, which they no
+   * longer are.
+   */
+  if (activeId !== null) {
+    throw new ApiError(
+      'CONFLICT',
+      `a version of this registry has been activated, so its decisions are reviewed with the overlay routes; `
+        + `the proposal is for its first version only`,
+    );
   }
   const generated = proposalFor(orderNetworks(await readSnapshot(context.db, versionId)), {
     repository: version.source_repository,
@@ -574,15 +680,19 @@ async function applyProposal(
   return jsonResponse({ digest, ...result });
 }
 
+/*
+ * A validation that ran answers 200 whatever it decided: an invalid version
+ * is the outcome of the command, not a failure of it, and `version.status`
+ * says which it is, beside the checks that decided it. A command that could
+ * not run — the import still running, the candidate changed under it — is
+ * answered in the error envelope, as every route answers a failure.
+ */
 async function postValidate(context: RegistryContext, versionId: string): Promise<Response> {
   const result = await validateStoredVersion(context.db, versionId);
   if (result.version.status === 'validated') {
     await context.warm(versionId);   // never throws: see the router
   }
-  return jsonResponse(
-    { version: result.version, changed: result.changed, summary: result.summary },
-    { status: result.version.status === 'validated' ? 200 : 422 },
-  );
+  return jsonResponse({ version: result.version, changed: result.changed, summary: result.summary });
 }
 
 async function postActivation(
@@ -590,12 +700,13 @@ async function postActivation(
   versionId: string,
   action: ActivationAction,
   reason: string,
+  expectation: { expectedActiveVersionId?: string | null } = {},
 ): Promise<Response> {
   // a version that does not exist is not a state conflict, and answers as every other route does
   if (await readVersion(context.db, versionId) === null) {
     throw new ApiError('NOT_FOUND', `no registry version with that id`);
   }
-  const result = await activateVersion(context.db, { versionId, action, actor: context.actor, reason });
+  const result = await activateVersion(context.db, { versionId, action, actor: context.actor, reason, ...expectation });
   /*
    * A rollback names a version that was validated long ago, and whose bytes
    * may have expired out of the cache, so the warm-up happens here too: the
@@ -609,9 +720,7 @@ async function postActivation(
 export type { RegistryContext };
 
 export {
-  SCHEMA_VERSION,
   chainIdOf,
-  etagOf,
   getActive,
   getChanges,
   getMarket,
@@ -628,5 +737,4 @@ export {
   getVersionDetail,
   postActivation,
   postValidate,
-  versionHeaders,
 };

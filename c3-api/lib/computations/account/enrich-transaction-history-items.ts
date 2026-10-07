@@ -88,15 +88,15 @@ function onlyMigratorActions(actions: RawTransactionHistoryAction[]) {
 const { implement, pipe1, pipe, value, join } = Compute.Functor<EnrichTransactionHistoryItem>({});
 
 const enrichTransactionHistoryItem = implement({
-  // 6: a bulker an earlier deployment used still makes an item a bulk item
-  version: 6,
+  // 7: keyed by what history reads, so a change to a feed or an exception keeps the items
+  version: 7,
   index: Index.Make<EnrichTransactionHistoryItem['expects']>(Index.Everything),
   async key(name, { network, accountAddress, item, catalog }) {
     return Key.toKey(name, {
       network,
       accountAddress,
-      // the enriched item carries what the version says about the markets of its network
-      registry: catalog.keyFor(network),
+      // the enriched item carries what the version says about the markets of its network that history reads
+      registry: catalog.historyKeyFor(network),
       itemHash: await sha256(Key.toKey('', item)),
     });
   },

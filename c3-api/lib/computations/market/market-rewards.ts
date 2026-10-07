@@ -1,8 +1,8 @@
 import * as Eth      from '../../eth-constants.js';
 import * as Fallible from '../../fallible/fallible.js';
 
-import { BigFixnum }  from '../../bigfixnum.js';
-import { registryOf } from '../../model/comet-registry.js';
+import { BigFixnum }    from '../../bigfixnum.js';
+import { annotationOf } from '../../model/comet-registry.js';
 
 import * as Key     from '../../symbolic/key.js';
 import * as Index   from '../../symbolic/index.js';
@@ -74,14 +74,13 @@ type MarketRewards = Compute.Spec<{
  * token reports itself on chain. Tokens get renamed — Tether's USDT is USD₮0
  * on Arbitrum and USDT0 on Polygon — and bridged USDC calls itself plain USDC
  * beside the native market of the same network, so the on-chain symbol would
- * give two markets of one network the same label. A contract that did not
- * come from the registry has no decisions and keeps what it carries.
+ * give two markets of one network the same label.
  */
-function baseAssetLabel(contract: Eth.Contract<StandaloneContract<Comet>>): { symbol: string, description: string | null } {
-  const market = registryOf(contract)?.market;
+function baseAssetLabel(contract: Eth.Contract<StandaloneContract<Comet>>): { symbol: string, description: string } {
+  const market = annotationOf(contract).market;
   return {
-    symbol:      market?.displayName ?? contract.base.asset.symbol,
-    description: market?.baseAsset.displayName ?? (contract.base.asset.description as string | undefined) ?? null,
+    symbol:      market.displayName,
+    description: market.baseAsset.displayName,
   };
 }
 
@@ -94,7 +93,7 @@ const marketRewards = implement({
     const { block: projected } = Fallible.must(this.index.project({ block, ...context }));
     // the summary reports the market's labels, which its contract's key leaves out
     const { symbol, description } = baseAssetLabel(context.contract);
-    return Key.toKey(name, { block: projected.number, label: `${symbol}|${description ?? ''}`, ...context });
+    return Key.toKey(name, { block: projected.number, label: `${symbol}|${description}`, ...context });
   },
   compute({ apiHost, nodeHost, nodeKey, contract, network, block }) {
     const projected = Fallible.must(this.index.project({
@@ -105,8 +104,20 @@ const marketRewards = implement({
       KnownNetwork.lookup({ name: network })
     );
 
-    const annotation  = registryOf(contract);
-    const rewardAsset = annotation?.market.rewardAsset ?? null;
+    const market      = annotationOf(contract).market;
+    const rewardAsset = market.rewardAsset;
+
+    /*
+     * The token the market pays and the contract that pays it. A market the
+     * rewards are valued for has both: the routes ask only about markets
+     * whose rewards or account rewards are served, and a version serves
+     * neither without a reward token, which only a rewards contract names.
+     */
+    const rewards = contract.rewards;
+    if (rewards?.asset === undefined) {
+      throw new Error(`invariant violated: ${contract.address} pays no reward token`);
+    }
+    const rewardToken = rewards.asset;
 
     /*
      * The feed that prices the reward token, as the registry states it. A
@@ -116,34 +127,10 @@ const marketRewards = implement({
      * market's USD feed, so every market reports its reward price in the same
      * unit.
      */
-    const rewardPriceFeed = annotation === null
-      ? contract.rewards.priceFeed
-      : rewardAsset?.priceFeed ?? null;
-    const usdConversionFeed = rewardAsset?.priceFeedQuote === 'base'
-      ? annotation?.market.baseAsset.usdPriceFeed ?? null
-      : null;
+    const rewardPriceFeed   = rewardAsset?.priceFeed ?? null;
+    const usdConversionFeed = rewardAsset?.priceFeedQuote === 'base' ? market.baseAsset.usdPriceFeed : null;
 
-    const rewards = {
-      baseBorrowMin: { apiHost, nodeHost, nodeKey, contract, network, blockNumber },
-      supplyRewardsApr: {
-        apiHost,
-        nodeHost,
-        nodeKey,
-        contract,
-        network,
-        blockNumber,
-        rewardsTokenPriceFeed: contract.rewards.priceFeed,
-      },
-      borrowRewardsApr: {
-        apiHost,
-        nodeHost,
-        nodeKey,
-        contract,
-        network,
-        blockNumber,
-        rewardsTokenPriceFeed: contract.rewards.priceFeed,
-      },
-    };
+    const baseBorrowMin = { apiHost, nodeHost, nodeKey, contract, network, blockNumber };
 
     /*
      * Aggregate and format summary data for display.
@@ -158,7 +145,7 @@ const marketRewards = implement({
     ): MarketRewards['returns'] => {
       const baseAsset = baseAssetLabel(contract);
       const rewardAssetDescription =
-        (contract.rewards.asset.description as string | undefined) ?? null;
+        (rewardToken.description as string | undefined) ?? null;
 
       return {
         status: 'success',
@@ -167,7 +154,7 @@ const marketRewards = implement({
           address: contract.address,
         },
         cometRewards: {
-          address: contract.rewards.contract.address,
+          address: rewards.contract.address,
         },
         baseAsset: {
           address: contract.base.asset.address,
@@ -178,11 +165,11 @@ const marketRewards = implement({
           priceFeed: contract.base.priceFeed.address,
         },
         rewardAsset: {
-          address: contract.rewards.asset.address,
-          decimals: contract.rewards.asset.decimals,
+          address: rewardToken.address,
+          decimals: rewardToken.decimals,
           description: rewardAssetDescription,
           price: rewardAssetPrice,
-          symbol: contract.rewards.asset.symbol,
+          symbol: rewardToken.symbol,
         },
         earnRewardsApr: supplyRewardsApr.toString(),
         borrowRewardsApr: borrowRewardsApr.toString(),
@@ -190,21 +177,24 @@ const marketRewards = implement({
     };
 
     /*
-     * Without a feed there is nothing to value the rewards in, and the APR
-     * computations would read the placeholder feed at the zero address, which
-     * reverts. Only the minimum borrow is read; the rates are zero.
+     * Without a feed there is nothing to value the rewards in, and nothing
+     * for the APR computations to read. Only the minimum borrow is read; the
+     * rates are zero.
      */
     if (rewardPriceFeed === null) {
       const none = BigFixnum.from({ value: 0 });
       return pipe([
-        { baseBorrowMin: rewards.baseBorrowMin },
+        { baseBorrowMin },
         ({ baseBorrowMin }) => summary({ baseBorrowMin, supplyRewardsApr: none, borrowRewardsApr: none }, '0.0'),
       ]);
     }
 
+    const apr = { apiHost, nodeHost, nodeKey, contract, network, blockNumber, rewardsTokenPriceFeed: rewardPriceFeed };
     return pipe([
       {
-        ...rewards,
+        baseBorrowMin,
+        supplyRewardsApr: apr,
+        borrowRewardsApr: apr,
         getPrice: {
           apiHost,
           nodeHost,

@@ -57,6 +57,12 @@ const accountRewards = implement({
     return Key.toKey(name, { block: projected.number, ...context });
   },
   compute({ apiHost, nodeHost, nodeKey, contract, network, block, account }) {
+    // an account is owed rewards in the token a market pays, through the contract that pays it
+    const rewards = contract.rewards;
+    if (rewards?.asset === undefined) {
+      throw new Error(`invariant violated: ${contract.address} pays no reward token`);
+    }
+    const rewardToken = rewards.asset;
     const marketRewards = Fallible.must(market.marketRewards.index.project({
       apiHost, nodeHost, nodeKey, contract, network, block
     }));
@@ -87,7 +93,7 @@ const accountRewards = implement({
           nodeKey,
           account,
           network,
-          contract: contract.rewards.asset,
+          contract: rewardToken,
           blockNumber: block.number,
         },
         getRewardOwed: {
@@ -97,9 +103,9 @@ const accountRewards = implement({
           network,
           account,
           comet:        contract.address,
-          contract:     contract.rewards.contract,
+          contract:     rewards.contract,
           blockNumber:  block.number,
-          rewardsAsset: contract.rewards.asset,
+          rewardsAsset: rewardToken,
         },
       },
       ({

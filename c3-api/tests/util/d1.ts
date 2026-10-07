@@ -1,6 +1,13 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+/*
+ * The statement splitter `wrangler d1 migrations apply` uses, which Wrangler
+ * exports under this name only: there is no stable one to use instead. It is
+ * what lets a test apply a migration exactly as a deploy does, triggers and
+ * all. The release package.json requires at least has it, and one that
+ * renamed it would fail the build here, at the import.
+ */
 import { unstable_splitSqlQuery } from 'wrangler';
 
 /*
@@ -30,10 +37,18 @@ async function applyMigrations(
     .filter(name => through === undefined || name.slice(0, 4) <= through)
     .sort();
   for (const file of files) {
-    const statements = unstable_splitSqlQuery(readFileSync(join(directory, file), 'utf8'));
-    await db.batch(statements.map(statement => db.prepare(statement)));
+    await applyMigration(db, file, directory);
   }
   return files;
+}
+
+/*
+ * Applies one migration file as one batch, for a test that upgrades a
+ * database an earlier migration left behind.
+ */
+async function applyMigration(db: D1Database, file: string, directory: string = MIGRATIONS_DIR): Promise<void> {
+  const statements = unstable_splitSqlQuery(readFileSync(join(directory, file), 'utf8'));
+  await db.batch(statements.map(statement => db.prepare(statement)));
 }
 
 /*
@@ -68,6 +83,7 @@ async function foreignKeyViolations(db: D1Database): Promise<unknown[]> {
 export {
   Row,
   SqlValue,
+  applyMigration,
   applyMigrations,
   changedRows,
   foreignKeyViolations,

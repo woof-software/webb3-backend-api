@@ -111,7 +111,7 @@ t.test(`test rawTransactionHistoryItems`, async t => {
       proxyAddresses: [],
       network: 'ethereum-mainnet',
       marketContracts: [contract],
-      rewardsContract: contract.rewards.contract,
+      rewardsContract: contract.rewards!.contract,
       blockNumber: startBlock.number,
       catalog,
     },

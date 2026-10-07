@@ -2,13 +2,13 @@ import t from 'tap';
 import { readFileSync } from 'node:fs';
 
 /*
- * Contract freeze for RegistrySnapshotV1, the body of GET /registry/v1/active
- * (D1_IMPLEMENTATION_SEQUENCE.md, step S0).
+ * Contract freeze for RegistrySnapshotV1, the body of GET /registry/v1/active.
  *
- * Until SEQ-REG-1 adds the typed DTO and its runtime validator, this test is
- * the executable description of the wire contract: exact key sets, value
- * formats, ordering, and cross-field rules. Each check collects every
- * violation so a failing run lists all of them at once.
+ * The type in lib/model/comet-registry.ts gives its shape to the compiler, and
+ * nothing checks the shape at run time, so this test is the executable
+ * description of the wire contract, held against the committed fixture:
+ * exact key sets, value formats, ordering, and cross-field rules. Each check
+ * collects every violation so a failing run lists all of them at once.
  */
 const FIXTURE_PATH = './tests/fixtures/registry/registry-snapshot-v1.json';
 const raw = readFileSync(FIXTURE_PATH, 'utf8');

@@ -6,7 +6,10 @@ import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
 
-import { markValidated, recordValidationResults, snapshotChecksum } from '../../../src/registry/repository.js';
+import type { RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
+
+import { snapshotKey } from '../../../src/registry/cache.js';
+import { activateVersion, markValidated, recordValidationResults, snapshotChecksum } from '../../../src/registry/repository.js';
 import { requestCatalog } from '../../../src/registry/request-catalog.js';
 
 import { applyMigrations } from '../../util/d1.js';
@@ -36,31 +39,18 @@ async function freshDatabase(): Promise<D1Database> {
 }
 
 /*
- * The environment a request reads the registry through: the same D1 and KV
- * bindings the worker holds, and the cache settings it is configured with.
+ * The environment a request reads the registry through: the worker's own, as
+ * wrangler.toml configures it, with the D1 binding the test reads through.
  */
 async function environmentOf(db: D1Database): Promise<Env> {
-  const { kv_registry } = await server.getWorker<Env>().getEnv();
-  return {
-    APP_DB:                        db,
-    kv_registry,
-    REGISTRY_SNAPSHOT_CACHE_TTL_S: '300',
-    REGISTRY_STALE_FALLBACK_MAX_S: '3600',
-  } as Env;
+  return { ...await server.getWorker<Env>().getEnv(), APP_DB: db };
 }
 
-async function activate(db: D1Database, versionId: string): Promise<void> {
+// validates a seeded candidate of `source` and switches it on
+async function activate(db: D1Database, versionId: string, source: RegistrySnapshotV1 = snapshot): Promise<void> {
   await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
-  await db.batch([
-    db.prepare(
-      `INSERT INTO registry_activations (id, registry_version_id, previous_version_id, action, actor, reason, created_at)
-       SELECT ?1, ?2, active_version_id, 'activate', 'test-admin', 'test', ?3 FROM registry_state
-       WHERE singleton_id = 1 AND active_version_id IS NOT ?2`
-    ).bind(randomUUID(), versionId, new Date().toISOString()),
-    db.prepare(`UPDATE registry_state SET active_version_id = ?1, updated_at = ?2 WHERE singleton_id = 1`)
-      .bind(versionId, new Date().toISOString()),
-  ]);
+  await markValidated(db, versionId, await snapshotChecksum(source.networks));
+  await activateVersion(db, { versionId, action: 'activate', actor: 'test-admin', reason: 'test' });
 }
 
 t.test('the active version is built once and reused, until another one is activated', async t => {
@@ -83,6 +73,65 @@ t.test('the active version is built once and reused, until another one is activa
   const activated = await requestCatalog(env).load();
   t.not(activated, first, 'activating another version builds the catalog again');
   t.equal(activated.versionId, next.versionId, 'and the request is served the version that is on');
+});
+
+/*
+ * A catalog applies the price exceptions that have not expired when it is
+ * built, so an isolate keeps it only until the first of those expires: a
+ * request after that is served a catalog built again, without it.
+ */
+t.test('a catalog is built again once an exception it applies has expired', async t => {
+  const db  = await freshDatabase();
+  const env = await environmentOf(db);
+
+  // a version of the fixture whose first mainnet exception expires a few seconds from now
+  const expiresAt = new Date(Date.now() + 3_000).toISOString();
+  const expiring: RegistrySnapshotV1 = {
+    ...snapshot,
+    networks: snapshot.networks.map(network => network.chainId !== 1 ? network : {
+      ...network,
+      priceExceptions: network.priceExceptions.map((exception, index) => index !== 0 ? exception : { ...exception, expiresAt }),
+    }),
+  };
+  const { versionId } = await seedCandidate(db, expiring);
+  await activate(db, versionId, expiring);
+
+  const applied = await requestCatalog(env).load();
+  t.equal(applied.validUntil, Date.parse(expiresAt), 'a catalog that applies the exception is kept until it expires');
+  t.equal(await requestCatalog(env).load(), applied, 'and until then every request is served it');
+
+  await new Promise(resolve => setTimeout(resolve, Date.parse(expiresAt) - Date.now() + 50));
+  const rebuilt = await requestCatalog(env).load();
+  t.not(rebuilt, applied, 'a request after the expiry is served a catalog built again');
+  t.equal(rebuilt.versionId, versionId, 'of the same version');
+  t.equal(rebuilt.validUntil, null, 'which no longer applies the exception, and has nothing left to expire');
+});
+
+/*
+ * An isolate keeps what it read per database binding, so what a request of a
+ * hot isolate pays rests on the worker being handed the same binding with
+ * every request. The tests above share one binding by construction; this one
+ * asks the worker itself, twice.
+ */
+t.test('the worker serves the next request of an isolate from what the first one read', async t => {
+  const db = await freshDatabase();
+  const { versionId } = await seedCandidate(db, snapshot);
+  await activate(db, versionId);
+  const { kv_registry: kv } = await server.getWorker<Env>().getEnv();
+
+  // a market of no version: refused once the request has read the version, before any chain is asked
+  const route = `/market/ethereum-mainnet/0x1111111111111111111111111111111111111111/summary`;
+  t.equal((await server.fetch(route)).status, 400, 'the first request reads the version to resolve the market');
+  const key = snapshotKey({ id: versionId, checksum: await snapshotChecksum(snapshot.networks) });
+  t.not(await kv.get(key), null, 'and caches its bytes for the isolates that have not read it');
+
+  /*
+   * The bytes are replaced with something no request may serve. A request
+   * that read them would refuse them and write the version back over them.
+   */
+  await kv.put(key, 'not the version');
+  t.equal((await server.fetch(route)).status, 400, 'the next request resolves the market all the same');
+  t.equal(await kv.get(key), 'not the version', 'without reading the bytes: its isolate held the version');
 });
 
 t.test('one request resolves everything from the version it loaded', async t => {
@@ -152,4 +201,39 @@ t.test('a request that cannot reach D1 is served the last version it named', asy
   const closed = requestCatalog({ ...flakyEnv, REGISTRY_STALE_FALLBACK_MAX_S: '0' } as Env);
   await t.rejects(closed.load(), { name: 'RegistryUnavailable' },
     'with no window configured the route fails rather than answering from the cache');
+});
+
+/*
+ * A market route reads the active version through the same entry as the
+ * registry's own routes, so it fails the way they do: nothing active, or a
+ * database that did not answer with nothing to fall back on, is the registry
+ * being unavailable, a 503; a database that answered with a fault is that
+ * fault, which must not be dressed as an outage — a release that went out
+ * ahead of its migration would otherwise look like a database that is down.
+ */
+t.test('a market route fails the way a registry route does', async t => {
+  const db  = await freshDatabase();
+  const env = await environmentOf(db);
+
+  const inactive = await requestCatalog(env).load().then(() => null, (error: unknown) => error as Error & { reason?: string });
+  t.equal(inactive?.name, 'RegistryUnavailable', 'nothing active is the registry being unavailable');
+  t.equal(inactive?.reason, 'not_active', 'and says that it is nothing being active');
+
+  const failing = (message: string) => ({
+    prepare() { throw new Error(message); },
+    batch()   { throw new Error(message); },
+  }) as unknown as D1Database;
+
+  const fault = await requestCatalog({ ...env, APP_DB: failing('D1_ERROR: no such table: registry_state: SQLITE_ERROR') } as Env)
+    .load().then(() => null, (error: unknown) => error as Error);
+  t.not(fault?.name, 'RegistryUnavailable', 'a database that answered with a fault is not an outage');
+  t.match(fault?.message, /no such table/, 'it is raised as the fault it is');
+
+  const { kv_registry } = await server.getWorker<Env>().getEnv();
+  t.equal((await kv_registry.list()).keys.length, 0, 'with nothing cached to fall back on');
+  const down = await requestCatalog({ ...env, APP_DB: failing('D1_ERROR: Network connection lost.') } as Env)
+    .load().then(() => null, (error: unknown) => error as Error & { reason?: string });
+  t.equal(down?.name, 'RegistryUnavailable', 'a database that did not answer is the registry being unavailable');
+  t.equal(down?.reason, 'unreadable', 'because it could not be read');
+  t.match((down?.cause as Error | undefined)?.message, /Network connection lost/, 'and why is its cause, for the log');
 });

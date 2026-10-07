@@ -13,8 +13,9 @@ import { snakeifyCamelObject } from '../lib/camel-snake.js';
 
 import { Comet, StandaloneContract } from '../lib/well-known/contracts/types.js'
 
-import { registryOf } from '../lib/model/comet-registry.js';
+import { annotationOf } from '../lib/model/comet-registry.js';
 
+import { ApiError } from './http/errors.js';
 import type { Catalog } from './registry/catalog.js';
 
 import {
@@ -50,13 +51,21 @@ function marketsOf(catalog: Catalog, network: KnownNetwork.Name): Eth.Contract<S
   return catalog.marketsOn(network).map(entry => entry.comet);
 }
 
+/*
+ * The networks a market route reads: the one it names, or for every network,
+ * every mainnet. Testnets are not served — the router refuses a request that
+ * names one or asks to include them (testnets.ts) — so a handler here only
+ * ever reads mainnets, and evaluates in the mainnet storage.
+ */
+function networksOf(network: MarketRouteData['network']): KnownNetwork.Name[] {
+  return network === AllNetworks ? KnownNetwork.getNames() : [ network ];
+}
+
 async function latestSummary(
-  { apiHost, nodeHost, nodeKey, network, contract, queryParams, catalog }: MarketRouteData,
+  { apiHost, nodeHost, nodeKey, network, contract, catalog }: MarketRouteData,
   context: UninstantiatedRouterContext,
 ): Promise<Response> {
-  const includeTestnets = queryParams.get('testnets') === 'include';
-  const allNetworks = KnownNetwork.getNames({ includeTestnets });
-  const selectedNetworks = network === AllNetworks ? allNetworks : [network];
+  const selectedNetworks = networksOf(network);
 
   if (contract !== AllContracts && !Comet.is(contract)) {
     return new Response(
@@ -67,11 +76,7 @@ async function latestSummary(
     );
   }
 
-  const networkEnv = (
-    network === AllNetworks || !KnownNetwork.isNameOfTestnet(network) ? 'mainnet' : 'testnet'
-  );
-
-  const { evaluate, pipe1, pull1, split } = context.instantiateEvaluator(networkEnv, {
+  const { evaluate, pipe1, pull1, split } = context.instantiateEvaluator('mainnet', {
     flags: {
       ...context.flags,
       batchingEnabled: true,
@@ -93,10 +98,12 @@ async function latestSummary(
       /*
        * One evaluation per network, not per market. Its markets share the
        * latest block, read once, and every round of their reads reaches the
-       * node as one batch. A Worker invocation may make only so many
-       * subrequests — 50 on the Free plan, where each call to the node
-       * provider proxy is one — and an evaluation per market made four for
-       * every market: all networks at once took 116.
+       * node as one batch: four calls to the node provider proxy per network,
+       * whatever its market count. An evaluation per market made four for
+       * every market, and all networks at once took 116 — each call a round
+       * trip of its own, and a subrequest, of which an invocation has 10,000
+       * on the Workers Paid plan stage and production run on, and 50 on the
+       * Free plan (README, "Workers Plan").
        *
        * Networks stay separate evaluations: within one, the batches of
        * different networks would go to the node one after another.
@@ -150,11 +157,7 @@ async function latestRewardsSummary(
     );
   }
 
-  const networkEnv = (
-    KnownNetwork.isNameOfTestnet(network) ? 'testnet' : 'mainnet'
-  );
-
-  const { evaluate, pipe1, pull1 } = context.instantiateEvaluator(networkEnv, {
+  const { evaluate, pipe1, pull1 } = context.instantiateEvaluator('mainnet', {
     flags: {
       ...context.flags,
       batchingEnabled: true,
@@ -164,28 +167,17 @@ async function latestRewardsSummary(
 
   /*
    * A market the version gives no rewards has no reward price to value them
-   * with: its reward feed stands at the zero address only to keep the
-   * contract shape uniform, and reading it would fail rather than answer. The
-   * route says so instead, the way the dapp-data route leaves such a market
-   * out.
-   */
-  if (registryOf(contract)?.market.capabilities.rewards === false) {
-    return new Response(
-      JSON.stringify({
-        error: `Rewards are not available for this market`,
-        code:  'REWARDS_NOT_AVAILABLE',
-      }),
-      { status: 404 }
-    );
-  }
-
-  /*
+   * with, and nothing stands in for the feed it lacks. The route says so, in
+   * the error envelope, where the dapp-data route leaves such a market out of
+   * its list.
+   *
    * FIXME: this can still be improved by using types in MarketRouteData
    */
-  const rewardsTokenPriceFeed = (
-    (contract as unknown as StandaloneContract<Comet>)
-    .rewards.priceFeed
-  );
+  const rewardsTokenPriceFeed = (contract as unknown as StandaloneContract<Comet>).rewards?.priceFeed;
+  if (annotationOf(contract).market.capabilities.rewards === false || rewardsTokenPriceFeed === undefined) {
+    throw new ApiError('REWARDS_NOT_AVAILABLE', `Rewards are not available for this market`);
+  }
+
   const rewardsSummary = await evaluate(pipe1([
     { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: 'latest', network } },
     latestBlock => {
@@ -206,12 +198,10 @@ async function latestRewardsSummary(
 }
 
 async function historicalSummary(
-  { apiHost, nodeHost, nodeKey, network, contract, queryParams, catalog }: MarketRouteData,
+  { apiHost, nodeHost, nodeKey, network, contract, catalog }: MarketRouteData,
   context: Context,
 ): Promise<Response> {
-  const includeTestnets = queryParams.get('testnets') === 'include';
-  const allNetworks = KnownNetwork.getNames({ includeTestnets });
-  const selectedNetworks = network === AllNetworks ? allNetworks : [network];
+  const selectedNetworks = networksOf(network);
 
   if (contract !== AllContracts && !Comet.is(contract)) {
     return new Response(
@@ -326,18 +316,10 @@ async function historicalSummary(
 }
 
 async function rewardsDappData(
-  { apiHost, nodeHost, nodeKey, network, contract, queryParams, catalog }: MarketRouteData,
+  { apiHost, nodeHost, nodeKey, network, contract, catalog }: MarketRouteData,
   context: UninstantiatedRouterContext,
 ): Promise<Response> {
-  const includeTestnets = queryParams.get('testnets') === 'include';
-  const allNetworks = KnownNetwork.getNames({ includeTestnets });
-  const selectedNetworks = network === AllNetworks ? allNetworks : [network];
-
-  const networkEnv = (
-    selectedNetworks.some((name) => KnownNetwork.isNameOfTestnet(name))
-      ? 'testnet' // at least one selectedNetwork is a testnet
-      : 'mainnet' // no selected networks are testnets
-  );
+  const selectedNetworks = networksOf(network);
 
   if (contract !== AllContracts && !Comet.is(contract)) {
     return new Response(
@@ -348,7 +330,7 @@ async function rewardsDappData(
     );
   }
 
-  const evaluator = context.instantiateEvaluator(networkEnv, {
+  const evaluator = context.instantiateEvaluator('mainnet', {
     flags: {
       ...context.flags,
       batchingEnabled: true,
@@ -365,7 +347,7 @@ async function rewardsDappData(
        * states it per market.
        */
       const selectedContracts = (contract === AllContracts ? marketsOf(catalog, networkName) : [ contract ])
-        .filter(selected => registryOf(selected)?.market.capabilities.rewards ?? true);
+        .filter(selected => annotationOf(selected).market.capabilities.rewards);
 
       if (selectedContracts.length === 0) {
         return [];

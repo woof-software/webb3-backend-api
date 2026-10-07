@@ -470,15 +470,25 @@ async function expectJsonBody(httpMessage: Request | Response)
   let json; try { json = JSON.parse(responseText) }
   catch {
     /*
-     * TODO(jordan): use debug logger instance
+     * A failure carries only what may be logged: the URL as redactedUrl gives
+     * it and, for a response, the status, never the body. Nothing is logged
+     * here; the caller's logger writes the failure with its other diagnostics.
+     *
+     * A response with an error status and no JSON is the request failing, as
+     * when the node proxy answers 503 because no provider served the calls,
+     * or 401 because its key is wrong. The status is not checked before the
+     * body is parsed: a node can answer a JSON-RPC error with an error status
+     * too, and that error is its answer to the call.
      */
-    console.warn(`Invalid JSON-RPC response: not JSON`, {
+    const details = {
       url:        redactedUrl(httpMessage.url),
-      text:       responseText,
       status:     (httpMessage instanceof Response) ? httpMessage.status     : '',
       statusText: (httpMessage instanceof Response) ? httpMessage.statusText : '',
-    });
-    throw InvalidResponse(`not JSON`, responseText);
+    };
+    if (httpMessage instanceof Response && !httpMessage.ok) {
+      throw new Error(`JSON-RPC request failed: HTTP ${httpMessage.status}`, { cause: details });
+    }
+    throw InvalidResponse(`not JSON`, details);
   }
   return json;
 }
@@ -492,7 +502,9 @@ function redactedUrl(url: string): string {
   try {
     const { origin, pathname } = new URL(url);
     const network = pathname.split('/')[1] ?? '';
-    return network === '' ? origin : `${origin}/${network}/…`;
+    // a provider's URL can lead with its key instead, as QuickNode's token
+    // does, so only a segment that reads as a network name is kept
+    return /^[a-z]+(-[a-z]+)+$/.test(network) ? `${origin}/${network}/…` : origin;
   } catch {
     return '';
   }

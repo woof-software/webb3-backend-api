@@ -1,4 +1,5 @@
 import type { MarketV1, NetworkV1 } from '../../lib/model/comet-registry.js';
+import { marketKey } from '../../lib/model/comet-registry.js';
 
 /*
  * What a version changes against the one that is on.
@@ -72,17 +73,21 @@ function withoutMarkets({ markets: _markets, ...network }: NetworkV1): Omit<Netw
   return network;
 }
 
-function marketsByScope(networks: NetworkV1[]): Map<string, MarketV1> {
+// a market with the chain it is on, by its key
+type Scoped = { chainId: number, market: MarketV1 };
+
+function marketsByScope(networks: NetworkV1[]): Map<string, Scoped> {
   return new Map(networks.flatMap(network => network.markets.map(market => (
-    [ `${network.chainId}/${market.deploymentKey}`, market ] as const
+    [ marketKey(network.chainId, market.deploymentKey), { chainId: network.chainId, market } ] as const
   ))));
 }
 
-// chain ids in numeric order, then deployment keys
-function byScope(left: string, right: string): number {
-  const [ leftChain, leftKey = '' ]   = left.split('/');
-  const [ rightChain, rightKey = '' ] = right.split('/');
-  return Number(leftChain) - Number(rightChain) || (leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0);
+// the keys of some markets, chain ids in numeric order and then deployment keys
+function inScopeOrder(markets: Map<string, Scoped>, scopes: string[]): string[] {
+  const order = (left: Scoped, right: Scoped) => left.chainId - right.chainId || (
+    left.market.deploymentKey < right.market.deploymentKey ? -1 : left.market.deploymentKey > right.market.deploymentKey ? 1 : 0
+  );
+  return [ ...scopes ].sort((left, right) => order(markets.get(left)!, markets.get(right)!));
 }
 
 /*
@@ -106,7 +111,7 @@ function compareVersions(
 
   const beforeMarkets = marketsByScope(before ?? []);
   const afterMarkets  = marketsByScope(after);
-  const scopes        = [ ...afterMarkets.keys() ].sort(byScope);
+  const scopes        = inScopeOrder(afterMarkets, [ ...afterMarkets.keys() ]);
 
   return {
     networks: {
@@ -117,11 +122,15 @@ function compareVersions(
     markets: {
       added: scopes
         .filter(scope => !beforeMarkets.has(scope))
-        .map(scope => ({ scope, reviewed: !unreviewed.has(scope), market: withoutId(afterMarkets.get(scope)!) })),
-      removed: [ ...beforeMarkets.keys() ].filter(scope => !afterMarkets.has(scope)).sort(byScope),
+        .map(scope => ({ scope, reviewed: !unreviewed.has(scope), market: withoutId(afterMarkets.get(scope)!.market) })),
+      removed: inScopeOrder(beforeMarkets, [ ...beforeMarkets.keys() ].filter(scope => !afterMarkets.has(scope))),
       changed: scopes
         .filter(scope => beforeMarkets.has(scope))
-        .flatMap(scope => fieldChanges(scope, withoutId(beforeMarkets.get(scope)!), withoutId(afterMarkets.get(scope)!))),
+        .flatMap(scope => fieldChanges(
+          scope,
+          withoutId(beforeMarkets.get(scope)!.market),
+          withoutId(afterMarkets.get(scope)!.market),
+        )),
     },
   };
 }

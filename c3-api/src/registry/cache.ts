@@ -1,32 +1,47 @@
 import type { Env } from '../../entrypoint.js';
 
-import type { RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
+import type { RegistrySnapshotV1, RegistryVersionRefV1, RegistryVersionRow } from '../../lib/model/comet-registry.js';
 
-import { readActivePointer, readRegistrySnapshot, readVersion } from './repository.js';
+import { registryConfig } from './config.js';
+import {
+  readActivePointer,
+  readRegistrySnapshot,
+  readRetainedVersions,
+  readVersion,
+  snapshotChecksum,
+} from './repository.js';
 import type { VersionRef } from './version-headers.js';
 
 /*
- * The snapshot cache: what a request reads instead of hydrating the active
- * version out of D1 again, and what it falls back to when D1 does not answer.
+ * The snapshot cache: what every request reads the active version through,
+ * and what it falls back to when D1 does not answer.
  *
  * Two facts make this safe. A version is immutable once it exists — its rows
  * are frozen and its checksum says so — and only the pointer to the active
- * one moves. So the bytes of a version are cached under a key that names the
+ * one moves. So the bytes of a version are held under a key that names the
  * version and its checksum, and are never invalidated; what a request
  * verifies against D1 is the pointer alone, which is one statement.
+ *
+ * They are held at two levels. An isolate keeps the versions it has served
+ * in memory, so a request it has answered before pays the pointer read and
+ * nothing else; KV holds them for the isolates that have not, so a new one
+ * pays a KV read rather than hydrating the snapshot out of D1. What KV holds
+ * is served only once it is checked to be the version it is cached as.
  *
  * D1 stays authoritative. The cache never decides which version is active,
  * and it never answers in place of a D1 that said there is no active version:
  * that is an answer, not an outage. It answers only when D1 could not be
  * reached at all, and then it says so, with the age of what it served, so a
  * caller is never told an old version is the current one.
+ *
+ * The registry's own routes and the market routes read the active version
+ * through the same entry, activeSnapshot, so they degrade the same way: a
+ * database that could not be reached, with nothing within the window to fall
+ * back on, is RegistryUnavailable, which every route answers with 503; one
+ * that answered with a fault is raised as it is, and answered 500.
  */
-type CacheSource = 'origin' | 'cache' | 'stale';
-
 type CachedSnapshot = {
   snapshot: RegistrySnapshotV1,
-  // where the bytes came from, which the response reports and metrics count
-  source:   CacheSource,
   // how old the pointer is, in seconds, when the answer is stale
   staleFor: number | null,
 };
@@ -34,12 +49,51 @@ type CachedSnapshot = {
 type CacheDeps = {
   db:      D1Database,
   kv:      KVNamespace,
-  // what the environment configures; see maxAgeOf/staleWindowOf in router.ts
+  // what the environment configures; see cacheDepsOf
   ttlSeconds:   number,
   staleSeconds: number,
   now?:    () => Date,
-  debug?:  { error: (...parameters: unknown[]) => unknown },
+  // a failure goes out as an error, a degradation the cache recovers from as a warning
+  debug?:  {
+    error: (...parameters: unknown[]) => unknown,
+    warn:  (...parameters: unknown[]) => unknown,
+  },
 };
+
+/*
+ * A validated version named by id, as a session that pinned it reads it: the
+ * reference that names its bytes, and a way to read them. The reference is
+ * all a conditional request needs, so a client that already holds the bytes
+ * is answered without them being read at all.
+ */
+type PinnedVersion = {
+  ref:      VersionRef,
+  snapshot: () => Promise<RegistrySnapshotV1 | null>,
+};
+
+/*
+ * The registry could not be read: nothing is active, or D1 did not answer
+ * and nothing within the fallback window is cached. Every route answers it
+ * with 503 — after the cutover there is nothing else to answer from, and
+ * silently answering from the static constants would serve markets nobody
+ * reviewed or activated. The reason tells the two apart for a route that
+ * answers them differently; why D1 did not answer is the cause, for the logs.
+ */
+type UnavailableReason = 'not_active' | 'unreadable';
+
+class RegistryUnavailable extends Error {
+  readonly reason: UnavailableReason;
+
+  constructor(message: string, reason: UnavailableReason, cause?: unknown) {
+    super(message, cause === undefined ? {} : { cause });
+    this.name   = 'RegistryUnavailable';
+    this.reason = reason;
+  }
+}
+
+function isRegistryUnavailable(error: unknown): error is RegistryUnavailable {
+  return error instanceof RegistryUnavailable;
+}
 
 /*
  * The schema the cached bytes are written in. A change to RegistrySnapshotV1
@@ -48,6 +102,8 @@ type CacheDeps = {
  */
 const SCHEMA = 'v1';
 
+const SNAPSHOT_PREFIX = 'snapshot:';
+
 // KV refuses an expiration under a minute, and a cache that short would not be one
 const MIN_TTL_SECONDS = 60;
 
@@ -55,164 +111,266 @@ const MIN_TTL_SECONDS = 60;
 const POINTER_REFRESH_SECONDS = 300;
 
 /*
- * What the environment configures. The TTL doubles as the max-age public
- * reads advertise, and the fallback window is how old an answer may be when
- * D1 cannot be reached; zero switches the fallback off, which is what an
- * environment that would rather fail than serve an older version sets.
+ * What the environment configures, as registryConfig reads it. The TTL is the
+ * max-age public reads advertise, and the fallback window is how old an
+ * answer may be when D1 cannot be reached; zero switches the fallback off,
+ * which is what an environment that would rather fail than serve an older
+ * version sets. A value neither takes is answered with its default, and the
+ * status names it.
  */
 function cacheDepsOf(env: Env, debug?: CacheDeps['debug']): CacheDeps {
-  const ttl   = Number(env.REGISTRY_SNAPSHOT_CACHE_TTL_S);
-  const stale = Number(env.REGISTRY_STALE_FALLBACK_MAX_S);
+  const { snapshotTtlSeconds, staleFallbackSeconds } = registryConfig(env);
   return {
     db:           env.APP_DB,
     kv:           env.kv_registry,
-    ttlSeconds:   Number.isInteger(ttl)   && ttl   >  0 ? ttl   : 300,
-    staleSeconds: Number.isInteger(stale) && stale >= 0 ? stale : 3600,
+    ttlSeconds:   snapshotTtlSeconds,
+    staleSeconds: staleFallbackSeconds,
     ...(debug === undefined ? {} : { debug }),
   };
 }
 
 function snapshotKey({ id, checksum }: VersionRef): string {
-  return `snapshot:${SCHEMA}:${id}:${checksum}`;
+  return `${SNAPSHOT_PREFIX}${SCHEMA}:${id}:${checksum}`;
 }
 
 /*
  * The pointer as it was last read successfully. It exists only for the
  * outage path: it is what tells a request which version to look for when D1
- * cannot be asked, and when that pointer was true.
+ * cannot be asked, what that version's bytes must be checked against, and
+ * when that pointer was true.
  */
 const POINTER_KEY = `active:${SCHEMA}`;
 
-type PointerRecord = VersionRef & { at: string };
-
-// what a cached entry remembers about itself: when it was written
-type Stored = { at: number };
-
-function ttlOf({ ttlSeconds, staleSeconds }: CacheDeps): number {
-  /*
-   * A version's bytes outlive the pointer record that names them: they have
-   * to still be there for the whole fallback window, or the fallback has
-   * nothing to serve.
-   */
-  return Math.max(ttlSeconds, staleSeconds, MIN_TTL_SECONDS);
-}
+type PointerRecord = RegistryVersionRefV1 & { at: string };
 
 function now(deps: CacheDeps): Date {
   return deps.now?.() ?? new Date();
 }
 
+function refOf({ id, checksum }: VersionRef): string {
+  return `${id}:${checksum}`;
+}
+
+// a version as its row names it, which is what its cached bytes are checked against
+function referenceOf(version: RegistryVersionRow, checksum: string): RegistryVersionRefV1 {
+  return {
+    id:               version.id,
+    sourceRepository: version.source_repository,
+    sourceCommitSha:  version.source_commit_sha,
+    checksum,
+  };
+}
+
 /*
- * A cached snapshot is trusted only when it is the one that was asked for.
- * The key already names the version and checksum; this rejects an entry whose
- * body disagrees with its own key, which is what a partial write or a
- * hand-edited namespace looks like.
+ * The versions this isolate holds in memory, per database binding. A version
+ * read once is answered from here for as long as the isolate lives: a hot
+ * isolate pays the pointer read and nothing else, where reading KV would
+ * fetch, check and parse the whole snapshot on every request. The database
+ * binding is part of the key, because a version id identifies a version of
+ * one registry, not of every database an isolate might hold.
+ *
+ * The version the pointer named last has a place of its own. Every public
+ * read and every market route wants it, while the versions sessions pinned
+ * are read by id on an anonymous route: in one shared set, a client reading a
+ * few old versions would push the active one out, and every request after it
+ * would read KV and build its catalog again. The pinned versions share the
+ * other places, the one read last kept longest.
  */
-function snapshotOf(value: unknown, pointer: VersionRef): RegistrySnapshotV1 | null {
+type Held = {
+  active: { ref: string, snapshot: RegistrySnapshotV1 } | null,
+  pinned: Map<string, RegistrySnapshotV1>,
+};
+
+const held = new WeakMap<D1Database, Held>();
+
+// how many of the versions sessions pinned an isolate keeps, besides the active one
+const PINNED_VERSIONS = 4;
+
+// which place a read holds a version in: the active version's, or one of the pinned versions'
+type Slot = 'active' | 'pinned';
+
+function heldSnapshot(deps: CacheDeps, pointer: VersionRef): RegistrySnapshotV1 | null {
+  const versions = held.get(deps.db);
+  if (versions === undefined) {
+    return null;
+  }
+  const ref = refOf(pointer);
+  return versions.active?.ref === ref ? versions.active.snapshot : versions.pinned.get(ref) ?? null;
+}
+
+// a version this isolate holds, found by its id alone
+function heldVersion(deps: CacheDeps, versionId: string): RegistrySnapshotV1 | null {
+  const versions = held.get(deps.db);
+  if (versions === undefined) {
+    return null;
+  }
+  return [ versions.active?.snapshot, ...versions.pinned.values() ]
+    .find(snapshot => snapshot?.registryVersion.id === versionId) ?? null;
+}
+
+function pin(versions: Held, ref: string, snapshot: RegistrySnapshotV1): void {
+  versions.pinned.delete(ref);
+  versions.pinned.set(ref, snapshot);
+  for (const oldest of versions.pinned.keys()) {
+    if (versions.pinned.size <= PINNED_VERSIONS) {
+      break;
+    }
+    versions.pinned.delete(oldest);
+  }
+}
+
+/*
+ * Keeps a version in memory, in the place the read that served it asks for.
+ * A version that becomes the active one leaves the pinned places, and the
+ * version that was active before takes one of them: the sessions that pinned
+ * it are what reads it next.
+ */
+function hold(deps: CacheDeps, pointer: VersionRef, snapshot: RegistrySnapshotV1, slot: Slot): void {
+  let versions = held.get(deps.db);
+  if (versions === undefined) {
+    versions = { active: null, pinned: new Map() };
+    held.set(deps.db, versions);
+  }
+  const ref = refOf(pointer);
+  if (slot === 'pinned') {
+    if (versions.active?.ref !== ref) {
+      pin(versions, ref, snapshot);
+    }
+    return;
+  }
+  const before = versions.active;
+  versions.active = { ref, snapshot };
+  versions.pinned.delete(ref);
+  if (before !== null && before.ref !== ref) {
+    pin(versions, before.ref, before.snapshot);
+  }
+}
+
+/*
+ * The snapshot some bytes hold, if they are the version they are cached as,
+ * built from the parts of them that were checked and from nothing else.
+ *
+ * What names the version — its id, the source it was imported from, and the
+ * checksum validation recorded — must be what its row says, as D1 or, during
+ * an outage, the pointer record names it. The networks are checked against
+ * that checksum, computed the way validation computed it. An entry edited by
+ * hand, cut short, or written in another shape is not the version, and would
+ * be served under that version's genuine checksum; content that cannot even
+ * be checksummed, such as a network whose markets are not a list, is not the
+ * version either. Whatever else an entry holds is not served.
+ *
+ * Market ids are the one part the check cannot reach. The checksum leaves out
+ * the row ids, which every import generates anew, so the ids of an entry's
+ * markets are served as KV holds them.
+ */
+async function verified(value: unknown, version: RegistryVersionRefV1): Promise<RegistrySnapshotV1 | null> {
   const snapshot = value as RegistrySnapshotV1 | null;
-  if (snapshot === null || typeof(snapshot) !== 'object') {
+  if (snapshot === null || typeof(snapshot) !== 'object' || !Array.isArray(snapshot.networks)) {
     return null;
   }
-  const version = snapshot.registryVersion;
-  if (version?.id !== pointer.id || version?.checksum !== pointer.checksum) {
+  const named = snapshot.registryVersion;
+  const same  = named?.id === version.id
+    && named?.sourceRepository === version.sourceRepository
+    && named?.sourceCommitSha === version.sourceCommitSha
+    && named?.checksum === version.checksum;
+  if (!same) {
     return null;
   }
-  /*
-   * The shape as well as the identity. An entry that names the right version
-   * but is not a snapshot would be trusted all the way into the catalog and
-   * fail there, on every request, until it expired; here it is merely a miss,
-   * and D1 answers instead.
-   */
-  if (!Array.isArray(snapshot.networks)) {
+  try {
+    if (await snapshotChecksum(snapshot.networks) !== version.checksum) {
+      return null;
+    }
+  } catch {
     return null;
+  }
+  return {
+    schemaVersion:   1,
+    registryVersion: {
+      id:               version.id,
+      sourceRepository: version.sourceRepository,
+      sourceCommitSha:  version.sourceCommitSha,
+      checksum:         version.checksum,
+    },
+    networks: snapshot.networks,
+  };
+}
+
+async function cachedSnapshot(deps: CacheDeps, pointer: RegistryVersionRefV1): Promise<RegistrySnapshotV1 | null> {
+  let value: unknown;
+  try {
+    value = await deps.kv.get(snapshotKey(pointer), 'json');
+  } catch (error) {
+    // a cache that cannot be read is a slow request, never a failed one
+    deps.debug?.warn(`registry snapshot cache unreadable`, { versionId: pointer.id, error });
+    return null;
+  }
+  if (value === null || value === undefined) {
+    // an ordinary miss: D1 answers
+    return null;
+  }
+
+  const snapshot = await verified(value, pointer);
+  if (snapshot === null) {
+    /*
+     * Something is under the key that is not the version it names. D1
+     * answers instead, and the bytes it hydrates are written over the entry.
+     */
+    deps.debug?.warn(`registry snapshot cache entry refused: it is not the version it is cached as`, { versionId: pointer.id });
   }
   return snapshot;
 }
 
-async function cachedSnapshot(deps: CacheDeps, pointer: VersionRef): Promise<RegistrySnapshotV1 | null> {
-  let value: unknown;
-  let metadata: Stored | null = null;
-  try {
-    const entry = await deps.kv.getWithMetadata(snapshotKey(pointer), 'json');
-    value    = entry.value;
-    metadata = (entry.metadata ?? null) as Stored | null;
-  } catch (error) {
-    // a cache that cannot be read is a slow request, never a failed one
-    deps.debug?.error(`registry snapshot cache unreadable`, { versionId: pointer.id, error });
-    return null;
+/*
+ * The bytes of a version this isolate or KV already holds, verified once:
+ * what KV answers is kept in memory, so the next request of this isolate
+ * reads neither.
+ */
+async function storedSnapshot(
+  deps: CacheDeps,
+  pointer: RegistryVersionRefV1,
+  slot: Slot,
+): Promise<RegistrySnapshotV1 | null> {
+  const inMemory = heldSnapshot(deps, pointer);
+  if (inMemory !== null) {
+    hold(deps, pointer, inMemory, slot);
+    return inMemory;
   }
-  if (value === null || value === undefined) {
-    // an ordinary miss: there is nothing to discard, and D1 answers
-    return null;
-  }
-
-  const cached = snapshotOf(value, pointer);
+  const cached = await cachedSnapshot(deps, pointer);
   if (cached === null) {
-    /*
-     * Something is under the key that is not the version it names. It would
-     * be read by every isolate until it expired, so it is discarded and the
-     * caller writes the version again from D1.
-     */
-    await dropCached(deps, pointer);
     return null;
   }
-
-  await refreshEntry(deps, pointer, cached, metadata);
+  hold(deps, pointer, cached, slot);
   return cached;
 }
 
 /*
- * The bytes of a version expire, and they are written once — so a version
- * that stays active longer than one expiry would vanish from under the
- * fallback that still names it. An entry that has lived half its life is
- * written again by the request that read it, which keeps a version cached
- * for as long as it is being served and lets one nobody serves expire.
+ * Writes the bytes of one version, for the isolates that come after.
+ *
+ * Entries are written once and without an expiry: the key contains the
+ * checksum of the content, so an entry is never wrong, only unwanted, and the
+ * scheduled job removes the unwanted ones (pruneSnapshots). An expiry would
+ * take the bytes of a version that stays active from under the fallback that
+ * names them, and renewing it would have a write ride on reads.
+ *
+ * Only bytes that verify are written. A version validated by a release that
+ * hydrated another shape does not match its own checksum when this release
+ * hydrates it: caching those bytes would only have every other isolate read
+ * them, refuse them and hydrate the version again. Such a version is served
+ * from D1 and then from memory, and the log says so once per isolate; a new
+ * attempt, validated by this release, is what makes it cacheable again.
  */
-async function refreshEntry(
-  deps: CacheDeps,
-  pointer: VersionRef,
-  snapshot: RegistrySnapshotV1,
-  metadata: Stored | null,
-): Promise<void> {
-  const ttl = ttlOf(deps);
-  const at  = metadata?.at ?? 0;
-  if (now(deps).getTime() - at < ttl * 1000 / 2) {
+async function writeSnapshot(deps: CacheDeps, pointer: RegistryVersionRefV1, snapshot: RegistrySnapshotV1): Promise<void> {
+  if (await verified(snapshot, pointer) === null) {
+    deps.debug?.warn(`registry snapshot not cached: this release hydrates it unlike the release that validated it`, {
+      versionId: pointer.id,
+    });
     return;
   }
-  await writeSnapshot(deps, pointer, snapshot);
-}
-
-// whether the bytes of a version are cached, without pulling them over the network
-async function isCached(deps: CacheDeps, pointer: VersionRef): Promise<boolean> {
-  const listed = await deps.kv.list({ prefix: snapshotKey(pointer) });
-  return listed.keys.length > 0;
-}
-
-async function dropCached(deps: CacheDeps, pointer: VersionRef): Promise<void> {
   try {
-    if (await isCached(deps, pointer)) {
-      await deps.kv.delete(snapshotKey(pointer));
-      deps.debug?.error(`registry snapshot cache entry discarded`, { versionId: pointer.id });
-    }
-  } catch (error) {
-    deps.debug?.error(`registry snapshot cache entry not discarded`, { versionId: pointer.id, error });
-  }
-}
-
-/*
- * Writes the bytes of one version. The key contains the checksum of the
- * content, so a write is always the same bytes: what changes is when they
- * were written, which is what decides the next refresh.
- */
-async function writeSnapshot(deps: CacheDeps, pointer: VersionRef, snapshot: RegistrySnapshotV1): Promise<void> {
-  try {
-    await deps.kv.put(snapshotKey(pointer), JSON.stringify(snapshot), {
-      expirationTtl: ttlOf(deps),
-      // when these bytes were written, which is what refreshEntry reads
-      metadata: { at: now(deps).getTime() } satisfies Stored,
-    });
+    await deps.kv.put(snapshotKey(pointer), JSON.stringify(snapshot));
   } catch (error) {
     // the answer is already computed; failing to remember it must not fail it
-    deps.debug?.error(`registry snapshot cache unwritable`, { versionId: pointer.id, error });
+    deps.debug?.warn(`registry snapshot cache unwritable`, { versionId: pointer.id, error });
   }
 }
 
@@ -227,11 +385,7 @@ async function writeSnapshot(deps: CacheDeps, pointer: VersionRef, snapshot: Reg
  */
 const written = new WeakMap<KVNamespace, { ref: string, at: number }>();
 
-function refOf({ id, checksum }: VersionRef): string {
-  return `${id}:${checksum}`;
-}
-
-async function rememberPointer(deps: CacheDeps, pointer: VersionRef): Promise<void> {
+async function rememberPointer(deps: CacheDeps, pointer: RegistryVersionRefV1): Promise<void> {
   if (deps.staleSeconds <= 0) {
     // with no fallback window nothing ever reads this record, so nothing writes it
     return;
@@ -256,7 +410,7 @@ async function rememberPointer(deps: CacheDeps, pointer: VersionRef): Promise<vo
     });
     written.set(deps.kv, { ref: refOf(pointer), at });
   } catch (error) {
-    deps.debug?.error(`registry pointer cache unwritable`, { versionId: pointer.id, error });
+    deps.debug?.warn(`registry pointer cache unwritable`, { versionId: pointer.id, error });
   }
 }
 
@@ -265,20 +419,21 @@ function pointerRecordOf(value: unknown): PointerRecord | null {
   if (record === null || typeof(record) !== 'object') {
     return null;
   }
-  return typeof(record.id) === 'string' && typeof(record.checksum) === 'string' && typeof(record.at) === 'string'
+  return [ record.id, record.sourceRepository, record.sourceCommitSha, record.checksum, record.at ]
+    .every(field => typeof(field) === 'string')
     ? record
     : null;
 }
 
 /*
- * What to serve when D1 did not answer: the version that was active the last
- * time it did, if that was recent enough and its bytes are still cached.
+ * Which version to fall back on when D1 did not answer: the one that was
+ * active the last time it did, if that was recent enough.
  *
  * The age is carried back to the caller rather than swallowed. A response
  * built from this is explicitly an older version of the registry, and says so
  * in its headers; nothing about it may look current.
  */
-async function stalePointer(deps: CacheDeps): Promise<{ pointer: VersionRef, staleFor: number } | null> {
+async function stalePointer(deps: CacheDeps): Promise<{ pointer: RegistryVersionRefV1, staleFor: number } | null> {
   if (deps.staleSeconds <= 0) {
     return null;
   }
@@ -286,7 +441,7 @@ async function stalePointer(deps: CacheDeps): Promise<{ pointer: VersionRef, sta
   try {
     record = pointerRecordOf(await deps.kv.get(POINTER_KEY, 'json'));
   } catch (error) {
-    deps.debug?.error(`registry pointer cache unreadable`, { error });
+    deps.debug?.warn(`registry pointer cache unreadable`, { error });
     return null;
   }
   if (record === null) {
@@ -297,25 +452,8 @@ async function stalePointer(deps: CacheDeps): Promise<{ pointer: VersionRef, sta
   if (!Number.isFinite(age) || age < 0 || age > deps.staleSeconds) {
     return null;
   }
-  return { pointer: { id: record.id, checksum: record.checksum }, staleFor: Math.round(age) };
-}
-
-async function staleFallback(deps: CacheDeps): Promise<CachedSnapshot | null> {
-  const stale = await stalePointer(deps);
-  if (stale === null) {
-    return null;
-  }
-  const snapshot = await cachedSnapshot(deps, stale.pointer);
-  return snapshot === null ? null : { snapshot, source: 'stale', staleFor: stale.staleFor };
-}
-
-/*
- * That D1 did not answer, and what is being tried instead. Both the
- * registry's own reads and the consumer catalog degrade through these, so
- * they cannot degrade differently or describe it differently.
- */
-function noteFallback(deps: CacheDeps, what: string, error: unknown): void {
-  deps.debug?.error(`registry ${what} unreadable; trying the stale fallback`, { error });
+  const { id, sourceRepository, sourceCommitSha, checksum } = record;
+  return { pointer: { id, sourceRepository, sourceCommitSha, checksum }, staleFor: Math.round(age) };
 }
 
 /*
@@ -329,11 +467,67 @@ function noteFallback(deps: CacheDeps, what: string, error: unknown): void {
  * says so.
  */
 const ANSWERED = /no such (table|column|index)|syntax error|constraint failed|not authorized|datatype mismatch/i;
-const UNREACHABLE = /network connection lost|fetch failed|timed? ?out|connection (reset|refused|closed)|storage (error|operation)|internal error|overloaded|unavailable/i;
+// D1's own transient failures are those its documentation says to retry: an object reset or restarted, a replica cut off
+const UNREACHABLE = /network connection lost|fetch failed|timed? ?out|connection (reset|refused|closed)|storage (error|operation)|internal error|overloaded|unavailable|code was updated|object to be reset|transient issue|replica disconnected/i;
 
 function isUnreachable(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return !ANSWERED.test(message) && UNREACHABLE.test(message);
+}
+
+// a database that could not be reached is the registry being unavailable; one that answered is its own fault
+function unavailableOr(error: unknown): unknown {
+  return isUnreachable(error)
+    ? new RegistryUnavailable(`the comet registry could not be read`, 'unreadable', error)
+    : error;
+}
+
+/*
+ * When this isolate last said it answers from the fallback, per database
+ * binding.
+ *
+ * A database that cannot be reached is a failure an operator has to see, so
+ * it is an error even while the fallback keeps every answer a success. It is
+ * said once a minute rather than once a request: an outage the fallback
+ * serves for its whole window would otherwise write a line, with the whole
+ * error, for every request it answered.
+ */
+const reportedOutage = new WeakMap<D1Database, number>();
+
+const REPORT_OUTAGE_EVERY_MS = 60_000;
+
+function reportOutage(deps: CacheDeps, stale: { pointer: VersionRef, staleFor: number }, error: unknown): void {
+  const at   = now(deps).getTime();
+  const last = reportedOutage.get(deps.db);
+  if (last !== undefined && at - last < REPORT_OUTAGE_EVERY_MS) {
+    return;
+  }
+  reportedOutage.set(deps.db, at);
+  deps.debug?.error(`registry database unreachable; answering from the version it last named`, {
+    versionId: stale.pointer.id,
+    staleFor:  stale.staleFor,
+    error,
+  });
+}
+
+/*
+ * What to answer when D1 did not: the version that was active the last time
+ * it did, if that was recent enough and its bytes are still held, by this
+ * isolate or in KV. A database that answered with a fault is not what this
+ * is for, and its failure is raised as it is.
+ */
+async function staleFallback(deps: CacheDeps, error: unknown): Promise<CachedSnapshot> {
+  if (!isUnreachable(error)) {
+    throw error;
+  }
+  const stale  = await stalePointer(deps);
+  const stored = stale === null ? null : await storedSnapshot(deps, stale.pointer, 'active');
+  if (stale === null || stored === null) {
+    throw unavailableOr(error);
+  }
+  // served, but older than it may be: the response says so, and the log says why
+  reportOutage(deps, stale, error);
+  return { snapshot: stored, staleFor: stale.staleFor };
 }
 
 /*
@@ -341,7 +535,7 @@ function isUnreachable(error: unknown): boolean {
  * cannot skip, and the only one a hot isolate usually pays: what a pointer
  * names never changes, so everything else can be held.
  */
-async function activePointer(deps: CacheDeps): Promise<VersionRef | null> {
+async function activePointer(deps: CacheDeps): Promise<RegistryVersionRefV1 | null> {
   const pointer = await readActivePointer(deps.db);
   if (pointer !== null) {
     await rememberPointer(deps, pointer);
@@ -350,42 +544,44 @@ async function activePointer(deps: CacheDeps): Promise<VersionRef | null> {
 }
 
 /*
- * The bytes of one version: from the cache, or hydrated out of D1 and written
- * to the cache for the isolates that come after.
+ * The bytes of one version: from this isolate, from KV, or hydrated out of D1
+ * and written to both for the requests and isolates that come after.
+ *
+ * `known` is the version's row, where the caller has already read it, which
+ * saves hydrating it a statement.
  */
-async function snapshotFor(deps: CacheDeps, pointer: VersionRef): Promise<{
-  snapshot: RegistrySnapshotV1,
-  source:   CacheSource,
-} | null> {
-  const cached = await cachedSnapshot(deps, pointer);
-  if (cached !== null) {
-    return { snapshot: cached, source: 'cache' };
+async function snapshotFor(
+  deps: CacheDeps,
+  pointer: RegistryVersionRefV1,
+  slot: Slot,
+  known?: RegistryVersionRow,
+): Promise<RegistrySnapshotV1 | null> {
+  const stored = await storedSnapshot(deps, pointer, slot);
+  if (stored !== null) {
+    return stored;
   }
 
-  const snapshot = await readRegistrySnapshot(deps.db, pointer.id);
+  const snapshot = await readRegistrySnapshot(deps.db, pointer.id, known);
   if (snapshot === null) {
     return null;
   }
   await writeSnapshot(deps, pointer, snapshot);
-  return { snapshot, source: 'origin' };
+  hold(deps, pointer, snapshot, slot);
+  return snapshot;
 }
 
 /*
  * The active snapshot: null when the registry has no active version, which is
- * a fact and not a failure. Throws only when D1 could not be reached and no
- * fallback within policy exists — the caller turns that into 503.
+ * a fact and not a failure. When D1 could not be reached it is the version D1
+ * last named, within the fallback window, or else RegistryUnavailable; when D1
+ * answered with a fault, that fault.
  */
 async function activeSnapshot(deps: CacheDeps): Promise<CachedSnapshot | null> {
-  let pointer: VersionRef | null;
+  let pointer: RegistryVersionRefV1 | null;
   try {
     pointer = await activePointer(deps);
   } catch (error) {
-    noteFallback(deps, 'pointer', error);
-    const fallback = isUnreachable(error) ? await staleFallback(deps) : null;
-    if (fallback === null) {
-      throw error;
-    }
-    return fallback;
+    return staleFallback(deps, error);
   }
 
   if (pointer === null) {
@@ -393,16 +589,59 @@ async function activeSnapshot(deps: CacheDeps): Promise<CachedSnapshot | null> {
   }
 
   try {
-    const resolved = await snapshotFor(deps, pointer);
-    return resolved === null ? null : { ...resolved, staleFor: null };
+    const snapshot = await snapshotFor(deps, pointer, 'active');
+    return snapshot === null ? null : { snapshot, staleFor: null };
   } catch (error) {
-    noteFallback(deps, 'snapshot', error);
-    const fallback = isUnreachable(error) ? await staleFallback(deps) : null;
-    if (fallback === null) {
-      throw error;
-    }
-    return fallback;
+    return staleFallback(deps, error);
   }
+}
+
+/*
+ * A validated version by id, for a session that pinned it, or null when there
+ * is no such validated version.
+ *
+ * A version this isolate holds is answered without asking D1: a validated
+ * version never changes, nor stops being validated. Otherwise its row names
+ * its bytes, and they are read the way the active version's are. A database
+ * that does not answer is RegistryUnavailable: a version named by id has no
+ * older answer to fall back on, only itself.
+ */
+async function versionSnapshot(deps: CacheDeps, versionId: string): Promise<PinnedVersion | null> {
+  const holding = heldVersion(deps, versionId);
+  if (holding !== null) {
+    const ref = { id: versionId, checksum: holding.registryVersion.checksum };
+    // read through the memory, so the version a session keeps reading is the last to go
+    hold(deps, ref, holding, 'pinned');
+    return { ref, snapshot: async () => holding };
+  }
+
+  let version: RegistryVersionRow | null;
+  try {
+    version = await readVersion(deps.db, versionId);
+  } catch (error) {
+    throw unavailableOr(error);
+  }
+  if (version === null || version.status !== 'validated' || version.snapshot_checksum === null) {
+    return null;
+  }
+
+  const named = referenceOf(version, version.snapshot_checksum);
+  return {
+    ref:      { id: named.id, checksum: named.checksum },
+    snapshot: async () => {
+      try {
+        return await snapshotFor(deps, named, 'pinned', version);
+      } catch (error) {
+        throw unavailableOr(error);
+      }
+    },
+  };
+}
+
+// whether the bytes of a version are cached, without pulling them over the network
+async function isCached(deps: CacheDeps, pointer: VersionRef): Promise<boolean> {
+  const listed = await deps.kv.list({ prefix: snapshotKey(pointer) });
+  return listed.keys.length > 0;
 }
 
 /*
@@ -435,7 +674,7 @@ async function cacheStatus(deps: CacheDeps, pointer: VersionRef | null): Promise
      * no cache at all, and so no fallback when the database next fails — went
      * unsaid.
      */
-    deps.debug?.error(`registry cache status unreadable`, { error });
+    deps.debug?.warn(`registry cache status unreadable`, { error });
     return { snapshotCached: false, pointerAgeSeconds: null, readable: false };
   }
 }
@@ -462,7 +701,7 @@ async function warmSnapshot(deps: CacheDeps, versionId: string): Promise<Version
   if (version === null || version.snapshot_checksum === null) {
     return null;
   }
-  const pointer: VersionRef = { id: version.id, checksum: version.snapshot_checksum };
+  const pointer = referenceOf(version, version.snapshot_checksum);
   if (await isCached(deps, pointer)) {
     return pointer;
   }
@@ -472,24 +711,67 @@ async function warmSnapshot(deps: CacheDeps, versionId: string): Promise<Version
   if (snapshot === null) {
     return null;
   }
-  await writeSnapshot(deps, snapshot.registryVersion, snapshot);
-  return snapshot.registryVersion;
+  await writeSnapshot(deps, pointer, snapshot);
+  return pointer;
 }
 
-export type { CacheDeps, CacheSource, CachedSnapshot };
+// at most this many entries are removed by one run; the next one continues
+const MAX_PRUNED_PER_RUN = 100;
+
+// one page of a KV listing, as every version of the Workers types describes it
+type ListedPage = { keys: Array<{ name: string }>, list_complete: boolean, cursor?: string };
+
+/*
+ * Removes from KV the bytes of versions nothing is about to serve.
+ *
+ * What stays is the active version, the version the pointer record names —
+ * what an outage falls back to, which right after an activation is still the
+ * one before — and every validated version newer than the active one, cached
+ * for the activation it waits for. Everything else under the snapshot prefix
+ * goes, the entries of an older schema with it. A version removed here and
+ * served again, by a rollback or by a session that pinned it, is cached again
+ * by the activation or by the read.
+ *
+ * The keys are listed before D1 is asked what to keep, so an entry written in
+ * between is either not listed or already one to keep. A D1 that cannot be
+ * asked removes nothing.
+ */
+async function pruneSnapshots(deps: CacheDeps): Promise<string[]> {
+  const listed: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page: ListedPage = await deps.kv.list(cursor === undefined
+      ? { prefix: SNAPSHOT_PREFIX }
+      : { prefix: SNAPSHOT_PREFIX, cursor });
+    listed.push(...page.keys.map(key => key.name));
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor !== undefined);
+
+  const record = pointerRecordOf(await deps.kv.get(POINTER_KEY, 'json'));
+  const keep   = new Set([
+    ...(await readRetainedVersions(deps.db)).map(snapshotKey),
+    ...(record === null ? [] : [ snapshotKey(record) ]),
+  ]);
+
+  const unwanted = listed.filter(name => !keep.has(name)).slice(0, MAX_PRUNED_PER_RUN);
+  for (const name of unwanted) {
+    await deps.kv.delete(name);
+  }
+  return unwanted;
+}
+
+export type { CacheDeps, CachedSnapshot, PinnedVersion };
 
 export {
-  MIN_TTL_SECONDS,
-  cacheDepsOf,
   POINTER_KEY,
-  activePointer,
+  RegistryUnavailable,
   activeSnapshot,
+  cacheDepsOf,
   cacheStatus,
-  snapshotFor,
-  cachedSnapshot,
+  isRegistryUnavailable,
   isUnreachable,
-  noteFallback,
+  pruneSnapshots,
   snapshotKey,
-  stalePointer,
+  versionSnapshot,
   warmSnapshot,
 };

@@ -11,6 +11,8 @@
 
 import { keccak256 } from '../hash.js';
 
+import type { Comet, Contract, StandaloneContract } from '../well-known/contracts/types.js';
+
 // same shape as Eth.Address, without importing the runtime constants module
 type Address = `0x${string}`;
 
@@ -110,6 +112,32 @@ function isChecksum(value: unknown): value is string {
 }
 
 /*
+ * How the registry names a market wherever it names one in text: the keys of
+ * an overlay directory, the scopes of a version's changes, its checks and its
+ * audit events, and what it lists as unreviewed. It is the chain id and the
+ * deployment key joined by a slash, which a deployment key cannot hold — the
+ * schema refuses one — so a name always reads back as the two it was made of.
+ */
+const MARKET_KEY_SEPARATOR = '/';
+
+function marketKey(chainId: number, deploymentKey: string): string {
+  return `${chainId}${MARKET_KEY_SEPARATOR}${deploymentKey}`;
+}
+
+/*
+ * The two parts of a market's name, or null for text that is not one. The
+ * chain id comes back as written: whether it is a chain id is for the caller
+ * to decide, and to say in its own words.
+ */
+function parseMarketKey(key: string): { chainId: string, deploymentKey: string } | null {
+  const separator = key.indexOf(MARKET_KEY_SEPARATOR);
+  if (separator <= 0 || separator === key.length - 1) {
+    return null;
+  }
+  return { chainId: key.slice(0, separator), deploymentKey: key.slice(separator + 1) };
+}
+
+/*
  * Source identity of one deployment discovered in the Comet repository.
  * `upstreamNetworkKey` is the repository's own directory name, such as
  * 'mainnet'; `network` is this API's canonical name, 'ethereum-mainnet'.
@@ -137,7 +165,12 @@ type ParsedRoot = DeploymentPath & {
 
 /*
  * D1 rows. Booleans are INTEGER 0 or 1 and every nullable column is
- * explicitly nullable, matching the migration.
+ * explicitly nullable, matching the migrations.
+ *
+ * `reviewed` says whether someone made the decisions a network or market row
+ * carries (0002). The column defaults to 1, which SQLite needs to add it to a
+ * table that has rows, so a row inserted without it would claim a review
+ * nobody made; the row types require it, and so every write states it.
  */
 type RegistryVersionRow = {
   id:                string,
@@ -161,6 +194,7 @@ type RegistryNetworkRow = {
   display_name:         string,
   is_testnet:           number,
   metadata:             string,
+  reviewed:             number,
 };
 
 type MarketRow = {
@@ -179,6 +213,7 @@ type MarketRow = {
   account_rewards_enabled:     number,
   transaction_history_enabled: number,
   collateral_value_quote:      PriceQuote,
+  reviewed:                    number,
 };
 
 type TokenRow = {
@@ -240,6 +275,18 @@ type ValidationResultRow = {
   created_at:          string,
 };
 
+type RegistryOverlayEventRow = {
+  id:                  string,
+  registry_version_id: string,
+  scope_type:          'network' | 'market',
+  scope_key:           string,
+  previous_digest:     string | null,
+  new_digest:          string,
+  actor:               string,
+  reason:              string,
+  created_at:          string,
+};
+
 type SyncRunRow = {
   id:                  string,
   source_commit_sha:   string,
@@ -251,7 +298,6 @@ type SyncRunRow = {
   status:              SyncRunStatus,
   outcome:             SyncOutcome | null,
   lease_owner:         string | null,
-  lease_generation:    number,
   lease_expires_at:    string | null,
   expected_count:      number,
   completed_count:     number,
@@ -259,6 +305,7 @@ type SyncRunRow = {
   last_error:          string | null,
   started_at:          string,
   completed_at:        string | null,
+  hold_for_review:     number,
 };
 
 type SyncRunItemRow = {
@@ -266,18 +313,31 @@ type SyncRunItemRow = {
   sync_run_id:          string,
   root_path:            string,
   source_blob_sha:      string,
-  root_checksum:        string,
   upstream_network_key: string,
   deployment_key:       string,
   status:               SyncItemStatus,
   attempts:             number,
   claim_owner:          string | null,
-  claim_generation:     number,
   claimed_at:           string | null,
   completed_at:         string | null,
   last_error:           string | null,
   created_at:           string,
   updated_at:           string,
+};
+
+/*
+ * The tables the registry writes row by row, with the row each one takes, so
+ * a write names its table and is checked against that table's columns.
+ */
+type RegistryTables = {
+  registry_versions:        RegistryVersionRow,
+  registry_networks:        RegistryNetworkRow,
+  network_price_exceptions: NetworkPriceExceptionRow,
+  markets:                  MarketRow,
+  tokens:                   TokenRow,
+  market_contracts:         MarketContractRow,
+  market_assets:            MarketAssetRow,
+  registry_overlay_events:  RegistryOverlayEventRow,
 };
 
 /*
@@ -651,17 +711,34 @@ type RegistryAnnotation = {
   priceExceptions: PriceExceptionV1[],
 };
 
+// a Comet as the catalog materializes it: the contract shape, and the registry's description of it
+type RegistryComet = Contract<StandaloneContract<Comet>> & { registry: RegistryAnnotation };
+
 /*
  * The registry description behind a contract, or null for one that came from
- * the static constants. A computation branches on what the registry says,
- * never on where the contract came from — except here, which is the one place
- * that tells the two apart.
+ * the static constants, which governance still decodes proposals against.
+ * This is the one place that tells the two apart.
  */
 function registryOf(contract: unknown): RegistryAnnotation | null {
   const annotation = (contract as { registry?: unknown } | null)?.registry;
   return typeof(annotation) === 'object' && annotation !== null && 'digest' in annotation
     ? annotation as RegistryAnnotation
     : null;
+}
+
+/*
+ * The registry description of a Comet a computation is handed. The routes
+ * hand the computations only Comets the request's catalog materialized, so a
+ * computation has one kind of market to read: one without a description is a
+ * caller's mistake, refused as one rather than computed as if the registry
+ * had said nothing about it.
+ */
+function annotationOf(contract: { address: string }): RegistryAnnotation {
+  const annotation = registryOf(contract);
+  if (annotation === null) {
+    throw new Error(`invariant violated: ${contract.address} is not a Comet the registry materialized`);
+  }
+  return annotation;
 }
 
 export type {
@@ -692,9 +769,12 @@ export type {
   PriceFeedV1,
   PriceQuote,
   RegistryNetworkRow,
+  RegistryOverlayEventRow,
   RegistrySnapshotV1,
+  RegistryTables,
   RegistryVersionRefV1,
   RegistryAnnotation,
+  RegistryComet,
   RegistryVersionRow,
   RewardAssetV1,
   SyncItemStatus,
@@ -746,6 +826,10 @@ export {
   isAddress,
   isChecksum,
   isCommitSha,
+  MARKET_KEY_SEPARATOR,
+  marketKey,
   normalizeAddress,
+  parseMarketKey,
+  annotationOf,
   registryOf,
 };

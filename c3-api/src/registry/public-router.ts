@@ -50,4 +50,4 @@ async function routePublic(
   }
 }
 
-export { ROUTES, routePublic };
+export { routePublic };

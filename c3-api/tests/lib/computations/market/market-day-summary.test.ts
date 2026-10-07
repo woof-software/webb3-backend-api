@@ -1,6 +1,5 @@
 import t from 'tap';
 
-import * as Eth      from '../../../../lib/eth-constants.js';
 import * as Debug    from '../../../../lib/debug-log.js';
 import * as Flags    from '../../../../lib/flags.js';
 import * as Fallible from '../../../../lib/fallible/fallible.js';
@@ -18,6 +17,7 @@ import * as market from '../../../../lib/computations/market.js';
 import '../../../../shim/node-self.js';
 
 import { setupTestEnvVars } from '../../../util/setupTestEnvVars.js';
+import { fixtureComet }     from '../../../util/registry-fixture.js';
 
 /*
  * Global env.
@@ -60,7 +60,7 @@ t.test(`market-summary@block:15435126`, async t => {
     apiHost,
     nodeHost,
     nodeKey,
-    contract: Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cUSDCv3'],
+    contract: fixtureComet('ethereum-mainnet', '0xc3d688b66703497daa19211eedff47f25384cdc3'),
     network: 'ethereum-mainnet',
     block: { number: 15_435_126 },
   };
@@ -68,7 +68,7 @@ t.test(`market-summary@block:15435126`, async t => {
   t.strictSame(result, {
     chainId: 1,
     comet: {
-      address: '0xc3d688b66703497daa19211eedff47f25384cdc3',
+      address: '0xc3d688B66703497DAA19211EEdff47f25384cdc3',
     },
     status: 'success',
     borrowApr: '0.040676825873232',
@@ -111,7 +111,7 @@ t.test(`market-day-summary@block:16380543`, async t => {
     apiHost,
     nodeHost,
     nodeKey,
-    contract: Eth.wellKnownContractsByNetwork['ethereum-mainnet']['Comet']['cUSDCv3'],
+    contract: fixtureComet('ethereum-mainnet', '0xc3d688b66703497daa19211eedff47f25384cdc3'),
     network: 'ethereum-mainnet',
     block: {
       number:    16_380_543,
@@ -145,7 +145,7 @@ t.test(`market-day-summary@block:16380543`, async t => {
   t.strictSame(result1, {
     chainId: 1,
     comet: {
-      address: '0xc3d688b66703497daa19211eedff47f25384cdc3',
+      address: '0xc3d688B66703497DAA19211EEdff47f25384cdc3',
     },
     status: 'success',
     date: '2023-01-10',
@@ -178,7 +178,7 @@ t.test(`market-day-summary@block:16380543`, async t => {
    */
   const cachedKeys1 = Object.keys(cache.store);
   const expectedKeys = [
-    `marketSummary-v6:(block:${projected.block.number};contract:${context.contract.address};network:${context.network})`,
+    `marketSummary-v6:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`,
     /*
      * FIXME(jordan): since we project(..) within compute(..), the
      * index.includes(..) check fails on the block unless it happens
@@ -190,7 +190,7 @@ t.test(`market-day-summary@block:16380543`, async t => {
      * index, then it should also properly cache the result at the
      * projection from the input.
      */
-    // `marketDaySummary-v2:(contract:${context.contract.address};date:2023-01-10;network:${context.network})`,
+    // `marketDaySummary-v2:(contract:${context.contract.key()};date:2023-01-10;network:${context.network})`,
   ];
   for (const key of expectedKeys) {
     const similar = cachedKeys1.find(k => k.startsWith(key));

@@ -13,20 +13,52 @@ Install dependencies with Node.js 22 or newer:
 npm install
 ```
 
+The worker reads its markets from the registry in its D1 database, and the
+chain through the node provider proxy, so a local run needs both.
 
-Run a local auto-reloading development build of the worker:
+Create the local database, with every migration applied:
 ```sh
-npm start
+npm run d1:migrate:local
 ```
 
-Hit an endpoint:
+Run the node provider proxy on this machine, in a terminal of its own, with
+its provider keys in `../node-provider-proxy/.dev.vars` (see
+[its README](../node-provider-proxy/README.md)). It is a package of its own,
+so its dependencies are installed there, the first time, before it starts:
+```sh
+cd ../node-provider-proxy
+npm install
+npm start -- --port 8788
+```
+
+Then, in a second terminal and from this directory, run a local
+auto-reloading development build of the worker bound to it:
+```sh
+npx wrangler dev --local -c wrangler.local-proxy.toml entrypoint.ts
+```
+
+[`wrangler.local-proxy.toml`](./wrangler.local-proxy.toml) is the local
+environment of `wrangler.toml` with the proxy bound to the worker, as stage
+and production bind theirs. `npm start` runs the worker without it, against
+the proxy that `NODE_PROXY_HOST` and `NODE_PROXY_KEY` in `.dev.vars` name — a
+deployed one, reached over HTTPS ([.dev.vars.example](./.dev.vars.example)).
+With neither, every read of the chain fails.
+
+Every market route answers `503 REGISTRY_NOT_ACTIVE` until a registry
+version is active. Bring one up as an operator brings up an environment: put
+the hash of an admin token of your own into `.dev.vars` before starting the
+worker ([The admin token](./REGISTRY_RUNBOOK.md#the-admin-token)), and follow
+[Bringing an environment up for the first time](./REGISTRY_RUNBOOK.md#bringing-an-environment-up-for-the-first-time)
+with `API=http://localhost:8787`.
+
+Then hit an endpoint:
 ```
 curl 'http://localhost:8787/market/{network}/{contract}/summary'
 ```
 
-Substituting a [well-known address](./lib/eth-constants.ts) to a Comet
-market contract for `{contract}` and a network (e.g. mainnet) for
-`{network}`.
+Substituting the address of a Comet the active version serves for
+`{contract}` — `/registry/v1/networks/{chain_id}/markets` lists them — and a
+network (e.g. mainnet) for `{network}`.
 
 See [API.md](./API.md) for documentation of routes with examples.
 
@@ -40,10 +72,11 @@ migration that has been applied anywhere.
 
 Migrations are numbered in the order they are applied, not by feature:
 `0001` is the Comet registry schema, `0002` marks the markets nobody has
-reviewed yet, `0003` adds how the frontend lists a market — its slug and
-whether it is institutional — and `0004` stores token policies, which tokens
-an administrator has marked strategic and the audit of every change. The
-Agreements migration takes the next free number.
+reviewed yet, and `0003` adds how the frontend lists a market — its slug and
+whether it is institutional. `0004` drops the columns and indexes nothing
+uses, `0005` stores token policies — which tokens an administrator has marked
+strategic, and the audit of every change — and the Agreements migration takes
+the next free number.
 
 Apply migrations to the local Miniflare database under `.wrangler/state`:
 ```sh
@@ -58,25 +91,86 @@ npm run d1:migrate:stage
 npm run d1:migrate:production
 ```
 
-The Comet registry also binds `kv_registry` for its snapshot cache,
-`REGISTRY_ADMIN_RATE_LIMITER` for admin writes, and an hourly Cron trigger
-for its resumable sync. One invocation imports
+The Comet registry also binds `kv_registry` for its snapshot cache and its
+last check of the chain, two rate limiters for its administrative routes,
+and an hourly Cron trigger for its resumable sync.
+`REGISTRY_ADMIN_AUTH_RATE_LIMITER` counts every request under
+`/registry/v1/admin/` before its token is checked, 60 a minute for each
+client address (`CF-Connecting-IP`; an IPv6 client by its /64), so wrong
+tokens and unknown paths are paid for too; `REGISTRY_ADMIN_RATE_LIMITER`
+counts every authenticated one, reads as well as commands, 30 a minute for
+each admin token and route family. Every environment gives each its own
+namespace id. One invocation imports
 `COMET_SYNC_MARKETS_PER_INVOCATION` markets and leaves the rest to the next
 one, resuming from the checkpoints in `APP_DB`; upstream is checked for a new
-commit once per `COMET_UPSTREAM_CHECK_INTERVAL_S`.
+commit once per `COMET_UPSTREAM_CHECK_INTERVAL_S`. The chain is read again for
+the version that is on as often, by the first invocation of each such
+interval — of each day (UTC), with the day every environment sets — and
+within the hour for a version switched on;
+`GET /registry/v1/admin/status` reports it as `chainCheck` and raises
+`chain-drift` where the two differ.
 
-Secrets and per-environment values, including the registry secrets, are
-listed in [./.dev.vars.example](./.dev.vars.example). Copy it to
+An invocation whose import fails — GitHub not answering while it looks for
+the commit to import, D1 not answering, or a setting the import refuses —
+fails the Cron, so the Cron's metrics and past events in the dashboard show
+it. The platform does not run it again: the next invocation resumes from the
+checkpoints. A market whose own reads fail — its root from GitHub, or the
+chain through the node provider proxy — fails only its root: the invocation
+records why on the run, goes on with the next market and succeeds, and
+`GET /registry/v1/admin/status` raises `sync-failing` once such failures
+repeat. An invocation that finds another one importing, such as an
+administrative sync, has nothing to do and succeeds too. A request to GitHub
+that has not answered within 20 seconds, or a batch to the node provider
+proxy within 30, is given up as a service that did not answer, so a
+connection nobody answers cannot hold the import, and every sync waiting for
+it, open.
+
+The registry's numbers — `COMET_SYNC_LEASE_SECONDS`,
+`COMET_SYNC_MARKETS_PER_INVOCATION`, `COMET_UPSTREAM_CHECK_INTERVAL_S`,
+`REGISTRY_SNAPSHOT_CACHE_TTL_S` and `REGISTRY_STALE_FALLBACK_MAX_S` — are
+whole numbers, and unset or empty is the default. A value that is not one is
+never used: the import refuses to start over one of its own, a read takes
+the default in its place, and `GET /registry/v1/admin/status` names it under
+the alert `configuration-invalid`, as it does a `COMET_SOURCE_REPOSITORY` or
+`COMET_SOURCE_REF` that names no source.
+
+The secrets, and every other value an environment sets outside
+`wrangler.toml` — the registry's among them, such as
+`COMET_REGISTRY_ADMIN_ACTOR` — are listed in
+[./.dev.vars.example](./.dev.vars.example). Copy it to
 `.dev.vars` for local runs; deployed environments set them with
 `npx wrangler secret put <NAME> --env <environment>`, never in
-`wrangler.toml`.
+`wrangler.toml`. Stage and production set `COMET_GITHUB_TOKEN`: without a
+token GitHub allows 60 API requests an hour per address, and a Worker shares
+its address with every other Worker that leaves Cloudflare through it.
 
 Run the worker with the scheduled-event test route and trigger the Cron
-handler locally:
+handler locally — with the node provider proxy on this machine, add
+`--test-scheduled` to the command in [Getting Started](#getting-started)
+instead of `npm run start:scheduled`:
 ```sh
 npm run start:scheduled
 curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=0+*+*+*+*"
 ```
+
+# Workers Plan
+
+Stage and production run on the Workers Paid plan, and need it. An
+invocation there may make 10,000 subrequests — every `fetch`, every request
+through a service binding, and every KV operation and D1 statement or batch
+counts — and spend 30 seconds of CPU, or 15 minutes in the hourly Cron. The
+Free plan gives an invocation 50 subrequests and 10 milliseconds of CPU,
+which the registry's import does not fit: an administrative sync of the
+whole source makes about 230 subrequests, seven for each of its 29 markets —
+its root from GitHub, three rounds of reads from the node, three D1
+statements or batches — and about thirty for the run.
+
+`wrangler.toml` sets no `[limits]`, so stage and production have the plan's
+defaults: an import of the whole source, or the summary of every market — four
+calls to the node provider proxy per network — stays far inside its
+subrequests. A `[limits]` section changes them for one Worker, as
+`woof.wrangler.toml` does for the woof deployment: a million subrequests and
+60 seconds of CPU an invocation.
 
 # The Comet Market Registry
 
@@ -94,16 +188,31 @@ What that means for the endpoints:
   nobody reviewed would be worse than failing;
 - an address the active version does not describe is not a market, and is
   refused with `400`, on any network;
-- transaction history cursors carry the version they were issued against. A
-  cursor from another version is refused with `409 REGISTRY_VERSION_CHANGED`
-  and the client restarts pagination; a cursor issued before the registry is
-  accepted once and upgraded;
-- routes that resolve no market — governance, V2, gas price — never read
-  `APP_DB`. Governance decodes proposal action targets against the static
-  constants and consults the registry only for a target they do not name.
+- transaction history cursors carry the version they were issued against,
+  and the markets it reads. A cursor stays valid across versions that read
+  the same markets; one from a version that read others is refused with
+  `409 REGISTRY_VERSION_CHANGED` and the client restarts pagination. A cursor
+  issued before the registry is accepted once and upgraded, and from then on
+  reads, and is compared on, the networks it had: a version that adds history
+  on another network does not end it;
+- routes that resolve no market — V2 and gas price — never read `APP_DB`,
+  and governance reads it only to describe proposal actions. The proposal
+  list describes the actions of the page it answers against the static
+  constants, then those the constants cannot fully name once more, with the
+  markets of the active version merged in: a target the constants do not
+  know and the version does, an action bridged to another chain, and a call
+  to the Configurator, CometProxyAdmin, CometRewards or CometFactory, whose
+  arguments name the market it acts on. Almost every page has one, so the
+  list reads the registry on almost every request; when it cannot, those
+  actions keep the constants' description, and the list is answered all the
+  same.
 
 A commit can be imported more than once — discovery tries again after an
-attempt fails, and an operator can force a new attempt. Once a newer attempt
+attempt that did not import every root, each time later, and an operator can
+force a new attempt. An attempt that imported every root and still failed
+validation is not tried again by itself: it would fail the same way, so the
+status names the commit until a person forces an attempt or the source moves
+on. Once a newer attempt
 of a commit succeeds — validates, or is held for review with every root
 imported — the commit's older attempts still importing are closed as
 `invalid`. Discovery closes any it finds left over, older than the commit's
@@ -119,33 +228,58 @@ Only attempts of the same commit replace each other. Reviews are inherited
 between attempts of one commit — a later attempt takes what earlier ones
 reviewed, and a newer review of the same market wins — but not across
 commits, so a draft of a commit the tracked ref has moved past is left open:
-validate it to close it.
+validate it to close it. What an earlier attempt hands down is what an
+overlay was written for in it, which its audit events name; the rest of its
+rows are copies of the version that was on when it was imported, and come
+from the version on now instead, so a hotfix or a rollback activated between
+two attempts is not undone by the second. Where the merged decisions name two
+default markets, the one an attempt decided is kept and the other is merged as
+not the default, and an import that would still write a second default is
+refused as `OVERLAY_INVALID`, naming both.
 
 ## What a request reads
 
 A version never changes once it exists, and only the pointer to the active
 one moves. So a request reads the pointer from D1 — one statement — and
-everything else from somewhere cheaper:
+everything else from somewhere cheaper. The registry's own routes and the
+market routes read it the same way:
 
-- the isolate holds the catalog it built from the version the pointer names,
-  and reuses it for as long as that pointer does not move;
+- the isolate holds in memory the versions it has served, and the catalog it
+  built from each, and reuses them for as long as the pointer names them. The
+  active version has a place of its own, so reading pinned versions by id
+  never pushes it out;
 - the bytes of a version are cached in the `kv_registry` namespace under a key
   that names the version and its checksum, so an isolate that has never seen
-  it pays a KV read rather than hydrating the snapshot out of D1;
+  it pays a KV read rather than hydrating the snapshot out of D1. What KV
+  holds is trusted only when it names the version as the version's row does —
+  id, source repository and commit, checksum — and its content matches that
+  checksum, and only those parts are served; anything else is refused,
+  answered from D1, and written over. Market ids are the one part the
+  checksum does not cover;
+- an entry is written once and never expires: it is never wrong, only
+  unwanted, and the hourly job removes those of versions nothing is about to
+  serve — every version but the active one, the one an outage would fall back
+  to, and the validated ones newer than the active one;
 - a validated candidate is cached before it is activated — by the import that
   validated it, by `POST .../validate`, and by the activation itself — so an
   activation is a pointer move and no request pays the serialization;
-- `REGISTRY_SNAPSHOT_CACHE_TTL_S` is how long a cached version lives, and the
-  `max-age` public reads advertise.
+- `REGISTRY_SNAPSHOT_CACHE_TTL_S` is the `max-age` public reads advertise to
+  browsers and proxies.
 
 When D1 cannot be reached at all, a request is answered from the version D1
 last named, for up to `REGISTRY_STALE_FALLBACK_MAX_S` after that. Such a
 response carries `X-Registry-Stale` with its age in seconds and
 `Cache-Control: no-store`, so nothing downstream keeps it and no client
-mistakes it for the current version. Set the window to `0` in an environment
-that would rather fail than answer from an older version. A D1 that answers
-"no version is active" is an answer, not an outage: it is served as `503`,
-never from the cache.
+mistakes it for the current version; the outage itself is logged as an
+error, once a minute per isolate. Set the window to `0` in an environment that
+would rather fail than answer from an older version. Past the window, or with
+nothing cached, every route answers `503 UPSTREAM_UNAVAILABLE`. A D1 that
+answers "no version is active" is an answer, not an outage: it is served as
+`503 REGISTRY_NOT_ACTIVE`, never from the cache; and a D1 that answers with a
+fault, such as a table a migration has not created yet, is a `500`, never
+masked by the cache. The token list and the token policy routes are the one
+exception, for their own tables: without migration `0005` they answer
+`503 UPSTREAM_UNAVAILABLE`, naming the migrations to apply.
 
 An operator changes what the API serves by importing, reviewing, validating
 and activating a version; see the admin routes in [./API.md](./API.md). The
@@ -226,23 +360,31 @@ decided.
 
 A correction belongs in the tables of `src/registry/bootstrap.ts`: the release
 that carries it proposes it. Once a version is active, the registry is where
-the decisions live, and a later version inherits them.
+the decisions live, and a later version inherits them: the proposal routes
+answer `409` from then on, because applying the constants' values to a draft
+would undo what was reviewed since.
 
 ### A market the source adds later
 
 A new deployment in the Comet repository arrives with the next commit as one
 more unreviewed market: disabled, not failing anything, while the rest of the
-commit validates and can be activated as usual. To serve it, import the
-commit again with the candidate held, review the new market, validate:
+commit validates and can be activated as usual. A deployment on a chain no
+version described yet arrives the same way, and so does its network: under
+its canonical name, unreviewed, and listed by no public read while it serves
+nothing. To serve it, import the commit again with the candidate held, review
+the new market — and the new network with it, since validation refuses a
+network nobody reviewed that serves a market — and validate:
 
 ```sh
 curl -X POST .../registry/v1/admin/sync ... \
   -d '{"forceNewAttempt": true, "holdForReview": true, "reason": "review the new market"}'
+# a market of a chain no version described yet needs its network reviewed too
+curl -X PUT  .../registry/v1/admin/versions/$VERSION/networks/<chain>/overlay ...
 curl -X PUT  .../registry/v1/admin/versions/$VERSION/markets/<chain>/<key>/overlay ...
 curl -X POST .../registry/v1/admin/versions/$VERSION/validate ...
 ```
 
-A new attempt at the same commit inherits what was reviewed for the attempt
+A new attempt at the same commit inherits what was reviewed for the attempts
 before it, so a candidate that ended invalid does not mean reviewing it all
 again.
 
@@ -278,7 +420,7 @@ decided about is not strategic, without a row. While a version without the
 token is active, its decision is kept, listed as `retained`, and readable with
 its history. Every change is written in one D1 transaction with an event that
 records the value it replaced, the value it set, the actor and the reason, and
-migration `0004` enforces that in the database: a policy row is written only
+migration `0005` enforces that in the database: a policy row is written only
 beside its token's newest event, which records that change; events are never
 edited, replaced or deleted, and a policy row is never deleted.
 
@@ -325,8 +467,11 @@ and writes it to KV, where an isolate that asks afterwards reads it; isolates
 that ask while it is being computed value it as well. Every request still
 reads the latest block. A record is keyed by
 the positions it valued, each named by its Comet's content digest, so an
-activation that changes a market, a feed or a price exception starts afresh,
-and one that changes none of them keeps the records.
+activation that changes a market, a feed or what a price exception does to a
+price starts afresh, and one that changes none of them keeps the records.
+Why an exception was added and until when it applies change no value, and
+key no record: a list describes every exception as the version it answers
+from does.
 
 The list fails open. A position the node cannot read leaves its token
 `partial`, if what could be read already reaches the threshold; otherwise the
@@ -380,6 +525,18 @@ Node-side tests build their worker environment with
 throw when used, so code that needs them must be tested through the
 harness.
 
+Every test that needs neither a node provider nor the R2 dumps runs with one
+command, which is what CI runs: the registry suites above, and the unit tests
+of the rest of the worker.
+
+```sh
+npm run test:offline
+```
+
+[`tests/offline.sh`](./tests/offline.sh) names each test it leaves out by
+its file, and says why. A new test runs there, in whichever directory it
+lives, unless it is added to that list as one that needs either.
+
 ## How to Update E2E test dumps
 The E2E tests have been configured with dumps in order to significantly cut down on requests to
 node providers. There are two types of dump files which are used in tests
@@ -402,6 +559,33 @@ TEST_FLAGS_ALLOW_FETCH_PASSTHROUGH=true TEST_FLAGS_REGENERATE_DUMP=true npm test
 
 # Regenerate the cache seed for the test
 TEST_FLAGS_REGENERATE_CACHE_SEED=true npm test <path to test file>
+```
+
+Every branch reads the dumps from the same place in R2. Two tests pin the
+SHA-256 of their expectation in `EXPECTATION_SHA256`, and their dumps are
+named by it: the all-networks historical summary
+([`historical-summary.test.ts`](./tests/e2e/market/all-networks/all-contracts/historical-summary.test.ts))
+and the historical market day summaries
+([`historical-market-day-summaries.test.ts`](./tests/lib/computations/market/historical-market-day-summaries.test.ts)).
+Regenerating them writes new files, named by the new hash, and the test
+prints the hash; pin it in the test, run the test again without the flags,
+upload the files with the sync script below, and commit the pin. A dump that
+changed in R2 without its pin fails the test instead of being compared
+against, and a branch that regenerates these dumps never replaces the ones
+another branch pins. The other tests' dumps are not pinned: each is one file
+for every branch, and regenerating it replaces it for all of them, so a test
+is pinned this way before a change to its output is recorded.
+
+A regeneration reads the chain without a cache seed, which takes minutes, so
+it needs a longer timeout than tap's default of 30 seconds. Name the tests
+whose dumps you regenerate:
+
+```sh
+npm run build
+TEST_FLAGS_ALLOW_FETCH_PASSTHROUGH=true TEST_FLAGS_REGENERATE_DUMP=true TEST_FLAGS_REGENERATE_CACHE_SEED=true \
+  npx tap --disable-coverage --timeout=900 \
+  dist/tests/e2e/market/all-networks/all-contracts/historical-summary.test.js \
+  dist/tests/lib/computations/market/historical-market-day-summaries.test.js
 ```
 
 At this point, you should now have some updated dump files. Due to the large size of these files, we don't
@@ -439,12 +623,16 @@ After setting that up, you can now run the sync script. This will update the fil
 # Network Compatibility
 
 The API should support any EVM-compatible networks where Comet is
-deployed:
+deployed. It serves the mainnets the registry imports from Compound's
+source — Ethereum, Polygon, Arbitrum, Optimism, Base, Scroll, Mantle, Linea,
+Unichain and Ronin (`src/registry/source/roots.ts`).
 
-- Ethereum mainnet, [maybe: sepolia]
-- Polygon mainnet, mumbai
-- Optimism mainnet, goerli
-- Arbitrum mainnet (one), goerli (goerli-rollup)
+Testnets are not served: the registry does not import them, so no market of
+one can be resolved. A request that names one — a testnet network of a
+market route, `testnets=include`, a testnet market in the transaction
+history, or a cursor of it that reads one — is answered `400` with the code
+`TESTNET_NOT_SERVED` ([API.md](./API.md#the-market-registry)). Which networks
+are testnets is what `lib/well-known/networks` defines.
 
 ## Adding a New Network
 
@@ -577,12 +765,14 @@ to support the new network.
 
 # Request Routing
 The server accepts requests at the Cloudflare worker
-[entrypoint](./entrypoint.ts). The entrypoint configures a simple
-[router](./src/market-router.ts) with a set of
-[handlers](./src/market-handlers/v1.ts). The router either fails the
-request (typically with a 4xx error because the URI path is malformed), or
-passes it to a handler, which invokes the symbolic computation engine to
-produce a response.
+[entrypoint](./entrypoint.ts). The entrypoint hands every request to a simple
+[router](./src/router.ts) and its handlers: the market routes in
+[./src/market.ts](./src/market.ts), the governance, account, transaction
+history and V2 routes in their directories under `./src`, and the
+registry's own routes in [./src/registry](./src/registry/router.ts). The
+router either fails the request (typically with a 4xx error because the URI
+path is malformed), or passes it to a handler, which invokes the symbolic
+computation engine to produce a response.
 
 Basically:
 `curl /example -> entrypoint -> router -> handler -> Response`.

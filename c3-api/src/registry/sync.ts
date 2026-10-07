@@ -1,5 +1,6 @@
 import {
   DeploymentPath,
+  RegistryVersionRow,
   SyncItemStatus,
   SyncOutcome,
   SyncRunItemRow,
@@ -9,7 +10,7 @@ import {
 } from '../../lib/model/comet-registry.js';
 
 import { RegistryError } from './errors.js';
-import { changedRows } from './repository.js';
+import { Condition, candidateStatement, changedRows, conditioned } from './repository.js';
 
 /*
  * The sync fence. One registry import may run at a time, and one invocation
@@ -17,16 +18,15 @@ import { changedRows } from './repository.js';
  * or a timeout, so work is claimed per root and committed only by the
  * invocation that still owns the run.
  *
- * Ownership is a random owner token plus a generation counter. Taking over an
- * expired lease increments the generation in the same statement that replaces
- * the owner, so a resumed invocation cannot be raced by the one it replaced:
- * every later write names both, and a stale invocation updates zero rows and
+ * Ownership is a random owner token, new for every invocation that takes the
+ * run. Taking over an expired lease replaces the owner in the same statement
+ * that checks the expiry, so the invocation that was replaced names an owner
+ * no row carries any more: every later write of it updates zero rows, and it
  * stops.
  */
 type Fence = {
-  runId:      string,
-  owner:      string,
-  generation: number,
+  runId: string,
+  owner: string,
 };
 
 type Clock = () => Date;
@@ -45,7 +45,7 @@ type RunInput = {
   requestedBy:     string | null,
   reason:          string | null,
   roots:           RootCheckpoint[],
-  // leave the candidate open for review once every root is imported
+  // leave the candidate open for review once no root is left to attempt, whether or not the run gave roots up
   holdForReview?:  boolean,
 };
 
@@ -61,6 +61,13 @@ type LeaseOptions = ClockOption & {
 
 // an item that keeps failing is left for an operator rather than retried forever
 const MAX_ITEM_ATTEMPTS = 5;
+
+/*
+ * A root still to attempt: not imported, and with attempts left. A root that
+ * exhausted its attempts is no longer work, though its market is still
+ * missing, which validation reports.
+ */
+const OUTSTANDING = `status <> 'completed' AND attempts < ${MAX_ITEM_ATTEMPTS}`;
 
 function at(clock: Clock | undefined): string {
   return (clock ?? (() => new Date()))().toISOString();
@@ -85,8 +92,8 @@ async function startRun(db: D1Database, input: RunInput, options: LeaseOptions):
     db.prepare(
       `INSERT INTO sync_runs (
          id, source_commit_sha, tracked_ref, trigger_kind, requested_by, reason,
-         status, lease_owner, lease_generation, lease_expires_at, expected_count, started_at, hold_for_review
-       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, 1, ?8, ?9, ?10, ?11)`
+         status, lease_owner, lease_expires_at, expected_count, started_at, hold_for_review
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9, ?10, ?11)`
     ).bind(
       runId, input.sourceCommitSha, input.trackedRef, input.triggerKind, input.requestedBy, input.reason,
       owner, expiry(options.now, options.leaseSeconds), input.roots.length, timestamp,
@@ -94,12 +101,12 @@ async function startRun(db: D1Database, input: RunInput, options: LeaseOptions):
     ),
     ...input.roots.map(root => db.prepare(
       `INSERT INTO sync_run_items (
-         id, sync_run_id, root_path, source_blob_sha, root_checksum,
+         id, sync_run_id, root_path, source_blob_sha,
          upstream_network_key, deployment_key, created_at, updated_at
-       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)`
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)`
     ).bind(
       crypto.randomUUID(), runId, root.rootPath, root.sourceBlobSha,
-      '0'.repeat(64), root.upstreamNetworkKey, root.deploymentKey, timestamp,
+      root.upstreamNetworkKey, root.deploymentKey, timestamp,
     )),
   ];
 
@@ -111,45 +118,64 @@ async function startRun(db: D1Database, input: RunInput, options: LeaseOptions):
     }
     throw error;
   }
-  return { runId, owner, generation: 1 };
+  return { runId, owner };
 }
+
+// why a root the invocation importing it left in progress failed, as its checkpoint and its run record it
+const ABANDONED = 'the invocation importing this root did not finish';
 
 /*
  * Takes over the running job when nobody holds an unexpired lease on it. The
  * compare-and-set is one statement: expiring a lease and claiming it in two
  * steps would let two invocations both believe they own the run.
+ *
+ * A root still in progress when the run is taken is one whose invocation
+ * stopped while importing it — a deploy, the time or the CPU a Worker is
+ * given, a client that went away — or overran its lease; either way nothing
+ * it would still write is accepted (checkpointHeld). That attempt failed, and
+ * the same transaction says so, as a failure committed by the invocation
+ * would have: the root is failed with why, the run carries the error, and a
+ * root that has spent its last attempt counts among the run's failed roots.
+ * Left in progress, a root whose invocations kept stopping would be retried
+ * with nothing recorded, and once out of attempts it would be neither
+ * outstanding nor failed.
  */
 async function acquireRun(db: D1Database, options: LeaseOptions): Promise<Fence | null> {
   const owner     = crypto.randomUUID();
   const timestamp = at(options.now);
+  // the run this batch has just given to `owner`, which no other run can be
+  const taken     = `SELECT id FROM sync_runs WHERE status = 'running' AND lease_owner = ?1`;
 
-  const claimed = await db.prepare(
-    `UPDATE sync_runs
-     SET lease_owner = ?1, lease_generation = lease_generation + 1, lease_expires_at = ?2
-     WHERE id = (
-       SELECT id FROM sync_runs
-       WHERE status = 'running' AND (lease_owner IS NULL OR lease_expires_at <= ?3)
-       LIMIT 1
-     )
-     RETURNING id, lease_generation`
-  ).bind(owner, expiry(options.now, options.leaseSeconds), timestamp).first<{ id: string, lease_generation: number }>();
+  const [ claimed ] = await db.batch([
+    db.prepare(
+      `UPDATE sync_runs
+       SET lease_owner = ?1, lease_expires_at = ?2
+       WHERE id = (
+         SELECT id FROM sync_runs
+         WHERE status = 'running' AND (lease_owner IS NULL OR lease_expires_at <= ?3)
+         LIMIT 1
+       )
+       RETURNING id`
+    ).bind(owner, expiry(options.now, options.leaseSeconds), timestamp),
+    // the counter first, while the roots it counts are still in progress
+    db.prepare(
+      `UPDATE sync_runs
+       SET failed_count = failed_count + (
+             SELECT COUNT(*) FROM sync_run_items
+             WHERE sync_run_id = sync_runs.id AND status = 'processing' AND attempts >= ${MAX_ITEM_ATTEMPTS}
+           ),
+           last_error = ?2
+       WHERE id = (${taken})
+         AND EXISTS (SELECT 1 FROM sync_run_items WHERE sync_run_id = sync_runs.id AND status = 'processing')`
+    ).bind(owner, ABANDONED),
+    db.prepare(
+      `UPDATE sync_run_items SET status = 'failed', last_error = ?2, updated_at = ?3
+       WHERE sync_run_id = (${taken}) AND status = 'processing'`
+    ).bind(owner, ABANDONED, timestamp),
+  ]);
 
-  return claimed === null || claimed === undefined
-    ? null
-    : { runId: claimed.id, owner, generation: claimed.lease_generation };
-}
-
-/*
- * Extends the lease of the invocation that still owns it. A false result
- * means the fence was taken over, and the caller must stop rather than
- * commit work the new owner is redoing.
- */
-async function renewLease(db: D1Database, fence: Fence, options: LeaseOptions): Promise<boolean> {
-  const result = await db.prepare(
-    `UPDATE sync_runs SET lease_expires_at = ?1
-     WHERE id = ?2 AND status = 'running' AND lease_owner = ?3 AND lease_generation = ?4`
-  ).bind(expiry(options.now, options.leaseSeconds), fence.runId, fence.owner, fence.generation).run();
-  return changedRows(result) === 1;
+  const [ run ] = (claimed?.results ?? []) as Array<{ id: string }>;
+  return run === undefined ? null : { runId: run.id, owner };
 }
 
 /*
@@ -159,16 +185,56 @@ async function renewLease(db: D1Database, fence: Fence, options: LeaseOptions): 
 async function releaseLease(db: D1Database, fence: Fence): Promise<boolean> {
   const result = await db.prepare(
     `UPDATE sync_runs SET lease_owner = NULL, lease_expires_at = NULL
-     WHERE id = ?1 AND status = 'running' AND lease_owner = ?2 AND lease_generation = ?3`
-  ).bind(fence.runId, fence.owner, fence.generation).run();
+     WHERE id = ?1 AND status = 'running' AND lease_owner = ?2`
+  ).bind(fence.runId, fence.owner).run();
   return changedRows(result) === 1;
 }
 
+// the run is still running, and this invocation still holds it
+function leaseHeld(fence: Fence): Condition {
+  return {
+    sql: first => `EXISTS (
+      SELECT 1 FROM sync_runs WHERE id = ?${first} AND status = 'running' AND lease_owner = ?${first + 1}
+    )`,
+    values: [ fence.runId, fence.owner ],
+  };
+}
+
 /*
- * Claims one root to process. A pending root is preferred, then one a lost
- * invocation left processing, then one that failed and may be retried. The
- * condition proves the caller still owns an unexpired run, so claiming and
- * the fence check cannot disagree.
+ * What every write committed with a checkpoint is conditioned on: the run is
+ * still running, this invocation holds its lease and the lease has not
+ * expired, and the root is still claimed by it and in progress. An
+ * invocation that lost the run — however late its result arrives — writes
+ * nothing at all.
+ */
+function checkpointHeld(fence: Fence, itemId: string, timestamp: string): Condition {
+  return {
+    sql: first => `EXISTS (
+      SELECT 1 FROM sync_runs AS run
+      JOIN sync_run_items AS item ON item.sync_run_id = run.id
+      WHERE run.id = ?${first} AND run.status = 'running' AND run.lease_owner = ?${first + 1}
+        AND run.lease_expires_at > ?${first + 2}
+        AND item.id = ?${first + 3} AND item.claim_owner = ?${first + 1} AND item.status = 'processing'
+    )`,
+    values: [ fence.runId, fence.owner, timestamp, itemId ],
+  };
+}
+
+// no run is importing into a version, so it changes only through its overlay
+function noRunImporting(versionId: string): Condition {
+  return {
+    sql:    first => `NOT EXISTS (SELECT 1 FROM sync_runs WHERE registry_version_id = ?${first} AND status = 'running')`,
+    values: [ versionId ],
+  };
+}
+
+/*
+ * Claims one root to process: a pending one, or one that failed and may be
+ * retried, the fewest attempts first, so every root is tried before any is
+ * tried again. A root in progress is never claimed: one a lost invocation
+ * left is failed by the invocation that took the run over (acquireRun), and
+ * is claimed as any failed root is. The condition proves the caller still
+ * owns an unexpired run, so claiming and the fence check cannot disagree.
  */
 async function claimItem(
   db: D1Database,
@@ -184,44 +250,48 @@ async function claimItem(
    * whole batch on one root and never reach the others.
    */
   const excluded = options.except ?? [];
-  const holes    = excluded.map((_, index) => `?${index + 6}`).join(', ');
+  const holes    = excluded.map((_, index) => `?${index + 5}`).join(', ');
   const claimed = await db.prepare(
     `UPDATE sync_run_items
-     SET status = 'processing', attempts = attempts + 1, claim_owner = ?1,
-         claim_generation = ?2, claimed_at = ?3, updated_at = ?3
+     SET status = 'processing', attempts = attempts + 1, claim_owner = ?1, claimed_at = ?2, updated_at = ?2
      WHERE id = (
        SELECT item.id
        FROM sync_run_items AS item
        JOIN sync_runs AS run ON run.id = item.sync_run_id
-       WHERE item.sync_run_id = ?4
+       WHERE item.sync_run_id = ?3
          AND run.status = 'running'
          AND run.lease_owner = ?1
-         AND run.lease_generation = ?2
-         AND run.lease_expires_at > ?3
-         AND item.attempts < ?5
-         AND (
-           item.status = 'pending'
-           OR item.status = 'failed'
-           OR (item.status = 'processing' AND item.claim_generation < ?2)
-         )
+         AND run.lease_expires_at > ?2
+         AND item.attempts < ?4
+         AND item.status IN ('pending', 'failed')
          ${excluded.length === 0 ? '' : `AND item.id NOT IN (${holes})`}
        ORDER BY item.attempts, item.root_path
        LIMIT 1
      )
      RETURNING *`
-  ).bind(fence.owner, fence.generation, timestamp, fence.runId, MAX_ITEM_ATTEMPTS, ...excluded)
+  ).bind(fence.owner, timestamp, fence.runId, MAX_ITEM_ATTEMPTS, ...excluded)
     .first<SyncRunItemRow>();
   return claimed ?? null;
 }
 
+type CommitOptions = LeaseOptions & {
+  spendsAttempt?: boolean,
+  /*
+   * What the root produced, committed in the same transaction as its
+   * checkpoint and under the same condition: both, or neither.
+   */
+  writes?:        (condition: Condition) => D1PreparedStatement[],
+};
+
 async function commitItem(
   db: D1Database,
   fence: Fence,
-  item: { id: string, checksum?: string, error?: string },
+  item: { id: string, error?: string },
   status: Extract<SyncItemStatus, 'completed' | 'failed'>,
-  options: ClockOption & { spendsAttempt?: boolean } = {},
+  options: CommitOptions,
 ): Promise<boolean> {
   const timestamp = at(options.now);
+  const held      = checkpointHeld(fence, item.id, timestamp);
   /*
    * An attempt is spent unless the caller says the failure was not about
    * this root. Claiming an item increments the counter, so giving it back is
@@ -234,76 +304,58 @@ async function commitItem(
    * expected count the schema enforces. A refunded attempt can never be the
    * last one, so it never makes a root a failed root.
    */
+  const spent = status === 'failed' && !refunded;
   const increment = status === 'completed'
     ? `completed_count = completed_count + 1`
     : refunded
       ? `failed_count = failed_count`
       : `failed_count = failed_count + (
          SELECT CASE WHEN attempts >= ${MAX_ITEM_ATTEMPTS} THEN 1 ELSE 0 END
-         FROM sync_run_items WHERE id = ?5
+         FROM sync_run_items WHERE id = ?4
        )`;
 
   /*
-   * The counter is bumped first, while the item is still processing: a batch
-   * runs in order, so the reverse order would make the counter's own guard
-   * contradict the update before it.
+   * What the root produced comes first and the checkpoint last, because every
+   * statement names a root still in progress, which the last one ends. The
+   * counter is bumped before the item for the same reason.
+   *
+   * A committed checkpoint extends the lease: an invocation that is getting
+   * through its roots keeps the run however many it has, while one stuck on a
+   * single root for longer than a lease loses it, and its late result is then
+   * refused by the condition above.
    */
-  const [ runResult, itemResult ] = await db.batch([
-    db.prepare(
+  const results = await db.batch([
+    ...(options.writes?.(held) ?? []),
+    conditioned(
+      db,
       /*
        * `last_error` is replaced, not coalesced: a run that recovers from a
        * failed attempt must stop reporting it, or a successful import still
        * carries the diagnostic of a root that has since succeeded.
-       *
-       * The lease expiry is part of this guard too. Both statements of the
-       * batch check the same fence, so an expired lease commits neither the
-       * counter nor the checkpoint.
        */
-      `UPDATE sync_runs SET ${increment}, last_error = ?1
-       WHERE id = ?2 AND status = 'running' AND lease_owner = ?3 AND lease_generation = ?4
-         AND lease_expires_at > ?6
-         AND EXISTS (
-           SELECT 1 FROM sync_run_items
-           WHERE id = ?5 AND sync_run_id = ?2 AND claim_owner = ?3
-             AND claim_generation = ?4 AND status = 'processing'
-         )`
-    ).bind(item.error ?? null, fence.runId, fence.owner, fence.generation, item.id, timestamp),
-    db.prepare(
+      `UPDATE sync_runs SET ${increment}, last_error = ?1, lease_expires_at = ?2 WHERE id = ?3`,
+      [ item.error ?? null, expiry(options.now, options.leaseSeconds), fence.runId, ...(spent ? [ item.id ] : []) ],
+      held,
+    ),
+    conditioned(
+      db,
       `UPDATE sync_run_items
-       SET status = ?1,
-           completed_at = ?2,
-           root_checksum = COALESCE(?3, root_checksum),
-           last_error = ?4,
-           updated_at = ?5${refunded ? ',\n           attempts = MAX(attempts - 1, 0)' : ''}
-       WHERE id = ?6 AND sync_run_id = ?7 AND claim_owner = ?8 AND claim_generation = ?9
-         AND status = 'processing'
-         AND EXISTS (
-           SELECT 1 FROM sync_runs
-           WHERE id = ?7 AND status = 'running' AND lease_owner = ?8
-             AND lease_generation = ?9 AND lease_expires_at > ?5
-         )`
-    ).bind(
-      status,
-      status === 'completed' ? timestamp : null,
-      item.checksum ?? null,
-      item.error ?? null,
-      timestamp,
-      item.id, fence.runId, fence.owner, fence.generation,
+       SET status = ?1, completed_at = ?2, last_error = ?3, updated_at = ?4${refunded ? ', attempts = MAX(attempts - 1, 0)' : ''}
+       WHERE id = ?5`,
+      [ status, status === 'completed' ? timestamp : null, item.error ?? null, timestamp, item.id ],
+      held,
     ),
   ]);
 
   /*
-   * Both statements change one row, or the result is stale and neither does:
-   * a late result from a replaced invocation must not move the counters.
+   * Every statement carries the same condition in one transaction, so they
+   * apply together or not at all: a late result from a replaced invocation
+   * moves neither the counters nor the checkpoint.
    */
-  const committed = changedRows(itemResult!) === 1 && changedRows(runResult!) === 1;
-  if (!committed && (changedRows(itemResult!) !== 0 || changedRows(runResult!) !== 0)) {
-    throw new RegistryError('SYNC_FENCE_INCONSISTENT', `a checkpoint update changed an unexpected number of rows`, item.id);
-  }
-  return committed;
+  return changedRows(results[results.length - 1]!) === 1;
 }
 
-async function completeItem(db: D1Database, fence: Fence, item: { id: string, checksum: string }, options: ClockOption = {}): Promise<boolean> {
+async function completeItem(db: D1Database, fence: Fence, item: { id: string }, options: CommitOptions): Promise<boolean> {
   return commitItem(db, fence, item, 'completed', options);
 }
 
@@ -316,48 +368,178 @@ async function failItem(
   db: D1Database,
   fence: Fence,
   item: { id: string, error: string },
-  options: ClockOption & { spendsAttempt?: boolean } = {},
+  options: CommitOptions,
 ): Promise<boolean> {
   return commitItem(db, fence, item, 'failed', options);
+}
+
+/*
+ * Creates the candidate a run imports into and names it on the run, in one
+ * transaction and under the run's fence: a run that has its candidate is never
+ * without it on record, and a candidate never exists without the run that
+ * imports into it. Both statements also require the run to have none yet, so
+ * an invocation replaced while it was creating one cannot move the run onto
+ * its own.
+ */
+async function bindCandidate(
+  db: D1Database,
+  fence: Fence,
+  version: RegistryVersionRow,
+  options: ClockOption = {},
+): Promise<boolean> {
+  const unbound: Condition = {
+    sql: first => `EXISTS (
+      SELECT 1 FROM sync_runs
+      WHERE id = ?${first} AND status = 'running' AND lease_owner = ?${first + 1}
+        AND lease_expires_at > ?${first + 2} AND registry_version_id IS NULL
+    )`,
+    values: [ fence.runId, fence.owner, at(options.now) ],
+  };
+  const [ created, bound ] = await db.batch([
+    candidateStatement(db, version, unbound),
+    conditioned(db, `UPDATE sync_runs SET registry_version_id = ?1 WHERE id = ?2`, [ version.id, fence.runId ], unbound),
+  ]);
+  // D1 rolls a batch back on an error, not on a statement that changed nothing
+  return changedRows(created!) === 1 && changedRows(bound!) === 1;
 }
 
 /*
  * Finishes the run. `completed` requires an outcome, which distinguishes an
  * import that produced a version from one that found the source unchanged.
  */
-async function finishRun(
+type RunFinish = {
+  status:             Exclude<SyncRunStatus, 'running'>,
+  outcome?:           SyncOutcome,
+  registryVersionId?: string,
+  error?:             string,
+};
+
+/*
+ * Closing a run as a statement, for a caller that commits it in one batch
+ * with what the run produced, and only while `when` holds as well.
+ */
+function finishRunStatement(
   db: D1Database,
   fence: Fence,
-  finish: { status: Exclude<SyncRunStatus, 'running'>, outcome?: SyncOutcome, registryVersionId?: string, error?: string },
-  options: ClockOption = {},
-): Promise<boolean> {
-  const result = await db.prepare(
+  finish: RunFinish,
+  options: ClockOption & { when?: Condition } = {},
+): D1PreparedStatement {
+  return conditioned(
+    db,
     `UPDATE sync_runs
      SET status = ?1, outcome = ?2, registry_version_id = COALESCE(?3, registry_version_id),
          last_error = COALESCE(?4, last_error), lease_owner = NULL, lease_expires_at = NULL,
          completed_at = ?5
-     WHERE id = ?6 AND status = 'running' AND lease_owner = ?7 AND lease_generation = ?8`
-  ).bind(
-    finish.status,
-    finish.status === 'completed' ? (finish.outcome ?? null) : null,
-    finish.registryVersionId ?? null,
-    finish.error ?? null,
-    at(options.now),
-    fence.runId, fence.owner, fence.generation,
-  ).run();
-  return changedRows(result) === 1;
+     WHERE id = ?6 AND status = 'running' AND lease_owner = ?7`,
+    [
+      finish.status,
+      finish.status === 'completed' ? (finish.outcome ?? null) : null,
+      finish.registryVersionId ?? null,
+      finish.error ?? null,
+      at(options.now),
+      fence.runId, fence.owner,
+    ],
+    options.when,
+  );
+}
+
+async function finishRun(db: D1Database, fence: Fence, finish: RunFinish, options: ClockOption = {}): Promise<boolean> {
+  return changedRows(await finishRunStatement(db, fence, finish, options).run()) === 1;
 }
 
 async function runningRun(db: D1Database): Promise<SyncRunRow | null> {
   return db.prepare(`SELECT * FROM sync_runs WHERE status = 'running'`).first<SyncRunRow>();
 }
 
+async function readRun(db: D1Database, runId: string): Promise<SyncRunRow | null> {
+  const run = await db.prepare(`SELECT * FROM sync_runs WHERE id = ?1`).bind(runId).first<SyncRunRow | null>();
+  return run ?? null;
+}
+
+// the roots a run checkpointed, with the git object ids its candidate's source identity is computed from
+async function checkpointsOf(db: D1Database, runId: string): Promise<Array<{ rootPath: string, sourceBlobSha: string }>> {
+  const { results } = await db.prepare(
+    `SELECT root_path, source_blob_sha FROM sync_run_items WHERE sync_run_id = ?1 ORDER BY root_path`
+  ).bind(runId).all<{ root_path: string, source_blob_sha: string }>();
+  return (results ?? []).map(item => ({ rootPath: item.root_path, sourceBlobSha: item.source_blob_sha }));
+}
+
+/*
+ * The run that imported a version, and the roots it checkpointed: which
+ * markets the version must hold to be complete. A version has one run, the
+ * one that created it; a version written some other way has none.
+ */
+type ImportRun = {
+  runId:         string,
+  status:        SyncRunStatus,
+  holdForReview: boolean,
+  completedAt:   string | null,
+  roots:         Array<{ upstreamNetworkKey: string, deploymentKey: string }>,
+};
+
+async function importOf(db: D1Database, versionId: string): Promise<ImportRun | null> {
+  const { results } = await db.prepare(
+    `SELECT run.id, run.status, run.hold_for_review, run.completed_at,
+            item.upstream_network_key, item.deployment_key
+     FROM sync_runs AS run
+     LEFT JOIN sync_run_items AS item ON item.sync_run_id = run.id
+     WHERE run.id = (SELECT id FROM sync_runs WHERE registry_version_id = ?1 ORDER BY started_at DESC LIMIT 1)
+     ORDER BY item.root_path`
+  ).bind(versionId).all<{
+    id: string, status: SyncRunStatus, hold_for_review: number, completed_at: string | null,
+    upstream_network_key: string | null, deployment_key: string | null,
+  }>();
+  const [ run ] = results ?? [];
+  if (run === undefined) {
+    return null;
+  }
+  return {
+    runId:         run.id,
+    status:        run.status,
+    holdForReview: run.hold_for_review === 1,
+    completedAt:   run.completed_at,
+    roots: (results ?? [])
+      .filter(item => item.upstream_network_key !== null && item.deployment_key !== null)
+      .map(item => ({ upstreamNetworkKey: item.upstream_network_key!, deploymentKey: item.deployment_key! })),
+  };
+}
+
 async function pendingItems(db: D1Database, runId: string): Promise<number> {
   const value = await db.prepare(
-    `SELECT COUNT(*) AS n FROM sync_run_items
-     WHERE sync_run_id = ?1 AND status <> 'completed' AND attempts < ?2`
-  ).bind(runId, MAX_ITEM_ATTEMPTS).first<number>('n');
+    `SELECT COUNT(*) AS n FROM sync_run_items WHERE sync_run_id = ?1 AND ${OUTSTANDING}`
+  ).bind(runId).first<number>('n');
   return value ?? 0;
+}
+
+/*
+ * How far a run has got, in roots. One statement, so every answer can carry
+ * it: a caller that is told `running` needs to know whether the invocation
+ * made progress and how much is left, and deriving that from the status
+ * alone is what makes a resumable import look erratic.
+ */
+async function progressOf(db: D1Database, runId: string): Promise<{
+  expected: number, completed: number, outstanding: number,
+}> {
+  const counts = await db.prepare(
+    `SELECT run.expected_count AS expected, run.completed_count AS completed,
+            (SELECT COUNT(*) FROM sync_run_items WHERE sync_run_id = ?1 AND ${OUTSTANDING}) AS outstanding
+     FROM sync_runs AS run WHERE run.id = ?1`
+  ).bind(runId).first<{ expected: number, completed: number, outstanding: number } | null>();
+  return counts ?? { expected: 0, completed: 0, outstanding: 0 };
+}
+
+/*
+ * When the newest finished run of a commit started, which is what a retry of
+ * the commit waits from. A run starts the discovery interval again, so whole
+ * intervals counted from its start are over by the discovery that many
+ * intervals later; counted from its end, hours later, they would always wait
+ * for the discovery after.
+ */
+async function lastStartedAt(db: D1Database, commitSha: string): Promise<string | null> {
+  const started = await db.prepare(
+    `SELECT MAX(started_at) AS started FROM sync_runs WHERE source_commit_sha = ?1 AND status <> 'running'`
+  ).bind(commitSha).first<string | null>('started');
+  return started ?? null;
 }
 
 /*
@@ -382,20 +564,28 @@ async function recordUpstreamCheck(db: D1Database, options: ClockOption = {}): P
   ).bind(timestamp).run();
 }
 
-export type { Clock, ClockOption, Fence, LeaseOptions, RootCheckpoint, RunInput };
+export type { Clock, ClockOption, CommitOptions, Fence, ImportRun, LeaseOptions, RootCheckpoint, RunFinish, RunInput };
 
 export {
   MAX_ITEM_ATTEMPTS,
   acquireRun,
+  bindCandidate,
+  checkpointsOf,
   claimItem,
   completeItem,
   dueForDiscovery,
   failItem,
   finishRun,
+  finishRunStatement,
+  importOf,
+  lastStartedAt,
+  leaseHeld,
+  noRunImporting,
   pendingItems,
+  progressOf,
+  readRun,
   recordUpstreamCheck,
   releaseLease,
-  renewLease,
   runningRun,
   startRun,
 };

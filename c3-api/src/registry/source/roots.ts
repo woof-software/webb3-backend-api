@@ -206,12 +206,8 @@ async function sourceChecksum(roots: Array<{ rootPath: string, sourceBlobSha: st
 
 export {
   MAX_ROOT_BYTES,
-  MAX_ROOT_KEYS,
-  ROOT_CONTRACT_ROLES,
   SUPPORTED_NETWORKS,
-  canonicalRootDocument,
   isSupportedNetworkKey,
-  networkOf,
   parseDeploymentPath,
   parseRoot,
   sourceChecksum,

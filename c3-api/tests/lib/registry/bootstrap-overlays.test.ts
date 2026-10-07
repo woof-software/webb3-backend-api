@@ -127,7 +127,7 @@ t.test('a base-quoted market proposes the feed its APR was converted through', a
   t.equal(weth.overlay.baseAsset.usdPriceFeedAddress, '0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419',
     'the USD feed the constants carry beside the base feed');
   t.equal(weth.overlay.baseAsset.isWrappedNative, true, 'and its base asset is the chain\'s wrapped native token');
-  t.equal(weth.overlay.rewardPriceFeed?.quote, 'base', 'an eighteen-decimal reward feed prices COMP in the base asset');
+  t.equal(weth.overlay.rewardPriceFeed?.quote, 'base', 'its reward feed, COMP / ETH, prices COMP in the base asset');
   t.equal(weth.overlay.contractName, 'cWETHv3', 'and the constants name the contract like every other market');
   t.notOk(weth.notes.some(note => note.open), 'so nothing about it is left to decide');
 
@@ -139,6 +139,20 @@ t.test('a base-quoted market proposes the feed its APR was converted through', a
     wbtc.notes.some(note => /rewards APR branches/.test(note.source)),
     'and the review says where that came from',
   );
+});
+
+/*
+ * Whether a reward feed prices COMP in USD or in the base asset is not in its
+ * decimals: Linea's COMP / ETH answers with eight, as every COMP / USD feed
+ * does. Proposed as USD, Linea WETH served COMP priced in ETH as if in USD.
+ */
+t.test('a reward feed is quoted in the unit it answers in, whatever its decimals', async t => {
+  const lineaWeth = overlayFor('linea-mainnet', 'weth', 'cWETHv3');
+  t.same(lineaWeth.overlay.rewardPriceFeed, { address: '0x6af327313876ef9a5d342105747ebf3aa2543547', quote: 'base' },
+    'COMP / ETH with eight decimals is quoted in the base asset');
+  const lineaUsdc = overlayFor('linea-mainnet', 'usdc', 'cUSDCv3');
+  t.same(lineaUsdc.overlay.rewardPriceFeed, { address: '0xc0068a2f7e4847df9c3a34b27ccc07b7e15e0458', quote: 'usd' },
+    'and COMP / USD, with the same eight, in USD');
 });
 
 /*
@@ -292,9 +306,9 @@ t.test('every network proposal is one the admin route accepts', async t => {
 });
 
 /*
- * REVIEW.md is what an operator reads instead of 39 documents, so every
- * decision has to be in it, and what is open has to be told apart from what
- * merely needs saying.
+ * The review document (`GET /versions/{id}/proposal/review`) is what an
+ * operator reads instead of 39 documents, so every decision has to be in it,
+ * and what is open has to be told apart from what merely needs saying.
  */
 function generatedFor(markets: Array<[ string, string, string | null ]>): Generated {
   const notes: Note[] = [];
@@ -313,8 +327,8 @@ function generatedFor(markets: Array<[ string, string, string | null ]>): Genera
 }
 
 /*
- * The bundle is the body of the route that applies it, so what REVIEW.md
- * describes is exactly what one request writes.
+ * The bundle is the body of the route that applies it, so what the review
+ * document describes is exactly what one request writes.
  */
 t.test('the bundle is the request body, keyed by what each overlay reviews', async t => {
   const generated = generatedFor([ [ 'ethereum-mainnet', 'usdc', 'cUSDCv3' ] ]);
@@ -342,6 +356,10 @@ t.test('the review document puts every decision in a table', async t => {
   t.match(document, /0x351a133fd850ea81ed8a782016e308acbaddec91` fixed at 1\.02447384: PumpBTC/,
     'a fixed price reads as the feed would report it');
   t.match(document, /## Needs a decision\n\nNothing\./, 'with nothing open, the review says so');
+  t.match(document, /Reward quote: `usd`, except where the reward feed answers in the base asset/,
+    'the reward quote is explained by the rule the proposal follows');
+  t.match(document, /cWETHv3 on ethereum-mainnet, cWETHv3 on linea-mainnet \(COMP \/ ETH\)/);
+  t.notMatch(document, /eighteen/, 'never by decimals, which cannot tell');
   t.match(document, '| ethereum-mainnet | `0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2` | ETH | Ether | the chain\'s own token |',
     'the presentation of each asset');
   t.match(document, /`0xae7ab96520de3a18e5e111b5eaab095312d7fe84` stETH \(Lido Staked ETH\) as `0x7f39/,
