@@ -5,7 +5,7 @@ name = "woof-c3-api"
 compatibility_date = "2026-06-25"
 compatibility_flags = ["nodejs_compat"]
 
-workers_dev = false
+workers_dev = true
 
 [[kv_namespaces]]
 binding = "kv_testnet"
@@ -60,9 +60,6 @@ REGISTRY_STALE_FALLBACK_MAX_S = "3600"
 [[vars.URL_SERVICE_BINDING_OVERRIDES]]
 host = "woof-node-provider-proxy.internal"
 binding = "node_provider_proxy"
-
-[vars.settings]
-maskUpstreamErrors = true
 
 [triggers]
 crons = ["0 * * * *"]
