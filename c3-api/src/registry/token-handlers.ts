@@ -5,10 +5,9 @@ import type * as KnownNetwork from '../../lib/well-known/networks/network.js';
 import { ApiError } from '../http/errors.js';
 import { jsonResponse } from '../http/json.js';
 
-import type { Catalog } from './catalog.js';
 import { isUnreachable } from './cache.js';
 import { RegistryContext, chainIdOf } from './handlers.js';
-import { catalogHeaders, isRegistryUnavailable } from './request-catalog.js';
+import { catalogHeaders } from './request-catalog.js';
 import { collateralView, positionsOf } from './token-collateral.js';
 import { tokenList } from './token-visibility.js';
 import {
@@ -112,33 +111,18 @@ function visibleOnlyOf(query: URLSearchParams): boolean {
   throw new ApiError('BAD_REQUEST', `visibleOnly must be true or false`);
 }
 
-async function loadCatalog(context: RegistryContext): Promise<Catalog> {
-  try {
-    return await context.catalog.load();
-  } catch (error) {
-    if (isRegistryUnavailable(error)) {
-      if (error.reason === 'not_active') {
-        throw new ApiError('REGISTRY_NOT_ACTIVE', `No active registry snapshot is available`);
-      }
-      // the client is told only that the registry could not be read; why goes to the logs
-      context.debug.error(`the token list could not read the registry`, { error, cause: error.cause });
-      throw new ApiError('UPSTREAM_UNAVAILABLE', `the comet registry could not be read`);
-    }
-    throw error;
-  }
-}
-
 /*
  * The strategic decisions of a chain. A database that does not answer is an
  * outage the client is told about, and fails open on: without them, a
- * strategic token below the threshold would be listed as hidden.
+ * strategic token below the threshold would be listed as hidden. Why it did
+ * not answer is logged under the request id, beside the answer's own line.
  */
 async function strategicTokens(context: RegistryContext, chainId: number): Promise<Set<Address>> {
   try {
     return await readStrategicTokens(context.db, chainId);
   } catch (error) {
     if (isUnreachable(error)) {
-      context.debug.error(`the token list could not read the token policies`, { chainId, error });
+      context.debug.error(`the token list could not read the token policies`, { requestId: context.requestId, chainId, error });
       throw new ApiError('UPSTREAM_UNAVAILABLE', `the token policies could not be read`);
     }
     throw error;
@@ -158,7 +142,8 @@ async function strategicTokens(context: RegistryContext, chainId: number): Promi
 async function getTokenList(request: Request, context: RegistryContext, chainIdText: string): Promise<Response> {
   const chainId     = chainIdOf(chainIdText);
   const visibleOnly = visibleOnlyOf(new URL(request.url).searchParams);
-  const catalog     = await loadCatalog(context);
+  // a registry that cannot be read is answered, and logged, by the router, as on every registry route
+  const catalog     = await context.catalog.load();
   const registryVersion = { id: catalog.versionId, checksum: catalog.checksum };
 
   const network = catalog.networks().find(entry => entry.chainId === chainId);

@@ -31,7 +31,7 @@ const assetOf = (market: RegistrySnapshotV1['networks'][number]['markets'][numbe
   market.collateralAssets.find(asset => asset.token.symbol === symbol)!;
 const units = (amount: bigint, decimals: number) => (amount * 10n ** BigInt(decimals)).toString();
 
-type ErrorBody = { error: { code: string, message: string } };
+type ErrorBody = { error: { code: string, message: string, requestId: string } };
 type Teardown  = { teardown: (fn: () => unknown) => void };
 
 let seed = 0;
@@ -189,8 +189,9 @@ t.test('policies the database cannot give are a 503, and are logged', async t =>
   t.equal(response.status, 503);
   const body = await response.json() as ErrorBody;
   t.same([ body.error.code, body.error.message ], [ 'UPSTREAM_UNAVAILABLE', 'the token policies could not be read' ]);
-  t.ok(errors.some(line => line.includes('the token list could not read the token policies')), 'the outage is logged with its cause');
-  t.ok(errors.some(line => line.includes('Network connection lost')));
+  t.ok(errors.some(line => line.includes('the token list could not read the token policies')), 'the outage is logged');
+  t.ok(errors.some(line => line.includes('Network connection lost') && line.includes(body.error.requestId)),
+    'with its cause, under the id the answer names');
 });
 
 /*
@@ -209,24 +210,23 @@ t.test('an answer from a version the database could not confirm is not stored', 
   t.match(response.headers.get('x-registry-stale'), /^[0-9]+$/, 'and it says how old the version is');
   t.equal(list.registryVersion.id, registry.versionId);
   t.equal(bySymbol(list).get('WETH')!.collateralValueUsd, '500000', 'the values are still the current minute\'s');
-  t.ok(errors.some(line => line.includes('trying the stale fallback')), 'and the fallback is logged');
+  t.ok(errors.some(line => line.includes('registry database unreachable; answering from the version it last named')), 'and the fallback is logged');
 });
 
+const FIXED   = '0x351a133fd850ea81ed8a782016e308acbaddec91';
+const MAINNET = fixture.networks.find(network => network.chainId === 1)!;
+
 /*
- * Statuses other than fresh, as the body carries them. pumpBTC is priced
- * through the feed the network's fixed price is stated for, with an expiry
- * written with an offset; wstETH's price in the WETH market fails at the node,
- * and what its other two markets hold already reaches the threshold.
+ * The fixture with pumpBTC priced through the feed the network's fixed price
+ * is stated for, and that exception described as `description` says.
  */
-t.test('an exception and a partial value reach the body as the rule decided them', async t => {
-  const FIXED = '0x351a133fd850ea81ed8a782016e308acbaddec91';
-  const mainnet = fixture.networks.find(network => network.chainId === 1)!;
-  const snapshot: RegistrySnapshotV1 = {
+function fixedPumpBtc(description: { provenance?: string, expiresAt?: string | null }): RegistrySnapshotV1 {
+  return {
     ...fixture,
-    networks: fixture.networks.map(network => network !== mainnet ? network : {
+    networks: fixture.networks.map(network => network !== MAINNET ? network : {
       ...network,
       priceExceptions: network.priceExceptions.map(exception => (
-        exception.priceFeedAddress === FIXED ? { ...exception, expiresAt: '2999-01-01T00:00:00+01:00' } : exception
+        exception.priceFeedAddress === FIXED ? { ...exception, ...description } : exception
       )),
       markets: network.markets.map(entry => entry.deploymentKey !== 'wbtc' ? entry : {
         ...entry,
@@ -237,7 +237,17 @@ t.test('an exception and a partial value reach the body as the rule decided them
       }),
     }),
   };
-  const market = (key: string) => mainnet.markets.find(entry => entry.deploymentKey === key)!;
+}
+
+/*
+ * Statuses other than fresh, as the body carries them. pumpBTC is priced
+ * through the feed the network's fixed price is stated for, with an expiry
+ * written with an offset; wstETH's price in the WETH market fails at the node,
+ * and what its other two markets hold already reaches the threshold.
+ */
+t.test('an exception and a partial value reach the body as the rule decided them', async t => {
+  const snapshot = fixedPumpBtc({ expiresAt: '2999-01-01T00:00:00+01:00' });
+  const market = (key: string) => MAINNET.markets.find(entry => entry.deploymentKey === key)!;
   const wstEth = assetOf(market('usdc'), 'wstETH');
   const comets = { usdc: market('usdc').contracts.comet!, weth: market('weth').contracts.comet!, usdt: market('usdt').contracts.comet! };
   // the node's refusal is logged by the JSON-RPC client, which is not what this test reads
@@ -264,4 +274,30 @@ t.test('an exception and a partial value reach the body as the rule decided them
     [ 'partial', '800000', 0, true, 'collateral_threshold' ],
     'what could be read already reaches the threshold, and is a lower bound (D7)',
   );
+});
+
+/*
+ * Why an exception was added and until when it applies change no value, so
+ * two versions that differ only in them share the minute's record. Each
+ * answers with its own description of the exception, whichever valued it.
+ */
+t.test('an exception is described as the version that answers describes it', async t => {
+  const first  = fixedPumpBtc({ provenance: 'as the first version describes it', expiresAt: '2999-01-01T00:00:00.000Z' });
+  const edited = fixedPumpBtc({ provenance: 'as the second version describes it', expiresAt: '2999-06-01T00:00:00.000Z' });
+  const second = await activeRegistryDatabase({
+    snapshot: { ...edited, registryVersion: { ...edited.registryVersion, id: '00000000-0000-4000-8000-0000000000b2' } },
+  });
+  t.teardown(() => second.dispose());
+  const { node, get } = await workerOf(t, {}, first);
+  const described = (list: TokenListV1) => bySymbol(list).get('pumpBTC')!.exceptions
+    .map(({ provenance, expiresAt }) => ({ provenance, expiresAt }));
+
+  t.same(described(await listOf(await get('/registry/v1/networks/1/tokens'))),
+    [ { provenance: 'as the first version describes it', expiresAt: '2999-01-01T00:00:00.000Z' } ]);
+
+  const answered = await listOf(await get('/registry/v1/networks/1/tokens', second.db));
+  t.equal(answered.registryVersion.id, second.versionId, 'the second version answers');
+  t.equal(batches(node).length, 1, 'from the minute the first one valued');
+  t.same(described(answered), [ { provenance: 'as the second version describes it', expiresAt: '2999-06-01T00:00:00.000Z' } ],
+    'with its own description of the exception');
 });

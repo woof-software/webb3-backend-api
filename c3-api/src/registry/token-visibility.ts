@@ -35,8 +35,7 @@ const THRESHOLD_TEXT = '250000';
  * Every token the active version serves on a chain, with every role it plays
  * in the markets that serve it. A deprecated market is still served, so its
  * tokens are listed; a disabled one is never materialized. A reward token is
- * the market's reward asset, never the placeholder a market without rewards
- * carries on its contract object.
+ * the market's reward asset.
  */
 function tokensOf(catalog: Catalog, network: KnownNetwork.Name): Array<{ token: TokenV1, roles: AssetRole[] }> {
   const found = new Map<Address, { token: TokenV1, roles: Set<AssetRole> }>();

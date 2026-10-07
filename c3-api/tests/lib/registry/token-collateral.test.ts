@@ -536,9 +536,12 @@ t.test('the stale window comes from the environment, and an empty value is unset
  * lower bound, then the newest complete earlier minute, then nothing.
  */
 t.test('a token takes the newest value it can stand behind', async t => {
+  const remap = { kind: 'deprecated_price_remap', priceFeedAddress: '0x0000000000000000000000000000000000000001', replacementPriceFeed: { address: '0x0000000000000000000000000000000000000002', decimals: 8 }, provenance: 'x', expiresAt: null };
+  // two positions of one token, of a version whose network holds the remap
+  const comet = { registry: { priceExceptions: [ remap ] } };
   const positions = [
-    { key: 'a@1#0', token: '0x00000000000000000000000000000000000000aa', assetIndex: 0 },
-    { key: 'b@1#0', token: '0x00000000000000000000000000000000000000aa', assetIndex: 0 },
+    { key: 'a@1#0', token: '0x00000000000000000000000000000000000000aa', assetIndex: 0, comet },
+    { key: 'b@1#0', token: '0x00000000000000000000000000000000000000aa', assetIndex: 0, comet },
   ] as any[];
   const TOKEN = '0x00000000000000000000000000000000000000aa';
   const block = (minute: number) => ({ number: minute, timestamp: minute * 60 });
@@ -549,7 +552,6 @@ t.test('a token takes the newest value it can stand behind', async t => {
   });
   const valueOf = (view: CollateralView) => tokenValue(TOKEN, view, positions, THRESHOLD, NOW);
   const reverted = { status: 'error', reason: 'price_reverted' };
-  const remap = { kind: 'deprecated_price_remap', priceFeedAddress: '0x0000000000000000000000000000000000000001', replacementPriceFeed: { address: '0x0000000000000000000000000000000000000002', decimals: 8 }, provenance: 'x', expiresAt: null };
 
   const fresh = valueOf({ block: block(100), current: record(100, [ usd('100000'), usd('150000') ]), earlier: [] });
   t.same([ fresh.status, fresh.valueUsd?.toString(), fresh.staleAgeSeconds ], [ 'fresh', '250000', 0 ], 'complete now is fresh');
@@ -576,6 +578,19 @@ t.test('a token takes the newest value it can stand behind', async t => {
     usd('3'),
   ]) ] });
   t.same([ staleExcepted.status, staleExcepted.exceptions ], [ 'stale', [ remap ] ], 'with the exceptions that minute applied');
+
+  /*
+   * Why an exception was added and until when it applies change no value, so
+   * a record is shared by versions that differ only in them: each answers
+   * with its own description, whichever valued the minute.
+   */
+  const redescribed = { ...remap, provenance: 'y', expiresAt: '2999-01-01T00:00:00.000Z' };
+  const answering   = positions.map(position => ({ ...position, comet: { registry: { priceExceptions: [ redescribed ] } } }));
+  const remapped    = { status: 'exception', valueUsd: { value: '1', decimals: 0 }, exceptions: [ remap ] };
+  t.same(tokenValue(TOKEN, { block: block(100), current: record(100, [ remapped, remapped ]), earlier: [] }, answering, THRESHOLD, NOW).exceptions,
+    [ redescribed ], 'an exception of this minute is described as the version answering describes it');
+  t.same(tokenValue(TOKEN, { block: block(100), current: null, earlier: [ record(97, [ remapped, usd('3') ]) ] }, answering, THRESHOLD, NOW).exceptions,
+    [ redescribed ], 'and so is one of an earlier minute');
 
   const unavailable = valueOf({ block: null, current: null, earlier: [ record(97, [ usd('1'), reverted ]) ] });
   t.same([ unavailable.status, unavailable.valueUsd, unavailable.block ], [ 'unavailable', null, null ],

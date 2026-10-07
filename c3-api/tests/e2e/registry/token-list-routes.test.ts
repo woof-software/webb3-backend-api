@@ -179,7 +179,7 @@ t.test('without an active version there is nothing to list', async t => {
  * threshold, so a list that cannot read them is not answered at all.
  */
 t.test('a database without the token policy migration says so', async t => {
-  await freshDatabase({ activate: true, through: '0003' });
+  await freshDatabase({ activate: true, through: '0004' });
 
   const response = await server.fetch(tokensPath(SCROLL));
   t.equal(response.status, 503);

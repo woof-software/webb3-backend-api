@@ -29,10 +29,12 @@ import type { Catalog, RegistryComet } from './catalog.js';
  *
  * A record is identified by what it valued, never by a version id: the set of
  * enabled positions, each named by its Comet's content digest, which covers
- * its tokens, feeds, decimals, quote and the exceptions of its network. A
- * version that values the same positions the same way shares the records of
- * the one before it, and one that changes anything a value depends on starts
- * afresh.
+ * its tokens, feeds, decimals, quote and what the exceptions of its network do
+ * to a price. A version that values the same positions the same way shares the
+ * records of the one before it, and one that changes anything a value depends
+ * on starts afresh. Why an exception was added and until when it applies
+ * change no value, so a list takes them from the version it answers from,
+ * never from a record (tokenValue).
  *
  * Nothing here is written to D1: values are recomputed, never stored.
  */
@@ -586,13 +588,23 @@ function sumOf(outcomes: Array<Exclude<PositionOutcome, { status: 'error' }>>): 
   return outcomes.reduce((sum, outcome) => sum.add(valueOf(outcome.valueUsd)), BigFixnum.from({ value: 0 }));
 }
 
-// each exception once, however many positions of the token it priced
-function exceptionsOf(outcomes: PositionOutcome[]): PriceExceptionV1[] {
+// an exception as a record and a version both name it: what it does, and to which feed
+const exceptionKey = (exception: PriceExceptionV1) => `${exception.kind}:${exception.priceFeedAddress}`;
+
+/*
+ * Each exception once, however many positions of the token it priced, as the
+ * answering version describes it rather than as the record does: a record is
+ * shared by every version that values its positions the same way, and may
+ * have been valued under one that described an exception otherwise. Each of
+ * those versions holds every exception the record names.
+ */
+function exceptionsOf(outcomes: PositionOutcome[], described: ReadonlyMap<string, PriceExceptionV1>): PriceExceptionV1[] {
   const seen = new Map<string, PriceExceptionV1>();
   for (const outcome of outcomes) {
     if (outcome.status === 'exception') {
       for (const exception of outcome.exceptions) {
-        seen.set(`${exception.kind}:${exception.priceFeedAddress}`, exception);
+        const key = exceptionKey(exception);
+        seen.set(key, described.get(key) ?? exception);
       }
     }
   }
@@ -606,17 +618,22 @@ function tokenValue(
   threshold: BigFixnum,
   now: Date,
 ): TokenValue {
-  const keys = new Set(positions.filter(position => position.token === token).map(position => position.key));
+  const held = positions.filter(position => position.token === token);
+  const keys = new Set(held.map(position => position.key));
   if (keys.size === 0) {
     return { status: 'fresh', valueUsd: BigFixnum.from({ value: 0 }), block: view.block, staleAgeSeconds: 0, exceptions: [] };
   }
   const of = (record: CollateralMinute) => record.positions.filter(entry => keys.has(entry.key)).map(entry => entry.outcome);
+  // the exceptions of the network as the answering version describes them, which its positions carry
+  const described = new Map(held.flatMap(position => position.comet.registry.priceExceptions)
+    .map(exception => [ exceptionKey(exception), exception ] as const));
+  const exceptionsIn = (outcomes: PositionOutcome[]) => exceptionsOf(outcomes, described);
 
   if (view.current !== null) {
     const outcomes = of(view.current);
     const readable = outcomes.filter(ok);
     if (readable.length === outcomes.length) {
-      const exceptions = exceptionsOf(outcomes);
+      const exceptions = exceptionsIn(outcomes);
       return {
         status:          exceptions.length === 0 ? 'fresh' : 'exception',
         valueUsd:        sumOf(readable),
@@ -628,7 +645,7 @@ function tokenValue(
     // values are never negative, so what could be read is a lower bound of the whole
     const partial = sumOf(readable);
     if (partial.gte(threshold)) {
-      return { status: 'partial', valueUsd: partial, block: view.current.block, staleAgeSeconds: 0, exceptions: exceptionsOf(readable) };
+      return { status: 'partial', valueUsd: partial, block: view.current.block, staleAgeSeconds: 0, exceptions: exceptionsIn(readable) };
     }
   }
 
@@ -642,7 +659,7 @@ function tokenValue(
         valueUsd:        sumOf(readable),
         block:           record.block,
         staleAgeSeconds: Math.max(1, reference - record.block.timestamp),
-        exceptions:      exceptionsOf(outcomes),
+        exceptions:      exceptionsIn(outcomes),
       };
     }
   }

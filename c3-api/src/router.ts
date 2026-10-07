@@ -218,7 +218,8 @@ async function route(
 
 async function unsafeRoute(
   request: Request,
-  context: Omit<Context, 'evaluator'>,
+  // by now with the request's id: the entrypoint's, or one route() made
+  context: Omit<Context, 'evaluator'> & { requestId: string },
   instantiateEvaluator: Evaluator.InstantiateFn<Scope>,
   registry: RequestCatalog,
 ): Promise<Response> {
@@ -232,6 +233,7 @@ async function unsafeRoute(
    */
   const registryResponse = await routeRegistry(request, context.env, {
     debug:     context.debug,
+    requestId: context.requestId,
     registry,
     waitUntil: context.waitUntil ?? (() => {}),
     /*

@@ -70,6 +70,7 @@ t.test('a database that cannot be reached, with nothing cached, is a 503 on ever
     '/registry/v1/networks',
     '/registry/v1/networks/1/markets',
     `/registry/v1/networks/1/markets/${USDC}`,
+    '/registry/v1/networks/1/tokens',
     `/registry/v1/versions/${randomUUID()}`,
     `/market/${MAINNET}/${USDC}/summary`,
     `/account/${USDC}/rewards`,
@@ -100,6 +101,26 @@ t.test('a database that answers with a fault is a 500 that says nothing but the 
     t.ok(logs.some(line => line.includes(body.error.requestId)), 'which the log has under the request id');
   }
   t.ok(logs.some(line => line.includes('no such column')), 'whole');
+});
+
+/*
+ * A missing table is such a fault too. Only the token policy tables are
+ * answered otherwise, by the routes that read them, with a 503 that names
+ * the remedy (token-list-routes, token-policy-routes); a registry table
+ * missing is a 500 on the token list as everywhere else.
+ */
+t.test('a missing table is a 500, unless it is a token policy table', async t => {
+  const logs = captureLogs(t);
+  const env  = await envWith({ APP_DB: failing('D1_ERROR: no such table: registry_state: SQLITE_ERROR') });
+
+  for (const path of [ '/registry/v1/active', '/registry/v1/networks/1/markets', '/registry/v1/networks/1/tokens' ]) {
+    const response = await get(env, path);
+    t.equal(response.status, 500, `${path} answers 500, not a missing migration`);
+    const body = await response.json() as Envelope;
+    t.equal(body.error.code, 'INTERNAL');
+    t.ok(logs.some(line => line.includes(body.error.requestId)), 'which the log has under the request id');
+  }
+  t.ok(logs.some(line => line.includes('no such table: registry_state')), 'whole');
 });
 
 /*

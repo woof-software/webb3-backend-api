@@ -291,7 +291,7 @@ async function setTokenPolicy(db: D1Database, change: PolicyChange): Promise<Tok
  * that the history and the decision it explains are the same moment's.
  *
  * The changes are listed in the order they were committed, newest first,
- * which is rowid order (migrations/0004_token_policies.sql says why), so the
+ * which is rowid order (migrations/0005_token_policies.sql says why), so the
  * first one is always the change that set the decision in force.
  *
  * A decision outlives a version that drops its token, and applies again when

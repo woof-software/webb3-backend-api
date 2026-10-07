@@ -504,7 +504,7 @@ type ValidationSummaryV1 = {
 };
 
 /*
- * Token policies, from migrations/0004_token_policies.sql: the decisions an
+ * Token policies, from migrations/0005_token_policies.sql: the decisions an
  * administrator makes about a token, kept by chain id and address rather than
  * on a versioned row, so that they outlive every activation.
  */

@@ -1,4 +1,4 @@
--- Migration number: 0004    2026-10-02T09:00:00.000Z
+-- Migration number: 0005    2026-10-02T09:00:00.000Z
 -- Token policies: which tokens an administrator has marked strategic.
 --
 -- A policy belongs to a token as a chain knows it, a chain id and an address,

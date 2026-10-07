@@ -259,7 +259,7 @@ t.test('the list routes are behind the token, and answer only for an active vers
  * internal error only the logs explain.
  */
 t.test('a database without the token policy migration says so', async t => {
-  await freshDatabase({ activate: true, through: '0003' });
+  await freshDatabase({ activate: true, through: '0004' });
 
   for (const [ name, response ] of [
     [ 'the export',     await server.fetch('/registry/v1/admin/token-policies', { headers: auth }) ],
