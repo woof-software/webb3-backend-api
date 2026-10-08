@@ -1,7 +1,7 @@
-import type { Env } from '../../entrypoint.js';
+import { corsHeaders } from '../http/cors.js';
+import { ApiError, ApiErrorCode, failureResponse, isApiError } from '../http/errors.js';
 
-import { corsHeadersFor, isAdminRoute } from '../http/cors.js';
-import { ApiError, ApiErrorCode, FailureLog, failureResponse, isApiError } from '../http/errors.js';
+import type * as Evaluator from '../evaluator.js';
 
 import { routeAdmin } from './admin-router.js';
 import type { CacheDeps, CachedSnapshot } from './cache.js';
@@ -9,29 +9,38 @@ import { activeSnapshot, cacheDepsOf, isUnreachable, versionSnapshot, warmSnapsh
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
-import { isRegistryUnavailable, unavailableError } from './request-catalog.js';
-import type { RequestCatalog } from './request-catalog.js';
-import { TokenCollateralDeps, maxStaleMinutesOf } from './token-collateral.js';
+import { catalogHeadersOf, isRegistryUnavailable, requestCatalog, unavailableError } from './request-catalog.js';
+import type * as TokenCollateral from './token-collateral.js';
+import { maxStaleMinutesOf } from './token-collateral.js';
 
 /*
  * The registry entry point: everything under /registry/v1 is answered here,
- * including its errors and its CORS headers, and nothing else is.
+ * including its preflight, its errors and its CORS headers, and nothing else
+ * is.
  *
- * Errors become the versioned envelope rather than propagating: an unhandled
- * throw would otherwise reach the legacy 500 path, and a D1 or upstream
- * message must never leave the worker.
+ * Errors become the versioned envelope rather than propagating: nothing past
+ * this router answers a throw, and a D1 or upstream message must never reach
+ * a client.
  */
 const PREFIX = '/registry/v1';
 
 /*
- * Whether a path is the registry's to answer, with its preflight and its CORS
- * headers. The entrypoint asks this same function before it answers a
- * preflight or sets CORS headers itself: a path one claimed and the other did
- * not would be answered by neither, which is how a preflight ends up as a
- * bare 404, or would carry CORS headers this router did not decide.
+ * Whether a path is the registry's to answer. The entrypoint asks this once,
+ * and hands every path it claims to this router and every other path to the
+ * legacy one, so no path is answered by both or by neither.
  */
 function isRegistryPath(pathname: string): boolean {
   return pathname === PREFIX || pathname.startsWith(`${PREFIX}/`);
+}
+
+/*
+ * Whether a registry path is an administrative one, which decides both the
+ * router that answers it and the CORS headers it answers with. It is matched
+ * as a prefix, so anything that only starts like an administrative path is
+ * answered as one: without CORS headers, and after the address limiter.
+ */
+function isAdminPath(pathname: string): boolean {
+  return pathname.startsWith(`${PREFIX}/admin`);
 }
 
 /*
@@ -134,33 +143,29 @@ function withHeaders(response: Response, headers: Record<string, string>): Respo
 
 async function routeRegistry(
   request: Request,
-  env: Env,
-  { debug, requestId, registry, evaluator, waitUntil }: {
-    debug:      FailureLog,
-    // the id the entrypoint gave the request, which its error answer and its log lines carry
-    requestId:  string,
-    // the registry version of the request, shared with every other route that reads it
-    registry:   RequestCatalog,
-    // an evaluator for the token list's collateral reads, batching every read of a chain
-    evaluator:  TokenCollateralDeps['evaluator'],
-    // keeps the token list's valuation alive past the answer of the request that started it
-    waitUntil:  TokenCollateralDeps['waitUntil'],
-  },
-): Promise<Response | null> {
-  const path = new URL(request.url).pathname;
-  if (!isRegistryPath(path)) {
-    return null;
-  }
-  const pathname = withoutTrailingSlash(path);
+  // the request's context, with the id the entrypoint gave it, which its error answer and its log lines carry
+  { env, debug, flags, waitUntil, requestId }: Evaluator.Context & { requestId: string },
+  // the evaluators the token list values collateral with
+  instantiateEvaluator: Evaluator.InstantiateFn<TokenCollateral.Dependencies>,
+): Promise<Response> {
+  const pathname = withoutTrailingSlash(new URL(request.url).pathname);
+  const route    = isAdminPath(pathname) ? 'admin' : 'public';
 
-  const cors = corsHeadersFor(pathname);
   if (request.method === 'OPTIONS') {
     // administrative routes answer no CORS headers, so a preflight there
     // tells a browser nothing it could use
-    return withHeaders(new Response(null, { status: 204 }), corsHeadersFor(pathname, { preflight: true }));
+    return withHeaders(new Response(null, { status: 204 }), corsHeaders(route, { preflight: true }));
   }
+  const cors = corsHeaders(route);
 
-  const deps = cacheDepsOf(env, debug);
+  /*
+   * The registry version of this request. It is loaded at most once, by the
+   * first handler that needs it — the token list resolves every market and
+   * token of its chain from it — and every answer given after it was loaded
+   * says which version that was.
+   */
+  const registry = requestCatalog(env, debug);
+  const deps     = cacheDepsOf(env, debug);
   const context: RegistryContext = {
     db:      env.APP_DB,
     actor:   env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`,
@@ -183,25 +188,30 @@ async function routeRegistry(
     catalog: registry,
     tokens: {
       frame:           { apiHost: env.V3_API_HOST, nodeHost: env.NODE_PROXY_HOST, nodeKey: env.NODE_PROXY_KEY },
-      evaluator,
+      // every collateral read of a chain in one batch, as the market summaries read theirs
+      evaluator:       networkEnv => instantiateEvaluator(networkEnv, {
+        flags: { ...flags, batchingEnabled: true, evaluatorAlgorithm: 'workingset' },
+      }),
       kv:              networkEnv => env[`kv_${networkEnv}`],
       maxStaleMinutes: maxStaleMinutesOf(env),
       now:             () => new Date(),
       debug,
-      waitUntil,
+      // keeps the valuation alive past the answer of the request that started it
+      waitUntil:       waitUntil ?? (() => {}),
     },
   };
 
+  let response: Response;
   try {
-    const response = isAdminRoute(pathname)
+    const answered = route === 'admin'
       ? await routeAdmin(request, env, context, pathname)
       : await routePublic(request, context, pathname, { maxAge: deps.ttlSeconds });
-    if (response === null) {
+    if (answered === null) {
       throw new ApiError('NOT_FOUND', `no registry route matches ${pathname}`);
     }
-    return withHeaders(response, cors);
+    response = withHeaders(answered, cors);
   } catch (error) {
-    return failureResponse(asApiError(error), error, {
+    response = failureResponse(asApiError(error), error, {
       requestId,
       pathname,
       debug,
@@ -209,6 +219,7 @@ async function routeRegistry(
       headers: cors,
     });
   }
+  return withHeaders(response, catalogHeadersOf(registry));
 }
 
 export { ERROR_STATUS, asApiError, isRegistryPath, routeRegistry };

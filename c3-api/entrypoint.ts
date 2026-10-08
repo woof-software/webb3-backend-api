@@ -6,8 +6,8 @@ import * as Debug from './lib/debug-log.js';
 import { route }      from './src/router.js';
 import * as Evaluator from './src/evaluator.js';
 
-import { legacyCorsHeaders } from './src/http/cors.js';
-import { isRegistryPath } from './src/registry/router.js';
+import { corsHeaders } from './src/http/cors.js';
+import { isRegistryPath, routeRegistry } from './src/registry/router.js';
 import {
   checkRegistryChain,
   maintainRegistryCache,
@@ -119,83 +119,108 @@ const SECURITY_HEADERS: Record<string, string> = {
   'Cross-Origin-Resource-Policy': 'cross-origin',
 };
 
-export default {
-  async fetch(request: Request, env: Env, executionContext?: ExecutionContext): Promise<Response> {
-    const { pathname } = new URL(request.url);
-    /*
-     * The registry answers its own preflight, because its administrative
-     * routes must not advertise cross-origin access the way the public
-     * routes do.
-     */
-    if (request.method === 'OPTIONS' && !isRegistryPath(pathname)) {
-      return new Response(null, {
-        status: 204,
-        headers: { ...legacyCorsHeaders({ preflight: true }), ...SECURITY_HEADERS },
-      });
-    }
-    /*
-     * What one request may spend before the counting fetch and the
-     * computation cache refuse it themselves. No environment sets either
-     * value, so both are unbounded and the platform's budget is the one that
-     * applies: on the Workers Paid plan, 10,000 subrequests an invocation,
-     * which fetches and KV operations count against (README, "Workers Plan").
-     */
-    const quota = Quota.initialize({
-      // cache operations, reads and writes alike: QUOTA_CACHE_OPERATIONS
-      ops:    env.QUOTA_CACHE_OPERATIONS ?? Infinity,
-      reads:  env.QUOTA_CACHE_OPERATIONS ?? Infinity,
-      writes: env.QUOTA_CACHE_OPERATIONS ?? Infinity,
-      // subrequests made with fetch(..): QUOTA_SUBREQUESTS
-      subrequests: env.QUOTA_SUBREQUESTS ?? Infinity,
-    });
-    fetch.configure(env, quota);
-    fetch.resetCount();
-    const debug = Debug.MakeLogger([]).configure(env);
-    const flags = Flags.parse(env);
-    const context: Evaluator.Context = {
-      env,
-      debug,
-      flags,
-      waitUntil: work => executionContext?.waitUntil(work),
-    };
+/*
+ * A response as it leaves the worker: with the CORS headers given, where the
+ * router that answered leaves them to the entrypoint, and the security
+ * headers over everything.
+ */
+function secured(response: Response, cors: Record<string, string> = {}): Response {
+  for (const [ name, value ] of Object.entries({ ...cors, ...SECURITY_HEADERS })) {
+    response.headers.set(name, value);
+  }
+  return response;
+}
+
+/*
+ * What a request is evaluated with, whichever router answers it: its context,
+ * the id it is answered under, what it may spend, and every computation the
+ * evaluators of either router evaluate. Each router is handed evaluators of
+ * these typed by the scope its own handlers read.
+ */
+function prepare(env: Env, executionContext?: ExecutionContext) {
+  /*
+   * What one request may spend before the counting fetch and the
+   * computation cache refuse it themselves. No environment sets either
+   * value, so both are unbounded and the platform's budget is the one that
+   * applies: on the Workers Paid plan, 10,000 subrequests an invocation,
+   * which fetches and KV operations count against (README, "Workers Plan").
+   */
+  const quota = Quota.initialize({
+    // cache operations, reads and writes alike: QUOTA_CACHE_OPERATIONS
+    ops:    env.QUOTA_CACHE_OPERATIONS ?? Infinity,
+    reads:  env.QUOTA_CACHE_OPERATIONS ?? Infinity,
+    writes: env.QUOTA_CACHE_OPERATIONS ?? Infinity,
+    // subrequests made with fetch(..): QUOTA_SUBREQUESTS
+    subrequests: env.QUOTA_SUBREQUESTS ?? Infinity,
+  });
+  fetch.configure(env, quota);
+  fetch.resetCount();
+  const debug = Debug.MakeLogger([]).configure(env);
+  const flags = Flags.parse(env);
+  const context: Evaluator.Context = {
+    env,
+    debug,
+    flags,
+    waitUntil: work => executionContext?.waitUntil(work),
+  };
+  return {
+    context,
     /*
      * One id per request, made here: every error answer carries it, and so
      * does the log line written about it, so a client's report leads to the
      * line that explains it.
      */
-    const requestId = crypto.randomUUID();
+    requestId: crypto.randomUUID(),
+    quota,
+    computations: {
+      ...evm.applyIndexBias(
+        Flags.defaults(flags).ethComputationIndexBias,
+        evm
+      ),
+      ...v2,
+      ...comet,
+      ...market,
+      ...account,
+      ...rewards,
+      ...defisaver,
+      ...governance,
+      ...cometRewards,
+      ...sleuthQuery,
+    },
+  };
+}
+
+export default {
+  async fetch(request: Request, env: Env, executionContext?: ExecutionContext): Promise<Response> {
+    const { pathname } = new URL(request.url);
+    /*
+     * The path decides which router answers, here and nowhere else. The
+     * registry answers everything under its prefix, its preflight, its errors
+     * and its CORS headers included — none on an administrative route, whose
+     * authenticated writes no script on any origin may read.
+     */
+    if (isRegistryPath(pathname)) {
+      const { context, requestId, quota, computations } = prepare(env, executionContext);
+      return secured(await routeRegistry(
+        request,
+        { ...context, requestId },
+        Evaluator.preInstantiate(quota, context, computations),
+      ));
+    }
+    /*
+     * Every other path is a legacy route's. Its preflight reads nothing, so
+     * it is answered before anything is set up for it.
+     */
+    if (request.method === 'OPTIONS') {
+      return secured(new Response(null, { status: 204 }), corsHeaders('legacy', { preflight: true }));
+    }
+    const { context, requestId, quota, computations } = prepare(env, executionContext);
     const response = await route(
       request,
       { ...context, requestId },
-      Evaluator.preInstantiate(quota, context, {
-        ...evm.applyIndexBias(
-          Flags.defaults(flags).ethComputationIndexBias,
-          evm
-        ),
-        ...v2,
-        ...comet,
-        ...market,
-        ...account,
-        ...rewards,
-        ...defisaver,
-        ...governance,
-        ...cometRewards,
-        ...sleuthQuery,
-      }),
+      Evaluator.preInstantiate(quota, context, computations),
     );
-    /*
-     * Security headers apply everywhere. CORS headers are set by the router
-     * that answered: a registry path keeps the ones the registry set — none on
-     * an administrative route, whose authenticated writes no script on any
-     * origin may read — and every other path takes the legacy routes' here.
-     */
-    const headers = isRegistryPath(pathname)
-      ? SECURITY_HEADERS
-      : { ...legacyCorsHeaders(), ...SECURITY_HEADERS };
-    for (const [name, value] of Object.entries(headers)) {
-      response.headers.set(name, value);
-    }
-    return response;
+    return secured(response, corsHeaders('legacy'));
   },
 
   /*

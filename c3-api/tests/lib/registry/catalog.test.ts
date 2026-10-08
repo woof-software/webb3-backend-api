@@ -2,7 +2,6 @@ import t from 'tap';
 
 import type * as KnownNetwork from '../../../lib/well-known/networks/network.js';
 import type { Address, MarketV1, NetworkV1, PriceExceptionV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
-import { annotationOf } from '../../../lib/model/comet-registry.js';
 import { exceptionFor } from '../../../lib/computations/comet/asset-price.js';
 import { Comet, ERC20 } from '../../../lib/well-known/contracts/types.js';
 
@@ -150,7 +149,7 @@ t.test('a network this API cannot name is not served', async t => {
  */
 function exceptionOn(catalog: Catalog, network: KnownNetwork.Name, feed: Address): PriceExceptionV1 | null {
   const [ market ] = catalog.marketsOn(network);
-  return exceptionFor(annotationOf(market!.comet), feed);
+  return exceptionFor(market!.comet.registry, feed);
 }
 
 /*

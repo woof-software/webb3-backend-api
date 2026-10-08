@@ -18,9 +18,10 @@ import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-
 /*
  * The registry HTTP API, served by the real worker in workerd over local D1.
  *
- * These tests go through the router the way a client does, so they cover what
- * unit tests of the handlers cannot: the dispatch order against the legacy
- * four-segment matcher, the CORS and security headers the entrypoint adds,
+ * These tests go through the worker the way a client does, so they cover what
+ * unit tests of the handlers cannot: the entrypoint handing registry paths to
+ * the registry router rather than to the legacy four-segment matcher, the
+ * CORS headers the router sets and the security headers the entrypoint adds,
  * authentication, and the error envelope.
  */
 const ADMIN_TOKEN = 'registry-admin-token-for-tests';

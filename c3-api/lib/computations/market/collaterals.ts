@@ -3,6 +3,8 @@ import * as Compute from '../../symbolic/computation.js';
 
 import { BigFixnum } from '../../bigfixnum.js';
 
+import type { RegistryComet } from '../../model/comet-registry.js';
+
 import type {
   AssetInfo,
   AssetPrice,
@@ -30,7 +32,8 @@ type Collateral = {
 type Collaterals = Compute.Spec<{
   name: 'collaterals',
   depends: [ NumAssets, AssetInfo, AssetTotalCollateral, AssetPrice, Symbol ],
-  expects: NumAssets['expects'],
+  // a Comet the registry materialized, whose version states how its collateral is priced
+  expects: Omit<NumAssets['expects'], 'contract'> & { contract: RegistryComet },
   returns: Collateral[],
 }>;
 

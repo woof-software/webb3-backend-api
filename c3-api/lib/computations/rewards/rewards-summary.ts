@@ -6,7 +6,7 @@ import * as Fallible from '../../fallible/fallible.js';
 
 import * as KnownNetwork from '../../well-known/networks/network.js';
 
-import { Contract } from '../../well-known/contracts/utils.js';
+import type { RegistryComet } from '../../model/comet-registry.js';
 
 import type { PriceError } from '../comet/get-price.js';
 
@@ -28,8 +28,9 @@ type RewardsSummary = Compute.Spec<{
     nodeHost: string,
     nodeKey: string,
     block:    Eth.Block,
-    contract: Contract,
+    contract: RegistryComet,
     network:  KnownNetwork.Name,
+    // the feed the version states for the token the market pays
     rewardsTokenPriceFeed: {
       address:  Eth.Address,
       decimals: number,

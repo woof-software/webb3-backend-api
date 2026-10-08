@@ -2,6 +2,8 @@ import t from 'tap';
 
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
+import * as rewards from '../../lib/computations/rewards.js';
+
 import * as marketHandlers from '../../src/market.js';
 import { rewardsSummary as accountRewardsSummary } from '../../src/account-handlers/rewards.js';
 import {
@@ -176,6 +178,35 @@ t.test('the rewards of every market pass on the status of each', async t => {
   t.strictSame(body.find(entry => entry.comet.address.toLowerCase() === WBTC), errorOf(WBTC));
   t.equal(statuses(body)[USDC], 'success');
   t.equal(evaluator.evaluations, 1, 'the markets of a network still share one evaluation');
+});
+
+/*
+ * The rewards summary of a market values its rewards at the feed the version
+ * states for the token it pays, as the rewards of every market do, and is
+ * kept under that feed as the version states it: its address as the registry
+ * stores it, and its scale.
+ */
+t.test('the rewards summary reads the reward feed its version states', async t => {
+  const usdc  = comet(MAINNET, USDC);
+  const feed  = usdc.registry.market.rewardAsset!.priceFeed!;
+  const asked: any[] = [];
+  const evaluator = stubEvaluator((name, context) => {
+    if (name === 'rewardsSummary') {
+      asked.push(context);
+    }
+    return answers([])(name, context);
+  });
+  const response = await marketHandlers.latestRewardsSummary(routeData(MAINNET, usdc), uninstantiated(evaluator));
+
+  t.equal(response.status, 200);
+  t.equal(asked.length, 1, 'one summary is asked for');
+  t.equal(asked[0].rewardsTokenPriceFeed, feed, 'of the feed the version states');
+  t.equal(
+    await rewards.rewardsSummary.key('rewardsSummary-v3', asked[0]),
+    `rewardsSummary-v3:(block:${asked[0].block.number};contract:${usdc.key()};network:${MAINNET};`
+      + `rewardsTokenPriceFeed:(address:${feed.address};decimals:${feed.decimals}))`,
+    'and kept under that feed',
+  );
 });
 
 t.test('the rewards of an account format only the markets that were valued', async t => {

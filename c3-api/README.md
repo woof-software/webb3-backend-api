@@ -176,9 +176,20 @@ subrequests. A `[limits]` section changes them for one Worker, as
 
 Markets, their tokens, and their price feeds come from the registry in
 `APP_DB`, not from the static constants. One activated version answers a
-whole request: the router loads it once, hands the same catalog to every
-computation of that request, and reports which version answered in
-`X-Registry-Version` and `X-Registry-Checksum` on the response.
+whole request: the router that answers it loads the version once, hands the
+same catalog to every computation of that request, and reports which version
+answered in `X-Registry-Version` and `X-Registry-Checksum` on the response.
+
+A computation takes a market in one form: the Comet the catalog materialized
+for it (`RegistryComet`, in
+[lib/model/comet-registry.ts](./lib/model/comet-registry.ts)) — the contract
+shape the static constants used, carrying the version's description of the
+market. Its units, its labels, its reward feed and the price exceptions of
+its network are read from that description, and every computation that
+reads it, or hands its market to one that does, is typed to take nothing
+else. The constants type their Comets for that: one read from them as
+`['Comet'][alias]` does not compile there. What the compiler cannot type —
+a cast, or a name computed at run time — it cannot refuse either.
 
 What that means for the endpoints:
 
@@ -765,14 +776,24 @@ to support the new network.
 
 # Request Routing
 The server accepts requests at the Cloudflare worker
-[entrypoint](./entrypoint.ts). The entrypoint hands every request to a simple
-[router](./src/router.ts) and its handlers: the market routes in
-[./src/market.ts](./src/market.ts), the governance, account, transaction
-history and V2 routes in their directories under `./src`, and the
-registry's own routes in [./src/registry](./src/registry/router.ts). The
-router either fails the request (typically with a 4xx error because the URI
+[entrypoint](./entrypoint.ts), which decides by the path, and nowhere else,
+which of two routers answers a request:
+
+- everything under `/registry/v1` goes to the
+  [registry router](./src/registry/router.ts): the registry's public reads
+  and its administrative routes, with their preflights, their errors and
+  their CORS headers;
+- every other path goes to the legacy [router](./src/router.ts) and its
+  handlers: the market routes in [./src/market.ts](./src/market.ts), and the
+  governance, account, transaction history and V2 routes in their
+  directories under `./src`. The entrypoint answers their preflight itself,
+  and adds their CORS headers.
+
+A router either fails the request (typically with a 4xx error because the URI
 path is malformed), or passes it to a handler, which invokes the symbolic
-computation engine to produce a response.
+computation engine to produce a response. The entrypoint adds the security
+headers to every response, and what each kind of route answers a browser
+with is in [./src/http/cors.ts](./src/http/cors.ts).
 
 Basically:
 `curl /example -> entrypoint -> router -> handler -> Response`.

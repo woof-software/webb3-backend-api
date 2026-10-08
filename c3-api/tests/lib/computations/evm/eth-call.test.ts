@@ -17,6 +17,7 @@ import { getCoder } from '../../../../lib/computations/abi-function.js';
 import type * as jsonRpc from '../../../../lib/json-rpc.js';
 
 import * as mock from '../../../util/mock/mock.js';
+import { fixtureComet } from '../../../util/registry-fixture.js';
 
 import '../../../../shim/node-self.js';
 
@@ -31,7 +32,7 @@ const debug = Debug.MakeLogger([]).configure(process.env);
 const network  = 'ethereum-mainnet' as const;
 const nodeHost = 'node.test';
 const nodeKey  = 'key';
-const contract = Eth.wellKnownContractsByNetwork[network]['Comet']['cUSDCv3'];
+const contract = fixtureComet(network, '0xc3d688b66703497daa19211eedff47f25384cdc3');
 const block    = 21_000_000;
 // getPrice(0xe3a409ed15cd53afdefdd191ad945cec528a2496), a retired wUSDM / USD feed
 const data     = '0x41976e09000000000000000000000000e3a409ed15cd53afdefdd191ad945cec528a2496';

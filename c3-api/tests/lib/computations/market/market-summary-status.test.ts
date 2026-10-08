@@ -1,6 +1,5 @@
 import t from 'tap';
 
-import * as Eth      from '../../../../lib/eth-constants.js';
 import * as Debug    from '../../../../lib/debug-log.js';
 import * as Flags    from '../../../../lib/flags.js';
 import { BigNumber } from '../../../../lib/bignumber.js';
@@ -175,7 +174,8 @@ t.test('a collateral the registry prices is never read', async t => {
  * historical block a Comet may report a feed its market has since moved off,
  * which the version does not describe: that one is read at eight decimals,
  * the only scale Comet takes a price feed at. A contract the registry did not
- * materialize has no version to state either, and is refused.
+ * materialize has no version to state either, and the computation's type
+ * refuses one (tests/lib/registry/consumers.test.ts).
  */
 t.test('a price is read at the scale the version states for its feed', async t => {
   const snapshot = loadRegistrySnapshotFixture();
@@ -207,13 +207,6 @@ t.test('a price is read at the scale the version states for its feed', async t =
   await evaluate(pull1({ assetPrice: { ...context, assetNumber: 1 } }));
   t.strictSame(scales, [ [ DESCRIBED, 18 ], [ RETIRED, 8 ] ],
     'a feed the version describes at its scale, and one it does not at eight decimals');
-
-  const staticComet = Eth.wellKnownContractsByNetwork[network]['Comet']['cUSDTv3'];
-  await t.rejects(
-    evaluate(pull1({ assetPrice: { ...context, contract: staticComet, assetNumber: 0 } })),
-    /is not a Comet the registry materialized/,
-    'and a contract from the constants is refused rather than read at a scale nobody stated',
-  );
 });
 
 /*

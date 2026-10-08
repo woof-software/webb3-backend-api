@@ -7,10 +7,8 @@ import * as Index   from '../../symbolic/index.js';
 import * as Compute from '../../symbolic/computation.js';
 
 import * as KnownNetwork from '../../well-known/networks/network.js';
-import {
-  Comet,
-  StandaloneContract,
-} from '../../well-known/contracts/types.js';
+
+import type { RegistryComet } from '../../model/comet-registry.js';
 
 import * as market            from '../market.js';
 import type * as comet        from '../comet.js';
@@ -32,7 +30,7 @@ type AccountRewards = Compute.Spec<{
     nodeKey: string;
     block: Eth.Block;
     network: KnownNetwork.Name;
-    contract: Eth.Contract<StandaloneContract<Comet>>;
+    contract: RegistryComet;
     account: Eth.Address;
   };
   // a market whose rewards cannot be valued reports only what identifies it

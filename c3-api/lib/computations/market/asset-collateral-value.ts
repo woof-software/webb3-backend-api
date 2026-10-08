@@ -11,8 +11,9 @@ import type {
   PriceExceptionV1,
   PriceFeedV1,
   RegistryAnnotation,
+  RegistryComet,
 } from '../../model/comet-registry.js';
-import { normalizeAddress, registryOf } from '../../model/comet-registry.js';
+import { normalizeAddress } from '../../model/comet-registry.js';
 
 import { exceptionFor } from '../comet/asset-price.js';
 import type { CollateralAssetInfo, CollateralAssetInfoRead } from '../comet/collateral-asset-info.js';
@@ -36,8 +37,6 @@ import type { GetPrice, PriceRead } from '../comet/get-price.js';
  * with a threshold never rounds.
  */
 type PositionFailure = (
-  // the contract is not one the registry describes, or the index is not one of its collaterals
-  | 'not_registry'
   | 'asset_info_reverted'
   // the Comet holds another asset, or prices it with another feed, than the registry says
   | 'asset_mismatch'
@@ -66,7 +65,7 @@ type AssetCollateralValue = Compute.Spec<{
     nodeKey:     string,
     network:     KnownNetwork.Name,
     // a Comet the registry materialized, which carries its market and the exceptions of its network
-    contract:    Eth.Contract,
+    contract:    RegistryComet,
     assetIndex:  number,
     blockNumber: Eth.BlockNumber,
   },
@@ -153,10 +152,11 @@ const { implement, join, pull1, value } = Compute.Functor<AssetCollateralValue>(
 const assetCollateralValue = implement({
   version: 1,
   compute({ apiHost, nodeHost, nodeKey, network, contract, assetIndex, blockNumber }) {
-    const annotation = registryOf(contract);
-    const position   = annotation?.market.collateralAssets.find(asset => asset.assetIndex === assetIndex);
-    if (annotation === null || position === undefined) {
-      return failed('not_registry');
+    const annotation = contract.registry;
+    // the token list values the positions its market's collateral names, and no other
+    const position   = annotation.market.collateralAssets.find(asset => asset.assetIndex === assetIndex);
+    if (position === undefined) {
+      throw new Error(`invariant violated: ${contract.address} has no collateral at index ${assetIndex}`);
     }
 
     const market = annotation.market;

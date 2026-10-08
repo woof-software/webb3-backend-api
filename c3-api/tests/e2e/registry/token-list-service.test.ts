@@ -15,10 +15,10 @@ import '../../../shim/node-self.js';
 
 /*
  * The token list through the whole worker, in the order production runs it:
- * the entrypoint and the computations it registers, the router's batching
- * evaluator, the per-minute valuation, the policies in D1, the rule and the
- * body. The node is a fake behind the node proxy's service binding, so every
- * value is one the test chose, and asserted to the digit.
+ * the entrypoint and the computations it registers, the registry router's
+ * batching evaluator, the per-minute valuation, the policies in D1, the rule
+ * and the body. The node is a fake behind the node proxy's service binding, so
+ * every value is one the test chose, and asserted to the digit.
  */
 const fixture = loadRegistrySnapshotFixture();
 const LATEST  = { number: 23_500_000, timestamp: 1_791_204_930 };
@@ -211,6 +211,66 @@ t.test('an answer from a version the database could not confirm is not stored', 
   t.equal(list.registryVersion.id, registry.versionId);
   t.equal(bySymbol(list).get('WETH')!.collateralValueUsd, '500000', 'the values are still the current minute\'s');
   t.ok(errors.some(line => line.includes('registry database unreachable; answering from the version it last named')), 'and the fallback is logged');
+});
+
+// the security headers every response carries, which tests/e2e/security-headers.test.ts holds to
+const SECURITY_HEADERS = new Set([
+  'strict-transport-security', 'content-security-policy', 'x-content-type-options',
+  'x-frame-options', 'referrer-policy', 'cross-origin-resource-policy',
+]);
+
+// what a response says beyond them
+const headersOf = (response: Response) => Object.fromEntries([ ...response.headers ].filter(([ name ]) => !SECURITY_HEADERS.has(name)));
+
+/*
+ * Whichever way the token list answers, it carries the CORS headers of a
+ * public registry read, and once it has read a version it names that version:
+ * a refusal after the version was read names it as an answer does, and says
+ * so when the database could not confirm it, while a refusal before any
+ * version was read names none.
+ */
+t.test('every answer of the token list names the version it read, and only that', async t => {
+  const { registry, env } = await workerOf(t, BASE_NODE);
+  captureErrors(t);
+  const answer = async (method: string, chainAndQuery: string, db: D1Database = registry.db) => {
+    const response = await C3Api.fetch(
+      new Request(`https://api.test.local/registry/v1/networks/${chainAndQuery}`, { method }),
+      { ...env, APP_DB: db },
+    );
+    return { status: response.status, headers: headersOf(response) };
+  };
+  const readable = {
+    'access-control-allow-origin':   '*',
+    'access-control-expose-headers': 'ETag, X-Registry-Version, X-Registry-Checksum, X-Registry-Stale',
+  };
+  const json    = { 'content-type': 'application/json; charset=utf-8' };
+  const version = { 'x-registry-version': registry.versionId, 'x-registry-checksum': fixture.registryVersion.checksum };
+  const tokens  = `${BASE}/tokens`;
+
+  t.same(await answer('GET', tokens), { status: 200, headers: { ...readable, ...json, 'cache-control': 'public, max-age=30', ...version } },
+    'a list names the version it was made from, and is kept briefly');
+  t.same(await answer('GET', '10/tokens'), { status: 404, headers: { ...readable, ...json, ...version } },
+    'a chain the version does not hold is refused under that version');
+  t.same(await answer('GET', tokens, unreachableFor(registry.db, /FROM token_policies WHERE chain_id/)),
+    { status: 503, headers: { ...readable, ...json, ...version } },
+    'and so is a list whose policies could not be read after the version was');
+  t.same(await answer('GET', `${tokens}?visibleOnly=yes`), { status: 400, headers: { ...readable, ...json } },
+    'while a request refused before any version was read names none');
+  t.same(await answer('OPTIONS', tokens), {
+    status:  204,
+    headers: {
+      ...readable,
+      'access-control-allow-methods': 'GET, OPTIONS',
+      'access-control-allow-headers': 'Content-Type, If-None-Match',
+      'access-control-max-age':       '86400',
+    },
+  }, 'and its preflight is the public registry preflight');
+
+  const stale = await answer('GET', tokens, unreachableFor(registry.db, /FROM registry_state|FROM token_policies WHERE chain_id/));
+  const { 'x-registry-stale': age, ...rest } = stale.headers;
+  t.match(age, /^[0-9]+$/, 'a refusal under a version the database could not confirm says how old it is');
+  t.same({ status: stale.status, headers: rest }, { status: 503, headers: { ...readable, ...json, ...version, 'cache-control': 'no-store' } },
+    'and that nothing may keep it');
 });
 
 const FIXED   = '0x351a133fd850ea81ed8a782016e308acbaddec91';

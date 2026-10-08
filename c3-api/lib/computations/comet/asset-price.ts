@@ -1,8 +1,7 @@
 import { BigFixnum } from '../../bigfixnum.js';
 import * as Compute  from '../../symbolic/computation.js';
 
-import type { Address, PriceExceptionV1, RegistryAnnotation } from '../../model/comet-registry.js';
-import { annotationOf } from '../../model/comet-registry.js';
+import type { Address, PriceExceptionV1, RegistryAnnotation, RegistryComet } from '../../model/comet-registry.js';
 
 import type { AssetInfo } from './asset-info.js';
 import type { GetPrice, PriceRead } from './get-price.js';
@@ -14,7 +13,8 @@ import type { GetPrice, PriceRead } from './get-price.js';
 type AssetPrice = Compute.Spec<{
   name: 'assetPrice',
   depends: [ AssetInfo, GetPrice ],
-  expects: AssetInfo['expects'],
+  // a Comet the registry materialized, whose version states how each of its feeds is priced
+  expects: Omit<AssetInfo['expects'], 'contract'> & { contract: RegistryComet },
   returns: PriceRead,
 }>;
 
@@ -62,7 +62,7 @@ const assetPrice = implement({
   compute: ({ apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network }) => pipe1([
     { assetInfo: { apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network } },
     ({ priceFeed }) => {
-      const annotation = annotationOf(contract);
+      const annotation = contract.registry;
       const exception  = exceptionFor(annotation, priceFeed);
 
       if (exception !== null) {

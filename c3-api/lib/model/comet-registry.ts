@@ -711,35 +711,19 @@ type RegistryAnnotation = {
   priceExceptions: PriceExceptionV1[],
 };
 
-// a Comet as the catalog materializes it: the contract shape, and the registry's description of it
+/*
+ * A Comet as the catalog materializes it: the contract shape, and the
+ * registry's description of it.
+ *
+ * It is the only kind of market a computation takes. The routes resolve every
+ * market through the request's catalog, so a computation reads one kind of
+ * Comet, and the compiler refuses it a Comet of the static constants, the
+ * ones governance still decodes proposals against: those describe none of
+ * what a computation reads here. The refusal rests on the constants typing
+ * their Comets (WellKnownContractsByNetworkAddress); a cast, or a read the
+ * compiler cannot type, is not refused.
+ */
 type RegistryComet = Contract<StandaloneContract<Comet>> & { registry: RegistryAnnotation };
-
-/*
- * The registry description behind a contract, or null for one that came from
- * the static constants, which governance still decodes proposals against.
- * This is the one place that tells the two apart.
- */
-function registryOf(contract: unknown): RegistryAnnotation | null {
-  const annotation = (contract as { registry?: unknown } | null)?.registry;
-  return typeof(annotation) === 'object' && annotation !== null && 'digest' in annotation
-    ? annotation as RegistryAnnotation
-    : null;
-}
-
-/*
- * The registry description of a Comet a computation is handed. The routes
- * hand the computations only Comets the request's catalog materialized, so a
- * computation has one kind of market to read: one without a description is a
- * caller's mistake, refused as one rather than computed as if the registry
- * had said nothing about it.
- */
-function annotationOf(contract: { address: string }): RegistryAnnotation {
-  const annotation = registryOf(contract);
-  if (annotation === null) {
-    throw new Error(`invariant violated: ${contract.address} is not a Comet the registry materialized`);
-  }
-  return annotation;
-}
 
 export type {
   ActivationAction,
@@ -830,6 +814,4 @@ export {
   marketKey,
   normalizeAddress,
   parseMarketKey,
-  annotationOf,
-  registryOf,
 };

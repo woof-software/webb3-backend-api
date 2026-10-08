@@ -11,19 +11,18 @@ import * as governanceHandlers        from './governance-handlers/handlers.js';
 import * as transactionHistoryHandler from './transaction-history-handler/transaction-history-items-handler.js';
 
 import type { Contract } from '../lib/well-known/contracts/types.js';
+import type { RegistryComet } from '../lib/model/comet-registry.js';
 
 import { ApiError, failureResponse, isApiError } from './http/errors.js';
 import { refuseTestnet, refuseTestnetsParameter } from './testnets.js';
 import type { Catalog } from './registry/catalog.js';
 import {
   RequestCatalog,
-  catalogHeaders,
+  catalogHeadersOf,
   isRegistryUnavailable,
   requestCatalog,
   unavailableError,
 } from './registry/request-catalog.js';
-import { routeRegistry } from './registry/router.js';
-import type * as tokenCollateral from './registry/token-collateral.js';
 
 import type * as Evaluator from './evaluator.js';
 
@@ -37,7 +36,6 @@ type Scope = (
   | accountHandlers.Dependencies
   | governanceHandlers.Dependencies
   | transactionHistoryHandler.Dependencies
-  | tokenCollateral.Dependencies
 );
 
 /*
@@ -88,7 +86,8 @@ interface MarketRouteData {
   nodeHost: string;
   nodeKey: string;
   network: KnownNetwork.Name | typeof AllNetworks;
-  contract: Contract | typeof AllContracts;
+  // a market the version materialized, or every market it serves
+  contract: RegistryComet | typeof AllContracts;
   queryParams: URL['searchParams'];
   // the one registry version that answers this request
   catalog: Catalog;
@@ -163,6 +162,10 @@ const handlerMappings = {
 type ResourceAPI = keyof typeof handlerMappings;
 type ResourceEndpoint<API extends ResourceAPI> = keyof typeof handlerMappings[API];
 
+/*
+ * The legacy routes: every path but the registry's, which the entrypoint
+ * hands to the registry router instead (src/registry/router.ts).
+ */
 async function route(
   request: Request,
   context: Omit<Context, 'evaluator'>,
@@ -201,17 +204,10 @@ async function route(
     }
   };
 
-  /*
-   * Whatever the outcome, a response that was computed against a version says
-   * which one. That holds for a failure too: an error a client reports is
-   * only diagnosable if it says what it was computed against.
-   */
+  // whatever the outcome, a response that was computed against a version says which one
   const response = await answer();
-  const catalog  = registry.loaded();
-  if (catalog !== null) {
-    for (const [ name, value ] of Object.entries(catalogHeaders(catalog, registry.staleFor()))) {
-      response.headers.set(name, value);
-    }
+  for (const [ name, value ] of Object.entries(catalogHeadersOf(registry))) {
+    response.headers.set(name, value);
   }
   return response;
 }
@@ -225,30 +221,6 @@ async function unsafeRoute(
 ): Promise<Response> {
   const url = new URL(request.url);
   let route = url.pathname;
-
-  /*
-   * The registry answers its own routes, including their errors and CORS.
-   * It is dispatched before the four-segment matcher below, which would
-   * otherwise claim paths such as /registry/v1/networks/1/markets.
-   */
-  const registryResponse = await routeRegistry(request, context.env, {
-    debug:     context.debug,
-    requestId: context.requestId,
-    registry,
-    waitUntil: context.waitUntil ?? (() => {}),
-    /*
-     * Every collateral read of a chain in one batch, as the market summaries
-     * read theirs. The evaluator of the router's whole scope evaluates the
-     * token list's part of it; the types cannot see that a wider scope serves
-     * a narrower one, so the narrowing is stated here, once.
-     */
-    evaluator: networkEnv => instantiateEvaluator(networkEnv, {
-      flags: { ...context.flags, batchingEnabled: true, evaluatorAlgorithm: 'workingset' },
-    }) as unknown as Evaluator.Implementation<tokenCollateral.Dependencies>,
-  });
-  if (registryResponse !== null) {
-    return registryResponse;
-  }
 
   // A URL path is generally split into 4 major parts:
   // 1. the resource API, e.g. 'market' or 'governance'
@@ -451,17 +423,47 @@ async function unsafeRoute(
    * The two resolve differently because they answer different questions: a
    * market is whatever the activated version says is a market, while the
    * governors, COMP, and the V2 contracts are part of the protocol this API
-   * is built against and do not change with an import.
+   * is built against and do not change with an import. So a market route is
+   * handed a Comet the version materialized, and never a contract of the
+   * constants.
    */
-  const catalog = resourceApi === 'market' ? await registry.load() : null;
+  if (resourceApi === 'market') {
+    const catalog  = await registry.load();
+    // If we specify all networks, we must also be querying all contracts
+    const contract = contractSpecifier === AllContracts || networkAlias === AllNetworks
+      ? AllContracts
+      : catalog.marketAt(networkAlias, contractSpecifier as Eth.Address)?.comet ?? null;
+    if (contract === null) {
+      return new Response(`Error: Contract address not known`, { status: 400 });
+    }
+    if (!isValidMarketEndpointSuffix(strippedEndpointSuffix)) {
+      return new Response(`Error: Not a valid market API endpoint`, { status: 400 });
+    }
+    const data: MarketRouteData = {
+      apiHost: context.env.V3_API_HOST,
+      nodeHost: context.env.NODE_PROXY_HOST,
+      nodeKey: context.env.NODE_PROXY_KEY,
+      network: networkAlias,
+      contract,
+      queryParams: url.searchParams,
+      catalog,
+    };
+    if (false
+      || strippedEndpointSuffix === 'rewards/dapp-data'
+      || strippedEndpointSuffix === 'rewards/summary'
+      || strippedEndpointSuffix === 'summary'
+    ) {
+      const handler = handlerMappings[resourceApi][strippedEndpointSuffix];
+      return handler(data, { ...context, instantiateEvaluator });
+    }
+    const handler = handlerMappings[resourceApi][strippedEndpointSuffix];
+    return handler(data, { ...context, evaluator: instantiateEvaluator(networkEnvironment) });
+  }
+
   const maybeWellKnownContract = (() => {
     // If we specify all networks, we must also be querying all contracts
     if (contractSpecifier === AllContracts || networkAlias === AllNetworks) {
       return AllContracts;
-    }
-    if (catalog !== null) {
-      return catalog.marketAt(networkAlias, contractSpecifier as Eth.Address)?.comet
-          ?? Fallible.Outcome.Of.Failure('no such market in the active registry');
     }
     if (contractSpecifier === DefaultCompContract) {
       return (Eth.wellKnownContractsByNetwork[networkAlias] as any)['COMP']['default'];
@@ -476,74 +478,26 @@ async function unsafeRoute(
     return new Response(`Error: Contract address not known`, { status: 400 });
   }
 
-  if (resourceApi === 'market') {
-    if (true
-      && maybeWellKnownContract
-      && isValidMarketEndpointSuffix(strippedEndpointSuffix)
-    ) {
-      if (false
-        || strippedEndpointSuffix === 'rewards/dapp-data'
-        || strippedEndpointSuffix === 'rewards/summary'
-        || strippedEndpointSuffix === 'summary'
-      ) {
-        const handler = handlerMappings[resourceApi][strippedEndpointSuffix];
-        return handler(
-          {
-            apiHost: context.env.V3_API_HOST,
-            nodeHost: context.env.NODE_PROXY_HOST,
-            nodeKey: context.env.NODE_PROXY_KEY,
-            network: networkAlias,
-            contract: maybeWellKnownContract,
-            queryParams: url.searchParams,
-            catalog: catalog!,
-          },
-          {
-            ...context,
-            instantiateEvaluator,
-          },
-        );
-      }
-      const handler = handlerMappings[resourceApi][strippedEndpointSuffix];
-      return handler(
-        {
-          apiHost: context.env.V3_API_HOST,
-          nodeHost: context.env.NODE_PROXY_HOST,
-          nodeKey: context.env.NODE_PROXY_KEY,
-          network: networkAlias,
-          contract: maybeWellKnownContract,
-          queryParams: url.searchParams,
-          catalog: catalog!,
-        },
-        {
-          ...context,
-          evaluator: instantiateEvaluator(networkEnvironment),
-        }
-      );
-    }
-    return new Response(`Error: Not a valid market API endpoint`, { status: 400 });
+  if (!(networkAlias.startsWith('ethereum'))) {
+    return new Response(`Error: Must choose either Ethereum mainnet for governance`, { status: 400 });
   }
-  else {
-    if (!(networkAlias.startsWith('ethereum'))) {
-      return new Response(`Error: Must choose either Ethereum mainnet for governance`, { status: 400 });
-    }
-    // Resource API is 'governance' (enforced by typing).
-    if (isValidGovernanceEndpointSuffix(strippedEndpointSuffix)) {
-      const handler = handlerMappings[resourceApi][strippedEndpointSuffix];
-      return handler({
-        apiHost: context.env.V3_API_HOST,
-        nodeHost: context.env.NODE_PROXY_HOST,
-        nodeKey: context.env.NODE_PROXY_KEY,
-        network: networkAlias as Extract<KnownNetwork.Name, `ethereum-${'mainnet'}`>,
-        contract: maybeWellKnownContract,
-        queryParams: url.searchParams,
-        registry,
-      }, {
-        ...context,
-        evaluator: instantiateEvaluator(networkEnvironment),
-      });
-    }
-    return new Response(`Error: Not a valid governance API endpoint`, { status: 400 });
+  // Resource API is 'governance' (enforced by typing).
+  if (isValidGovernanceEndpointSuffix(strippedEndpointSuffix)) {
+    const handler = handlerMappings[resourceApi][strippedEndpointSuffix];
+    return handler({
+      apiHost: context.env.V3_API_HOST,
+      nodeHost: context.env.NODE_PROXY_HOST,
+      nodeKey: context.env.NODE_PROXY_KEY,
+      network: networkAlias as Extract<KnownNetwork.Name, `ethereum-${'mainnet'}`>,
+      contract: maybeWellKnownContract,
+      queryParams: url.searchParams,
+      registry,
+    }, {
+      ...context,
+      evaluator: instantiateEvaluator(networkEnvironment),
+    });
   }
+  return new Response(`Error: Not a valid governance API endpoint`, { status: 400 });
 }
 
 function isValidResourceAPI(apiRoute: string): apiRoute is ResourceAPI {

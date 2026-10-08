@@ -1,5 +1,5 @@
 /*
- * Route-aware CORS, decided here for every route of the worker.
+ * CORS, decided here for every route of the worker, by the kind of route.
  *
  * The legacy routes answer every origin, and the public registry reads are
  * the same kind of public data, so they keep that. The administrative routes
@@ -8,10 +8,11 @@
  * at all, which is what keeps a cross-origin script from reading a response
  * even if it manages to send the request.
  *
- * Each response takes them from one place: the registry router sets them on
- * a registry path, and the entrypoint on every other path. Neither sets the
- * other's, so what this module says for a route is what the route answers
- * with.
+ * Which kind a path is, the router that owns it says: the entrypoint hands a
+ * path to the registry router or to the legacy one, and the registry router
+ * tells its administrative routes from its public ones. Each response takes
+ * its headers from the router that answered it, and neither sets the other's,
+ * so what this module says for a kind of route is what the route answers with.
  */
 /*
  * The version headers are the contract a browser client reads: which version
@@ -44,29 +45,25 @@ const LEGACY_PREFLIGHT: Record<string, string> = {
   'Access-Control-Allow-Methods': 'GET',
 };
 
-function isAdminRoute(pathname: string): boolean {
-  return pathname.startsWith('/registry/v1/admin');
-}
+// the kinds of route that answer a browser differently
+type CorsRoute = 'legacy' | 'public' | 'admin';
 
 /*
- * The CORS headers a response on this registry path may carry. An
- * administrative path yields none, and the caller must not add any.
- */
-function corsHeadersFor(pathname: string, { preflight = false }: { preflight?: boolean } = {}): Record<string, string> {
-  if (isAdminRoute(pathname)) {
-    return {};
-  }
-  return preflight ? { ...PUBLIC_PREFLIGHT } : { ...PUBLIC_CORS };
-}
-
-/*
- * The CORS headers of a legacy route. They are the public registry reads'
- * own: a legacy route that resolves a market names the version it was
+ * What each kind answers with. A legacy route's are the public registry
+ * reads' own: a legacy route that resolves a market names the version it was
  * computed from in the same headers, and a browser has to be able to read
- * them there too.
+ * them there too. An administrative route answers none, to a preflight as to
+ * anything else, and the caller must not add any.
  */
-function legacyCorsHeaders({ preflight = false }: { preflight?: boolean } = {}): Record<string, string> {
-  return preflight ? { ...LEGACY_PREFLIGHT } : { ...PUBLIC_CORS };
+const CORS: Record<CorsRoute, { response: Record<string, string>, preflight: Record<string, string> }> = {
+  legacy: { response: PUBLIC_CORS, preflight: LEGACY_PREFLIGHT },
+  public: { response: PUBLIC_CORS, preflight: PUBLIC_PREFLIGHT },
+  admin:  { response: {},          preflight: {} },
+};
+
+function corsHeaders(route: CorsRoute, { preflight = false }: { preflight?: boolean } = {}): Record<string, string> {
+  return { ...CORS[route][preflight ? 'preflight' : 'response'] };
 }
 
-export { corsHeadersFor, isAdminRoute, legacyCorsHeaders };
+export type { CorsRoute };
+export { corsHeaders };
