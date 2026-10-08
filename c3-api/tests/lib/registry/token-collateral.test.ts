@@ -30,6 +30,9 @@ import {
   tokenValue,
 } from '../../../src/registry/token-collateral.js';
 
+import { legacyDecisionsOf } from '../../../src/registry/legacy-collaterals.js';
+import { tokenList } from '../../../src/registry/token-visibility.js';
+
 import { FakeNode, NodeScript, batches, blockReads, fakeNode } from '../../util/fake-node.js';
 import { MemoryKv } from '../../util/kv.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
@@ -242,6 +245,66 @@ t.test('a token held in several markets is the sum of its positions, each in its
   t.ok(wstEth.valueUsd!.eq(BigFixnum.from({ value: 590_000 })), 'wstETH is 100 × 4000 + 50 × 1.2 × 2500 + 10 × 4000, exactly');
   const usdc = tokenValue(USDC, view, mainnet, THRESHOLD, NOW);
   t.ok(usdc.valueUsd!.eq(BigFixnum.from({ value: 2_000 })), 'USDC is 1000 × 0.0004 × 2500 + 1000 × 0.00001 × 100000');
+});
+
+/*
+ * Governance delisted wUSDM in the USDT market and pumpBTC in the WBTC market
+ * by moving both onto a "Constant price feed" that answers 1 at 8 decimals,
+ * 10^-8 USD, and zeroing their caps (TOK-0 audit §6, trap 1). A version
+ * imported since describes that feed, and the token list reads it like any
+ * other: the network's seeded exceptions name the feeds the two had before,
+ * which neither Comet reads any more, and are not applied. The list says so
+ * — a fresh value, no exception, below the threshold — rather than calling
+ * either an exception or a value it could not read.
+ */
+t.test('a delisted collateral is valued through the constant feed its Comet now reads', async t => {
+  const CONSTANT = '0x7badab7109afbbf48ecd8d6498caacd2630b45b9';
+  const WUSDM    = '0x57f5e098cad7a3d1eed53991d4d66c45c9af7812';
+  const PUMPBTC  = '0xf469fbd2abcd6b9de8e169d128226c0fc90a012e';
+  const BTC_USD  = '0xf4030086522a5beea4988f8ca5b36dbc97bee88c';
+  const [ cUSDT, cWBTC ] = [ '0x3afdc9bca9213a35503b077a6072f3d0d5ab0840', '0xe85dc543813b8c2cfeaac371517b925a166a9293' ];
+  const held: Record<string, string> = {
+    [`${cUSDT}:${WUSDM}`]:   (1_000_000n * 10n ** 18n).toString(),
+    [`${cWBTC}:${PUMPBTC}`]: (30n * 10n ** 8n).toString(),
+  };
+  const described = (deploymentKey: string, symbol: string) => snapshot.networks.find(network => network.chainId === 1)!.markets
+    .find(entry => entry.deploymentKey === deploymentKey)!.collateralAssets.find(asset => asset.token.symbol === symbol)!.priceFeed.address;
+  t.same([ described('usdt', 'wUSDM'), described('wbtc', 'pumpBTC') ], [ CONSTANT, CONSTANT ], 'the version describes the constant feed for both');
+
+  const node = nodeOf({
+    answer: read => read.name === 'totalsCollateral' ? (held[`${read.comet}:${read.argument}`] === undefined ? undefined : [ held[`${read.comet}:${read.argument}`] ])
+      : read.name === 'getPrice' && read.argument === CONSTANT ? [ '1' ]
+      : read.name === 'getPrice' && read.argument === BTC_USD ? [ (100_000n * 10n ** 8n).toString() ]
+      : undefined,
+  });
+  useNode(t, node);
+  captureEvents(t);
+  const view = await collateralView(depsOf(countedKv().kv), chain1);
+  const list = tokenList({
+    registryVersion: { id: versionId, checksum: snapshot.registryVersion.checksum },
+    chainId:   1,
+    catalog,
+    network:   'ethereum-mainnet',
+    positions: mainnet,
+    view,
+    strategic: new Set(),
+    legacy:    legacyDecisionsOf([]),
+    now:       NOW,
+  });
+  const entry = (address: string) => list.tokens.find(token => token.address === address)!;
+
+  t.match(entry(WUSDM), {
+    collateralValueUsd: '0.01', collateralValueStatus: 'fresh', exceptions: [], isVisible: false, visibilityReason: 'below_threshold',
+  }, 'a million wUSDM at 10^-8 USD each');
+  t.match(entry(PUMPBTC), {
+    collateralValueUsd: '0.03', collateralValueStatus: 'fresh', exceptions: [], isVisible: false, visibilityReason: 'below_threshold',
+  }, 'thirty pumpBTC at 10^-8 BTC each, at 100000 USD per BTC');
+  const feedsAsked = batches(node).flatMap(request => request.calls)
+    .filter(call => call.method === 'eth_call' && call.params[0].data.startsWith('0x41976e09'))
+    .map(call => `0x${call.params[0].data.slice(-40)}`);
+  t.ok(feedsAsked.includes(CONSTANT), 'the constant feed is read');
+  t.notOk(feedsAsked.some(feed => [ '0xe3a409ed15cd53afdefdd191ad945cec528a2496', '0x351a133fd850ea81ed8a782016e308acbaddec91' ].includes(feed)),
+    'and neither feed an exception names');
 });
 
 t.test('one call the node refuses costs only its own position', async t => {

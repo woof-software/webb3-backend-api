@@ -89,9 +89,13 @@ function administersMarkets(network: KnownNetwork.Name, address: Eth.Address): b
  * targets are all statically known, and which bridges nothing, never reads
  * D1 at all. A target neither source knows — a grant recipient, another
  * protocol — would read the same described again, so it is not. If the
- * registry cannot be loaded, the actions keep the description they already
- * have, which is what they read as before the registry existed, rather than
- * failing the whole proposal list.
+ * registry cannot be loaded, the actions that configure a market or bridge
+ * are described again against the constants alone, which is what they read
+ * as before the registry existed, rather than failing the whole proposal
+ * list. Either way this build describes them: the proposal list caches each
+ * description as the build that computed it gave it, and is not computed
+ * again when a description changes, since that would read every governor's
+ * logs again from its creation.
  */
 async function describeRegistryTargets(
   proposals: governanceModel.proposal.Proposal[],
@@ -112,16 +116,18 @@ async function describeRegistryTargets(
     catalog = await registry.load();
   } catch (error) {
     debug?.error(`proposal targets not described from the registry`, { error });
-    return;
+    catalog = null;
   }
 
-  const described = new Set([ ...unknown ].filter(target => (
+  const described = catalog === null ? new Set<Eth.Address>() : new Set([ ...unknown ].filter(target => (
     catalog.marketAt(network, target) !== null || catalog.tokenAt(network, target) !== null
   )));
   if (described.size === 0 && !more) {
     return;
   }
-  const contracts = withRegistryContracts(Eth.wellKnownContractsByNetwork, catalog.markets());
+  const contracts = catalog === null
+    ? Eth.wellKnownContractsByNetwork
+    : withRegistryContracts(Eth.wellKnownContractsByNetwork, catalog.markets());
 
   for (const proposal of proposals) {
     for (const action of proposal.actions) {

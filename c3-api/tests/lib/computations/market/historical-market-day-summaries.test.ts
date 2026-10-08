@@ -53,7 +53,7 @@ testDebug.log({ flags });
  * what it read on the way (the cache seed). Both live in R2, outside the
  * repository, in one place every branch shares, while the result changes
  * with the computation: since version 6 a day summary reports the status of
- * its price reads.
+ * its price reads, and since version 7 it carries its totals in USD too.
  *
  * So they are named by the SHA-256 of the expectation, which this test pins,
  * as the all-networks historical summary pins its own. Regenerating them
@@ -164,14 +164,14 @@ t.test(`historical-market-day-summaries@startBlock:${startBlock.number}`, async 
   ));
   const cachedKeys1 = Object.keys(cache.store);
   const expectedKeys = enumerated.flatMap(({ contract, network, block }) => [
-    `marketSummary-v6:(block:${block.number};`
+    `marketSummary-v7:(block:${block.number};`
       + `contract:${contract.key()};network:${network})`,
-    `marketDaySummary-v6:(contract:${contract.key()};`
+    `marketDaySummary-v7:(contract:${contract.key()};`
       + `date:${Eth.Timestamp.toDateString(Eth.estimateBlockTimestamp(network, block))};`
       + `network:${network})`,
   ])
   .concat([
-    `historicalMarketDaySummaries-v6:(contract:${contract.key()};`
+    `historicalMarketDaySummaries-v7:(contract:${contract.key()};`
       + `daysBack:30;`
       + `network:${network};`
       + `startDate:${Eth.Timestamp.toDateString(startBlock.timestamp)})`,

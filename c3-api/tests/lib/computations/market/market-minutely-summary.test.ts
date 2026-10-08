@@ -94,6 +94,10 @@ t.test(`market-minutely-summary@block:16380543`, async (t) => {
     totalBorrowValue: "85029209.375671",
     totalSupplyValue: "152956822.280687",
     totalCollateralValue: "198600936.76810451139983159362475978",
+    // cUSDCv3 is quoted in USD, so its totals in USD are the quoted ones
+    totalBorrowValueUsd: "85029209.375671",
+    totalSupplyValueUsd: "152956822.280687",
+    totalCollateralValueUsd: "198600936.76810451139983159362475978",
     utilization: "555903304895608716",
     baseUsdPrice: "1.0",
     collateralAssetSymbols: ["COMP", "WBTC", "WETH", "UNI", "LINK"],
@@ -111,7 +115,7 @@ t.test(`market-minutely-summary@block:16380543`, async (t) => {
    */
   const cachedKeys1 = Object.keys(cache.store);
   const expectedKeys = [
-    `marketSummary-v6:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`,
+    `marketSummary-v7:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`,
   ];
   for (const key of expectedKeys) {
     const similar = cachedKeys1.find(k => k.startsWith(key));

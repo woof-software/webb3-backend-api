@@ -32,8 +32,8 @@ const {
 } = Compute.Functor<HistoricalMarketDaySummaries>({});
 
 const historicalMarketDaySummaries = implement({
-  // 6: summaries report the status of their price reads
-  version: 6,
+  // 7: summaries carry their totals in USD, and their collateral and base feed as the registry version describes them
+  version: 7,
   index: Index.Everything,
   /*
    * Key computation by materialized date for startBlock's

@@ -33,6 +33,7 @@ import {
 import { wellKnownENSHashes } from '../ens-hashes.js';
 
 import type { ResolvedMarket } from '../../model/registry-lookup.js';
+import { feedContract, tokenContract } from '../../model/registry-contracts.js';
 
 export {
   Contract,
@@ -435,8 +436,12 @@ function describeContractCallForHumans(
       const marketAddress = formatContractAddress(functionValues[0]);
       const asset = functionValues[1];
       const assetAddress = asset[0];
-      const assetContract = lookupContract(assetAddress);
-      const assetDecimals = TokenLike.is(assetContract) && assetContract.decimals || 18;
+      /*
+       * The cap is in the asset's own units, at the scale the configuration
+       * states beside it: a Comet takes no asset whose token reports another,
+       * and the asset is new to the market, so neither the constants nor the
+       * registry need know it yet.
+       */
       const assetConfig = `{
         **asset**: ${formatContractAddress(assetAddress)},
         **priceFeed**: ${formatContractAddress(asset[1])},
@@ -444,7 +449,7 @@ function describeContractCallForHumans(
         **borrowCollateralFactor**: ${round2(toWei(asset[3]))},
         **liquidateCollateralFactor**: ${round2(toWei(asset[4]))},
         **liquidationFactor**: ${round2(toWei(asset[5]))},
-        **supplyCap**: ${round2(toTokenBase(asset[6], assetDecimals))}
+        **supplyCap**: ${round2(toTokenBase(asset[6], asset[2]))}
       }`;
       return { title: `Add new asset to market ${marketAddress} with asset configuration: ${assetConfig}` };
     }
@@ -716,6 +721,12 @@ function describeContractCallForHumans(
     }
     if (functionName == 'updateAssetSupplyCap' && Eth.parseAddress(functionValues[0]) && Eth.parseAddress(functionValues[1]) && BigNumber.isBigNumber(functionValues[2])) {
       const [cometAddress, assetAddress, supplyCap] = functionValues;
+      /*
+       * The call states no scale, so the cap is read at the asset's as the
+       * constants or the registry version know it, and at 18 decimals for an
+       * asset neither knows: one added to the market since the version was
+       * imported, until a version describes it.
+       */
       const assetContract = lookupContract(assetAddress);
       const assetDecimals = TokenLike.is(assetContract) && assetContract.decimals || 18;
       const formattedSupplyCap = round2(toTokenBase(supplyCap, assetDecimals));
@@ -973,15 +984,17 @@ function getNetworkIfCrossChain({ network, target, signature }: {
 }
 
 /*
- * The static contracts of one network, with the markets and tokens of a
- * registry version merged in.
+ * The static contracts of one network, with the markets, tokens and price
+ * feeds of a registry version merged in.
  *
  * Governance decodes proposal action targets against the contracts this API
  * knows by name. The protocol's own contracts — governors, COMP, V2, the
- * bridges — are static and stay static; markets and their tokens come from
- * the activated version, so a proposal that configures a market added after
- * this Worker was built still reads as something rather than as a bare
- * address. A target neither source knows keeps its address, as before.
+ * bridges — are static and stay static; markets, every token they name and
+ * every feed they read come from the activated version, so a proposal that
+ * configures a market or a collateral added after this Worker was built
+ * still reads as something rather than as a bare address, and a cap or an
+ * amount of a token is written at the scale its token has. A target neither
+ * source knows keeps its address, as before.
  */
 function withRegistryContracts(
   wellKnownContracts: WellKnownContractsByNetworkAddress,
@@ -992,15 +1005,41 @@ function withRegistryContracts(
   }
   const merged = new Map<KnownNetwork.Name, Record<string, Contract>>();
 
-  for (const { comet } of markets) {
+  for (const { market, comet } of markets) {
     const contracts = merged.get(comet.network) ?? { ...wellKnownContracts[comet.network] };
     merged.set(comet.network, contracts);
     contracts[comet.address.toLowerCase()] = comet;
-    // the reward token is one only where the market pays one
-    const tokens = [ comet.base.asset, ...(comet.rewards?.asset === undefined ? [] : [ comet.rewards.asset ]) ];
+
+    const block  = market.creationBlock;
+    // the reward token and its feed are one only where the market pays one, and prices it
+    const tokens = [
+      comet.base.asset,
+      ...(comet.rewards?.asset === undefined ? [] : [ comet.rewards.asset ]),
+      ...market.collateralAssets.map(asset => tokenContract(comet.network, asset.token, block)),
+    ];
+    const feeds = [
+      comet.base.priceFeed,
+      ...(comet.base.usdPriceFeed === undefined ? [] : [ comet.base.usdPriceFeed ]),
+      ...(comet.rewards?.priceFeed === undefined ? [] : [ comet.rewards.priceFeed ]),
+      ...market.collateralAssets.map(asset => feedContract(comet.network, asset.priceFeed, block)),
+    ];
+
+    /*
+     * A token the constants already name keeps that name, and takes the scale
+     * the version read from the chain: the constants can be wrong about it —
+     * they have cbBTC on Base at 18 decimals, where it has 8 — and a cap would
+     * then be written 10^10 times too small.
+     */
     for (const token of tokens) {
-      // a token the constants already name keeps that name
-      contracts[token.address.toLowerCase()] ??= token;
+      const key   = token.address.toLowerCase();
+      const known = contracts[key];
+      contracts[key] = known === undefined
+        ? token
+        : TokenLike.is(known) && known.decimals !== token.decimals ? { ...known, decimals: token.decimals } : known;
+    }
+    // a feed the constants already name keeps that name
+    for (const feed of feeds) {
+      contracts[feed.address.toLowerCase()] ??= feed;
     }
   }
 

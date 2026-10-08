@@ -73,9 +73,13 @@ t.test(`market-summary@block:15435126`, async t => {
     status: 'success',
     borrowApr: '0.040676825873232',
     supplyApr: '0.023842766908944',
-    totalBorrowValue:     '4314230.2466899356248',
-    totalCollateralValue: '7926309.21335647434063405362122141',
-    totalSupplyValue:     '5880695.9243046279408',
+    totalBorrowValue:        '4314230.2466899356248',
+    totalCollateralValue:    '7926309.21335647434063405362122141',
+    totalSupplyValue:        '5880695.9243046279408',
+    // cUSDCv3 is quoted in USD, so its totals in USD are the quoted ones
+    totalBorrowValueUsd:     '4314230.2466899356248',
+    totalCollateralValueUsd: '7926309.21335647434063405362122141',
+    totalSupplyValueUsd:     '5880695.9243046279408',
     utilization: '733623598244969371',
     baseUsdPrice: '0.99999196',
     collateralAssetSymbols: [
@@ -155,6 +159,9 @@ t.test(`market-day-summary@block:16380543`, async t => {
     totalBorrowValue: '85848414.109706',
     totalCollateralValue: '205500797.77955724299515861328038964',
     totalSupplyValue: '165824411.75013',
+    totalBorrowValueUsd: '85848414.109706',
+    totalCollateralValueUsd: '205500797.77955724299515861328038964',
+    totalSupplyValueUsd: '165824411.75013',
     utilization: '517706230149330789',
     baseUsdPrice: '1.0',
     collateralAssetSymbols: [
@@ -178,7 +185,7 @@ t.test(`market-day-summary@block:16380543`, async t => {
    */
   const cachedKeys1 = Object.keys(cache.store);
   const expectedKeys = [
-    `marketSummary-v6:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`,
+    `marketSummary-v7:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`,
     /*
      * FIXME(jordan): since we project(..) within compute(..), the
      * index.includes(..) check fails on the block unless it happens

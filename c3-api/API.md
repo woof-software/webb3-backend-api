@@ -94,8 +94,9 @@ summaries, their history, the rewards routes and `/account/{address}/rewards`
 
 - `success`: everything was read.
 - `partially` (summaries and history only): the base asset was priced, and at
-  least one collateral was not. The totals leave that collateral out, and
-  `collaterals` says which it was.
+  least one collateral was not — its feed reverted, or the Comet holds
+  another asset at its index than the registry version describes. The totals
+  leave that collateral out, and `collaterals` says which it was.
 - `error`: the base asset could not be priced, or — for the rewards routes —
   a price the rewards are valued in: the reward token's, the base asset's, or
   the USD price a base-quoted reward is converted with. Only what identifies
@@ -107,6 +108,16 @@ summaries, their history, the rewards routes and `/account/{address}/rewards`
 
 `/market/{network}/{address}/rewards/summary` names no market in its answer,
 so its `error` is `{ "status": "error", "message": … }` alone.
+
+`/account/{address}/rewards` also answers a market as `error` when its
+rewards contract pays another token than the one the registry version
+describes: what the account is owed is an amount of the token paid, and
+reading it as the described one would scale, price and name it wrongly. It
+stays so until a version describing the token paid is active:
+
+```json
+{ "chain_id": 1, "comet": { "address": "0xc3d6…cdc3" }, "status": "error", "message": "the rewards contract pays 0x…, not the COMP the registry version describes" }
+```
 
 A summary lists every collateral with its own status:
 
@@ -120,9 +131,12 @@ A summary lists every collateral with its own status:
 
 A history reports this per day, with the day's `date` and `timestamp`. A
 market is read in full again once a registry version that says how to price
-the feed is active. Only a price feed reports a status this way: a node that
-does not answer, or any other call that reverts, still fails the whole
-request.
+the feed is active. Only these report a status this way: a node that does not
+answer, or any other call that reverts, still fails the whole request.
+
+```json
+{ "address": "0x1f98…f984", "symbol": "UNI", "status": "error", "message": "asset 3 of the Comet is 0x…, not the UNI the registry version describes" }
+```
 
 ## Market labels
 
@@ -137,7 +151,8 @@ market, `USDC.e` (`USDbC` on Base) and `USD Coin (Bridged)` for bridged USDC,
 { "chain_id": 1, "comet": { "address": "0xa175…ae94" }, "base_asset": { "symbol": "ETH", "description": "Ether", … }, … }
 ```
 
-The summaries report the token's own on-chain symbol instead (`WETH`). The
+The summaries report the token's own symbol instead (`WETH`), as the active
+registry version read it from the token when it imported the market. The
 history does too, except where the network renames a token in place: bridged
 USDC is `USDC.e` there, although its `symbol()` answers `USDC`. One token can
 therefore appear under two names across the API, so match a market by
@@ -162,13 +177,27 @@ endpoint and `GET`ting it again.
 Point-in-time summary at the current block of various market statistics:
 - Total collateral, supply and borrow value, in the unit the market's price
   feeds answer in: USD, or the base asset for a market quoted in it, such as
-  ETH for a WETH market
+  ETH for a WETH market (`total_collateral_value`, `total_supply_value`,
+  `total_borrow_value`)
+- The same totals in USD (`total_collateral_value_usd`,
+  `total_supply_value_usd`, `total_borrow_value_usd`): as they are for a
+  market the registry quotes in USD, and converted at the base asset's USD
+  price (`base_usd_price`) for one it quotes in its base asset. A client that
+  converted the quoted totals itself can read these instead
 - Borrow APR
 - Supply APR
 - Utilization, as the Comet answers it: a fraction scaled by 10^18
 - The base asset's price in USD (`base_usd_price`)
 - What could be priced: `status`, and `collaterals` with each collateral's
   own status — see [Market status](#market-status)
+
+The collaterals are those the active registry version describes for the
+market, in the order the Comet numbers them, and named as the version names
+them: a collateral the Comet listed after the version was imported is left
+out until a version describes it, and the registry's chain check raises it
+meanwhile ([REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md#a-market-that-changed-on-chain)).
+Each is priced through the feed the Comet reads for it at the block
+summarized, and the base asset through the feed the version names for it.
 
 ```sh
 $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3/summary'
@@ -185,6 +214,9 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
   "total_borrow_value": "291934.5637828698",
   "total_supply_value": "802511.3150470128",
   "total_collateral_value": "736406.32667881067597418742582842",
+  "total_borrow_value_usd": "291934.5637828698",
+  "total_supply_value_usd": "802511.3150470128",
+  "total_collateral_value_usd": "736406.32667881067597418742582842",
   "utilization": "363775913612426560",
   "base_usd_price": "0.99996",
   "collateral_asset_symbols": [ "COMP", "WBTC", "WETH", "UNI", "LINK" ],
@@ -198,13 +230,22 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
 }
 ```
 
+The USDC market is quoted in USD, so its totals and their USD form are the
+same numbers. A WETH market is quoted in ETH, and reports, for instance:
+
+```json
+  "total_supply_value": "250000.5",
+  "total_supply_value_usd": "625001250.0",
+  "base_usd_price": "2500.0",
+```
+
 ## `/market/{network}/{address}/historical/summary`
 ### description:
 
 30 days of historical `/summary`s — two in stage, and one in a local run —
 one block sampled per day, oldest first, up to the most recent day sampled.
-Each day carries the same fields as the summary, and its `date` and
-`timestamp`.
+Each day carries the same fields as the summary, its totals in USD converted
+at that day's price, and its `date` and `timestamp`.
 
 ```sh
 $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3/historical/summary'
@@ -222,6 +263,9 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
     "total_borrow_value": "0.0",
     "total_supply_value": "0.0",
     "total_collateral_value": "0.0",
+    "total_borrow_value_usd": "0.0",
+    "total_supply_value_usd": "0.0",
+    "total_collateral_value_usd": "0.0",
     "utilization": "0",
     "base_usd_price": "1.0",
     "collateral_asset_symbols": [ "COMP", "WBTC", "WETH", "UNI", "LINK" ],
@@ -283,6 +327,20 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
 ### description:
 
 Aggregate of all governance proposals across Governors alpha and bravo.
+
+Each action is described against the contracts this API knows by name. One
+the static constants cannot fully name — a target only the active registry
+version knows, an action bridged to another chain, a call that configures a
+market — is described again with the version's markets, every token they
+name and every price feed they read: a cap or an amount of a token is
+written there at the decimals the version read for it, under the constants'
+name where they know the token too. When the registry cannot be read, an
+action bridged or configuring a market is described again against the
+constants alone. `addAsset` writes the new asset's cap at the decimals its
+configuration states. `updateAssetSupplyCap` states none, so the cap of an
+asset neither the constants nor the version know — one added to the market
+since the version was imported — is written at 18 decimals until a version
+describes it.
 
 Query parameters:
 - Pagination: `page_size`, `page_number`
@@ -666,6 +724,13 @@ Query parameters:
 - `markets[]` (optional): array of markets filter to be included in the response. Default is every market whose history the active version serves. A market of a testnet is refused with `TESTNET_NOT_SERVED`, and so is a cursor that reads one ([The market registry](#the-market-registry)). (e.g. filter only Ethereum cUSDCv3 market `markets[]=1_0xc3d688B66703497DAA19211EEdff47f25384cdc3`)
 - `actions[]` (optional): array of actions to filter transactions by. Default is all actions. (e.g. filter only borrow actions `actions[]=Borrow`)
 - `cursor` (optional): The first response (with no cursor parameter) will return with a cursor value, to pass that cursor value will allow request to get more transaction history further in the past.
+
+Each action names its token by address, and by the symbol the active
+registry version gives it, and states its amount at the decimals the version
+read for the token. A token the version does not describe — a collateral a
+market listed, or a reward token it started paying, after the version was
+imported — has an empty `symbol`, and its amount is read at the decimals the
+token itself reports, until a version describes it.
 
 A cursor holds a position in the logs of each market it reads. It stays
 valid across registry versions that read the same markets — a rollback, a new

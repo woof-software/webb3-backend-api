@@ -666,7 +666,7 @@ fields below are decided.
 | `isDefault` | The market the website opens first | `false` — exactly one market in the whole registry is the default |
 | `creationBlock` | Where the market's history and indexes start | The block the Comet proxy was deployed in (the explorer's "Contract Creation"). Must be above `0` for a market that is served |
 | `collateralValueQuote` | The unit the market's own price feeds answer in | Call `description()` on the base token's price feed from step 2. `X / USD` → `usd`. `Constant price feed` (WETH, wstETH) or `WBTC / BTC` → `base` |
-| `baseAsset.usdPriceFeedAddress` | The feed that turns the unit the market's feeds answer in into USD | `null` when the quote is `usd`. When it is `base`, the USD feed of that unit on that chain: ETH / USD for a WETH market, BTC / USD for the WBTC market, whose feeds answer in BTC |
+| `baseAsset.usdPriceFeedAddress` | The feed that turns the unit the market's feeds answer in into USD: the token list converts collateral values with it, and the market summaries their totals (`total_*_value_usd`) | `null` when the quote is `usd`. When it is `base`, the USD feed of that unit on that chain: ETH / USD for a WETH market, BTC / USD for the WBTC market, whose feeds answer in BTC |
 | `baseAsset.isWrappedNative` | The base token wraps the chain's own token | `true` for WETH on Ethereum and its L2s, WPOL, WMNT, WRON |
 | `capabilities.rewards`, `capabilities.accountRewards`, `rewardPriceFeed` | Rewards | If step 2 shows no reward token, the market has no rewards: both `false`, `rewardPriceFeed` `null`. Otherwise a COMP price feed of that chain, quoted in the unit its `description()` names: `COMP / USD` gives `"quote": "usd"`; `COMP / ETH` — the reward feed of mainnet's and Linea's WETH markets — gives `"quote": "base"`, which needs `collateralValueQuote` `base` and a `usdPriceFeedAddress`. Never pair a COMP / ETH address with `usd`: validation does not catch it, and the rewards routes would serve COMP priced in ETH as if in USD |
 | `capabilities.transactionHistory` | Whether the market appears in users' transaction history | `true` if it should. The market needs a rewards contract, and a right `creationBlock` |
@@ -764,6 +764,14 @@ overlay with `GET …/markets/<chainId>/<deploymentKey>/overlay`, and send it
 back changed as in its step 5, with the `digest` the read answered as
 `"expectedDigest"`: if somebody changes the market in between, your write is
 refused instead of undoing theirs.
+
+An exception names a feed, not a token, and applies wherever a Comet reads
+that feed: at the latest block, and at a past block a history reads. A feed
+governance has since replaced is still priced by its exception on the days
+the market read it. That is all the seeded exceptions of wUSDM and pumpBTC do
+now: governance delisted both by moving them onto a "Constant price feed"
+that answers 10^-8, which the summaries and the token list read like any
+other feed from then on, with no exception.
 
 ### 2. Decide how to price it
 
@@ -864,9 +872,33 @@ on the Comet answers the asset and its feed. A network listed under
 `unreadable` keeps the drifts the last read of it found, with that read's
 `seenAt`, until it can be read again.
 
-The market summaries were right all along: they price every collateral with
-the feed its Comet reads. What was wrong is what `/registry/v1/*` serves, which
-a client that prices from the registry's feeds would use.
+Until the version that agrees is on, the market routes serve what the version
+says. A summary prices each collateral the version describes with the feed
+its Comet reads at the block, so a collateral's new feed is priced right all
+along; but it names collateral as the version does and prices the base asset
+through the base feed the version stores. So a collateral the Comet added is
+left out of the summaries, and its amounts in a user's transaction history
+are read at the decimals the token reports, with no symbol; a collateral it
+replaced at an index is reported as one that could not be read
+(`partially`); and a base feed governance replaced is still read — once
+Chainlink retires it, every summary of the market answers `error`. The token
+list, which values the latest block, fails a position whose feed moved
+(`feed_mismatch`), and its token follows the list's rules for a value it
+could not read: a partial value that already reaches the threshold, an
+earlier minute's, or shown as `data_unavailable`. And `/registry/v1/*`
+serves the old facts, which a client that prices from the registry's feeds
+would use.
+
+The check does not read reward tokens. A rewards contract that starts paying
+another token than the version describes shows instead in the worker's log,
+once a minute per market for as long as it lasts:
+
+```
+reward token differs from the registry: 0xc3d688B66703497DAA19211EEdff47f25384cdc3 on ethereum-mainnet pays 0x…, the version describes 0xc00e94cb662c3520282e6f5717214004a7f26888
+```
+
+and `/account/{address}/rewards` answers that market as `error` until a
+version describes the token it pays: import the commit again as below.
 
 ### 2. Import the commit again
 
@@ -911,6 +943,11 @@ it has, `chainCheck` is still the check of the version before it — its
 `versionId` says which — and the alert stays; it clears once that check
 finds the version agrees with the chain. Switching back to a version that
 stores what drifted keeps it raised.
+
+A version that changes a market's base feed prices the market's whole
+history through the new feed, whatever its quote: a day sampled before that
+feed existed answers `error`, and does until the history no longer samples
+it — up to 30 days.
 
 ## Switching back
 
@@ -1231,7 +1268,9 @@ nothing is written. Applying the same file again changes nothing.
 ### The initial list of legacy collaterals
 
 Until this release the app hid legacy collaterals by a list of its own
-(Linear COM-18), 20 collaterals of five Ethereum markets. Apply it once in
+(Linear COM-18), 20 collaterals of five Ethereum markets — the list is also
+how it hides wUSDM in the USDT market, which its row `usdt`/`wUSDM` below now
+decides as `isLegacy`. Apply it once in
 each environment, as the document below: it has the address of every Comet
 and every token, and holds 12 of the 20. The other 8 are taken from the
 environment itself, in the next step.
@@ -1359,7 +1398,7 @@ When `alerts` is not empty, each name says what to do:
 | `candidate-awaiting-review` | A draft is held for review and no import is running | Review it, then validate it (step 4 of [the first bring-up](#bringing-an-environment-up-for-the-first-time)) |
 | `candidate-awaiting-activation` | A new commit was imported and validated, and is waiting to be switched on; `candidates.validated` names it | [When the source changes](#when-the-source-changes). The alert holds until a version at least that new is switched on: one you decide not to switch on keeps it raised until a newer commit's version is |
 | `commit-rejected` | The newest commit imported completely but did not validate, and the scheduled job will not import it again by itself; `sync.rejectedCommit` names it | Read why it failed (`GET /registry/v1/admin/versions/<versionId>`). If a decision was wrong, hold a new attempt (step 1 of [Describing a new market](#describing-a-new-market)), correct it there and validate; otherwise the alert clears when the source moves on |
-| `chain-drift` | The version on stores a price feed or a collateral asset its market's Comet no longer answers with: governance changed the market on chain after the import, and the source did not move. `chainCheck.drifts` names each, with what the version stores and what the chain answers | [A market that changed on chain](#a-market-that-changed-on-chain): import the commit again with `forceNewAttempt`, check what it changes and switch it on. The alert clears once the next hourly invocation has checked the version on and found it agrees with the chain, within the hour of the switch |
+| `chain-drift` | The version on stores a price feed or a collateral asset its market's Comet no longer answers with: governance changed the market on chain after the import, and the source did not move. `chainCheck.drifts` names each, with what the version stores and what the chain answers. Until a version that agrees is on, the summaries leave out a collateral the Comet added and read the base feed the version stores ([A market that changed on chain](#a-market-that-changed-on-chain)) | [A market that changed on chain](#a-market-that-changed-on-chain): import the commit again with `forceNewAttempt`, check what it changes and switch it on. The alert clears once the next hourly invocation has checked the version on and found it agrees with the chain, within the hour of the switch |
 | `last-sync-failed` | The last import failed | Read its run: `GET /registry/v1/admin/sync-runs/<id>` tells you which root failed and why |
 | `sync-failing` | The import that is running keeps failing: the last root it tried failed, and the roots left failed have spent two attempts or more between them — two roots once, or one root twice. A single failure does not raise it. `sync.lastRun.lastError` says why, once an invocation has recorded it | Read its run: `GET /registry/v1/admin/sync-runs/<id>` lists each root with why it failed and the `attempts` it has spent. `SOURCE_REQUEST_FAILED` and `CHAIN_REQUEST_FAILED` are GitHub or the node provider proxy not answering: fix the proxy, or wait for GitHub, and the next hourly invocation carries on. Until then an invocation that imports nothing spends an attempt of each root it tries, and a root is given up after five, whatever failed it. `the invocation importing this root did not finish` is an invocation stopped in the middle of that root — a deploy, or a Worker past its time or CPU: the next one tries it again, and if one market keeps stopping it, the worker's logs say what did. Until the next one records it, such a root is still `processing`, under a `leaseExpiresAt` already past, and the run's `lastError` is still that of the attempt before it — `null` if that one succeeded. Anything else is the root itself |
 | `sync-stalled` | A run says it is running, but nobody is continuing it | The hourly import resumes it by itself; if the alert stays for hours, look at the worker's logs |

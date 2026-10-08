@@ -8,8 +8,6 @@ import { keccak256 } from '../../lib/hash.js';
 import {
   Comet,
   Contract,
-  ERC20,
-  PriceFeed,
   StandaloneContract,
   UntypedContract,
 } from '../../lib/well-known/contracts/types.js';
@@ -20,13 +18,13 @@ import {
   MarketV1,
   NetworkV1,
   PriceExceptionV1,
-  PriceFeedV1,
   RegistryAnnotation,
   RegistryComet,
   RegistrySnapshotV1,
   TokenV1,
   checksumAddress,
 } from '../../lib/model/comet-registry.js';
+import { feedContract, tokenContract } from '../../lib/model/registry-contracts.js';
 
 /*
  * The request catalog: one activated snapshot, materialized into the contract
@@ -120,44 +118,11 @@ function networkName(network: NetworkV1): KnownNetwork.Name | null {
  * An address as a contract carries it, and so as every response echoes it:
  * checksummed, the form the API answered with before the registry. The
  * registry stores addresses lowercased, and every lookup and cache key keeps
- * comparing that form.
+ * comparing that form. Tokens and feeds are materialized the same way
+ * (registry-contracts.ts).
  */
 function shown(address: Address): Address {
   return checksumAddress(address) as Address;
-}
-
-/*
- * A token as the contract shapes carry it. The registry's `name` goes into
- * `description`, which is where the static constants put the human name of a
- * token ("USD Coin" beside the symbol "USDC") and where the market rewards
- * computation reads it from. `displayName` stays unset, so a token still
- * reads as its symbol wherever a contract is named.
- */
-function erc20(
-  network: KnownNetwork.Name,
-  token: TokenV1,
-  creationBlock: number,
-): Contract<StandaloneContract<ERC20>> {
-  return ERC20(token.symbol, {
-    network,
-    address:     shown(token.address),
-    decimals:    token.decimals,
-    description: token.name,
-    block:       { number: creationBlock },
-  }) as unknown as Contract<StandaloneContract<ERC20>>;
-}
-
-function priceFeed(
-  network: KnownNetwork.Name,
-  feed: PriceFeedV1,
-  creationBlock: number,
-): Contract<StandaloneContract<PriceFeed>> {
-  return PriceFeed({
-    network,
-    address:  shown(feed.address),
-    decimals: feed.decimals,
-    block:    { number: creationBlock },
-  }) as unknown as Contract<StandaloneContract<PriceFeed>>;
 }
 
 /*
@@ -222,11 +187,11 @@ function cometOf(
 ): RegistryComet {
   const block = market.creationBlock;
   const base  = {
-    asset:     erc20(network, market.baseAsset.token, block),
-    priceFeed: priceFeed(network, market.baseAsset.priceFeed, block),
+    asset:     tokenContract(network, market.baseAsset.token, block),
+    priceFeed: feedContract(network, market.baseAsset.priceFeed, block),
     ...(market.baseAsset.usdPriceFeed === null
       ? {}
-      : { usdPriceFeed: priceFeed(network, market.baseAsset.usdPriceFeed, block) }),
+      : { usdPriceFeed: feedContract(network, market.baseAsset.usdPriceFeed, block) }),
   };
 
   const rewardsContract = market.contracts.rewards;
@@ -237,8 +202,8 @@ function cometOf(
       address: shown(rewardsContract),
       block:   { number: block },
     }),
-    ...(market.rewardAsset === null ? {} : { asset: erc20(network, market.rewardAsset.token, block) }),
-    ...(rewardFeed === null ? {} : { priceFeed: priceFeed(network, rewardFeed, block) }),
+    ...(market.rewardAsset === null ? {} : { asset: tokenContract(network, market.rewardAsset.token, block) }),
+    ...(rewardFeed === null ? {} : { priceFeed: feedContract(network, rewardFeed, block) }),
   };
 
   const address = market.contracts.comet;

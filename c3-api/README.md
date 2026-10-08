@@ -209,16 +209,28 @@ What that means for the endpoints:
   issued before the registry is accepted once and upgraded, and from then on
   reads, and is compared on, the networks it had: a version that adds history
   on another network does not end it;
+- a market summary, and each day of its history, takes what the market's
+  collateral is and the feed that prices its base asset from the version;
+  what the Comet holds, the feed it reads for each collateral at the block,
+  and the prices are read on chain. Its totals are given in the market's
+  quote unit and, beside them, in USD. A collateral the Comet listed after
+  the import is left out until a version describes it, and transaction
+  history reads the amounts of a token no version describes at the decimals
+  the token reports ([API.md](./API.md));
 - routes that resolve no market — V2 and gas price — never read `APP_DB`,
   and governance reads it only to describe proposal actions. The proposal
   list describes the actions of the page it answers against the static
   constants, then those the constants cannot fully name once more, with the
-  markets of the active version merged in: a target the constants do not
-  know and the version does, an action bridged to another chain, and a call
-  to the Configurator, CometProxyAdmin, CometRewards or CometFactory, whose
-  arguments name the market it acts on. Almost every page has one, so the
-  list reads the registry on almost every request; when it cannot, those
-  actions keep the constants' description, and the list is answered all the
+  markets of the active version merged in, with every token they name and
+  every feed they read: a target the constants do not know and the version
+  does, an action bridged to another chain, and a call to the Configurator,
+  CometProxyAdmin, CometRewards or CometFactory, whose arguments name the
+  market it acts on. A token both know keeps the constants' name and takes
+  the version's decimals, which the constants have wrong for cbBTC on Base.
+  Almost every page has one, so the list reads the registry on almost every
+  request; when it cannot, the bridged actions and the calls that configure a
+  market are described against the constants alone, by the build answering
+  rather than the one that cached them, and the list is answered all the
   same.
 
 A commit can be imported more than once — discovery tries again after an
@@ -493,13 +505,15 @@ each environment before it is applied there.
 An administrator can mark a collateral of a market legacy: one the app no
 longer offers in that market, and keeps showing to a user who still holds
 some of it, so that it can be withdrawn. This replaces the list the frontend
-kept itself (Linear COM-18). `/registry/v1/active` and the market reads mark
-every collateral with `isLegacy`, by the decisions in force when they answer,
-and the token list says per token which Comets it is a legacy collateral of
-(`legacyIn`) and whether it is legacy in every enabled market that takes it
-(`isLegacy`). The flag changes nothing else: what the token list shows, and
-why, is decided as before ([Token Visibility](#token-visibility)), and the
-app decides what to hide.
+kept itself (Linear COM-18), which is also how it hides wUSDM in the USDT
+market now: that rule is the list's row for it, and so, once the list is
+applied, the decision `isLegacy` on wUSDM in cUSDTv3. `/registry/v1/active`
+and the market reads mark every collateral with `isLegacy`, by the decisions
+in force when they answer, and the token list says per token which Comets it
+is a legacy collateral of (`legacyIn`) and whether it is legacy in every
+enabled market that takes it (`isLegacy`). The flag changes nothing else:
+what the token list shows, and why, is decided as before
+([Token Visibility](#token-visibility)), and the app decides what to hide.
 
 A decision belongs to the collateral of the Comet — a chain id, the Comet's
 address and the token's — and not to a registry version, so it survives

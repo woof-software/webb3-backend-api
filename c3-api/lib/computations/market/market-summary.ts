@@ -6,6 +6,7 @@ import * as Compute from '../../symbolic/computation.js';
 import * as KnownNetwork from '../../well-known/networks/network.js';
 import * as Fallible from "../../fallible/fallible.js";
 
+import type { BigFixnum } from '../../bigfixnum.js';
 import type { RegistryComet } from '../../model/comet-registry.js';
 
 import {
@@ -75,6 +76,9 @@ type MarketSummary = Compute.Spec<{
         totalBorrowValue: string,
         totalSupplyValue: string,
         totalCollateralValue: string,
+        totalBorrowValueUsd: string,
+        totalSupplyValueUsd: string,
+        totalCollateralValueUsd: string,
         utilization: string,
         baseUsdPrice: string,
         collateralAssetSymbols: string[],
@@ -85,8 +89,8 @@ type MarketSummary = Compute.Spec<{
 
 const { implement, pipe } = Compute.Functor<MarketSummary>({});
 const marketSummary = implement({
-  // 6: every price read reports a status instead of failing the summary
-  version: 6,
+  // 7: totals in USD beside the quoted ones; collateral and base feed as the registry version describes them
+  version: 7,
   /*
    * validate that the block requested does not predate the market
    * contract creation block.
@@ -157,14 +161,34 @@ const marketSummary = implement({
             ? { status: 'success' as const }
             : { status: 'error' as const, message: price.message }),
         }));
+        /*
+         * The totals are in the unit the market's own feeds answer in: USD,
+         * or the base asset of a market the registry says is quoted in it,
+         * such as ETH for a WETH market — what they have always been, and
+         * what a client that converts them itself expects. Beside each is the
+         * same total in USD: as it is for a market quoted in USD, and through
+         * the base asset's USD price for one quoted in its base asset, as the
+         * token list converts a collateral's value.
+         */
+        const quoted = {
+          borrow:     totalBorrow.mul(basePrice.price),
+          supply:     totalSupply.mul(basePrice.price),
+          collateral: collateralValue(collaterals),
+        };
+        const inUsd = (value: BigFixnum) => contract.registry.market.collateralValueQuote === 'usd'
+          ? value
+          : value.mul(baseUsdPrice.price);
         return {
           ...identity,
           status: statuses.some(collateral => collateral.status === 'error') ? 'partially' : 'success',
           borrowApr: borrowApr.toString(),
           supplyApr: supplyApr.toString(),
-          totalBorrowValue: totalBorrow.mul(basePrice.price).toString(),
-          totalSupplyValue: totalSupply.mul(basePrice.price).toString(),
-          totalCollateralValue: collateralValue(collaterals).toString(),
+          totalBorrowValue: quoted.borrow.toString(),
+          totalSupplyValue: quoted.supply.toString(),
+          totalCollateralValue: quoted.collateral.toString(),
+          totalBorrowValueUsd: inUsd(quoted.borrow).toString(),
+          totalSupplyValueUsd: inUsd(quoted.supply).toString(),
+          totalCollateralValueUsd: inUsd(quoted.collateral).toString(),
           utilization: utilization.toString(),
           baseUsdPrice: baseUsdPrice.price.toString(),
           collateralAssetSymbols: collaterals.map(({ symbol }) => symbol),

@@ -50,8 +50,8 @@ type SupplyRewardsApr = Compute.Spec<{
 
 const { implement, pipe, pipe1 } = Compute.Functor<SupplyRewardsApr>({});
 const supplyRewardsApr = implement({
-  // 2: a price that reverts is answered, not thrown
-  version: 2,
+  // 3: the base price is read from the feed the registry version names
+  version: 3,
   compute({ apiHost, nodeHost, nodeKey, rewardsTokenPriceFeed, blockNumber, contract, network }) {
     /*
      * The base price in the unit the reward feed answers in: the market's own
