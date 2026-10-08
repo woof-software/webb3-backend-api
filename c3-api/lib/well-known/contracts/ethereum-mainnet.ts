@@ -1282,81 +1282,6 @@ const Comet_01testusdc = Comet(<const>{
 
 const market01testusdc = <const>[Comet_01testusdc];
 
-/*
- * Two empty test USDC markets for exercising reverting price feeds. Both are
- * governed by the same EOA as ctest1uUSDCv3 (0x480905619075F892304C470057C0De9BEe38F899),
- * have no reward config on the canonical CometRewards, and have USDT + WETH
- * collateral. The reverting feeds are "Mock Chainlink price aggregator"
- * contracts whose latestRoundData() reverts (selector 0x4a5033eb), so
- * Comet.getPrice() reverts for them too.
- *
- * "Compound TEST USDT Feed Revert" (ctestrcUSDCv3): the USDT collateral feed
- * (0xbd91102fd0291ae3a0163b25aa8347dd95da9943) reverts; the base feed is the
- * production USDC / USD one. Collateral feeds are read from getAssetInfo() on
- * chain, so the reverting one needs no declaration here.
- */
-const Comet_01testrcusdc = Comet(<const>{
-  displayName: "ctestrcUSDCv3",
-  aliases: ["01-testrcusdc", "ctestrcUSDCv3"],
-  base: {
-    asset: USDC,
-    priceFeed: USDC_USD_priceFeed,
-  },
-  rewards: {
-    asset: COMP,
-    contract: CometRewards,
-    priceFeed: COMP_USD_priceFeed,
-  },
-  network: "ethereum-mainnet",
-  address: "0xA179594246F3640AA2b44Dfbd482f9a20975eB2D",
-  block: {
-    number: 26146957,
-    timestamp: 1791453779,
-  },
-});
-
-const market01testrcusdc = <const>[Comet_01testrcusdc];
-
-/*
- * "Compound TEST Base Feed Revert" (ctestrbUSDCv3): the base USDC feed reverts.
- * It is declared as base.priceFeed on purpose -- baseUsdPrice prices the base
- * through Comet.getPrice(base.priceFeed), so declaring the production
- * USDC / USD feed instead would hide exactly the failure this market exists
- * to test.
- */
-const USDC_reverting_priceFeed = PriceFeed(<const>{
-  aliases: ["USDC-USD-reverting"],
-  decimals: 8,
-  network: "ethereum-mainnet",
-  address: "0x388400dd3E17F9CAe00FB84Ac381FaBe6166F667",
-  block: {
-    number: 26147035,
-    timestamp: 1791454715,
-  },
-});
-
-const Comet_01testrbusdc = Comet(<const>{
-  displayName: "ctestrbUSDCv3",
-  aliases: ["01-testrbusdc", "ctestrbUSDCv3"],
-  base: {
-    asset: USDC,
-    priceFeed: USDC_reverting_priceFeed,
-  },
-  rewards: {
-    asset: COMP,
-    contract: CometRewards,
-    priceFeed: COMP_USD_priceFeed,
-  },
-  network: "ethereum-mainnet",
-  address: "0xbc37A455F92cfc13ff70b811ce315030483AcCe8",
-  block: {
-    number: 26147065,
-    timestamp: 1791455075,
-  },
-});
-
-const market01testrbusdc = <const>[USDC_reverting_priceFeed, Comet_01testrbusdc];
-
 // governance
 const Timelock = UntypedContract("Timelock", <const>{
   aliases: ["default"],
@@ -2137,8 +2062,6 @@ const contractData = [
   ...market01iusdc,
   ...market01test1uusdc,
   ...market01testusdc,
-  ...market01testrcusdc,
-  ...market01testrbusdc,
   // everything else...
   ...misc,
 ] as const;
