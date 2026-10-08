@@ -75,8 +75,10 @@ Migrations are numbered in the order they are applied, not by feature:
 reviewed yet, and `0003` adds how the frontend lists a market — its slug and
 whether it is institutional. `0004` drops the columns and indexes nothing
 uses, `0005` stores token policies — which tokens an administrator has marked
-strategic, and the audit of every change — and the Agreements migration takes
-the next free number.
+strategic, and the audit of every change — `0006` stores legacy collaterals —
+which collaterals of which Comets an administrator has marked legacy, and the
+audit of every change — and the Agreements migration takes the next free
+number.
 
 Apply migrations to the local Miniflare database under `.wrangler/state`:
 ```sh
@@ -91,9 +93,10 @@ npm run d1:migrate:stage
 npm run d1:migrate:production
 ```
 
-The Comet registry also binds `kv_registry` for its snapshot cache and its
-last check of the chain, two rate limiters for its administrative routes,
-and an hourly Cron trigger for its resumable sync.
+The Comet registry also binds `kv_registry` for its snapshot cache, its
+last check of the chain and the legacy collateral decisions it last recorded,
+two rate limiters for its administrative routes, and an hourly Cron trigger
+for its resumable sync.
 `REGISTRY_ADMIN_AUTH_RATE_LIMITER` counts every request under
 `/registry/v1/admin/` before its token is checked, 60 a minute for each
 client address (`CF-Connecting-IP`; an IPv6 client by its /64), so wrong
@@ -277,6 +280,13 @@ market routes read it the same way:
 - `REGISTRY_SNAPSHOT_CACHE_TTL_S` is the `max-age` public reads advertise to
   browsers and proxies.
 
+The legacy collateral decisions ([Legacy Collaterals](#legacy-collaterals))
+are no part of a version, so they are not cached with it. `/active` and the
+market reads read them beside the pointer, in one more statement, and mark
+the version's collaterals with them in the answer; the answer's `ETag` names
+the flags it carries, so a decision that changes them is never confirmed with
+a `304` to a client holding a copy made before it.
+
 When D1 cannot be reached at all, a request is answered from the version D1
 last named, for up to `REGISTRY_STALE_FALLBACK_MAX_S` after that. Such a
 response carries `X-Registry-Stale` with its age in seconds and
@@ -288,9 +298,26 @@ nothing cached, every route answers `503 UPSTREAM_UNAVAILABLE`. A D1 that
 answers "no version is active" is an answer, not an outage: it is served as
 `503 REGISTRY_NOT_ACTIVE`, never from the cache; and a D1 that answers with a
 fault, such as a table a migration has not created yet, is a `500`, never
-masked by the cache. The token list and the token policy routes are the one
-exception, for their own tables: without migration `0005` they answer
-`503 UPSTREAM_UNAVAILABLE`, naming the migrations to apply.
+masked by the cache. The routes that read the token policy or legacy
+collateral tables are the one exception, for those tables: without migration
+`0005` the token list and the token policy routes, and without `0006` the
+token list, `/active`, the market reads and the legacy collateral routes,
+answer `503 UPSTREAM_UNAVAILABLE`, naming the migrations to apply.
+
+During an outage `/active` and the market reads mark legacy collaterals by
+the decisions the worker last recorded in `kv_registry`. Every command that
+decides records them once it has committed. An isolate checks the record
+against the decisions it reads whenever they are not the ones it last found
+there or wrote, and every five minutes besides, and writes them only where
+the record differs: KV takes one write a second to a key, and the isolates of
+a deploy, starting together, mostly find the record right. KV also keeps
+whichever write reaches it last, so a read that began before a decision and
+wrote after it puts back the decisions before it, until the next check puts
+that right, within about five minutes while the reads go on. An answer that
+could read the version but not the decisions is marked the same way, as
+`X-Registry-Stale: 0`, and one with no decisions recorded to answer with is
+`503 UPSTREAM_UNAVAILABLE`. With the window at `0` nothing is recorded, and
+nothing is answered from the record.
 
 An operator changes what the API serves by importing, reviewing, validating
 and activating a version; see the admin routes in [./API.md](./API.md). The
@@ -460,6 +487,54 @@ applies only where the active version holds every token it names, so the file
 kept for other environments is best reduced to the rows the list decides —
 the routes leave every token a list does not name as it is — and reviewed in
 each environment before it is applied there.
+
+# Legacy Collaterals
+
+An administrator can mark a collateral of a market legacy: one the app no
+longer offers in that market, and keeps showing to a user who still holds
+some of it, so that it can be withdrawn. This replaces the list the frontend
+kept itself (Linear COM-18). `/registry/v1/active` and the market reads mark
+every collateral with `isLegacy`, by the decisions in force when they answer,
+and the token list says per token which Comets it is a legacy collateral of
+(`legacyIn`) and whether it is legacy in every enabled market that takes it
+(`isLegacy`). The flag changes nothing else: what the token list shows, and
+why, is decided as before ([Token Visibility](#token-visibility)), and the
+app decides what to hide.
+
+A decision belongs to the collateral of the Comet — a chain id, the Comet's
+address and the token's — and not to a registry version, so it survives
+every activation, as a token policy does; a version that drops the
+collateral from its market and a later one that brings it back bring its
+decision back with it. It is decided only for a collateral of a market of the
+active version, and a collateral nobody has decided about is not legacy,
+without a row. Every change is written in one D1 transaction with an event
+that records the value it replaced, the value it set, the actor and the
+reason, and migration `0006` enforces that in the database as `0005` does for
+token policies.
+
+The routes are those of the token policies, for a collateral of a Comet in
+place of a token, under the same limiter budgets: marking a collateral and
+applying a list share the `policy` one, and the reads and the review count as
+reads. One collateral is marked with
+`PATCH …/networks/{chain_id}/markets/{comet}/collaterals/{token}/legacy`, and
+a list is exported, reviewed without writing anything, and applied in one
+transaction:
+
+```sh
+curl -s "$API/registry/v1/admin/legacy-collaterals" -H "Authorization: Bearer $TOKEN" > legacy-collaterals.json
+# edit legacy-collaterals.json: "isLegacy": true on the legacy collaterals, and "reason"
+curl -s -X POST "$API/registry/v1/admin/legacy-collaterals/review" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @legacy-collaterals.json | jq 'if .error then .error else .summary end'
+curl -s -X POST "$API/registry/v1/admin/legacy-collaterals/apply" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @legacy-collaterals.json | jq 'if .error then .error else .summary end'
+```
+
+The frontend's list is not seeded by a migration: a migration cannot know
+which version an environment has on, and a decision is only made about a
+collateral of one. The runbook holds it as a document applied once per
+environment, with every Comet and token address the repository's registry
+data resolves, and the steps for the rest
+([The initial list of legacy collaterals](./REGISTRY_RUNBOOK.md#the-initial-list-of-legacy-collaterals)).
 
 # Token Visibility
 

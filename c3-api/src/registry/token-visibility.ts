@@ -15,7 +15,8 @@ import {
   VisibilityReasonV1,
 } from '../../lib/model/comet-registry.js';
 
-import type { Catalog } from './catalog.js';
+import type { Catalog, CatalogMarket } from './catalog.js';
+import type { LegacyDecisions } from './legacy-collaterals.js';
 import { CollateralView, Position, RULE_VERSION, TokenValue, tokenValue } from './token-collateral.js';
 
 /*
@@ -52,6 +53,33 @@ function tokensOf(catalog: Catalog, network: KnownNetwork.Name): Array<{ token: 
     market.collateralAssets.forEach(asset => add(asset.token, 'collateral'));
   }
   return [ ...found.values() ].map(({ token, roles }) => ({ token, roles: ASSET_ROLES.filter(role => roles.has(role)) }));
+}
+
+/*
+ * Where a token is a legacy collateral: the Comets of the chain's served
+ * markets that take it as collateral and whose decision marks it legacy,
+ * sorted, and whether it is legacy in every enabled market that takes it, of
+ * which there is at least one. A deprecated market's decision is named, but
+ * takes no part in `isLegacy`, which says that no enabled market offers the
+ * token as a current collateral any longer.
+ *
+ * Neither changes whether discovery shows the token. The frontend decides
+ * what to hide, because it keeps a legacy collateral visible to a user who
+ * still holds some of it.
+ */
+function legacyOf(
+  chainId: number,
+  token: Address,
+  markets: CatalogMarket[],
+  legacy: LegacyDecisions,
+): { isLegacy: boolean, legacyIn: Address[] } {
+  const taking  = markets.filter(({ market }) => market.collateralAssets.some(asset => asset.token.address === token));
+  const marked  = taking.filter(({ market }) => legacy.has(chainId, market.contracts.comet, token));
+  const enabled = taking.filter(({ market }) => market.status === 'enabled');
+  return {
+    isLegacy: enabled.length > 0 && enabled.every(entry => marked.includes(entry)),
+    legacyIn: marked.map(({ market }) => market.contracts.comet).sort(),
+  };
 }
 
 function visibilityOf(isStrategic: boolean, value: TokenValue): { isVisible: boolean, visibilityReason: VisibilityReasonV1 } {
@@ -107,9 +135,11 @@ function tokenList(input: {
   positions:       Position[],
   view:            CollateralView,
   strategic:       ReadonlySet<Address>,
+  legacy:          LegacyDecisions,
   now:             Date,
 }): TokenListV1 {
-  const tokens = tokensOf(input.catalog, input.network).map(({ token, roles }): TokenVisibilityV1 => {
+  const markets = input.catalog.marketsOn(input.network);
+  const tokens  = tokensOf(input.catalog, input.network).map(({ token, roles }): TokenVisibilityV1 => {
     const value       = tokenValue(token.address, input.view, input.positions, THRESHOLD_USD, input.now);
     const isStrategic = input.strategic.has(token.address);
     return {
@@ -119,6 +149,7 @@ function tokenList(input: {
       decimals:              token.decimals,
       roles,
       isStrategic,
+      ...legacyOf(input.chainId, token.address, markets, input.legacy),
       collateralValueUsd:    value.valueUsd === null ? null : decimalString(value.valueUsd),
       collateralValueStatus: value.status,
       valueAt:               value.block === null ? null : new Date(value.block.timestamp * 1000).toISOString(),
@@ -139,4 +170,4 @@ function tokenList(input: {
   };
 }
 
-export { THRESHOLD_USD, decimalString, tokenList, tokensOf, visibilityOf };
+export { THRESHOLD_USD, decimalString, legacyOf, tokenList, tokensOf, visibilityOf };

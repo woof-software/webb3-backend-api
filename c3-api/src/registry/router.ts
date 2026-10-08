@@ -8,6 +8,8 @@ import type { CacheDeps, CachedSnapshot } from './cache.js';
 import { activeSnapshot, cacheDepsOf, isUnreachable, versionSnapshot, warmSnapshot } from './cache.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
+import type { LegacyRead } from './legacy-collaterals.js';
+import { legacyDecisions, recordLegacyCollaterals } from './legacy-collaterals.js';
 import { routePublic } from './public-router.js';
 import { catalogHeadersOf, isRegistryUnavailable, requestCatalog, unavailableError } from './request-catalog.js';
 import type * as TokenCollateral from './token-collateral.js';
@@ -62,6 +64,12 @@ function activeReader(deps: CacheDeps): () => Promise<CachedSnapshot | null> {
   return () => pending ??= activeSnapshot(deps);
 }
 
+// the legacy decisions of one request, read at most once, for the same reason
+function legacyReader(deps: CacheDeps): () => Promise<LegacyRead> {
+  let pending: Promise<LegacyRead> | null = null;
+  return () => pending ??= legacyDecisions(deps);
+}
+
 /*
  * How a registry failure is answered. Only a source or a node provider that
  * did not answer is a 503, worth trying again. Everything else the registry
@@ -93,13 +101,14 @@ const ERROR_STATUS: Record<RegistryErrorCode, ApiErrorCode> = {
 };
 
 /*
- * A release that reached an environment before its token policy migration
- * finds those tables missing. The remedy is known and is an operator's, so it
- * is said, rather than answered as an internal error only the logs explain.
- * Any other table missing is a fault like the rest, and stays a 500.
+ * A release that reached an environment before its token policy or legacy
+ * collateral migration finds those tables missing. The remedy is known and is
+ * an operator's, so it is said, rather than answered as an internal error only
+ * the logs explain. Any other table missing is a fault like the rest, and
+ * stays a 500.
  */
 function missingSchema(error: unknown): boolean {
-  return /no such table: token_polic/i.test(String(error));
+  return /no such table: (token_polic|legacy_collateral)/i.test(String(error));
 }
 
 /*
@@ -185,6 +194,8 @@ async function routeRegistry(
         debug.warn(`registry snapshot not warmed`, { versionId, error });
       }
     },
+    legacy:       legacyReader(deps),
+    recordLegacy: () => recordLegacyCollaterals(deps),
     catalog: registry,
     tokens: {
       frame:           { apiHost: env.V3_API_HOST, nodeHost: env.NODE_PROXY_HOST, nodeKey: env.NODE_PROXY_KEY },

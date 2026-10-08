@@ -5,9 +5,10 @@ import { randomUUID } from 'node:crypto';
 import { createTestHarness } from 'wrangler';
 
 import { registryConfig } from '../../../src/registry/config.js';
+import { readLegacyCollateral } from '../../../src/registry/legacy-collateral-repository.js';
 import { activationStatements } from '../../../src/registry/repository.js';
 import type { Env } from '../../../entrypoint.js';
-import { readTokenPolicy } from '../../../src/registry/token-policy-repository.js';
+import { readTokenPolicy, setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 import {
   Row,
   applyMigration,
@@ -61,6 +62,8 @@ const APPLICATION_TABLES = [
   'sync_run_items',
   'token_policies',
   'token_policy_events',
+  'legacy_collaterals',
+  'legacy_collateral_events',
 ];
 
 const NOT_IMPORTING = { message: /registry version is not importing/ };
@@ -323,6 +326,7 @@ t.test('migration 0001 creates strict tables and an empty active pointer', async
     `SELECT name FROM sqlite_schema WHERE type = 'index' AND sql LIKE '%WHERE%' ORDER BY name`
   ).all<{ name: string }>();
   t.same((partialIndexes.results ?? []).map(index => index.name), [
+    'legacy_collaterals_marked',
     'market_assets_collateral_index',
     'market_assets_single_base',
     'market_assets_single_reward',
@@ -1216,5 +1220,237 @@ t.test('a token policy is decided for an active token, and every change is audit
   for (const [ name, overrides ] of cases) {
     await t.rejects(() => insertRow(db, 'token_policy_events', { ...event({ value: 1, at: NOW }, 0), ...overrides }), CHECK_FAILED, name);
   }
+  t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
+});
+
+/*
+ * Migration 0006: a legacy collateral decision is about a collateral of a
+ * Comet of the active registry, and the schema keeps its audit complete
+ * whatever code writes it, as 0005 does for token policies.
+ */
+const COMET = address('comet');
+
+/*
+ * A candidate whose market declares its Comet, at the same address in every
+ * version, and takes its second token as collateral.
+ */
+async function insertCollateralCandidate(db: D1Database): Promise<Candidate & { token: string, base: string }> {
+  const candidate = await insertCandidate(db, randomUUID(), 1);
+  const scope     = { registry_version_id: candidate.registry_version_id, network_id: candidate.network_id };
+  await db.batch([
+    insertStatement(db, 'market_contracts', { market_id: candidate.marketId, role: 'comet', address: COMET }),
+    insertStatement(db, 'market_assets', collateralAssetRow(scope, candidate.marketId, candidate.collateralTokenId)),
+  ]);
+  const addressOf = (id: string) => db.prepare(`SELECT address FROM tokens WHERE id = ?1`).bind(id).first<string>('address');
+  return { ...candidate, token: (await addressOf(candidate.collateralTokenId))!, base: (await addressOf(candidate.baseTokenId))! };
+}
+
+t.test('a legacy collateral is decided for a collateral of an active Comet, and every change is audited', async t => {
+  const { APP_DB: db } = await freshEnv();
+  const candidate = await insertCollateralCandidate(db);
+  const token     = candidate.token;
+
+  type Decision = { chainId?: number, comet?: string, token?: string, value: number, at: string, actor?: string };
+  const event = ({ chainId = 1, comet = COMET, token: tokenAddress = token, value, at, actor = 'test-admin' }: Decision, previous: number | null): Row => ({
+    id:                 randomUUID(),
+    chain_id:           chainId,
+    comet_address:      comet,
+    token_address:      tokenAddress,
+    previous_is_legacy: previous,
+    is_legacy:          value,
+    actor,
+    reason:             'reviewed',
+    created_at:         at,
+  });
+  const decision = ({ chainId = 1, comet = COMET, token: tokenAddress = token, value, at, actor = 'test-admin' }: Decision): Row => ({
+    chain_id:      chainId,
+    comet_address: comet,
+    token_address: tokenAddress,
+    is_legacy:     value,
+    updated_at:    at,
+    updated_by:    actor,
+  });
+  // the repository's write: the event and the row in one batch, which is one transaction
+  const decide = (change: Decision, previous: number | null) => db.batch([
+    insertStatement(db, 'legacy_collateral_events', event(change, previous)),
+    db.prepare(
+      `INSERT INTO legacy_collaterals (chain_id, comet_address, token_address, is_legacy, updated_at, updated_by)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+       ON CONFLICT (chain_id, comet_address, token_address) DO UPDATE
+       SET is_legacy = excluded.is_legacy, updated_at = excluded.updated_at, updated_by = excluded.updated_by`
+    ).bind(change.chainId ?? 1, change.comet ?? COMET, change.token ?? token, change.value, change.at, change.actor ?? 'test-admin'),
+  ]);
+  const NOT_ACTIVE = { message: /collateral is not in the active registry/ };
+  const UNAUDITED  = { message: /changes only with its audit event/ };
+  const APPENDED   = { message: /append-only/ };
+
+  await t.rejects(() => decide({ value: 1, at: NOW }, null), NOT_ACTIVE, 'nothing is decided while no version is active');
+  t.equal(await count(db, 'legacy_collateral_events'), 0, 'and the refused write leaves no event behind');
+
+  await validate(db, candidate.registry_version_id);
+  await activate(db, candidate.registry_version_id);
+
+  await t.rejects(() => decide({ chainId: 10, value: 1, at: NOW }, null), NOT_ACTIVE, 'a chain the active version does not hold');
+  await t.rejects(() => decide({ comet: address('another comet'), value: 1, at: NOW }, null), NOT_ACTIVE,
+    'a Comet no market of the active version has');
+  await t.rejects(() => decide({ token: address('unknown'), value: 1, at: NOW }, null), NOT_ACTIVE, 'a token it does not hold');
+  await t.rejects(() => decide({ token: candidate.base, value: 1, at: NOW }, null), NOT_ACTIVE,
+    'or a token of the market that is not one of its collateral: its base');
+  await t.rejects(() => insertRow(db, 'legacy_collaterals', decision({ value: 1, at: NOW })), UNAUDITED, 'a decision row without its event');
+  await t.rejects(() => decide({ value: 1, at: NOW }, 0), UNAUDITED, 'or with an event that misstates the value it replaces');
+  await t.rejects(() => insertRow(db, 'legacy_collateral_events', event({ value: 0, at: NOW }, null)), CHECK_FAILED,
+    'an event that changes nothing: a collateral without a row is not legacy');
+
+  await t.resolves(() => decide({ value: 1, at: NOW }, null), 'a decision with its event');
+  await t.resolves(() => decide({ value: 0, at: '2026-09-17T00:00:01.000Z' }, 1), 'and its reversal, which names what it replaced');
+  await t.rejects(() => decide({ value: 1, at: '2026-09-17T00:00:02.000Z' }, null), UNAUDITED,
+    'a change must name the decision in force, not the default');
+  await t.rejects(() => run(db, `UPDATE legacy_collaterals SET is_legacy = 1, updated_at = ?1`, '2026-09-17T00:00:03.000Z'), UNAUDITED,
+    'a direct update has no event to stand beside');
+  await t.rejects(() => run(db, `UPDATE legacy_collaterals SET updated_by = 'someone-else'`), UNAUDITED,
+    'and a row is not touched without a change');
+  await t.rejects(() => run(db, `UPDATE legacy_collaterals SET comet_address = ?1`, address('moved')), { message: /belongs to one collateral/ },
+    'a decision cannot move to another Comet');
+  await t.rejects(() => run(db, `UPDATE legacy_collaterals SET token_address = ?1`, address('moved')), { message: /belongs to one collateral/ },
+    'nor to another token');
+  await t.rejects(() => run(db, `DELETE FROM legacy_collaterals`), { message: /changed, not deleted/ }, 'a decision is never deleted');
+  await t.rejects(() => run(db, `UPDATE legacy_collateral_events SET reason = 'edited'`), APPENDED);
+  await t.rejects(() => run(db, `DELETE FROM legacy_collateral_events`), APPENDED);
+
+  t.same(
+    await db.prepare(`SELECT chain_id, comet_address, token_address, is_legacy, updated_by FROM legacy_collaterals`).all().then(result => result.results),
+    [ { chain_id: 1, comet_address: COMET, token_address: token, is_legacy: 0, updated_by: 'test-admin' } ],
+    'one row holds the decision in force',
+  );
+  t.same(
+    await db.prepare(`SELECT previous_is_legacy, is_legacy FROM legacy_collateral_events ORDER BY rowid`).all().then(result => result.results),
+    [ { previous_is_legacy: null, is_legacy: 1 }, { previous_is_legacy: 1, is_legacy: 0 } ],
+    'and the events hold every change that led to it',
+  );
+
+  // an older event that happens to describe the change is not its event, however it is reached
+  await t.resolves(() => decide({ value: 1, at: '2026-09-17T00:00:02.000Z' }, 0), 'a third change');
+  await t.rejects(() => run(db, `UPDATE legacy_collaterals SET is_legacy = 0, updated_at = '2026-09-17T00:00:01.000Z'`), UNAUDITED,
+    'a change cannot reuse an older event that happens to describe it');
+  const [ first ] = (await db.prepare(`SELECT id FROM legacy_collateral_events ORDER BY rowid LIMIT 1`).all<{ id: string }>()).results ?? [];
+  await t.rejects(
+    () => run(db,
+      `INSERT OR REPLACE INTO legacy_collateral_events
+         (id, chain_id, comet_address, token_address, previous_is_legacy, is_legacy, actor, reason, created_at)
+       VALUES (?1, 1, ?2, ?3, NULL, 1, 'test-admin', 'edited', ?4)`,
+      first!.id, COMET, token, NOW),
+    APPENDED,
+    'nor is an event rewritten by replacing it',
+  );
+  await t.rejects(
+    () => run(db,
+      `INSERT OR REPLACE INTO legacy_collaterals (chain_id, comet_address, token_address, is_legacy, updated_at, updated_by)
+       VALUES (1, ?1, ?2, 0, '2026-09-17T00:00:01.000Z', 'test-admin')`,
+      COMET, token),
+    UNAUDITED,
+    'nor can a replace of the row reuse an older event',
+  );
+  for (const [ verb, rowid ] of [ [ 'INSERT OR REPLACE', 1 ], [ 'INSERT', 1000 ], [ 'INSERT', -1 ], [ 'INSERT OR REPLACE', -1 ] ] as const) {
+    await t.rejects(
+      () => run(db,
+        `${verb} INTO legacy_collateral_events
+           (rowid, id, chain_id, comet_address, token_address, previous_is_legacy, is_legacy, actor, reason, created_at)
+         VALUES (?1, ?2, 1, ?3, ?4, 1, 0, 'test-admin', 'reviewed', ?5)`,
+        rowid, randomUUID(), COMET, token, NOW),
+      APPENDED,
+      `${verb} at rowid ${rowid} is refused: an event takes the next rowid, never one a writer chooses`,
+    );
+  }
+  await t.rejects(
+    () => run(db,
+      `INSERT OR REPLACE INTO legacy_collaterals (rowid, chain_id, comet_address, token_address, is_legacy, updated_at, updated_by)
+       VALUES (1, 1, ?1, ?2, 1, ?3, 'test-admin')`,
+      COMET, address('another'), NOW),
+    { message: /rowid/ },
+    'a decision row has no rowid through which a replace could reach another collateral\'s row',
+  );
+
+  // history is read in the order it was committed, whatever the stamps say
+  await t.resolves(() => decide({ value: 0, at: '2026-09-17T00:00:00.500Z' }, 1), 'a change stamped earlier than the one before it');
+  const history = await readLegacyCollateral(db, { chainId: 1, cometAddress: COMET as `0x${string}`, tokenAddress: token as `0x${string}` });
+  t.same(
+    [ history.isLegacy, history.events[0]?.previousIsLegacy, history.events[0]?.isLegacy, history.events[0]?.createdAt ],
+    [ false, true, false, '2026-09-17T00:00:00.500Z' ],
+    'is listed first, as the change that set the decision in force',
+  );
+
+  // an expectation states what a collateral must hold when a write is done; one that does not hold aborts
+  const expect = (value: number, tokenAddress: string = token) => run(db,
+    `INSERT INTO legacy_collateral_expectations (chain_id, comet_address, token_address, is_legacy) VALUES (1, ?1, ?2, ?3)`,
+    COMET, tokenAddress, value);
+  await t.resolves(() => expect(0), 'an expectation that holds passes');
+  t.equal(await count(db, 'legacy_collateral_expectations'), 0, 'and writes nothing');
+  await t.rejects(() => expect(1), { message: /changed while they were being written/ }, 'one for another decision aborts');
+  await t.rejects(() => expect(0, candidate.base), NOT_ACTIVE, 'and so does one for a token that is no collateral of the Comet');
+
+  // the membership check runs on a plain UPDATE too: a version without the collateral keeps the decision unchanged
+  const next = await insertCollateralCandidate(db);
+  await validate(db, next.registry_version_id);
+  await activate(db, next.registry_version_id);
+  const events = await count(db, 'legacy_collateral_events');
+  await t.rejects(
+    () => db.batch([
+      insertStatement(db, 'legacy_collateral_events', event({ value: 1, at: '2026-09-17T00:00:03.000Z' }, 0)),
+      db.prepare(`UPDATE legacy_collaterals SET is_legacy = 1, updated_at = ?1, updated_by = 'test-admin'`).bind('2026-09-17T00:00:03.000Z'),
+    ]),
+    NOT_ACTIVE,
+    'a collateral the active version no longer holds keeps its decision until a version brings it back',
+  );
+  t.equal(await count(db, 'legacy_collateral_events'), events, 'and the refused change leaves no event');
+
+  // a literal, so the value reaches the column as the integer it is rather than as a bound double
+  await t.rejects(
+    () => run(db,
+      `INSERT INTO legacy_collateral_events
+         (id, chain_id, comet_address, token_address, previous_is_legacy, is_legacy, actor, reason, created_at)
+       VALUES (?1, 9007199254740992, ?2, ?3, 0, 1, 'test-admin', 'reviewed', ?4)`,
+      randomUUID(), COMET, token, NOW),
+    CHECK_FAILED,
+    'a chain id past the safe integer range',
+  );
+  const cases: Array<[ string, Row ]> = [
+    [ 'a chain id of zero', { chain_id: 0 } ],
+    [ 'a Comet address that is not lowercase', { comet_address: COMET.toUpperCase().replace('0X', '0x') } ],
+    [ 'a token address that is not hex', { token_address: `0x${'g'.repeat(40)}` } ],
+    [ 'a value that is not a flag', { is_legacy: 2, previous_is_legacy: 0 } ],
+    [ 'a blank reason', { reason: ' ' } ],
+    [ 'an unbounded reason', { reason: 'x'.repeat(1001) } ],
+    [ 'a blank actor', { actor: ' ' } ],
+  ];
+  for (const [ name, overrides ] of cases) {
+    await t.rejects(() => insertRow(db, 'legacy_collateral_events', { ...event({ value: 1, at: NOW }, 0), ...overrides }), CHECK_FAILED, name);
+  }
+  t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
+});
+
+/*
+ * Migration 0006 only adds tables, so it applies over a database a release
+ * before it serves from, while that release goes on serving: the version it
+ * activated and the token policies it decided are left as they were.
+ */
+t.test('migration 0006 adds its tables beside a registry in use', async t => {
+  await server.reset();
+  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
+  await applyMigrations(db, undefined, { through: '0005' });
+
+  const snapshot = loadRegistrySnapshotFixture();
+  const { versionId, counts } = await seedCandidate(db, snapshot);
+  await validate(db, versionId);
+  await activate(db, versionId);
+  const weth = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
+  await setTokenPolicy(db, { chainId: 1, tokenAddress: weth, isStrategic: true, actor: 'test-admin', reason: 'decided before 0006' });
+
+  await applyMigration(db, '0006_legacy_collaterals.sql');
+
+  t.equal(await activeVersionId(db), versionId, 'the version that was on is on');
+  t.equal(await count(db, 'market_assets'), counts.market_assets, 'with every row of it');
+  t.equal((await readTokenPolicy(db, 1, weth)).isStrategic, true, 'and the token policies decided before it stand');
+  t.same([ await count(db, 'legacy_collaterals'), await count(db, 'legacy_collateral_events') ], [ 0, 0 ],
+    'while nothing is decided about any collateral yet');
   t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
 });

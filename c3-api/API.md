@@ -27,9 +27,14 @@ Cache-Control:    no-store
 A client that must not act on an older version refuses such a response; one
 that only reads can use it. How long that is allowed is per environment, and
 a `503` with the code `UPSTREAM_UNAVAILABLE` is the answer once the window has
-passed. These endpoints and the registry's own fail the same way, except the
-token list: it reads the token policies from the database on every request,
-so it answers `503` as soon as the database cannot be reached.
+passed. These endpoints and the registry's own fail the same way, with two
+exceptions. The token list reads the token policies and the legacy collateral
+decisions from the database on every request, so it answers `503` as soon as
+the database cannot be reached. `/registry/v1/active` and the market reads
+under `/registry/v1/networks/{chain_id}/markets` mark every collateral with
+the legacy collateral decisions, and when the database cannot be reached they
+use the ones the API last recorded: with none recorded, they answer `503`
+inside the window too (see `/registry/v1/active`).
 
 Testnets are not served: the registry imports mainnets only. A request that
 names one is answered `400` in the [envelope](#errors), with the code
@@ -777,21 +782,24 @@ read, an overlay — carries its own code in `details.code`, such as
 `SYNC_ALREADY_RUNNING` or `OVERLAY_FEED_UNREADABLE`, under the kind of answer
 it is; a monitor matches `details.code` for those. Besides
 `REGISTRY_NOT_ACTIVE`, only a source or a node provider that did not answer,
-a database that could not be reached, and — on the token list and the token
-policy routes — a database without the token policy migration are a `503`:
-those are the answers worth trying again.
+a database that could not be reached, and a database without the migration of
+the tables a route reads — the token policies' on the token list and the token
+policy routes, the legacy collaterals' on the token list, `/active`, the
+market reads and the legacy collateral routes — are a `503`: those are the
+answers worth trying again.
 
 Public reads carry `X-Registry-Version` and `X-Registry-Checksum`, which a
 browser can read. Every one of them but the token list is cacheable by its
 version, carries an `ETag`, and answers `304` to an `If-None-Match` that names
-what it would send; the token list's values change every minute, so it is
-kept for 30 seconds and carries none. The tags are compared weakly, as
-RFC 9110 has it: `W/"…"`, which is what a browser sends back for a response
-Cloudflare compressed, names the same as the tag itself; `*` names any; and a
-list of tags names what any tag in it names. A header that is none of those
-is answered with the body, and so is every request while an answer comes from
-the cache because the database cannot be reached. They answer
-`503 REGISTRY_NOT_ACTIVE` when no version is active, and
+what it would send; `/active` and the market reads are cacheable by the legacy
+flags they carry as well, which their tag names. The token list's values
+change every minute, so it is kept for 30 seconds and carries none. The tags
+are compared weakly, as RFC 9110 has it: `W/"…"`, which is what a browser
+sends back for a response Cloudflare compressed, names the same as the tag
+itself; `*` names any; and a list of tags names what any tag in it names. A
+header that is none of those is answered with the body, and so is every
+request while an answer comes from the cache because the database cannot be
+reached. They answer `503 REGISTRY_NOT_ACTIVE` when no version is active, and
 `503 UPSTREAM_UNAVAILABLE` when the database cannot be reached and no older
 version may be served instead. A path is matched with or without a trailing
 slash.
@@ -813,9 +821,11 @@ administrative request is rate limited twice, reads as well as commands:
 - Then, once it is authenticated, by its token: 30 a minute for each token
   and each family of routes. Every read shares one budget, so a monitor
   polling the status spends it with an operator who holds the same token, and
-  each kind of command has one of its own. `POST …/token-policies/review`,
-  which writes nothing, counts as a read; `PATCH …/policy` and
-  `POST …/token-policies/apply` share one `policy` budget.
+  each kind of command has one of its own. `POST …/token-policies/review`
+  and `POST …/legacy-collaterals/review`, which write nothing, count as reads;
+  the decisions an administrator makes about what the app offers —
+  `PATCH …/policy`, `POST …/token-policies/apply`, `PATCH …/legacy` and
+  `POST …/legacy-collaterals/apply` — share one `policy` budget.
 
 Past either budget the answer is `429` `RATE_LIMITED`, saying in
 `Retry-After` how many seconds to wait, and in its message which budget ran
@@ -823,9 +833,10 @@ out: `too many administrative requests from this address`, or
 `too many <family> requests with this token`.
 
 A command's body is at most 64 KiB — 512 KiB for `PUT …/overlays`, and 1 MiB
-for `POST …/token-policies/review` and `…/apply` — and a larger one is refused
-with `413`. A `reason`, wherever a command takes one, is at most 1,000
-characters, and a longer one is refused with `400`.
+for `POST …/token-policies/review`, `POST …/legacy-collaterals/review` and
+their `…/apply` — and a larger one is refused with `413`. A `reason`, wherever
+a command takes one, is at most 1,000 characters, and a longer one is refused
+with `400`.
 
 ## `/registry/v1/active`
 ### description:
@@ -838,6 +849,62 @@ A `disabled` market is part of the version but is served by no public read,
 and a network whose every market is disabled is not listed at all: a chain
 the source has just added arrives that way, under its canonical name and
 with nothing about it reviewed, until a version decides to offer it.
+
+Every collateral of every market says whether an administrator has marked it
+legacy in that market (`isLegacy`), beside what the version says of it. A
+legacy collateral is one the app no longer offers in that market: it leaves
+it out of the market's collateral and of what can be supplied, and keeps
+showing it to a user who still holds some of it, so that it can be
+withdrawn. The decision is about one collateral of one market, so a token can
+be legacy in one market and current in another:
+
+```json
+{
+  "schemaVersion": 1,
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "…": "…" },
+  "networks": [ {
+    "chainId": 1,
+    "…": "…",
+    "markets": [ {
+      "deploymentKey": "usdt",
+      "…": "…",
+      "collateralAssets": [
+        {
+          "assetIndex": 1,
+          "token": { "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "symbol": "WETH", "name": "Wrapped Ether", "decimals": 18 },
+          "priceFeed": { "address": "0x…", "decimals": 8 },
+          "isLegacy": false
+        },
+        {
+          "assetIndex": 10,
+          "token": { "address": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa", "symbol": "mETH", "name": "mETH", "decimals": 18 },
+          "priceFeed": { "address": "0x…", "decimals": 8 },
+          "isLegacy": true
+        }
+      ]
+    } ]
+  } ]
+}
+```
+
+The flag is not part of the version — a decision outlives every activation
+(`PATCH …/collaterals/{token_address}/legacy` below) — so it is read with
+every answer, and the `ETag` names the flags an answer carries beside the
+version: a decision that changes them changes the tag, and a client holding a
+copy made before it is sent the new one rather than a `304`. A browser may
+still keep a copy for its `max-age`.
+
+When the database cannot be reached, the flags are the decisions the API last
+recorded. Every decision records them once it has committed, and the reads
+keep that record in step: they check it against the decisions they read, and
+write those where it differs, whenever they find the decisions changed and at
+least every five minutes besides. A read that began before a decision can
+still write after it and put back the decisions before it; the next check
+puts that right, within about five minutes while the API is being read. An
+answer with the recorded flags carries `X-Registry-Stale` and `no-store`, as
+every answer from the cache does, with `X-Registry-Stale: 0` where the
+version was confirmed and the decisions alone could not be read; with nothing
+recorded it is `503 UPSTREAM_UNAVAILABLE`.
 
 ```sh
 $ curl 'localhost:8787/registry/v1/active'
@@ -853,24 +920,28 @@ markets.
 ### description:
 
 The markets of one chain that are not `disabled`, in the same order the
-snapshot lists them. A chain the active version does not list answers `404`.
+snapshot lists them, each collateral with its `isLegacy` as
+`/registry/v1/active` has it. A chain the active version does not list
+answers `404`. The `ETag` names the flags of this chain's markets, so a
+decision about another chain leaves it as it is.
 
 ## `/registry/v1/networks/{chain_id}/markets/{comet_address}`
 ### description:
 
-One market, addressed by its Comet. A `disabled` market answers `404`; a
-`deprecated` one is served, because positions and history in it must stay
-reachable.
+One market, addressed by its Comet, each collateral with its `isLegacy` as
+`/registry/v1/active` has it, and an `ETag` that names this market's flags
+alone. A `disabled` market answers `404`; a `deprecated` one is served,
+because positions and history in it must stay reachable.
 
 ## `/registry/v1/networks/{chain_id}/tokens`
 ### description:
 
 Every token the active version serves on one chain — the base, reward and
 collateral tokens of its enabled and deprecated markets — with its strategic
-mark, the USD value of its collateral across the chain's enabled markets, and
-whether token discovery shows it. `?visibleOnly=true` lists only the tokens it
-shows; `visibleOnly` is exactly `true` or `false`, and anything else answers
-`400`.
+mark, the markets it is a legacy collateral of, the USD value of its
+collateral across the chain's enabled markets, and whether token discovery
+shows it. `?visibleOnly=true` lists only the tokens it shows; `visibleOnly` is
+exactly `true` or `false`, and anything else answers `400`.
 
 A token is shown when an administrator marked it strategic, or when its
 collateral is worth at least `thresholdUsd`, USD 250,000, compared exactly. A
@@ -893,6 +964,8 @@ knowing what a token is worth is no reason to hide one someone may hold.
       "decimals": 8,
       "roles": [ "collateral" ],
       "isStrategic": false,
+      "isLegacy": true,
+      "legacyIn": [ "0xe85dc543813b8c2cfeaac371517b925a166a9293" ],
       "collateralValueUsd": "182345.0912",
       "collateralValueStatus": "exception",
       "valueAt": "2026-10-05T12:00:23.000Z",
@@ -916,6 +989,8 @@ knowing what a token is worth is no reason to hide one someone may hold.
       "decimals": 6,
       "roles": [ "collateral" ],
       "isStrategic": false,
+      "isLegacy": false,
+      "legacyIn": [],
       "collateralValueUsd": "1843210.123456",
       "collateralValueStatus": "fresh",
       "valueAt": "2026-10-05T12:00:23.000Z",
@@ -959,13 +1034,26 @@ enabled market takes as collateral is then `"0"` with no block.
 `visibilityReason` is `strategic`, `collateral_threshold`, `below_threshold`
 or `data_unavailable`.
 
+`legacyIn` lists, sorted, the Comets of the chain's served markets that take
+the token as a collateral an administrator has marked legacy in that market
+(`PATCH …/collaterals/{token_address}/legacy`), and is empty for a token no
+market marks so — a base or reward token among them. `isLegacy` is `true` when
+the token is a collateral of at least one enabled market and legacy in every
+enabled market that takes it: no enabled market offers it as a current
+collateral any longer. A deprecated market's decision is named in `legacyIn`,
+but takes no part in `isLegacy`. Neither changes whether discovery shows the
+token: `isVisible` and `visibilityReason` follow the rule above, and
+`ruleVersion` is still `1`. Where to hide a legacy collateral is the app's
+decision, since it keeps one visible to a user who still holds some of it.
+
 The list answers `200` whatever the node does: a token that cannot be valued
 is a status of that token, never a failure of the list. It answers `404` for a
 chain the active version does not list, as `/networks/{chain_id}/markets`
 does: one it does not hold, or one whose every market is disabled. It answers
 `503` when no version is active, or when the database cannot be reached for
-the token policies or does not have their migration yet — without them a
-strategic token would be listed as hidden. It carries
+the token policies or the legacy collateral decisions, or does not have their
+migrations yet — without them a strategic token would be listed as hidden,
+and a legacy collateral as current. It carries
 `Cache-Control: public, max-age=30` and no `ETag`; an answer from a version
 the database could not confirm carries `X-Registry-Stale` and `no-store`
 instead.
@@ -978,9 +1066,11 @@ $ curl 'localhost:8787/registry/v1/networks/1/tokens?visibleOnly=true'
 ### description:
 
 A validated version by id, so a session that pinned one can refetch exactly
-what it pinned even after another version was activated. It is the same
-representation as `/registry/v1/active` for the same version, with the same
-`ETag`, and a client that sends it back is answered `304` without the
+what it pinned even after another version was activated. It is the version as
+it was imported: the networks and markets `/registry/v1/active` serves for
+the same version, without the `isLegacy` the active reads add to every
+collateral, since a legacy decision is no part of a version. It has an `ETag`
+of its own, and a client that sends it back is answered `304` without the
 version being read again.
 
 ## `POST /registry/v1/admin/sync`
@@ -1861,3 +1951,237 @@ $ curl -X POST 'localhost:8787/registry/v1/admin/token-policies/apply' \
 Every token policy route answers `503 UPSTREAM_UNAVAILABLE` naming the D1
 migrations when the environment's database does not have migration `0005`
 yet: a release deployed before its migration.
+
+## `PATCH /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/collaterals/{token_address}/legacy`
+### description:
+
+Marks a collateral of a market legacy, or makes it current again. A legacy
+collateral is one the app no longer offers in that market; it keeps showing
+it to a user who still holds some, so that it can be withdrawn. `/active` and
+the market reads mark it with `isLegacy` on that collateral of that market,
+and the token list names the market's Comet in the token's `legacyIn`; all of
+them read the decisions on every request, so a change is in their next
+answer, and changes the `ETag` of every read whose flags it changes.
+
+A decision belongs to the collateral of the Comet — a chain id, the Comet's
+address and the token's — and not to a registry version, so it survives every
+activation, and a version that drops the collateral from its market and a
+later one that brings it back bring the decision back with it. It is decided
+only for a collateral of a market of the active version, of any status: a
+chain the version does not hold, a Comet no market of that chain has there,
+or a token that is not one of that market's collateral answers `404`, and no
+active version answers `503 REGISTRY_NOT_ACTIVE`. Both addresses may be in any
+case; they are stored and answered lowercase.
+
+The body is exactly a boolean and the reason, which is required and stored
+with the audit event beside the actor:
+
+```json
+{ "isLegacy": true, "reason": "Legacy collateral of the USDT market" }
+```
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "chainId": 1,
+  "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840",
+  "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa",
+  "isLegacy": true,
+  "changed": true,
+  "updatedAt": "2026-10-08T09:12:44.512Z"
+}
+```
+
+A collateral nobody has decided about is not legacy. Asking for the decision
+already in force answers `changed: false`, writes nothing and keeps the time
+the decision was made, so a repeated or retried request is safe; `updatedAt`
+is `null` for a collateral nobody has ever decided about. A change is
+committed with its audit event before it is answered, and the answer names
+the version it was checked against, in the body and in `X-Registry-Version`.
+If a version without the collateral is activated while the change is being
+written, the write is rolled back, event and all, and the request answers
+`409`. Once it has committed, the command records the decisions in force for
+the active reads to answer with while the database cannot be reached.
+
+```sh
+$ curl -X PATCH 'localhost:8787/registry/v1/admin/networks/1/markets/0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840/collaterals/0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa/legacy' \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"isLegacy": true, "reason": "Legacy collateral of the USDT market"}'
+```
+
+## `GET /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/collaterals/{token_address}/legacy`
+### description:
+
+One collateral's decision and the changes that led to it, at most 100, newest
+first in the order they were committed, so the first is always the change
+that set the decision in force. `previousIsLegacy` is `null` for the first
+decision about a collateral.
+
+A decision stays readable while the active version does not hold the
+collateral in that Comet, with `inActiveVersion: false`; it applies again once
+a version that holds it is activated. Only a collateral the active version
+does not hold and nobody has decided about answers `404`.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "chainId": 1,
+  "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840",
+  "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa",
+  "inActiveVersion": true,
+  "isLegacy": true,
+  "updatedAt": "2026-10-08T09:12:44.512Z",
+  "updatedBy": "registry-admin:stage",
+  "events": [
+    {
+      "id": "0c55b0f3-8b1e-4a54-b3f4-6a0d3c2e7f19",
+      "previousIsLegacy": null,
+      "isLegacy": true,
+      "actor": "registry-admin:stage",
+      "reason": "Legacy collateral of the USDT market",
+      "createdAt": "2026-10-08T09:12:44.512Z"
+    }
+  ]
+}
+```
+
+## `GET /registry/v1/admin/legacy-collaterals`
+### description:
+
+Every collateral of every market of the active version with the decision in
+force, as a list review and apply take back: the file an operator edits
+instead of writing addresses by hand. Rows are ordered by chain, then by the
+market's deployment key, then by asset index, and a disabled market's
+collaterals are listed too: a decision about one applies once the market is
+served.
+
+`retained` lists the decisions kept for collaterals the active version does
+not hold in their Comet, each with when and by whom it was made. Each applies
+again as soon as a version whose market takes the collateral is activated,
+so it is worth reviewing before one is.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "reason": null,
+  "collaterals": [
+    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa", "symbol": "mETH", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x68749665ff8d2d112fa859aa293f07a622782f38", "symbol": "XAUt", "isLegacy": false }
+  ],
+  "retained": [
+    {
+      "chainId": 1,
+      "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840",
+      "tokenAddress": "0x57f5e098cad7a3d1eed53991d4d66c45c9af7812",
+      "isLegacy": true,
+      "updatedAt": "2026-10-08T09:20:11.903Z",
+      "updatedBy": "registry-admin:stage"
+    }
+  ]
+}
+```
+
+## `POST /registry/v1/admin/legacy-collaterals/review`
+### description:
+
+What applying a list would change, row by row, without writing anything. The
+body is a list as the export answers it, edited, of 1 to 500 rows and at most
+1 MiB:
+
+- `collaterals[]`: `chainId`, `cometAddress` and `tokenAddress` (both in any
+  case) and `isLegacy` are required; `deploymentKey` and `symbol` are
+  optional and only checked — a market or a symbol that is not the one the
+  active version names is reported as the mistake it usually is; `reason` is
+  optional.
+- `reason` at the top is the reason for every row that changes and has none of
+  its own. A row that changes a decision needs one or the other; a row that
+  leaves its collateral as it is needs neither.
+- `registryVersion` and `retained` say where the list was exported from and
+  what the active version does not hold, and are not read: a decision belongs
+  to no version.
+
+A malformed body answers `400` with every problem of every row in
+`details.problems`. A well-formed one answers `200`, with each row's
+`problem` in place of refusing:
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "summary": { "change": 1, "unchanged": 0, "problems": 0 },
+  "collaterals": [
+    {
+      "row": 1,
+      "chainId": 1,
+      "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840",
+      "deploymentKey": "usdt",
+      "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa",
+      "symbol": "mETH",
+      "current": false,
+      "requested": true,
+      "action": "change",
+      "reason": "Legacy collateral the app hid by its own list until the registry served it (Linear COM-18)",
+      "problem": null
+    }
+  ]
+}
+```
+
+A `problem` is one of: a chain the active version does not hold, a Comet no
+market of that chain has there, a token that is not one of that market's
+collateral, a market or a symbol that names another, or a change without a
+reason.
+
+## `POST /registry/v1/admin/legacy-collaterals/apply`
+### description:
+
+Applies a list — the same body as review — in one transaction, as
+`POST …/token-policies/apply` applies one: every decision it changes is
+written with its own audit event, and the transaction requires every row, the
+unchanged ones included, to hold what the list says once it is done. A list
+is applied completely or not at all:
+
+- a list with any `problem` answers `422`, naming each such row in
+  `details.problems`, and writes nothing;
+- a version activated, or a decision of the list changed by someone else,
+  while the list is being written answers `409` and writes nothing.
+
+The list is compared with the decisions in force when it is applied, not when
+it was reviewed, so review it right before applying it. A row the comparison
+finds unchanged is not written, only checked, so a decision made on that
+collateral while the list is being written is never reverted by it. Applying
+the same list again changes nothing. Once it has committed, the command
+records the decisions in force, as a single change does.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "summary": { "changed": 1, "unchanged": 0 },
+  "collaterals": [
+    {
+      "row": 1,
+      "chainId": 1,
+      "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840",
+      "deploymentKey": "usdt",
+      "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa",
+      "symbol": "mETH",
+      "isLegacy": true,
+      "changed": true,
+      "updatedAt": "2026-10-08T09:12:44.512Z"
+    }
+  ]
+}
+```
+
+```sh
+$ curl -X POST 'localhost:8787/registry/v1/admin/legacy-collaterals/apply' \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    --data @legacy-collaterals.json
+```
+
+The list the app hid until this release is applied once in each environment
+from the document in [REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md).
+
+Every legacy collateral route answers `503 UPSTREAM_UNAVAILABLE` naming the
+D1 migrations when the environment's database does not have migration `0006`
+yet — a release deployed before its migration — and so do `/active`, the
+market reads and the token list, which read the decisions.

@@ -34,6 +34,17 @@ import {
 } from './handlers.js';
 import { isExplicit } from './importer.js';
 import type { InvocationResult } from './importer.js';
+import {
+  getLegacyCollateral,
+  getLegacyCollateralExport,
+  patchLegacyCollateral,
+  postLegacyCollateralApply,
+  postLegacyCollateralReview,
+} from './legacy-collateral-handlers.js';
+import type {
+  DecisionList as LegacyDecisionList,
+  ListedDecision as ListedLegacyDecision,
+} from './legacy-collateral-repository.js';
 import { runRegistrySync, transportFor } from './scheduled.js';
 import {
   getTokenPolicies,
@@ -97,6 +108,11 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/token-policies$/,                                       method: 'GET',  handler: 'exportTokenPolicies', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/token-policies\/review$/,                               method: 'POST', handler: 'reviewTokenPolicies', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/token-policies\/apply$/,                                method: 'POST', handler: 'applyTokenPolicies',  family: 'policy' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/legacy$/, method: 'GET',   handler: 'legacyCollateral',    family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/legacy$/, method: 'PATCH', handler: 'setLegacyCollateral', family: 'policy' },
+  { pattern: /^\/registry\/v1\/admin\/legacy-collaterals$/,                                   method: 'GET',  handler: 'exportLegacyCollaterals', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/legacy-collaterals\/review$/,                           method: 'POST', handler: 'reviewLegacyCollaterals', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/legacy-collaterals\/apply$/,                            method: 'POST', handler: 'applyLegacyCollaterals',  family: 'policy' },
 ] as const;
 
 const MAX_REASON = 1000;
@@ -126,18 +142,21 @@ const MAX_OVERLAYS_PER_REQUEST = 100;
 const MAX_OVERLAYS_BODY_BYTES  = 512 * 1024;
 
 /*
- * A list of token policies in one request: every token of every network of a
+ * A list of decisions in one request, of token policies or of legacy
+ * collaterals: every token, or every collateral, of every network of a
  * registry fits, with a reason on each row. The list is written as a handful
  * of statements whatever its length, so the bound is the body, not D1.
  */
-const MAX_POLICIES_PER_REQUEST = 500;
-const MAX_POLICIES_BODY_BYTES  = 1024 * 1024;
+const MAX_DECISIONS_PER_REQUEST = 500;
+const MAX_DECISIONS_BODY_BYTES  = 1024 * 1024;
 
 // the bodies larger than an ordinary command, by the route that takes them
 const BODY_BYTES: Partial<Record<string, number>> = {
-  overlays:            MAX_OVERLAYS_BODY_BYTES,
-  reviewTokenPolicies: MAX_POLICIES_BODY_BYTES,
-  applyTokenPolicies:  MAX_POLICIES_BODY_BYTES,
+  overlays:                MAX_OVERLAYS_BODY_BYTES,
+  reviewTokenPolicies:     MAX_DECISIONS_BODY_BYTES,
+  applyTokenPolicies:      MAX_DECISIONS_BODY_BYTES,
+  reviewLegacyCollaterals: MAX_DECISIONS_BODY_BYTES,
+  applyLegacyCollaterals:  MAX_DECISIONS_BODY_BYTES,
 };
 
 /*
@@ -463,8 +482,8 @@ function decisionList(body: Record<string, unknown>): DecisionList {
   const reason = optionalReason(body.reason, 'reason', problems);
 
   const policies = body.policies;
-  if (!Array.isArray(policies) || policies.length === 0 || policies.length > MAX_POLICIES_PER_REQUEST) {
-    throw new ApiError('BAD_REQUEST', `policies must be a list of 1 to ${MAX_POLICIES_PER_REQUEST} decisions`);
+  if (!Array.isArray(policies) || policies.length === 0 || policies.length > MAX_DECISIONS_PER_REQUEST) {
+    throw new ApiError('BAD_REQUEST', `policies must be a list of 1 to ${MAX_DECISIONS_PER_REQUEST} decisions`);
   }
 
   const seen = new Map<string, number>();
@@ -519,6 +538,91 @@ function decisionList(body: Record<string, unknown>): DecisionList {
 
   if (problems.length > 0) {
     throw new ApiError('BAD_REQUEST', `the list of token policies is invalid`, { problems });
+  }
+  return { reason, decisions };
+}
+
+const LEGACY_DECISION_KEYS = [ 'chainId', 'cometAddress', 'deploymentKey', 'tokenAddress', 'symbol', 'isLegacy', 'reason' ];
+
+/*
+ * The body of `POST /legacy-collaterals/review` and `/apply`: a list as the
+ * export answers it, edited, read as a list of token policies is read.
+ * `registryVersion` and `retained` say where it was exported from and which
+ * decisions the active version does not hold, and are not read, since a
+ * decision belongs to no version. Every problem of every row is reported at
+ * once, so a file is fixed in one pass.
+ */
+function legacyCollateralList(body: Record<string, unknown>): LegacyDecisionList {
+  requireExactKeys(body, [ 'registryVersion', 'reason', 'collaterals', 'retained' ]);
+  const problems: string[] = [];
+  const reason = optionalReason(body.reason, 'reason', problems);
+
+  const collaterals = body.collaterals;
+  if (!Array.isArray(collaterals) || collaterals.length === 0 || collaterals.length > MAX_DECISIONS_PER_REQUEST) {
+    throw new ApiError('BAD_REQUEST', `collaterals must be a list of 1 to ${MAX_DECISIONS_PER_REQUEST} decisions`);
+  }
+
+  const seen = new Map<string, number>();
+  const decisions: ListedLegacyDecision[] = [];
+  collaterals.forEach((entry: unknown, index: number) => {
+    const row = `row ${index + 1}`;
+    if (typeof(entry) !== 'object' || entry === null || Array.isArray(entry)) {
+      problems.push(`${row} must be an object`);
+      return;
+    }
+    const value  = entry as Record<string, unknown>;
+    const before = problems.length;
+
+    const unexpected = Object.keys(value).filter(key => !LEGACY_DECISION_KEYS.includes(key));
+    if (unexpected.length > 0) {
+      problems.push(`${row} has unexpected properties: ${unexpected.sort().join(', ')}`);
+    }
+    const { chainId, cometAddress, deploymentKey, tokenAddress, symbol, isLegacy } = value;
+    if (typeof(chainId) !== 'number' || !Number.isSafeInteger(chainId) || chainId <= 0) {
+      problems.push(`${row}: chainId must be a positive integer`);
+    }
+    if (!isAddress(cometAddress)) {
+      problems.push(`${row}: cometAddress must be an address`);
+    }
+    if (deploymentKey !== undefined && deploymentKey !== null && typeof(deploymentKey) !== 'string') {
+      problems.push(`${row}: deploymentKey must be null or a string`);
+    }
+    if (!isAddress(tokenAddress)) {
+      problems.push(`${row}: tokenAddress must be an address`);
+    }
+    if (symbol !== undefined && symbol !== null && typeof(symbol) !== 'string') {
+      problems.push(`${row}: symbol must be null or a string`);
+    }
+    if (typeof(isLegacy) !== 'boolean') {
+      problems.push(`${row}: isLegacy must be a boolean`);
+    }
+    const rowReason = optionalReason(value.reason, `${row}: reason`, problems);
+    if (problems.length > before) {
+      return;
+    }
+
+    const comet = normalizeAddress(cometAddress as string);
+    const token = normalizeAddress(tokenAddress as string);
+    const key   = `${chainId}:${comet}:${token}`;
+    const first = seen.get(key);
+    if (first !== undefined) {
+      problems.push(`${row} repeats row ${first} (chain ${chainId}, ${comet}, ${token})`);
+      return;
+    }
+    seen.set(key, index + 1);
+    decisions.push({
+      chainId:       chainId as number,
+      cometAddress:  comet,
+      deploymentKey: (deploymentKey as string | null | undefined) ?? null,
+      tokenAddress:  token,
+      symbol:        (symbol as string | null | undefined) ?? null,
+      isLegacy:      isLegacy as boolean,
+      reason:        rowReason,
+    });
+  });
+
+  if (problems.length > 0) {
+    throw new ApiError('BAD_REQUEST', `the list of legacy collaterals is invalid`, { problems });
   }
   return { reason, decisions };
 }
@@ -659,6 +763,30 @@ async function routeAdmin(
       return await postTokenPolicyReview(context, decisionList(body));
     case 'applyTokenPolicies':
       return await postTokenPolicyApply(context, decisionList(body));
+    case 'legacyCollateral':
+      // a chain id, the Comet and the token, as on the token routes
+      return await getLegacyCollateral(context, versionId!, second!, third!);
+    case 'setLegacyCollateral': {
+      /*
+       * A legacy decision changes which collaterals the frontend offers, so it
+       * carries a reason like every other decision, and the audit event stores
+       * it beside the actor.
+       */
+      requireExactKeys(body, [ 'isLegacy', 'reason' ]);
+      if (typeof(body.isLegacy) !== 'boolean') {
+        throw new ApiError('BAD_REQUEST', `isLegacy must be a boolean`);
+      }
+      return await patchLegacyCollateral(context, versionId!, second!, third!, {
+        isLegacy: body.isLegacy,
+        reason:   requireReason(body),
+      });
+    }
+    case 'exportLegacyCollaterals':
+      return await getLegacyCollateralExport(context);
+    case 'reviewLegacyCollaterals':
+      return await postLegacyCollateralReview(context, legacyCollateralList(body));
+    case 'applyLegacyCollaterals':
+      return await postLegacyCollateralApply(context, legacyCollateralList(body));
   }
 }
 

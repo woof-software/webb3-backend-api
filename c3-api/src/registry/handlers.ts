@@ -14,6 +14,8 @@ import { ApiError } from '../http/errors.js';
 import { jsonResponse } from '../http/json.js';
 
 import type { CachedSnapshot, PinnedVersion } from './cache.js';
+import type { LegacyDecisions, LegacyRead } from './legacy-collaterals.js';
+import { legacyRepresentation, markedMarket, markedNetwork } from './legacy-collaterals.js';
 import type { RequestCatalog } from './request-catalog.js';
 import type { TokenCollateralDeps } from './token-collateral.js';
 import { registryHeaders } from './version-headers.js';
@@ -84,6 +86,15 @@ type RegistryContext = {
    */
   warm: (versionId: string) => Promise<void>,
   /*
+   * The legacy decisions of every chain, which the active reads mark the
+   * collaterals of the active version with (legacy-collaterals.ts): read from
+   * D1 at most once per request, or during an outage from the record the
+   * Worker keeps of them. `recordLegacy` keeps that record, after a command
+   * that may have changed them; it never fails the command.
+   */
+  legacy:       () => Promise<LegacyRead>,
+  recordLegacy: () => Promise<void>,
+  /*
    * The registry version of the request as the market routes load it, so the
    * token list values a chain's markets from the same catalog they use.
    */
@@ -98,23 +109,25 @@ const SCHEMA_VERSION = 1;
  * The revision of what these routes send for a version. A body is the version
  * as this release presents it, and a release can change that for a version
  * that is already active: the one that stopped listing a network with no
- * served market did. A tag that named the version alone would then confirm,
- * with a 304, a copy an earlier release sent, for as long as that version
- * stays active; so a release that changes what a route sends for a version
- * that already exists moves this on.
+ * served market did, and so did the one that marks legacy collaterals. A tag
+ * that named the version alone would then confirm, with a 304, a copy an
+ * earlier release sent, for as long as that version stays active; so a release
+ * that changes what a route sends for a version that already exists moves
+ * this on.
  */
-const REPRESENTATION_REVISION = 2;
+const REPRESENTATION_REVISION = 3;
 
 /*
  * The strong ETag of one representation: schema version, the revision of what
  * is sent, what was asked for, the version id, and its checksum. It needs
- * nothing but the reference to the version, so a conditional request is
- * decided before any of its bytes are read.
+ * nothing but the reference to the version, and for a read that marks legacy
+ * collaterals the flags it marks, so a conditional request is decided before
+ * any of its bytes are read.
  *
  * The representation is part of it because these routes serve different
  * bodies from the same version. An ETag that named the version alone would
  * let a conditional request for one route be answered 304 while the client
- * holds another route's body.
+ * holds another route's body, or a body marked by decisions since changed.
  */
 function etagOf({ id, checksum }: VersionRef, representation: string): string {
   return `"v${SCHEMA_VERSION}-r${REPRESENTATION_REVISION}-${representation}-${id}-${checksum}"`;
@@ -132,8 +145,8 @@ function versionRef(snapshot: RegistrySnapshotV1): VersionRef {
  * A cacheable snapshot response, honoring If-None-Match as RFC 9110 reads it
  * (matchesIfNoneMatch): `*`, a list of tags, and the weak form of this tag,
  * which is what a browser sends back for a response Cloudflare compressed.
- * The body is immutable for a version, so a matching ETag needs no body at
- * all, and the body is built only when it is sent.
+ * The tag names everything the body is made of, so a matching ETag needs no
+ * body at all, and the body is serialized only when it is sent.
  */
 async function snapshotResponse(
   request: Request,
@@ -144,10 +157,10 @@ async function snapshotResponse(
 ): Promise<Response> {
   const etag    = etagOf(ref, representation);
   /*
-   * A stale answer is the version that was active when D1 last answered, and
-   * it must not be stored anywhere: not in a browser, not in a CDN, not under
-   * a conditional request. It names its own age, so a client that cares can
-   * refuse it.
+   * A stale answer is the version that was active when D1 last answered, or
+   * one marked with the legacy decisions last recorded, and it must not be
+   * stored anywhere: not in a browser, not in a CDN, not under a conditional
+   * request. It names its own age, so a client that cares can refuse it.
    */
   const stale   = staleFor !== undefined && staleFor !== null;
   const headers = {
@@ -197,6 +210,40 @@ async function activeSnapshot(context: RegistryContext): Promise<CachedSnapshot>
     throw new ApiError('REGISTRY_NOT_ACTIVE', `No active registry snapshot is available`);
   }
   return active;
+}
+
+/*
+ * The active snapshot and the legacy decisions its collaterals are marked
+ * with, read side by side. The version decides first: one that could not be
+ * read fails the request, whatever the decisions did, and the decisions are
+ * taken (`legacy`) only once the version has selected what they mark, so a
+ * request the version refuses — a chain id that is not one, a chain it does
+ * not hold, a market it does not serve — is refused as it always has been.
+ * Only a request the version answers fails for want of the decisions.
+ *
+ * Decisions that came from the record rather than from D1 are not confirmed
+ * either, so the answer says so as one from an older version does: as that
+ * version's age, or as 0 seconds old when the version itself was read now.
+ */
+async function activeWithLegacy(context: RegistryContext): Promise<{
+  snapshot: RegistrySnapshotV1,
+  // the decisions, and how stale an answer marked with them is; it throws what reading them failed with
+  legacy:   () => { decisions: LegacyDecisions, staleFor: number | null },
+}> {
+  const [ active, legacy ] = await Promise.allSettled([ activeSnapshot(context), context.legacy() ]);
+  if (active.status === 'rejected') {
+    throw active.reason;
+  }
+  const { snapshot, staleFor } = active.value;
+  return {
+    snapshot,
+    legacy: () => {
+      if (legacy.status === 'rejected') {
+        throw legacy.reason;
+      }
+      return { decisions: legacy.value.decisions, staleFor: staleFor ?? (legacy.value.recorded ? 0 : null) };
+    },
+  };
 }
 
 /*
@@ -263,10 +310,22 @@ function marketOf(network: NetworkV1, address: string): MarketV1 {
 /*
  * Public reads. The convenience routes serve the same objects and the same
  * order as the bootstrap snapshot; none of them resolves "latest" on its own.
+ *
+ * The bootstrap snapshot and the market reads mark every collateral with
+ * whether it is legacy in its Comet, by the decisions in force when they
+ * answer, and their tags name the flags they carry (legacyRepresentation).
+ * The flags are not part of the version, so the version read by id, which
+ * serves the version as it was imported, carries none.
  */
 async function getActive(request: Request, context: RegistryContext, maxAge: number): Promise<Response> {
-  const { snapshot, staleFor } = await activeSnapshot(context);
-  return snapshotResponse(request, versionRef(snapshot), 'snapshot', () => selectable(snapshot), { maxAge, staleFor });
+  const { snapshot, legacy } = await activeWithLegacy(context);
+  const { decisions, staleFor } = legacy();
+  const served   = selectable(snapshot);
+  const networks = served.networks.map(network => markedNetwork(network, decisions));
+  return snapshotResponse(request, versionRef(snapshot), legacyRepresentation('snapshot', networks), () => ({
+    ...served,
+    networks,
+  }), { maxAge, staleFor });
 }
 
 async function getNetworks(request: Request, context: RegistryContext, maxAge: number): Promise<Response> {
@@ -279,10 +338,13 @@ async function getNetworks(request: Request, context: RegistryContext, maxAge: n
 }
 
 async function getMarkets(request: Request, context: RegistryContext, chainId: string, maxAge: number): Promise<Response> {
-  const { snapshot, staleFor } = await activeSnapshot(context);
+  const { snapshot, legacy } = await activeWithLegacy(context);
   // the same selectability rule the market route and the catalog apply
-  const network  = networkOf(selectable(snapshot), chainIdOf(chainId));
-  return snapshotResponse(request, versionRef(snapshot), `markets:${network.chainId}`, () => ({
+  const selected = networkOf(selectable(snapshot), chainIdOf(chainId));
+  const { decisions, staleFor } = legacy();
+  const network  = markedNetwork(selected, decisions);
+  const tagged   = legacyRepresentation(`markets:${network.chainId}`, [ network ]);
+  return snapshotResponse(request, versionRef(snapshot), tagged, () => ({
     registryVersion: versionRef(snapshot),
     chainId:         network.chainId,
     markets:         network.markets,
@@ -296,10 +358,15 @@ async function getMarket(
   cometAddress: string,
   maxAge: number,
 ): Promise<Response> {
-  const { snapshot, staleFor } = await activeSnapshot(context);
+  const { snapshot, legacy } = await activeWithLegacy(context);
   const network  = networkOf(snapshot, chainIdOf(chainId));
-  const market   = marketOf(network, cometAddress);
-  return snapshotResponse(request, versionRef(snapshot), `market:${network.chainId}:${market.contracts.comet}`, () => ({
+  const selected = marketOf(network, cometAddress);
+  const { decisions, staleFor } = legacy();
+  const market   = markedMarket(network.chainId, selected, decisions);
+  const tagged   = legacyRepresentation(`market:${network.chainId}:${market.contracts.comet}`, [
+    { chainId: network.chainId, markets: [ market ] },
+  ]);
+  return snapshotResponse(request, versionRef(snapshot), tagged, () => ({
     registryVersion: versionRef(snapshot),
     chainId:         network.chainId,
     market,

@@ -1099,6 +1099,236 @@ GET {{API}}/registry/v1/networks/1/tokens
 `data_unavailable` is shown because its value could not be established — see
 [When something goes wrong](#when-something-goes-wrong).
 
+## Marking a collateral legacy
+
+A legacy collateral is a collateral of a market that the app no longer
+offers there: it leaves it out of the market's collateral list, of what can
+be supplied, and of the markets overview. A user who still holds some keeps
+seeing it, so that it can be withdrawn. The decision is about one collateral
+of one market — its chain, the market's Comet and the token — so a token can
+be legacy in one market and current in another.
+
+Like a strategic mark, the decision stays when a newer version is switched
+on, and comes back if a version drops the collateral and a later one brings
+it back. You can only decide about a collateral of a market of the version
+that is on, and every change needs a reason, which is kept with who made it.
+
+```sh
+curl -s -X PATCH "$API/registry/v1/admin/networks/1/markets/0x3afdc9bca9213a35503b077a6072f3d0d5ab0840/collaterals/0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa/legacy" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"isLegacy": true, "reason": "Legacy collateral of the USDT market"}' | jq
+```
+
+Postman:
+
+```http
+PATCH {{API}}/registry/v1/admin/networks/1/markets/0x3afdc9bca9213a35503b077a6072f3d0d5ab0840/collaterals/0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa/legacy
+Authorization: Bearer {{TOKEN}}
+Content-Type: application/json
+
+{"isLegacy": true, "reason": "Legacy collateral of the USDT market"}
+```
+
+**You should see** `"changed": true` and the time in `updatedAt`. Sending the
+same request again answers `"changed": false` and records nothing, so it is
+safe to repeat. To make the collateral current again, send `"isLegacy": false`
+with a reason.
+
+The reads say it in their next answer, which a browser may keep for up to 5
+minutes (`REGISTRY_SNAPSHOT_CACHE_TTL_S`), and the token list for 30 seconds:
+
+- `GET /registry/v1/networks/1/markets/<comet>`, the chain's market list and
+  `/registry/v1/active` have `"isLegacy": true` on that collateral of that
+  market;
+- the token list names the market's Comet in the token's `legacyIn`, and says
+  `"isLegacy": true` once the token is legacy in every enabled market that
+  takes it. Whether the list shows the token does not change.
+
+One collateral's decision, with its history, newest change first:
+
+```sh
+curl -s "$API/registry/v1/admin/networks/1/markets/<comet>/collaterals/<token>/legacy" \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+A decision stays when a version that drops the collateral from its market is
+switched on: the export below lists it under `retained`, and its history
+still answers, with `"inActiveVersion": false`. It applies again the moment a
+version whose market takes the collateral is switched on.
+
+### A reviewed list of legacy collaterals
+
+A list is applied as a list of strategic tokens is, in three requests, and
+you never type an address: the first one gives you every collateral as a
+file.
+
+**1. Export the collaterals.** Every collateral of every market of the
+version that is on, with its decision, in the form the next two requests
+take:
+
+```sh
+curl -s "$API/registry/v1/admin/legacy-collaterals" -H "Authorization: Bearer $TOKEN" > legacy-collaterals.json
+jq 'if .error then .error else (.collaterals | length) end' legacy-collaterals.json   # how many collaterals, or why not
+```
+
+Postman:
+
+```http
+GET {{API}}/registry/v1/admin/legacy-collaterals
+Authorization: Bearer {{TOKEN}}
+```
+
+(**Save Response → Save to a file**.) Edit the file: set `"isLegacy": true` on
+the collaterals the list decides (or `false` to make one current again) and
+write why in the `"reason"` at the top. A row may carry its own `"reason"`,
+which wins. Leave every other row as it is, or delete it. A row's
+`deploymentKey` and `symbol` are there for you to read, and are checked: a
+market or a symbol that is not the one the version that is on names is
+refused. `retained` is not read.
+
+**2. See what it would change** — this writes nothing:
+
+```sh
+curl -s -X POST "$API/registry/v1/admin/legacy-collaterals/review" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @legacy-collaterals.json \
+  | jq 'if .error then .error else .summary, (.collaterals[] | select(.action == "change" or .problem != null)) end'
+```
+
+Postman:
+
+```http
+POST {{API}}/registry/v1/admin/legacy-collaterals/review
+Authorization: Bearer {{TOKEN}}
+Content-Type: application/json
+
+(Body → raw → JSON, and paste the file)
+```
+
+**You should see** `"problems": 0`, and under `change` exactly the
+collaterals the list decides, each with what it is now (`current`), what the
+list wants (`requested`) and the reason it will be recorded with. A row with
+a `problem` names a chain or a Comet the version that is on does not hold, a
+token that is not a collateral of that Comet, a market or a symbol that is
+not that row's, or a change without a reason; fix the file and review it
+again.
+
+**3. Apply it** — the same file, right after the review:
+
+```sh
+curl -s -X POST "$API/registry/v1/admin/legacy-collaterals/apply" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @legacy-collaterals.json \
+  | jq 'if .error then .error else .summary end'
+```
+
+Postman: the same request as step 2, to `…/legacy-collaterals/apply`.
+
+**You should see** `"changed"` equal to the number of changes the review
+showed. The list is written in one go, as a list of strategic tokens is: if
+any row cannot be applied (`422`, naming the rows), or a version is switched
+on or one of its collaterals decided while it is being written (`409`),
+nothing is written. Applying the same file again changes nothing.
+
+### The initial list of legacy collaterals
+
+Until this release the app hid legacy collaterals by a list of its own
+(Linear COM-18), 20 collaterals of five Ethereum markets. Apply it once in
+each environment, as the document below: it has the address of every Comet
+and every token, and holds 12 of the 20. The other 8 are taken from the
+environment itself, in the next step.
+
+Save it as `legacy-collaterals-initial.json`:
+
+```json
+{
+  "reason": "Legacy collateral the app hid by its own list until the registry served it (Linear COM-18)",
+  "collaterals": [
+    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa", "symbol": "mETH", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee", "symbol": "weETH", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x5c5b196abe0d54485975d1ec29617d42d9198326", "symbol": "sdeUSD", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x57f5e098cad7a3d1eed53991d4d66c45c9af7812", "symbol": "wUSDM", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x15700b564ca08d9439c58ca5053166e8317aa138", "symbol": "deUSD", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x4c9edd5852cd905f086c759e8383e09bff1e68b3", "symbol": "USDe", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "tokenAddress": "0xa1290d69c65a6fe4df752f95823fae25cb99e5a7", "symbol": "rsETH", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "tokenAddress": "0x4c9edd5852cd905f086c759e8383e09bff1e68b3", "symbol": "USDe", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "tokenAddress": "0x15700b564ca08d9439c58ca5053166e8317aa138", "symbol": "deUSD", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "tokenAddress": "0x5c5b196abe0d54485975d1ec29617d42d9198326", "symbol": "sdeUSD", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0xe85dc543813b8c2cfeaac371517b925a166a9293", "deploymentKey": "wbtc", "tokenAddress": "0x8236a87084f8b84306f72007f36f2618a5634494", "symbol": "LBTC", "isLegacy": true },
+    { "chainId": 1, "cometAddress": "0xe85dc543813b8c2cfeaac371517b925a166a9293", "deploymentKey": "wbtc", "tokenAddress": "0xf469fbd2abcd6b9de8e169d128226c0fc90a012e", "symbol": "pumpBTC", "isLegacy": true }
+  ]
+}
+```
+
+Review it and apply it as steps 2 and 3 above, with
+`--data @legacy-collaterals-initial.json`. **You should see** `"change": 12`
+and `"problems": 0` from the review, and `"changed": 12` from apply; in an
+environment where it was applied before, `"unchanged": 12`.
+
+Where the addresses come from: each is what the registry's own data in the
+repository holds for that market and that symbol — the registry's test
+fixture (`tests/fixtures/registry/registry-snapshot-v1.json`), imported from
+the Comet repository and read on chain — and in it each token is exactly one
+collateral of its Comet:
+
+| App's key | Market | Comet | Collaterals |
+|---|---|---|---|
+| `1:USDT` | `usdt` (cUSDTv3) | `0x3afdc9bca9213a35503b077a6072f3d0d5ab0840` | mETH, weETH, sdeUSD, wUSDM, deUSD, USDe |
+| `1:USDC` | `usdc` (cUSDCv3) | `0xc3d688b66703497daa19211eedff47f25384cdc3` | rsETH, USDe, deUSD, sdeUSD |
+| `1:WBTC` | `wbtc` (cWBTCv3) | `0xe85dc543813b8c2cfeaac371517b925a166a9293` | LBTC, pumpBTC |
+
+The app's key `1:USDC` also names the institutional USDC market (ciUSDCv3,
+`0x207158a267cbd2598bb3d611d8cbdee2709f2f8c`, its root in the source
+fixtures). The static constants describe its collateral as WETH, wstETH,
+cbBTC and WBTC, none of the four, so the document names the USDC market
+alone; review shows it, since a token that is no collateral of a Comet is a
+problem there.
+
+#### The 8 collaterals taken from the environment
+
+The app's list also names 3 collaterals of the wstETH market and 5 of the
+USDS market:
+
+| App's key | Comet, from the static constants | Collateral | Token address the repository holds |
+|---|---|---|---|
+| `1:wstETH` | cwstETHv3, `0x3d0bb1ccab520a66e607822fc55bc921738fafe3` | rsETH | `0xa1290d69c65a6fe4df752f95823fae25cb99e5a7` |
+| | | ezETH | `0xbf5495efe5db9ce00f80364c8b423567e58d2110` |
+| | | weETH | `0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee` |
+| `1:USDS` | cUSDSv3, `0x5d409e56d886231adaf00c8775665ad0f9897b56` | USDe | `0x4c9edd5852cd905f086c759e8383e09bff1e68b3` |
+| | | sdeUSD | `0x5c5b196abe0d54485975d1ec29617d42d9198326` |
+| | | tBTC | `0x18084fba666a33d37592fa2633fd49a74dd93a88` |
+| | | weETH | `0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee` |
+| | | deUSD | `0x15700b564ca08d9439c58ca5053166e8317aa138` |
+
+They are not in the document because nothing in the repository says which
+tokens these two Comets take as collateral. The registry's test fixture holds
+four Ethereum markets — USDC, WETH, USDT and WBTC — the source fixtures hold
+the roots of the USDC and institutional USDC markets only, and the static
+constants name both Comets but no Comet's collateral. Every symbol has a
+known token address, but not that it is exactly one collateral of that Comet,
+and that is not guessed: the version that is on knows, so the rows are taken
+from its export.
+
+```sh
+curl -s "$API/registry/v1/admin/legacy-collaterals" -H "Authorization: Bearer $TOKEN" \
+  | jq '{
+      reason: "Legacy collateral the app hid by its own list until the registry served it (Linear COM-18)",
+      collaterals: [ .collaterals[]
+        | select(.chainId == 1)
+        | select(
+            (.cometAddress == "0x3d0bb1ccab520a66e607822fc55bc921738fafe3" and (.symbol | ascii_downcase | IN("rseth", "ezeth", "weeth")))
+            or (.cometAddress == "0x5d409e56d886231adaf00c8775665ad0f9897b56" and (.symbol | ascii_downcase | IN("usde", "sdeusd", "tbtc", "weeth", "deusd"))))
+        | .isLegacy = true ] }' > legacy-collaterals-wsteth-usds.json
+jq -r '.collaterals[] | "\(.deploymentKey) \(.symbol) \(.tokenAddress)"' legacy-collaterals-wsteth-usds.json
+```
+
+**You should see** 8 lines, one for each collateral of the table, with the
+token address the table has. Fewer means the version that is on does not hold
+one of the two markets, or one of them does not take that symbol as
+collateral; more means one market has two collaterals of one symbol. Either
+way, do not apply the file: tell the frontend developer which collateral it
+is, since the app's list was written against what these markets took then.
+With the 8 lines as the table has them, review the file and apply it, as
+steps 2 and 3 above.
+
 ## Keeping an eye on it
 
 One request tells you whether the registry is well:
@@ -1208,19 +1438,22 @@ refusal is explained by the answer alone.
 | A network under `chainCheck.unreadable` in `/admin/status` | The check of the chain could not read that network, for the reason it names — most often `CHAIN_REQUEST_FAILED`, as in the row above. Nothing new is known about its markets: it raises no `chain-drift` of its own and clears none, since a drift found there before stays, with the `seenAt` of the last read that found it. The warning `registry chain not read` in the worker's log has the cause | Fix the proxy for that network. The check reads it again at the next hourly invocation, until it has read every network |
 | `chain-drift` in `/admin/status` | The chain answers a market's feed or collateral otherwise than the version on stores it | [A market that changed on chain](#a-market-that-changed-on-chain) |
 | `401` | The token is wrong, or is the hash | Use the admin token itself |
-| `413` | The request body is larger than the route takes | Send less: a directory of overlays, or a list of token policies, in several requests |
+| `413` | The request body is larger than the route takes | Send less: a directory of overlays, or a list of token policies or of legacy collaterals, in several requests |
 | `429`, "too many administrative requests from this address" | More than 60 administrative requests in a minute from your address — over IPv6, from your /64 — whatever they were: every request under `/registry/v1/admin/` is counted by address before its token is checked, a wrong token or a path no route takes included, and the right token is refused too once the address has spent its budget | Wait the seconds its `Retry-After` names — a minute at most. A script in a loop, or a monitor sharing your address, is what spends it |
-| `429`, "too many … requests with this token" | More than 30 administrative requests in a minute with your token, counted per family of routes. Reads count too, and every read shares one budget — a monitor polling `/admin/status` with your token spends it with you — while each kind of command has its own. Reviewing a list of token policies writes nothing and counts as a read ("too many read requests"); marking a token and applying a list share one budget ("too many policy requests") | Wait the seconds its `Retry-After` names. The environment has one token, so a monitor polls the status every few minutes, not in a loop |
+| `429`, "too many … requests with this token" | More than 30 administrative requests in a minute with your token, counted per family of routes. Reads count too, and every read shares one budget — a monitor polling `/admin/status` with your token spends it with you — while each kind of command has its own. Reviewing a list of token policies or of legacy collaterals writes nothing and counts as a read ("too many read requests"); marking a token or a collateral, and applying a list of either, share one budget ("too many policy requests") | Wait the seconds its `Retry-After` names. The environment has one token, so a monitor polls the status every few minutes, not in a loop |
 | `404` marking a token | The version that is on does not hold that chain or that token | Check the chain id and the address against `GET /registry/v1/admin/networks/<chain>/tokens`; a token only a newer draft holds can be marked once that draft is switched on |
 | `409` marking a token, "left the active registry" | A version without that token was switched on while the change was being written; nothing was written | Check which version is on, and mark the token again if it is still there |
 | `404` "no registry route matches …/token-policies" | The Worker at that address was deployed before token policies | Deploy the release with token policies first |
+| `404` marking a collateral legacy | The version that is on does not hold that chain, no market of it has that Comet, or that market does not take that token as collateral — the message says which | Check the addresses against the export (`GET /registry/v1/admin/legacy-collaterals`); a collateral only a newer draft holds can be marked once that draft is switched on |
+| `409` marking a collateral legacy, "left the collateral of" | A version whose market does not take that token was switched on while the change was being written; nothing was written | Check which version is on, and mark the collateral again if its market still takes it |
+| `404` "no registry route matches …/legacy-collaterals" | The Worker at that address was deployed before legacy collaterals | Deploy the release with legacy collaterals first |
 | `422` applying a list | Some rows cannot be applied; `details.problems` names each with why; nothing was written | Fix those rows — review shows them in context — and apply again |
-| `409` applying a list, "while it was being applied" | A version was switched on, or one of the list's tokens was decided by someone else, while the list was being written | Review the file again, then apply it |
-| `503` "the database is missing tables this release needs", from the token list or a token policy route | The worker was deployed before its D1 migrations: the token policy tables, `0005`, are missing | Apply the migrations to this environment (`npm run d1:migrate:<env>`, or `npx wrangler d1 migrations apply APP_DB --remote -c <config>`) |
+| `409` applying a list, "while it was being applied" | A version was switched on, or one of the list's tokens or collaterals was decided by someone else, while the list was being written | Review the file again, then apply it |
+| `503` "the database is missing tables this release needs", from the token list, a token policy or legacy collateral route, `/active` or the market reads | The worker was deployed before its D1 migrations: the token policy tables, `0005`, or the legacy collateral tables, `0006`, are missing | Apply the migrations to this environment (`npm run d1:migrate:<env>`, or `npx wrangler d1 migrations apply APP_DB --remote -c <config>`) |
 | The token list has `"block": null`, and its collateral tokens are `stale` or `unavailable` | The worker cannot reach the node provider proxy. Tokens no enabled market takes as collateral stay `fresh` `"0"` | Fix the proxy or its binding; the list recovers by itself on the next minute |
 | A token is `unavailable` (`data_unavailable`) while `block` is set | Some of its collateral could not be valued, what could is below the threshold, and no minute of the last 15 valued all of it. The worker's `token_collateral_minute` log line lists each failed position under `failures`, with its market, asset index and reason | `price_reverted`: the feed reverts — the worker also logs `price feed reverted: <feed> read by <Comet>` — see [A market that stopped answering](#a-market-that-stopped-answering). `usd_price_reverted`: the market's base USD feed reverts; change it in the market's overlay. `asset_mismatch`, `feed_mismatch`, `scale_mismatch` or `asset_info_reverted`: the chain no longer describes the market as the version does — import again and switch the new version on. `transport` (counted under `failed` only): the node, as above |
 | Collateral tokens are `stale` or `unavailable` while `block` is set, and there is no `token_collateral_minute` line, only `token_collateral_deadline` with `"phase": "minute"` | The node answered the minute's reads too slowly for a request to wait for them | Nothing to do if it passes: the valuation finishes in the background and the next request of the minute answers from it. If it persists, the node provider proxy is slow — check it |
-| `503` on the token list | No version is on (`REGISTRY_NOT_ACTIVE`), or the database did not answer the token policies (`UPSTREAM_UNAVAILABLE`) | The list cannot say which tokens are strategic without the database; it answers again once D1 does |
+| `503` on the token list | No version is on (`REGISTRY_NOT_ACTIVE`), or the database did not answer the token policies or the legacy collateral decisions (`UPSTREAM_UNAVAILABLE`) | The list cannot say which tokens are strategic, or legacy, without the database; it answers again once D1 does |
 | `422`, `details.code` `OVERLAY_FEED_UNREADABLE`, writing an overlay | A feed the overlay names does not answer its decimals on that chain: it reverts, or nothing is deployed at that address there — most often a feed of another chain | Check the address against the chain's feed; a `503` instead is the node provider not answering, and worth trying again |
 | `409` writing overlays, "… registry version cannot be changed" or "is no longer importing" | The draft is no longer open: it was validated, switched on, or replaced by a newer attempt of its commit (`GET /registry/v1/admin/versions/<id>` says which) | Look for the newest open draft first (`GET /registry/v1/admin/versions?status=importing`) and continue there; start a new attempt (step 1 with `forceNewAttempt`) only if there is none |
 | `409` on apply, naming another digest | The proposal changed since you read it | Read the review again, and apply its digest |
@@ -1240,6 +1473,8 @@ refusal is explained by the answer alone.
 | `/admin/status` keeps listing a draft of an older commit | The source moved to a newer commit while that draft was open; drafts are only replaced by attempts of their own commit, because reviews do not carry across commits | Finish it (validate it — that also closes it), or, if the newer commit's version has taken its place, validate it anyway to close it |
 | `409 CONFLICT`, `details.code` `SYNC_ALREADY_RUNNING` | An import is in progress — the hourly one, a request you already sent, or one you are asking to change with `forceNewAttempt`, `holdForReview` or `sourceCommitSha`. "another invocation is importing right now" means one is holding the run this very moment | Continue it with an empty body until it says `completed`, sending it again a little later while another invocation is importing; only then ask for a new attempt |
 | A market reports `"status": "partially"` or `"status": "error"` | A price feed it reads reverts, usually one Chainlink retired | [A market that stopped answering](#a-market-that-stopped-answering) |
+| `/active` and the market reads carry `X-Registry-Stale: 0`, and the log has the warning `legacy collateral decisions unreadable; answering with the ones last recorded` | The database answered for the version that is on, but not for the legacy collateral decisions, so the flags are the ones the API last recorded, and the answer may not be kept | Check the database's health; the answers recover by themselves once it answers |
+| `503 UPSTREAM_UNAVAILABLE` from `/active` and the market reads while the database cannot be reached, though other routes answer from the cache | No legacy collateral decisions are recorded in the environment's `kv_registry` to answer with: no read of `/active` or the market reads, and no decision, has recorded them since this release, or the record was removed | Nothing to change: once the database answers, the reads record them again, within five minutes at most |
 | Answers carry `X-Registry-Stale: <seconds>`, and the log has the error `registry database unreachable; answering from the version it last named` | The database could not be reached, so the API is answering from the version it last saw, and saying how old it is. Each isolate logs the error once a minute while this lasts | Check the database's health; the API recovers by itself once D1 answers, and starts returning `503` if the outage outlasts the configured window |
 | `503 UPSTREAM_UNAVAILABLE` from the market and registry routes, or from `/admin/status` | The database could not be reached, and there is no version within the window to answer from. The token list does not wait for the window: it reads the token policies from the database on every request | Check the database's health; nothing in the registry needs changing |
 | `500 INTERNAL` from the market and registry routes | The database answered with a fault — most often a release deployed before its migrations — or a bug. The worker's log line `route failed` or `registry route failed` with the answer's `requestId` has the error | Apply the migrations if they are missing; otherwise report the log line |

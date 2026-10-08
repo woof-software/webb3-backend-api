@@ -22,6 +22,7 @@ import {
 import type { Address, MarketV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
+import { legacyDecisionsOf } from '../../../src/registry/legacy-collaterals.js';
 import { RULE_VERSION, collateralView, positionsOf } from '../../../src/registry/token-collateral.js';
 import type { BlockRef, TokenCollateralDeps } from '../../../src/registry/token-collateral.js';
 import { tokenList } from '../../../src/registry/token-visibility.js';
@@ -61,8 +62,8 @@ const LIST_KEYS      = [ 'registryVersion', 'chainId', 'thresholdUsd', 'ruleVers
 const VERSION_KEYS   = [ 'id', 'checksum' ];
 const BLOCK_KEYS     = [ 'number', 'timestamp' ];
 const TOKEN_KEYS     = [
-  'address', 'symbol', 'name', 'decimals', 'roles', 'isStrategic', 'collateralValueUsd', 'collateralValueStatus',
-  'valueAt', 'valueBlock', 'staleAgeSeconds', 'exceptions', 'isVisible', 'visibilityReason',
+  'address', 'symbol', 'name', 'decimals', 'roles', 'isStrategic', 'isLegacy', 'legacyIn', 'collateralValueUsd',
+  'collateralValueStatus', 'valueAt', 'valueBlock', 'staleAgeSeconds', 'exceptions', 'isVisible', 'visibilityReason',
 ];
 const EXCEPTION_KEYS = [ 'kind', 'priceFeedAddress', 'provenance', 'expiresAt' ];
 
@@ -197,6 +198,15 @@ t.test('every token is typed, listed once, and ordered by symbol then address', 
     }
 
     checkBoolean(problems, token.isStrategic, `${where}.isStrategic`);
+    checkBoolean(problems, token.isLegacy, `${where}.isLegacy`);
+    if (!Array.isArray(token.legacyIn)) {
+      problems.push(`${where}.legacyIn: expected an array`);
+    } else {
+      token.legacyIn.forEach((comet: unknown, c: number) => checkPattern(problems, comet, ADDRESS, `${where}.legacyIn[${c}]`));
+      if ([ ...token.legacyIn ].sort().join(',') !== token.legacyIn.join(',') || new Set(token.legacyIn).size !== token.legacyIn.length) {
+        problems.push(`${where}.legacyIn: expected each Comet once, sorted`);
+      }
+    }
     if (token.collateralValueUsd !== null) checkPattern(problems, token.collateralValueUsd, DECIMAL, `${where}.collateralValueUsd`);
     checkMember(problems, token.collateralValueStatus, COLLATERAL_VALUE_STATUSES, `${where}.collateralValueStatus`);
     if (token.valueAt !== null) checkInstant(problems, token.valueAt, `${where}.valueAt`);
@@ -323,6 +333,27 @@ t.test('a token is shown when strategic, when its value is unknown, or when its 
   t.same(problems, []);
 });
 
+/*
+ * Legacy collateral (migrations/0006): only a collateral is legacy in a
+ * Comet, and a token legacy in every enabled market that takes it names at
+ * least one. Whether a token is shown is decided without either, which the
+ * rule above holds the fixture to: it derives every reason without them.
+ */
+t.test('a token is legacy only as a collateral, and in a Comet it names', async t => {
+  const problems: Problems = [];
+  typed.forEach((token, i) => {
+    const where    = `tokens[${i}] ${token.symbol}`;
+    const legacyIn = Array.isArray(token.legacyIn) ? token.legacyIn : [];
+    if (!token.roles.includes('collateral') && (token.isLegacy !== false || legacyIn.length !== 0)) {
+      problems.push(`${where}: a token no market takes as collateral is legacy nowhere`);
+    }
+    if (token.isLegacy === true && legacyIn.length === 0) {
+      problems.push(`${where}: a legacy token names the Comets it is legacy in`);
+    }
+  });
+  t.same(problems, []);
+});
+
 t.test('the fixture shows every case a client must handle', async t => {
   const missing = (expected: readonly string[], found: unknown[]) => expected.filter(entry => !found.includes(entry));
   const values  = typed.map(token => token.collateralValueUsd).filter((value): value is string => typeof value === 'string');
@@ -341,6 +372,10 @@ t.test('the fixture shows every case a client must handle', async t => {
   t.ok(typed.some(token => token.exceptions.some((exception: any) => exception?.expiresAt !== null)), 'an exception that expires');
   t.ok(typed.some(token => token.collateralValueStatus === 'fresh' && blockOf(token.valueBlock) !== null && !sameBlock(blockOf(token.valueBlock), blockOf(list.block))),
     'a value read at an earlier block of the list\'s minute');
+  t.ok(typed.some(token => token.isLegacy === true), 'a token legacy in every enabled market that takes it');
+  t.ok(typed.some(token => token.isLegacy === true && token.isVisible === true), 'and one discovery shows all the same');
+  t.ok(typed.some(token => token.isLegacy === false && Array.isArray(token.legacyIn) && token.legacyIn.length > 0),
+    'a token legacy in a Comet, but current in another enabled market, or taken by none');
 });
 
 /*
@@ -353,6 +388,11 @@ t.test('the fixture shows every case a client must handle', async t => {
  * the registry's 1.02447384 BTC and is never read; that price is given an
  * expiry, stated with an offset, as an overlay may state it. COMP and WBTC
  * are strategic.
+ *
+ * LBTC and pumpBTC are legacy collateral of the WBTC market, tBTC and wstETH
+ * of the USDC market, and XAUt of the deprecated USDT market. LBTC, pumpBTC
+ * and tBTC are legacy, tBTC shown all the same; wstETH is not, being current
+ * in the WETH market, and nor is XAUt, which no enabled market takes.
  *
  * Three requests value the chain. The first is three minutes back, when only
  * tBTC's price reverts. The second is the first of the current minute, when
@@ -383,6 +423,13 @@ const WBTC         = '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599';
 const KEPT: Record<string, string[]> = {
   usdc: [ 'COMP', 'WETH', 'wstETH', 'tBTC' ],
   weth: [ 'cbETH', 'wstETH', 'USDC' ],
+  usdt: [ 'XAUt' ],
+  wbtc: [ 'LBTC', 'pumpBTC' ],
+};
+
+// the collaterals each market has marked legacy, by symbol
+const LEGACY: Record<string, string[]> = {
+  usdc: [ 'tBTC', 'wstETH' ],
   usdt: [ 'XAUt' ],
   wbtc: [ 'LBTC', 'pumpBTC' ],
 };
@@ -507,6 +554,9 @@ t.test('the scenario the fixture was made from reproduces it exactly', async t =
     positions,
     view,
     strategic:       new Set<Address>([ COMP, WBTC ]),
+    legacy:          legacyDecisionsOf(markets.flatMap(entry => entry.collateralAssets
+      .filter(asset => (LEGACY[entry.deploymentKey] ?? []).includes(asset.token.symbol))
+      .map(asset => ({ chainId: 1, cometAddress: entry.contracts.comet!, tokenAddress: asset.token.address })))),
     now,
   });
   /*

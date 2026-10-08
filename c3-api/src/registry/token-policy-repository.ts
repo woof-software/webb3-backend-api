@@ -605,12 +605,15 @@ async function applyTokenPolicies(db: D1Database, list: DecisionList, actor: str
 export type { DecisionList, ListedDecision, PolicyChange };
 export {
   MAX_POLICY_EVENTS,
+  activeVersionOf,
   applyTokenPolicies,
   exportTokenPolicies,
   readStrategicTokens,
   readTokenPolicies,
   readTokenPolicy,
+  refusal,
   reviewTokenPolicies,
+  rowsOf,
   setTokenPolicy,
   writeTokenPolicy,
   writeTokenPolicyList,

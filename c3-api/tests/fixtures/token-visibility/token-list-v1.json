@@ -21,6 +21,8 @@
         "collateral"
       ],
       "isStrategic": false,
+      "isLegacy": false,
+      "legacyIn": [],
       "collateralValueUsd": "250000",
       "collateralValueStatus": "fresh",
       "valueAt": "2026-10-05T12:55:11.000Z",
@@ -43,6 +45,8 @@
         "collateral"
       ],
       "isStrategic": true,
+      "isLegacy": false,
+      "legacyIn": [],
       "collateralValueUsd": "68250",
       "collateralValueStatus": "fresh",
       "valueAt": "2026-10-05T12:55:11.000Z",
@@ -64,6 +68,10 @@
         "collateral"
       ],
       "isStrategic": false,
+      "isLegacy": true,
+      "legacyIn": [
+        "0xe85dc543813b8c2cfeaac371517b925a166a9293"
+      ],
       "collateralValueUsd": "249999.9975",
       "collateralValueStatus": "stale",
       "valueAt": "2026-10-05T12:52:11.000Z",
@@ -85,6 +93,10 @@
         "collateral"
       ],
       "isStrategic": false,
+      "isLegacy": true,
+      "legacyIn": [
+        "0xe85dc543813b8c2cfeaac371517b925a166a9293"
+      ],
       "collateralValueUsd": "204894.768",
       "collateralValueStatus": "exception",
       "valueAt": "2026-10-05T12:55:11.000Z",
@@ -113,6 +125,10 @@
         "collateral"
       ],
       "isStrategic": false,
+      "isLegacy": true,
+      "legacyIn": [
+        "0xc3d688b66703497daa19211eedff47f25384cdc3"
+      ],
       "collateralValueUsd": null,
       "collateralValueStatus": "unavailable",
       "valueAt": null,
@@ -132,6 +148,8 @@
         "collateral"
       ],
       "isStrategic": false,
+      "isLegacy": false,
+      "legacyIn": [],
       "collateralValueUsd": "999940.49997",
       "collateralValueStatus": "fresh",
       "valueAt": "2026-10-05T12:55:11.000Z",
@@ -153,6 +171,8 @@
         "base"
       ],
       "isStrategic": false,
+      "isLegacy": false,
+      "legacyIn": [],
       "collateralValueUsd": "0",
       "collateralValueStatus": "fresh",
       "valueAt": "2026-10-05T12:55:23.000Z",
@@ -174,6 +194,8 @@
         "base"
       ],
       "isStrategic": true,
+      "isLegacy": false,
+      "legacyIn": [],
       "collateralValueUsd": "0",
       "collateralValueStatus": "fresh",
       "valueAt": "2026-10-05T12:55:23.000Z",
@@ -196,6 +218,8 @@
         "collateral"
       ],
       "isStrategic": false,
+      "isLegacy": false,
+      "legacyIn": [],
       "collateralValueUsd": "2469288.19602331961380164056090136",
       "collateralValueStatus": "fresh",
       "valueAt": "2026-10-05T12:55:11.000Z",
@@ -217,6 +241,10 @@
         "collateral"
       ],
       "isStrategic": false,
+      "isLegacy": false,
+      "legacyIn": [
+        "0xc3d688b66703497daa19211eedff47f25384cdc3"
+      ],
       "collateralValueUsd": "264055",
       "collateralValueStatus": "partial",
       "valueAt": "2026-10-05T12:55:11.000Z",
@@ -238,6 +266,10 @@
         "collateral"
       ],
       "isStrategic": false,
+      "isLegacy": false,
+      "legacyIn": [
+        "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840"
+      ],
       "collateralValueUsd": "0",
       "collateralValueStatus": "fresh",
       "valueAt": "2026-10-05T12:55:23.000Z",

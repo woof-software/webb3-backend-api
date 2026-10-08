@@ -104,12 +104,13 @@ t.test('a database that answers with a fault is a 500 that says nothing but the 
 });
 
 /*
- * A missing table is such a fault too. Only the token policy tables are
- * answered otherwise, by the routes that read them, with a 503 that names
- * the remedy (token-list-routes, token-policy-routes); a registry table
- * missing is a 500 on the token list as everywhere else.
+ * A missing table is such a fault too. Only the token policy and legacy
+ * collateral tables are answered otherwise, by the routes that read them,
+ * with a 503 that names the remedy (token-list-routes, token-policy-routes,
+ * legacy-collateral-routes); a registry table missing is a 500 on the token
+ * list and the active reads as everywhere else.
  */
-t.test('a missing table is a 500, unless it is a token policy table', async t => {
+t.test('a missing table is a 500, unless it is a token policy or legacy collateral table', async t => {
   const logs = captureLogs(t);
   const env  = await envWith({ APP_DB: failing('D1_ERROR: no such table: registry_state: SQLITE_ERROR') });
 

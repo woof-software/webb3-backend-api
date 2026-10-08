@@ -471,6 +471,19 @@ type RegistrySnapshotV1 = {
 };
 
 /*
+ * The active version as the active reads serve it — /active and the market
+ * reads — beside RegistrySnapshotV1, which stays the version as imported:
+ * every collateral also says whether an administrator marked it legacy in its
+ * Comet (migrations/0006_legacy_collaterals.sql). The flag is a decision
+ * about the market, not part of the version, so it takes no part in the
+ * version's checksum and is read anew for every answer.
+ */
+type ActiveCollateralAssetV1 = CollateralAssetV1 & { isLegacy: boolean };
+type ActiveMarketV1          = Omit<MarketV1, 'collateralAssets'> & { collateralAssets: ActiveCollateralAssetV1[] };
+type ActiveNetworkV1         = Omit<NetworkV1, 'markets'> & { markets: ActiveMarketV1[] };
+type ActiveSnapshotV1        = Omit<RegistrySnapshotV1, 'networks'> & { networks: ActiveNetworkV1[] };
+
+/*
  * How a response that resolved a version identifies it. It is deliberately
  * smaller than the snapshot's own reference: a convenience read states which
  * version answered, not where it came from.
@@ -646,6 +659,155 @@ type TokenPolicyApplyV1 = {
 };
 
 /*
+ * Legacy collaterals, from migrations/0006_legacy_collaterals.sql: which
+ * collaterals of which Comets an administrator has marked legacy, kept by
+ * chain id, Comet address and token address rather than on a versioned row,
+ * so that they outlive every activation as token policies do.
+ */
+type LegacyCollateralRow = {
+  chain_id:      number,
+  comet_address: Address,
+  token_address: Address,
+  is_legacy:     number,
+  updated_at:    string,
+  updated_by:    string,
+};
+
+type LegacyCollateralEventRow = {
+  id:                 string,
+  chain_id:           number,
+  comet_address:      Address,
+  token_address:      Address,
+  previous_is_legacy: number | null,
+  is_legacy:          number,
+  actor:              string,
+  reason:             string,
+  created_at:         string,
+};
+
+/*
+ * The decision in force for a collateral of a Comet. A collateral nobody has
+ * decided about is not legacy, and has no time or author to name.
+ */
+type LegacyCollateralV1 = {
+  isLegacy:  boolean,
+  updatedAt: string | null,
+  updatedBy: string | null,
+};
+
+type LegacyCollateralEventV1 = {
+  id:               string,
+  // null where the collateral had no decision yet, which is not legacy
+  previousIsLegacy: boolean | null,
+  isLegacy:         boolean,
+  actor:            string,
+  reason:           string,
+  createdAt:        string,
+};
+
+/*
+ * One collateral's decision, and the changes that led to it, newest committed
+ * first. `inActiveVersion` is false for a decision kept while the active
+ * version does not hold the collateral in that Comet, which applies again once
+ * one does.
+ */
+type LegacyCollateralDetailV1 = LegacyCollateralV1 & {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  cometAddress:    Address,
+  tokenAddress:    Address,
+  inActiveVersion: boolean,
+  events:          LegacyCollateralEventV1[],
+};
+
+/*
+ * The answer to a decision about one collateral. `changed` is false when the
+ * decision asked for was already in force, which writes nothing; `updatedAt`
+ * is when the decision in force was made, and null where nobody has decided.
+ */
+type LegacyCollateralResultV1 = {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  cometAddress:    Address,
+  tokenAddress:    Address,
+  isLegacy:        boolean,
+  changed:         boolean,
+  updatedAt:       string | null,
+};
+
+/*
+ * A list of decisions about collaterals: what the export answers, and what
+ * review and apply take, so a list is exported, edited and sent back as one
+ * file, as a list of token policies is.
+ *
+ * A row that changes a decision needs a reason: its own, or the list's.
+ * `deploymentKey` and `symbol` are there for the person editing the file; the
+ * addresses decide, and a market or a symbol that is not the one the active
+ * version names is refused as the mistake it usually is. `registryVersion`
+ * and `retained` say where the list was exported from and which decisions
+ * the active version does not hold, and are not read.
+ */
+type LegacyCollateralDecisionV1 = {
+  chainId:        number,
+  cometAddress:   Address,
+  deploymentKey?: string | null,
+  tokenAddress:   Address,
+  symbol?:        string | null,
+  isLegacy:       boolean,
+  reason?:        string | null,
+};
+
+// a decision kept for a collateral the active version does not hold in that Comet
+type RetainedLegacyCollateralV1 = LegacyCollateralV1 & {
+  chainId:      number,
+  cometAddress: Address,
+  tokenAddress: Address,
+};
+
+type LegacyCollateralListV1 = {
+  registryVersion?: VersionRefV1,
+  reason:           string | null,
+  collaterals:      LegacyCollateralDecisionV1[],
+  retained?:        RetainedLegacyCollateralV1[],
+};
+
+// what applying a list would change, row by row, without writing anything
+type LegacyCollateralReviewV1 = {
+  registryVersion: VersionRefV1,
+  summary:         { change: number, unchanged: number, problems: number },
+  collaterals:     Array<{
+    row:           number,
+    chainId:       number,
+    cometAddress:  Address,
+    deploymentKey: string | null,
+    tokenAddress:  Address,
+    symbol:        string | null,
+    current:       boolean,
+    requested:     boolean,
+    action:        'change' | 'unchanged',
+    reason:        string | null,
+    problem:       string | null,
+  }>,
+};
+
+// what applying a list wrote: every row, as the transaction that wrote it left it
+type LegacyCollateralApplyV1 = {
+  registryVersion: VersionRefV1,
+  summary:         { changed: number, unchanged: number },
+  collaterals:     Array<{
+    row:           number,
+    chainId:       number,
+    cometAddress:  Address,
+    deploymentKey: string,
+    tokenAddress:  Address,
+    symbol:        string,
+    isLegacy:      boolean,
+    changed:       boolean,
+    updatedAt:     string | null,
+  }>,
+};
+
+/*
  * The token list: every token the active version serves on one chain, with
  * its strategic decision, its collateral value in USD across the chain's
  * enabled markets, and whether discovery shows it.
@@ -668,9 +830,17 @@ type AppliedPriceExceptionV1 = {
   expiresAt:        string | null,
 };
 
+/*
+ * `legacyIn` names the Comets of the chain's served markets that take the
+ * token as a collateral an administrator marked legacy, sorted; `isLegacy`
+ * says it is legacy in every enabled market that takes it, of which there is
+ * at least one. Neither changes whether discovery shows the token.
+ */
 type TokenVisibilityV1 = TokenV1 & {
   roles:                 AssetRole[],
   isStrategic:           boolean,
+  isLegacy:              boolean,
+  legacyIn:              Address[],
   collateralValueUsd:    string | null,
   collateralValueStatus: CollateralValueStatusV1,
   valueAt:               string | null,
@@ -728,6 +898,10 @@ type RegistryComet = Contract<StandaloneContract<Comet>> & { registry: RegistryA
 export type {
   ActivationAction,
   ActivationResultV1,
+  ActiveCollateralAssetV1,
+  ActiveMarketV1,
+  ActiveNetworkV1,
+  ActiveSnapshotV1,
   Address,
   AssetDisplayOverrideV1,
   AppliedPriceExceptionV1,
@@ -740,6 +914,16 @@ export type {
   ContractRoleKey,
   DeploymentPath,
   ExceptionKind,
+  LegacyCollateralApplyV1,
+  LegacyCollateralDecisionV1,
+  LegacyCollateralDetailV1,
+  LegacyCollateralEventRow,
+  LegacyCollateralEventV1,
+  LegacyCollateralListV1,
+  LegacyCollateralResultV1,
+  LegacyCollateralReviewV1,
+  LegacyCollateralRow,
+  LegacyCollateralV1,
   MarketAssetRow,
   MarketContractRow,
   MarketRow,
@@ -760,6 +944,7 @@ export type {
   RegistryAnnotation,
   RegistryComet,
   RegistryVersionRow,
+  RetainedLegacyCollateralV1,
   RewardAssetV1,
   SyncItemStatus,
   SyncOutcome,

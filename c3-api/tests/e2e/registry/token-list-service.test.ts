@@ -4,6 +4,7 @@ import C3Api, { Env } from '../../../entrypoint.js';
 
 import type { RegistrySnapshotV1, TokenListV1, TokenVisibilityV1 } from '../../../lib/model/comet-registry.js';
 
+import { setLegacyCollateral } from '../../../src/registry/legacy-collateral-repository.js';
 import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
 import { FakeNode, NodeScript, batches, fakeNode } from '../../util/fake-node.js';
@@ -194,6 +195,69 @@ t.test('policies the database cannot give are a 503, and are logged', async t =>
     'with its cause, under the id the answer names');
 });
 
+const MAINNET_MARKETS = fixture.networks.find(network => network.chainId === 1)!.markets;
+
+// marks one collateral of one mainnet market legacy, by the market's deployment key and the token's symbol
+const markLegacy = (db: D1Database, key: string, symbol: string, isLegacy: boolean = true) => {
+  const market = MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!;
+  return setLegacyCollateral(db, {
+    chainId:      1,
+    cometAddress: market.contracts.comet!,
+    tokenAddress: assetOf(market, symbol).token.address,
+    isLegacy,
+    actor:        'test',
+    reason:       'decided for a token list test',
+  });
+};
+
+/*
+ * Legacy collateral (migrations/0006): weETH is a collateral of the USDC,
+ * WETH and USDT markets of the fixture's mainnet, and mETH of the USDT market
+ * alone. A decision is read on every request, and changes nothing but the two
+ * fields that say where a token is legacy.
+ */
+t.test('a token says where it is a legacy collateral, read on every request, and nothing else changes', async t => {
+  const { registry, get } = await workerOf(t);
+  const comet = (key: string) => MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!.contracts.comet!;
+  const list  = async () => bySymbol(await listOf(await get('/registry/v1/networks/1/tokens')));
+  const legacyOf = (tokens: Map<string, TokenVisibilityV1>, symbol: string) => {
+    const { isLegacy, legacyIn } = tokens.get(symbol)!;
+    return { isLegacy, legacyIn };
+  };
+
+  const before = await list();
+  t.ok([ ...before.values() ].every(token => token.isLegacy === false && token.legacyIn.length === 0), 'nothing is legacy at first');
+
+  await markLegacy(registry.db, 'usdc', 'weETH');
+  await markLegacy(registry.db, 'usdt', 'weETH');
+  await markLegacy(registry.db, 'usdt', 'mETH');
+  const partly = await list();
+  t.same(legacyOf(partly, 'weETH'), { isLegacy: false, legacyIn: [ comet('usdc'), comet('usdt') ].sort() },
+    'a token legacy in two of the three enabled markets that take it names the two, and is not legacy');
+  t.same(legacyOf(partly, 'mETH'), { isLegacy: true, legacyIn: [ comet('usdt') ] }, 'one legacy in the one market that takes it is');
+
+  await markLegacy(registry.db, 'weth', 'weETH');
+  const after = await list();
+  t.same(legacyOf(after, 'weETH'), { isLegacy: true, legacyIn: [ comet('usdc'), comet('usdt'), comet('weth') ].sort() },
+    'and a token legacy in every enabled market that takes it is legacy, the next request says');
+
+  const rest = (tokens: Map<string, TokenVisibilityV1>) => [ ...tokens.values() ].map(({ isLegacy: _isLegacy, legacyIn: _legacyIn, ...token }) => token);
+  t.same(rest(after), rest(before), 'every other field of every token is what it was, whether it is shown included');
+});
+
+t.test('legacy decisions the database cannot give are a 503, and are logged', async t => {
+  const { registry, get } = await workerOf(t, BASE_NODE);
+  const errors = captureErrors(t);
+
+  const response = await get(`/registry/v1/networks/${BASE}/tokens`, unreachableFor(registry.db, /FROM legacy_collaterals\s+WHERE chain_id/));
+  t.equal(response.status, 503, 'without them the list would call a legacy collateral current');
+  const body = await response.json() as ErrorBody;
+  t.same([ body.error.code, body.error.message ], [ 'UPSTREAM_UNAVAILABLE', 'the legacy collateral decisions could not be read' ]);
+  t.ok(errors.some(line => line.includes('the token list could not read the legacy collateral decisions')), 'the outage is logged');
+  t.ok(errors.some(line => line.includes('Network connection lost') && line.includes(body.error.requestId)),
+    'with its cause, under the id the answer names');
+});
+
 /*
  * When D1 cannot be reached, the registry answers from the version it last
  * saw, and says so. Such an answer may not be stored, by a browser or
@@ -254,6 +318,9 @@ t.test('every answer of the token list names the version it read, and only that'
   t.same(await answer('GET', tokens, unreachableFor(registry.db, /FROM token_policies WHERE chain_id/)),
     { status: 503, headers: { ...readable, ...json, ...version } },
     'and so is a list whose policies could not be read after the version was');
+  t.same(await answer('GET', tokens, unreachableFor(registry.db, /FROM legacy_collaterals\s+WHERE chain_id/)),
+    { status: 503, headers: { ...readable, ...json, ...version } },
+    'or whose legacy collateral decisions could not be');
   t.same(await answer('GET', `${tokens}?visibleOnly=yes`), { status: 400, headers: { ...readable, ...json } },
     'while a request refused before any version was read names none');
   t.same(await answer('OPTIONS', tokens), {

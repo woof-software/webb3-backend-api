@@ -5,12 +5,14 @@ import { BigFixnum } from '../../../lib/bigfixnum.js';
 import type { Address } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
+import { legacyDecisionsOf } from '../../../src/registry/legacy-collaterals.js';
 import { visibleOnlyOf } from '../../../src/registry/token-handlers.js';
 import { positionsOf } from '../../../src/registry/token-collateral.js';
 import type { TokenValue } from '../../../src/registry/token-collateral.js';
 import {
   THRESHOLD_USD,
   decimalString,
+  legacyOf,
   tokenList,
   tokensOf,
   visibilityOf,
@@ -109,6 +111,7 @@ t.test('the list is ordered by symbol and names when each value was read', async
     positions: positionsOf(catalog, 'scroll-mainnet'),
     view,
     strategic: new Set<Address>(),
+    legacy:    legacyDecisionsOf([]),
     now:       NOW,
   };
   const list = tokenList(input);
@@ -128,6 +131,81 @@ t.test('the list is ordered by symbol and names when each value was read', async
   );
   t.same(list.tokens[0]!.valueAt, new Date(1_791_204_000 * 1000).toISOString(), 'a zero is as of the latest block');
   t.same({ threshold: list.thresholdUsd, rule: list.ruleVersion, computedAt: list.computedAt }, { threshold: '250000', rule: 1, computedAt: NOW.toISOString() });
+});
+
+/*
+ * Legacy collateral (migrations/0006): a decision is about one collateral of
+ * one Comet, and the list says where a token is one, and whether it is one in
+ * every enabled market that takes it. Mainnet's weETH is a collateral of the
+ * USDC, WETH and USDT markets of the fixture; mETH of the USDT market alone.
+ */
+t.test('a token is legacy only where every enabled market that takes it marks it so', async t => {
+  const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
+  const comet   = (key: string) => mainnet.markets.find(entry => entry.deploymentKey === key)!.contracts.comet!;
+  const token   = (symbol: string) => mainnet.markets.flatMap(entry => entry.collateralAssets)
+    .find(asset => asset.token.symbol === symbol)!.token.address;
+  const [ WEETH, METH, XAUT ] = [ token('weETH'), token('mETH'), token('XAUt') ];
+  const decided = (...pairs: Array<[ string, Address ]>) => legacyDecisionsOf(pairs.map(([ key, tokenAddress ]) => (
+    { chainId: 1, cometAddress: comet(key), tokenAddress }
+  )));
+  const markets = catalog.marketsOn('ethereum-mainnet');
+  const sorted  = (...keys: string[]) => keys.map(comet).sort();
+
+  t.same(legacyOf(1, WEETH, markets, decided([ 'usdc', WEETH ], [ 'usdt', WEETH ])), { isLegacy: false, legacyIn: sorted('usdc', 'usdt') },
+    'legacy in two of the three enabled markets that take it is not legacy, and names the two');
+  t.same(legacyOf(1, WEETH, markets, decided([ 'usdc', WEETH ], [ 'usdt', WEETH ], [ 'weth', WEETH ])),
+    { isLegacy: true, legacyIn: sorted('usdc', 'usdt', 'weth') }, 'legacy in all three is');
+  t.same(legacyOf(1, METH, markets, decided([ 'usdt', METH ])), { isLegacy: true, legacyIn: sorted('usdt') },
+    'as is a token legacy in the one market that takes it');
+
+  t.same(legacyOf(1, METH, markets, decided([ 'usdc', METH ])), { isLegacy: false, legacyIn: [] },
+    'a decision about a Comet that does not take the token as collateral marks nothing');
+  t.same(legacyOf(8453, METH, catalog.marketsOn('base-mainnet'), decided([ 'usdt', METH ])), { isLegacy: false, legacyIn: [] },
+    'and a decision belongs to its chain');
+  t.same(legacyOf(1, token('WETH'), markets, decided()), { isLegacy: false, legacyIn: [] }, 'nobody deciding is nothing legacy');
+
+  const changed = catalogOf({
+    ...snapshot,
+    networks: snapshot.networks.map(network => network.chainId !== 1 ? network : {
+      ...network,
+      markets: network.markets.map(entry =>
+          entry.deploymentKey === 'weth' ? { ...entry, status: 'deprecated' as const }
+        : entry.deploymentKey === 'usdt' ? { ...entry, status: 'deprecated' as const }
+        : entry),
+    }),
+  }, NOW).marketsOn('ethereum-mainnet');
+  t.same(legacyOf(1, WEETH, changed, decided([ 'usdc', WEETH ], [ 'usdt', WEETH ])), { isLegacy: true, legacyIn: sorted('usdc', 'usdt') },
+    'a deprecated market that does not mark it does not keep it current');
+  t.same(legacyOf(1, XAUT, changed, decided([ 'usdt', XAUT ])), { isLegacy: false, legacyIn: sorted('usdt') },
+    'and one only a deprecated market takes is named there, but no enabled market makes it legacy');
+});
+
+t.test('the legacy fields change nothing else in the list', async t => {
+  const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
+  const usdt    = mainnet.markets.find(entry => entry.deploymentKey === 'usdt')!;
+  const input = {
+    registryVersion: { id: 'v', checksum: 'c' },
+    chainId:   1,
+    catalog,
+    network:   'ethereum-mainnet' as const,
+    positions: positionsOf(catalog, 'ethereum-mainnet'),
+    view:      { block: { number: 100, timestamp: 1_791_204_000 }, current: null, earlier: [] },
+    strategic: new Set<Address>(),
+    now:       NOW,
+  };
+  const legacy = legacyDecisionsOf(usdt.collateralAssets.map(asset => (
+    { chainId: 1, cometAddress: usdt.contracts.comet!, tokenAddress: asset.token.address }
+  )));
+  const before = tokenList({ ...input, legacy: legacyDecisionsOf([]) });
+  const after  = tokenList({ ...input, legacy });
+
+  const withoutLegacy = (list: typeof before) => list.tokens.map(({ isLegacy: _isLegacy, legacyIn: _legacyIn, ...rest }) => rest);
+  t.same(withoutLegacy(after), withoutLegacy(before), 'every other field of every token is what it was, visibility included');
+  t.equal(after.ruleVersion, before.ruleVersion, 'and the rule is the same rule');
+  t.same(after.tokens.filter(entry => entry.isLegacy).map(entry => entry.symbol), [ 'mETH', 'sFRAX', 'wUSDM', 'XAUt' ],
+    'with every collateral of the USDT market legacy, the tokens no other market takes are');
+  t.ok(after.tokens.filter(entry => entry.legacyIn.length > 0).every(entry => entry.roles.includes('collateral')),
+    'and only a collateral is ever named legacy');
 });
 
 t.test('visibleOnly is true or false, once, or absent', async t => {
