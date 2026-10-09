@@ -190,13 +190,21 @@ function StaticWellKnownContracts<
 }
 
 /*
+ * The constants of every network, by address and by canonical name.
  *
+ * Their Comets are typed, where every other name is loose, so that the
+ * compiler tells a Comet of the constants from a Comet of the catalog
+ * (RegistryComet), the only market a computation takes. Each network is one
+ * object type, not an intersection with the loose index, because a typed key
+ * intersected with `any` is `any` again.
  */
 export type WellKnownContractsByNetworkAddress = {
-  [Network in KnownNetwork.Name]: (
-    & { [address in Eth.Address]: Contract }
-    & { [key: string]: any }
-  )
+  [Network in KnownNetwork.Name]: {
+    [address: Eth.Address]: Contract,
+    [key: string]: any,
+    // by alias and by address; a network may have none
+    Comet?: { [aliasOrAddress: string]: Contract<StandaloneContract<Comet>> },
+  }
 };
 
 /*

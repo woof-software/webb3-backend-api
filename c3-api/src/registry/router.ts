@@ -1,7 +1,9 @@
-import type { Env } from '../../entrypoint.js';
+import * as jsonRpc from '../../lib/json-rpc.js';
 
-import { corsHeadersFor, isAdminRoute } from '../http/cors.js';
-import { ApiError, ApiErrorCode, FailureLog, failureResponse, isApiError } from '../http/errors.js';
+import { corsHeaders } from '../http/cors.js';
+import { ApiError, ApiErrorCode, failureResponse, isApiError, nodeUnavailable } from '../http/errors.js';
+
+import type * as Evaluator from '../evaluator.js';
 
 import { routeAdmin } from './admin-router.js';
 import type { CacheDeps, CachedSnapshot } from './cache.js';
@@ -13,23 +15,32 @@ import { isRegistryUnavailable, unavailableError } from './request-catalog.js';
 
 /*
  * The registry entry point: everything under /registry/v1 is answered here,
- * including its errors and its CORS headers, and nothing else is.
+ * including its preflight, its errors and its CORS headers, and nothing else
+ * is.
  *
- * Errors become the versioned envelope rather than propagating: an unhandled
- * throw would otherwise reach the legacy 500 path, and a D1 or upstream
- * message must never leave the worker.
+ * Errors become the versioned envelope rather than propagating: nothing past
+ * this router answers a throw, and a D1 or upstream message must never reach
+ * a client.
  */
 const PREFIX = '/registry/v1';
 
 /*
- * Whether a path is the registry's to answer, with its preflight and its CORS
- * headers. The entrypoint asks this same function before it answers a
- * preflight or sets CORS headers itself: a path one claimed and the other did
- * not would be answered by neither, which is how a preflight ends up as a
- * bare 404, or would carry CORS headers this router did not decide.
+ * Whether a path is the registry's to answer. The entrypoint asks this once,
+ * and hands every path it claims to this router and every other path to the
+ * legacy one, so no path is answered by both or by neither.
  */
 function isRegistryPath(pathname: string): boolean {
   return pathname === PREFIX || pathname.startsWith(`${PREFIX}/`);
+}
+
+/*
+ * Whether a registry path is an administrative one, which decides both the
+ * router that answers it and the CORS headers it answers with. It is matched
+ * as a prefix, so anything that only starts like an administrative path is
+ * answered as one: without CORS headers, and after the address limiter.
+ */
+function isAdminPath(pathname: string): boolean {
+  return pathname.startsWith(`${PREFIX}/admin`);
 }
 
 /*
@@ -96,6 +107,10 @@ function asApiError(error: unknown): ApiError | null {
   if (isRegistryUnavailable(error)) {
     return unavailableError(error);
   }
+  // a node provider that did not serve a call no registry code names: a 503, as on every route
+  if (jsonRpc.isNotServed(error)) {
+    return nodeUnavailable(error);
+  }
   /*
    * A database that could not be reached, wherever a route read it, is the
    * registry being unavailable: a 503 whichever route found out. One that
@@ -116,25 +131,18 @@ function withHeaders(response: Response, headers: Record<string, string>): Respo
 
 async function routeRegistry(
   request: Request,
-  env: Env,
-  { debug, requestId = crypto.randomUUID() }: {
-    debug:      FailureLog,
-    // the id the entrypoint gave the request, which its error answer and its log lines carry
-    requestId?: string,
-  },
-): Promise<Response | null> {
-  const path = new URL(request.url).pathname;
-  if (!isRegistryPath(path)) {
-    return null;
-  }
-  const pathname = withoutTrailingSlash(path);
+  // the request's context, with the id the entrypoint gave it, which its error answer and its log lines carry
+  { env, debug, requestId }: Evaluator.Context & { requestId: string },
+): Promise<Response> {
+  const pathname = withoutTrailingSlash(new URL(request.url).pathname);
+  const route    = isAdminPath(pathname) ? 'admin' : 'public';
 
-  const cors = corsHeadersFor(pathname);
   if (request.method === 'OPTIONS') {
     // administrative routes answer no CORS headers, so a preflight there
     // tells a browser nothing it could use
-    return withHeaders(new Response(null, { status: 204 }), corsHeadersFor(pathname, { preflight: true }));
+    return withHeaders(new Response(null, { status: 204 }), corsHeaders(route, { preflight: true }));
   }
+  const cors = corsHeaders(route);
 
   const deps = cacheDepsOf(env, debug);
   const context: RegistryContext = {
@@ -159,7 +167,7 @@ async function routeRegistry(
   };
 
   try {
-    const response = isAdminRoute(pathname)
+    const response = route === 'admin'
       ? await routeAdmin(request, env, context, pathname)
       : await routePublic(request, context, pathname, { maxAge: deps.ttlSeconds });
     if (response === null) {

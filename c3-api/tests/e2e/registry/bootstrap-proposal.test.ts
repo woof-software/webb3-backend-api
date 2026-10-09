@@ -6,10 +6,10 @@ import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
 import { sha256Hex } from '../../../src/http/bearer-auth.js';
-import { markValidated, readSnapshot, readUnreviewed, recordValidationResults, snapshotChecksum } from '../../../src/registry/repository.js';
+import { readSnapshot, readUnreviewed } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 
 /*
  * The first review of an environment, as an operator does it: read the
@@ -144,8 +144,7 @@ t.test('the apply route takes a digest and a reason, and an open candidate only'
   t.equal((await server.fetch(`/registry/v1/admin/versions/${versionId}/proposal`)).status, 401, 'the routes are authenticated');
   t.equal((await server.fetch('/registry/v1/admin/versions/00000000-0000-4000-8000-000000000999/proposal', { headers: auth })).status, 404);
 
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(loadRegistrySnapshotFixture().networks));
+  await validateSeeded(db, versionId);
   t.equal((await apply(versionId, { reason: 'too late', digest })).status, 409, 'a validated version can no longer be changed');
 });
 
@@ -162,8 +161,7 @@ t.test('the proposal is for an environment no version has been switched on in', 
   const { digest } = await (await server.fetch(`/registry/v1/admin/versions/${versionId}/proposal`, { headers: auth })).json() as Proposal;
 
   const { versionId: on } = await seedCandidate(db, loadRegistrySnapshotFixture(), { versionId: randomUUID(), attempt: 2 });
-  await recordValidationResults(db, on, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, on, await snapshotChecksum(loadRegistrySnapshotFixture().networks));
+  await validateSeeded(db, on);
   const activated = await server.fetch(`/registry/v1/admin/versions/${on}/activate`, {
     method:  'POST',
     headers: { ...auth, 'Content-Type': 'application/json' },

@@ -1,7 +1,4 @@
-import type { PriceFeedV1 } from '../../model/comet-registry.js';
-import { annotationOf } from '../../model/comet-registry.js';
-
-import type { Contract } from '../../well-known/contracts/utils.js';
+import type { PriceFeedV1, RegistryComet } from '../../model/comet-registry.js';
 
 /*
  * A rewards APR divides the annual value of the rewards by the value of the
@@ -17,8 +14,8 @@ import type { Contract } from '../../well-known/contracts/utils.js';
  * branches on network and display name that used to encode the same four
  * markets by hand.
  */
-function usdBasePriceFeedFor(contract: Contract): PriceFeedV1 | null {
-  const market = annotationOf(contract).market;
+function usdBasePriceFeedFor(contract: RegistryComet): PriceFeedV1 | null {
+  const market = contract.registry.market;
   return market.rewardAsset?.priceFeedQuote === 'usd' && market.collateralValueQuote === 'base'
     ? market.baseAsset.usdPriceFeed
     : null;

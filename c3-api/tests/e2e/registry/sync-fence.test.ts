@@ -16,7 +16,7 @@ import {
   dueForDiscovery,
   failItem,
   finishRun,
-  pendingItems,
+  progressOf,
   recordUpstreamCheck,
   releaseLease,
   runningRun,
@@ -86,7 +86,7 @@ t.test('one import runs at a time', async t => {
   t.equal(run?.lease_owner, fence.owner, 'a new run is created with its lease held by its creator');
   t.equal(run?.id, fence.runId);
   t.equal(run?.expected_count, ROOTS.length, 'every root is checkpointed');
-  t.equal(await pendingItems(db, fence.runId), ROOTS.length, 'and starts unprocessed');
+  t.equal((await progressOf(db, fence.runId)).outstanding, ROOTS.length, 'and starts unprocessed');
 
   try {
     await newRun(db);
@@ -96,7 +96,7 @@ t.test('one import runs at a time', async t => {
   }
 
   // the refused creation leaves no partial run behind
-  t.equal(await pendingItems(db, fence.runId), ROOTS.length);
+  t.equal((await progressOf(db, fence.runId)).outstanding, ROOTS.length);
   const runs = await db.prepare(`SELECT COUNT(*) AS n FROM sync_runs`).first<number>('n');
   t.equal(runs, 1, 'and no orphaned run rows');
 });
@@ -342,7 +342,7 @@ t.test('a root that keeps failing stops being retried', async t => {
   }
   t.equal(processed, MAX_ITEM_ATTEMPTS * ROOTS.length, 'each root is retried up to its bound, then left alone');
   t.equal(await claimItem(db, fence, { now: clockAt(T0) }), null, 'nothing remains claimable');
-  t.equal(await pendingItems(db, fence.runId), 0, 'and nothing is reported as outstanding work');
+  t.equal((await progressOf(db, fence.runId)).outstanding, 0, 'and nothing is reported as outstanding work');
   t.equal(
     (await runningRun(db))?.failed_count,
     ROOTS.length,
@@ -406,7 +406,7 @@ t.test('a root an invocation left in progress is failed by the invocation that t
   const run = await runningRun(db);
   t.same([ run?.completed_count, run?.failed_count, run?.last_error ], [ ROOTS.length - 1, 1, ABANDONED ],
     'and the root is counted among those the run gave up, with why the run did');
-  t.equal(await pendingItems(db, fence.runId), 0, 'so nothing is left to attempt');
+  t.equal((await progressOf(db, fence.runId)).outstanding, 0, 'so nothing is left to attempt');
   t.equal(await claimItem(db, fence, { now }), null, 'and nothing to claim');
 });
 
@@ -457,7 +457,7 @@ t.test('a finished run records what it produced', async t => {
     await completeItem(db, fence, { id: item.id }, lease(T0));
   }
 
-  t.equal(await pendingItems(db, fence.runId), 0, 'every root is checkpointed as done');
+  t.equal((await progressOf(db, fence.runId)).outstanding, 0, 'every root is checkpointed as done');
   t.equal(
     await finishRun(db, fence, { status: 'completed', outcome: 'no_change' }, { now: clockAt(T0) }),
     true,

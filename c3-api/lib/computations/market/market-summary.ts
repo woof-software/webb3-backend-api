@@ -6,6 +6,8 @@ import * as Compute from '../../symbolic/computation.js';
 import * as KnownNetwork from '../../well-known/networks/network.js';
 import * as Fallible from "../../fallible/fallible.js";
 
+import type { RegistryComet } from '../../model/comet-registry.js';
+
 import {
   Utilization,
   type BasePrice,
@@ -17,7 +19,6 @@ import {
 import type { BorrowApr } from './borrow-apr.js';
 import type { SupplyApr } from './supply-apr.js';
 import { type Collaterals, collateralValue } from './collaterals.js';
-import { Comet, StandaloneContract } from '../../well-known/contracts/types.js';
 
 /*
  * How much of a market could be priced. Every read of a price goes through
@@ -60,7 +61,7 @@ type MarketSummary = Compute.Spec<{
     nodeKey: string;
     block:    Eth.Block,       // block at which to compute summary
     network:  KnownNetwork.Name, // network on which market is deployed
-    contract: Eth.Contract<StandaloneContract<Comet>>,    // comet contract for the market
+    contract: RegistryComet,     // comet contract for the market
   },
   returns: (
     | MarketIdentity & {

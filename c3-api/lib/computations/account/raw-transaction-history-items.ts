@@ -75,7 +75,6 @@ function tokenDecimals(catalog: RegistryLookup, network: KnownNetwork.Name, addr
       ?? UNKNOWN_DECIMALS;
 }
 
-// the base token of a market, addressed by its Comet; '0x0' for anything else
 /*
  * Checksummed, as the addresses a decoded log carries are: one history page
  * must not name some tokens in one form and some in another.

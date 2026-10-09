@@ -228,10 +228,7 @@ namespace StepState {
  */
 const pendedKeys = new WeakMap<object, Set<string>>();
 
-/*
- * The error a computation that answered a Failure throws: named by the
- * failure's type when it has one, and carrying the failure as its cause.
- */
+// the error a computation that answered a Failure throws
 function failureOf(payload: unknown): Error {
   const type = (typeof(payload) === 'object' && payload !== null && 'type' in payload)
     ? String((payload as { type: unknown }).type)

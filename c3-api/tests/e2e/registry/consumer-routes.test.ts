@@ -24,8 +24,9 @@ import '../../../shim/node-self.js';
  * Nothing here reaches the network. Every request leaves through a fetch
  * mock that refuses whatever a test did not say it expects, and the node
  * provider answers a route that resolved its market as a node that is down
- * does: what it took to get that far is what is tested. Everything past
- * resolution lives in the market and transaction-history suites.
+ * does: what it took to get that far is what is tested, and what the route
+ * answers a node that failed it with. Everything past resolution lives in the
+ * market and transaction-history suites.
  */
 const MAINNET = 'ethereum-mainnet';
 const USDC    = '0xc3d688b66703497daa19211eedff47f25384cdc3';
@@ -53,14 +54,41 @@ async function get(env: Env, path: string): Promise<Response> {
 
 /*
  * The next request to the node provider of `network`, the one a route makes
- * once it has resolved a market there, is answered as by a node that is down.
+ * once it has resolved a market there, is answered as by a node that is down:
+ * as the node provider proxy answers when no provider served the calls, with
+ * the seconds to wait before asking again.
  */
 function nodeDown(env: Env, network: KnownNetwork.Name): void {
   fetch.expect(Eth.nodeEndpoint(env.NODE_PROXY_HOST, env.NODE_PROXY_KEY, network), { method: 'POST' })
-    .returns('node down', { status: 503 });
+    .returns('upstream error', { status: 503, headers: { 'Retry-After': '5' } });
 }
 
-// what the route logged as an error, for the length of a test
+type Call = { id: number, method: string };
+
+/*
+ * A node in place of the mock for the length of `run`, which answers each call
+ * of every request as `answer` says, however many requests the route makes,
+ * and reports the URLs it was asked at.
+ */
+async function answering(
+  answer: (call: Call) => object,
+  run: () => Promise<Response>,
+): Promise<{ response: Response, asked: string[] }> {
+  const mocked = globalThis.fetch;
+  const asked: string[] = [];
+  globalThis.fetch = (async (input: Request | string, init?: RequestInit) => {
+    const request = new Request(input, init);
+    asked.push(request.url);
+    const calls = await request.json() as Call[];
+    return new Response(JSON.stringify(calls.map(call => ({ jsonrpc: '2.0', id: call.id, ...answer(call) }))));
+  }) as typeof globalThis.fetch;
+  try {
+    return { response: await run(), asked };
+  } finally {
+    globalThis.fetch = mocked;
+  }
+}
+
 function captureErrors(t: Test): string[] {
   const lines: string[] = [];
   const error = console.error;
@@ -91,8 +119,10 @@ t.test('a market route says which version answered it', async t => {
   t.equal(response.headers.get('x-registry-version'), registry.versionId,
     'every response whose content depends on the registry names the version');
   t.equal(response.headers.get('x-registry-checksum'), registry.snapshot.registryVersion.checksum);
-  t.equal(response.status, 500, 'a market of the active version resolves, and goes on to read the chain of its network');
+  t.equal(response.status, 503, 'a market of the active version resolves, and goes on to read the chain of its network');
   t.match(errors.join('\n'), /JSON-RPC request failed: HTTP 503/, 'where only the node that is down fails it');
+  t.equal((await envelopeOf(t, response)).code, 'UPSTREAM_UNAVAILABLE', 'as a node provider that did not answer');
+  t.equal(response.headers.get('retry-after'), '5', 'which may be asked again after as long as the proxy said');
 });
 
 t.test('an address the active version does not describe is not a market', async t => {
@@ -131,8 +161,74 @@ t.test('the rewards summary of a market without rewards says so', async t => {
   const errors = captureErrors(t);
   nodeDown(env, MAINNET);
   const rewarded = await get(env, `/market/${MAINNET}/${USDC}/rewards/summary`);
-  t.equal(rewarded.status, 500, 'a market with rewards is not refused: its summary goes on to read the chain');
+  t.equal(rewarded.status, 503, 'a market with rewards is not refused: its summary goes on to read the chain');
   t.match(errors.join('\n'), /JSON-RPC request failed: HTTP 503/, 'where only the node that is down fails it');
+  t.equal((await envelopeOf(t, rewarded)).code, 'UPSTREAM_UNAVAILABLE');
+  t.equal(rewarded.headers.get('retry-after'), '5');
+});
+
+/*
+ * A node provider that did not serve a market route fails it with a 503,
+ * however it failed: answering with an error status, as above, not being
+ * reached at all, breaking off its answer, or answering a call with an error
+ * that is not a revert — which is how the proxy masks a provider's own
+ * failure. A call the contract reverted is its answer, and where a value was
+ * needed it is a fault: a 500. So is a route that spent the subrequests its
+ * invocation is given, since the node was never asked.
+ */
+t.test('a node provider that did not serve a market route is a 503, and a revert is not', async t => {
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+  const env      = envWith({ APP_DB: registry.db });
+  const endpoint = Eth.nodeEndpoint(env.NODE_PROXY_HOST, env.NODE_PROXY_KEY, MAINNET);
+  const summary  = `/market/${MAINNET}/${USDC}/summary`;
+  const errors   = captureErrors(t);
+  const failed   = () => errors.at(-1) ?? '';
+
+  fetch.expect(endpoint, { method: 'POST' }).returns(() => Promise.reject(new TypeError('fetch failed')));
+  const unreachable = await get(env, summary);
+  t.equal(unreachable.status, 503, 'a node provider the worker cannot reach');
+  t.equal((await envelopeOf(t, unreachable)).code, 'UPSTREAM_UNAVAILABLE');
+  t.equal(unreachable.headers.get('retry-after'), null, 'which asked for no wait, since nothing answered');
+  t.match(failed(), /JSON-RPC request failed: fetch failed/);
+
+  fetch.expect(endpoint, { method: 'POST' }).returns(() => new Response(
+    new ReadableStream({ pull(controller) { controller.error(new TypeError('terminated')); } }),
+    { status: 503, headers: { 'Retry-After': '5' } },
+  ));
+  const cut = await get(env, summary);
+  t.equal(cut.status, 503, 'a node provider whose answer breaks off');
+  t.equal((await envelopeOf(t, cut)).code, 'UPSTREAM_UNAVAILABLE');
+  t.equal(cut.headers.get('retry-after'), '5', 'with the wait its status line asked for');
+  t.match(failed(), /JSON-RPC request failed: terminated/);
+
+  const block  = { result: { number: '0x1c9c380', timestamp: '0x6a8e5f00', transactions: [] } };
+  const latest = (otherwise: object) => (call: Call) => call.method === 'eth_getBlockByNumber' ? block : otherwise;
+
+  const masked = await answering(() => ({ error: { code: -32000, message: 'upstream error' } }), () => get(env, summary));
+  t.equal(masked.response.status, 503, 'a node provider that answers each call with its masked failure');
+  t.equal((await envelopeOf(t, masked.response)).code, 'UPSTREAM_UNAVAILABLE');
+  t.match(failed(), /eth_getBlockByNumber: call error: .*upstream error/, 'the first of which is the latest block');
+
+  const behind = await answering(latest({ error: { code: -32000, message: 'header not found' } }), () => get(env, summary));
+  t.equal(behind.response.status, 503, 'and one that answers the latest block, but not the reads at it');
+  t.equal((await envelopeOf(t, behind.response)).code, 'UPSTREAM_UNAVAILABLE');
+  t.match(failed(), /ethCall: call error: .*header not found/);
+
+  const reverted = await answering(latest({ error: { code: 3, message: 'execution reverted', data: '0x' } }), () => get(env, summary));
+  t.equal(reverted.response.status, 500, 'while reads the contract reverted fail the summary as a fault');
+  t.equal((await envelopeOf(t, reverted.response)).code, 'INTERNAL');
+  t.match(failed(), /ethCall: call error: \{"code":3,"message":"execution reverted"\}/, 'the revert of a read that is not a price');
+
+  fetch.expect(endpoint, { method: 'POST' }).returns(() => Promise.reject(new Error('Too many subrequests.')));
+  const spent = await get(env, summary);
+  t.equal(spent.status, 500, 'and a route past the subrequests of its invocation fails as its own fault');
+  t.equal((await envelopeOf(t, spent)).code, 'INTERNAL');
+  t.match(failed(), /Error: Too many subrequests\./, 'which the log names, not a node that did not answer');
+  t.notMatch(failed(), /NotServed/);
+
+  t.same([ ...new Set([ ...masked.asked, ...behind.asked, ...reverted.asked ]) ], [ endpoint ],
+    'and the route asked nothing but the node provider of its network');
 });
 
 /*

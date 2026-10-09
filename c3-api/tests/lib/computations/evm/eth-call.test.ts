@@ -14,9 +14,10 @@ import * as comet from '../../../../lib/computations/comet.js';
 
 import { getCoder } from '../../../../lib/computations/abi-function.js';
 
-import type * as jsonRpc from '../../../../lib/json-rpc.js';
+import * as jsonRpc from '../../../../lib/json-rpc.js';
 
 import * as mock from '../../../util/mock/mock.js';
+import { fixtureComet } from '../../../util/registry-fixture.js';
 
 import '../../../../shim/node-self.js';
 
@@ -31,7 +32,7 @@ const debug = Debug.MakeLogger([]).configure(process.env);
 const network  = 'ethereum-mainnet' as const;
 const nodeHost = 'node.test';
 const nodeKey  = 'key';
-const contract = Eth.wellKnownContractsByNetwork[network]['Comet']['cUSDCv3'];
+const contract = fixtureComet(network, '0xc3d688b66703497daa19211eedff47f25384cdc3');
 const block    = 21_000_000;
 // getPrice(0xe3a409ed15cd53afdefdd191ad945cec528a2496), a retired wUSDM / USD feed
 const data     = '0x41976e09000000000000000000000000e3a409ed15cd53afdefdd191ad945cec528a2496';
@@ -80,7 +81,9 @@ t.test('a revert without data is answered too', async t => {
 
 t.test('a node that cannot serve the call still fails', async t => {
   answerWith({ code: -32000, message: 'header not found' });
-  await t.rejects(call(), /header not found/, 'a failure of the node says nothing about the contract');
+  const failure = await call().then(() => null, (error: unknown) => error);
+  t.match((failure as Error | null)?.message, /header not found/, 'a failure of the node says nothing about the contract');
+  t.ok(jsonRpc.isNotServed(failure), 'so it is a call the node did not serve');
   fetch.satisfy(t);
 });
 
@@ -88,10 +91,10 @@ t.test('a function that does not answer reverts still fails on one', async t => 
   const numAssets = getCoder('function numAssets() view returns (uint8)').encode([]);
   answerWith({ code: 3, message: 'execution reverted', data: '0x' }, numAssets);
   const { pull1, evaluate } = evaluator();
-  await t.rejects(
-    evaluate(pull1({ numAssets: { apiHost: '', nodeHost, nodeKey, network, contract, blockNumber: block } })),
-    /^ethCall: call error: .*execution reverted/,
-    'as every function did before a revert could be answered',
-  );
+  const failure = await evaluate(pull1({ numAssets: { apiHost: '', nodeHost, nodeKey, network, contract, blockNumber: block } }))
+    .then(() => null, (error: unknown) => error);
+  t.match((failure as Error | null)?.message, /^ethCall: call error: .*execution reverted/,
+    'as every function did before a revert could be answered');
+  t.notOk(jsonRpc.isNotServed(failure), 'and the contract answered it, so the node served the call');
   fetch.satisfy(t);
 });

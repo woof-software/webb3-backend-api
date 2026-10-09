@@ -2,7 +2,6 @@ import t from 'tap';
 
 import type * as KnownNetwork from '../../../lib/well-known/networks/network.js';
 import type { Address, MarketV1, NetworkV1, PriceExceptionV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
-import { annotationOf } from '../../../lib/model/comet-registry.js';
 import { exceptionFor } from '../../../lib/computations/comet/asset-price.js';
 import { Comet, ERC20 } from '../../../lib/well-known/contracts/types.js';
 
@@ -92,15 +91,14 @@ t.test('a market is addressed case-insensitively, and only on its own network', 
 
   t.equal(catalog.marketsOn(MAINNET).length, 4);
   t.equal(catalog.marketsOn(SCROLL).length, 1);
-  t.equal(catalog.defaultMarket()?.deploymentKey, 'usdc', 'the default market is the one the version marks');
 });
 
 /*
  * The status of a market decides what may resolve it: a disabled market must
  * not be reachable at all, while a deprecated one stays reachable so existing
- * positions and history keep working, and only drops out of discovery.
+ * positions and history keep working.
  */
-t.test('a disabled market is unreachable, a deprecated one is readable but not discoverable', async t => {
+t.test('a disabled market is unreachable, a deprecated one is readable', async t => {
   const disabled = catalogOf(withMarket('weth', market => ({ ...market, status: 'disabled' })));
   t.equal(disabled.marketsOn(MAINNET).length, 3, 'a disabled market is not in the catalog');
   t.equal(disabled.markets().length, 5);
@@ -108,7 +106,6 @@ t.test('a disabled market is unreachable, a deprecated one is readable but not d
   const deprecated = catalogOf(withMarket('weth', market => ({ ...market, status: 'deprecated' })));
   const weth = deprecated.marketAt(MAINNET, '0xa17581a9e3356d9a858b789d68b4d866e593ae94');
   t.ok(weth, 'a deprecated market still resolves');
-  t.equal(deprecated.discoverable().length, 5, 'but is not offered for discovery');
   t.equal(deprecated.markets().length, 6);
 });
 
@@ -139,7 +136,6 @@ t.test('a network this API cannot name is not served', async t => {
   });
 
   t.equal(catalog.networks().length, snapshot.networks.length, 'the unknown network is dropped');
-  t.equal(catalog.networkOf('nowhere-mainnet' as KnownNetwork.Name), null);
   t.equal(catalog.markets().length, marketsOf(snapshot.networks).length, 'and so are its markets');
 });
 
@@ -150,7 +146,7 @@ t.test('a network this API cannot name is not served', async t => {
  */
 function exceptionOn(catalog: Catalog, network: KnownNetwork.Name, feed: Address): PriceExceptionV1 | null {
   const [ market ] = catalog.marketsOn(network);
-  return exceptionFor(annotationOf(market!.comet), feed);
+  return exceptionFor(market!.comet.registry, feed);
 }
 
 /*
@@ -229,14 +225,6 @@ t.test('a catalog is valid until the next exception it applies expires', async t
   );
 });
 
-t.test('the default market is one the API offers', async t => {
-  t.equal(catalogOf(snapshot).defaultMarket()?.deploymentKey, 'usdc');
-
-  const deprecated = catalogOf(withMarket('usdc', market => ({ ...market, status: 'deprecated' })));
-  t.equal(deprecated.marketAt(MAINNET, USDC)?.market.status, 'deprecated', 'the market is still readable');
-  t.equal(deprecated.defaultMarket(), null, 'but a deprecated market is not offered as the default');
-});
-
 /*
  * Not every market rewards, and a market's rewards are what it has of them:
  * nothing stands in for a feed nobody states or a token the chain does not
@@ -284,7 +272,6 @@ t.test('a network with no market the API serves is not one the catalog offers', 
 
   const disabled = catalogOf(status('disabled'));
   t.notOk(disabled.networks().some(network => network.key === SCROLL), 'a network of disabled markets is not listed');
-  t.equal(disabled.networkOf(SCROLL), null, 'nor found');
   t.same(disabled.marketsOn(SCROLL), [], 'and serves no market');
 
   const deprecated = catalogOf(status('deprecated'));

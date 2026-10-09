@@ -297,7 +297,6 @@ function validateCandidate({ networks, roots, unreviewedNetworks = [] }: Candida
   const defaults = networks.flatMap(network => network.markets
     .filter(market => market.isDefault)
     .map(market => marketKey(network.chainId, market.deploymentKey)));
-  // exactly one market opens by default across the whole registry
   results.push(check('single-default-market', 'global', defaults.length === 1, { defaults }));
 
   for (const network of networks) {

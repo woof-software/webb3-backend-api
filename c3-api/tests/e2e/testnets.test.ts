@@ -85,7 +85,6 @@ async function registryOf(t: Test, options: { activate?: boolean } = {}): Promis
   return registry.db;
 }
 
-// a database whose every statement fails as `message` says
 function failing(message: string): D1Database {
   const fail = () => { throw new Error(message); };
   return { prepare: fail, batch: fail, exec: fail, dump: fail } as unknown as D1Database;

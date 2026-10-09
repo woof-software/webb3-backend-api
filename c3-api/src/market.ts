@@ -11,9 +11,7 @@ import * as rewards from '../lib/computations/rewards.js';
 
 import { snakeifyCamelObject } from '../lib/camel-snake.js';
 
-import { Comet, StandaloneContract } from '../lib/well-known/contracts/types.js'
-
-import { annotationOf } from '../lib/model/comet-registry.js';
+import type { RegistryComet } from '../lib/model/comet-registry.js';
 
 import { ApiError } from './http/errors.js';
 import type { Catalog } from './registry/catalog.js';
@@ -47,7 +45,7 @@ type Dependencies = (
  * the version still serves, deprecated ones included: a position in a
  * deprecated market must keep reporting.
  */
-function marketsOf(catalog: Catalog, network: KnownNetwork.Name): Eth.Contract<StandaloneContract<Comet>>[] {
+function marketsOf(catalog: Catalog, network: KnownNetwork.Name): RegistryComet[] {
   return catalog.marketsOn(network).map(entry => entry.comet);
 }
 
@@ -66,15 +64,6 @@ async function latestSummary(
   context: UninstantiatedRouterContext,
 ): Promise<Response> {
   const selectedNetworks = networksOf(network);
-
-  if (contract !== AllContracts && !Comet.is(contract)) {
-    return new Response(
-      JSON.stringify({
-        error: `Invalid contract address for network`,
-      }),
-      { status: 400 }
-    );
-  }
 
   const { evaluate, pipe1, pull1, split } = context.instantiateEvaluator('mainnet', {
     flags: {
@@ -171,10 +160,13 @@ async function latestRewardsSummary(
    * the error envelope, where the dapp-data route leaves such a market out of
    * its list.
    *
-   * FIXME: this can still be improved by using types in MarketRouteData
+   * The feed is the one the version states for the token the market pays,
+   * read from the version's description of the market as the rewards of the
+   * dapp-data route read it (marketRewards), so both value the token alike.
    */
-  const rewardsTokenPriceFeed = (contract as unknown as StandaloneContract<Comet>).rewards?.priceFeed;
-  if (annotationOf(contract).market.capabilities.rewards === false || rewardsTokenPriceFeed === undefined) {
+  const { capabilities, rewardAsset } = contract.registry.market;
+  const rewardsTokenPriceFeed = rewardAsset?.priceFeed ?? null;
+  if (!capabilities.rewards || rewardsTokenPriceFeed === null) {
     throw new ApiError('REWARDS_NOT_AVAILABLE', `Rewards are not available for this market`);
   }
 
@@ -202,15 +194,6 @@ async function historicalSummary(
   context: Context,
 ): Promise<Response> {
   const selectedNetworks = networksOf(network);
-
-  if (contract !== AllContracts && !Comet.is(contract)) {
-    return new Response(
-      JSON.stringify({
-        error: `Invalid contract address for network`,
-      }),
-      { status: 400 }
-    );
-  }
 
   // Local testing can really hammer rpc requests when trying to
   // test locally so force to 1 day back to save on billing when testing.
@@ -321,15 +304,6 @@ async function rewardsDappData(
 ): Promise<Response> {
   const selectedNetworks = networksOf(network);
 
-  if (contract !== AllContracts && !Comet.is(contract)) {
-    return new Response(
-      JSON.stringify({
-        error: `Invalid contract address for network`,
-      }),
-      { status: 400 }
-    );
-  }
-
   const evaluator = context.instantiateEvaluator('mainnet', {
     flags: {
       ...context.flags,
@@ -347,7 +321,7 @@ async function rewardsDappData(
        * states it per market.
        */
       const selectedContracts = (contract === AllContracts ? marketsOf(catalog, networkName) : [ contract ])
-        .filter(selected => annotationOf(selected).market.capabilities.rewards);
+        .filter(selected => selected.registry.market.capabilities.rewards);
 
       if (selectedContracts.length === 0) {
         return [];

@@ -6,11 +6,15 @@ import type { Address, MarketV1, RegistryComet, TokenV1 } from './comet-registry
  * What a computation needs from the registry: resolve an address, and say
  * which version it is answering from.
  *
- * The request catalog implements this, and it is the only shape the
- * computations depend on. They are given one lookup for the whole request, so
- * every address in one response is resolved against one version, and `key()`
- * is what puts that version into their cache keys: the same addresses
- * described differently are different results.
+ * The request catalog implements this. It is not the only way computations
+ * read the registry: a market computation reads the version's description of
+ * its market from the Comet it is handed (`contract.registry` of a
+ * RegistryComet), which the same catalog materialized. There is one catalog
+ * for the whole request, so every address in one response is resolved
+ * against one version. `key()` is what puts that version into the cache keys
+ * of a computation given this lookup, and a RegistryComet keys itself by its
+ * market's digest: the same addresses described differently are different
+ * results.
  */
 type ResolvedMarket = {
   market: MarketV1,

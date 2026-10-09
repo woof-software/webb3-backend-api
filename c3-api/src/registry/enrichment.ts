@@ -63,7 +63,7 @@ type EnrichedMarket = MarketEnrichment & {
   feeds: Map<Address, PriceFeedV1>,
 };
 
-// one collateral asset as getAssetInfo answers for it: the token, and the feed that prices it
+// one collateral asset as getAssetInfo answers for it
 type CollateralInfo = {
   assetIndex: number,
   token:      Address,
@@ -185,7 +185,6 @@ function isRpcError(error: unknown): error is jsonRpc.Error {
     && typeof((error as jsonRpc.Error).message) === 'string';
 }
 
-// one call with what the node provider answered to it
 type Answer = { call: jsonRpc.Call, response: { result?: unknown, error?: unknown } };
 
 /*
@@ -241,7 +240,6 @@ function resultOf({ call, response }: Answer, scope: string): string {
   return response.result;
 }
 
-// runs calls in bounded batches and returns their raw results in order
 async function callAll(transport: RpcTransport, calls: jsonRpc.Call[], scope: string): Promise<string[]> {
   const results: string[] = [];
   for (let index = 0; index < calls.length; index += MAX_CALLS_PER_BATCH) {
@@ -314,7 +312,6 @@ function decodeAssetInfo(data: string, assetIndex: number, comet: Address, scope
   };
 }
 
-// a read of every collateral asset of a Comet, in the order getAssetInfo reports them
 function assetInfoCalls(comet: Address, numAssets: number): jsonRpc.Call[] {
   return [ ...Array(numAssets).keys() ].map(index => call(comet, COMET.encodeFunctionData('getAssetInfo', [ index ])));
 }
@@ -340,7 +337,6 @@ function decodeText(method: 'symbol' | 'name', data: string, address: Address, s
   return trimmed;
 }
 
-// the metadata of some tokens and the decimals of some feeds, read together
 async function readTokensAndFeeds(
   transport: RpcTransport,
   tokenAddresses: Address[],
@@ -374,7 +370,7 @@ async function readTokensAndFeeds(
   return { tokens, feeds };
 }
 
-// the decimals of some feeds, which is what an overlay write reads of the chain
+// what an overlay write reads of the chain
 async function readFeeds(
   transport: RpcTransport,
   addresses: Address[],

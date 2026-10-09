@@ -15,6 +15,7 @@ import * as comet from '../../../../lib/computations/comet.js';
 import type * as jsonRpc from '../../../../lib/json-rpc.js';
 
 import * as mock from '../../../util/mock/mock.js';
+import { fixtureComet } from '../../../util/registry-fixture.js';
 
 import '../../../../shim/node-self.js';
 
@@ -29,7 +30,7 @@ const debug = Debug.MakeLogger([]).configure(process.env);
 const network   = 'ethereum-mainnet' as const;
 const nodeHost  = 'node.test';
 const nodeKey   = 'key';
-const contract  = Eth.wellKnownContractsByNetwork[network]['Comet']['cUSDTv3'];
+const contract  = fixtureComet(network, '0x3afdc9bca9213a35503b077a6072f3d0d5ab0840');
 const block     = 21_000_000;
 const priceFeed = { address: '0xe3a409ed15cd53afdefdd191ad945cec528a2496' as const, decimals: 8 };
 
@@ -66,7 +67,6 @@ function read(feed: Feed = priceFeed) {
   }));
 }
 
-// what was written as a warning, for the length of a test
 function captureWarnings(t: { teardown: (fn: () => void) => void }): string[] {
   const logged: string[] = [];
   const consoleWarn = console.warn;

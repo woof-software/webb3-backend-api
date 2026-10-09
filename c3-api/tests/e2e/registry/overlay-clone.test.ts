@@ -14,22 +14,19 @@ import type {
 } from '../../../lib/model/comet-registry.js';
 import { CONTRACT_ROLES, CONTRACT_ROLE_KEYS } from '../../../lib/model/comet-registry.js';
 
-import { applyMarketOverlay, applyNetworkOverlay, orderNetworks } from '../../../src/registry/overlay.js';
+import { applyMarketOverlay, applyNetworkOverlay, orderNetworks, overlayOfMarket } from '../../../src/registry/overlay.js';
 import {
   activateVersion,
   readActiveOverlays,
   readImportOverlays,
   readOverlays,
-  readSnapshot,
-  recordValidationResults,
-  markValidated,
   snapshotChecksum,
 } from '../../../src/registry/repository.js';
 import type { ClonedOverlays } from '../../../src/registry/repository.js';
 import type { MarketEnrichment } from '../../../src/registry/enrichment.js';
 
 import { applyMigrations } from '../../util/d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { activateSeeded, loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
 
 /*
  * Overlay cloning, against real local D1: the reviewed decisions of a stored
@@ -130,36 +127,7 @@ t.test('a stored version yields the overlay it was built from', async t => {
   );
 
   const weth = mainnet.markets.find(market => market.deploymentKey === 'weth')!;
-  const market = overlays.markets.get('1/weth')!;
-  t.same({
-    displayName:          market.displayName,
-    contractName:         market.contractName,
-    slug:                 market.slug,
-    isInstitutional:      market.isInstitutional,
-    isDefault:            market.isDefault,
-    status:               market.status,
-    creationBlock:        market.creationBlock,
-    collateralValueQuote: market.collateralValueQuote,
-    capabilities:         market.capabilities,
-    baseAsset:            market.baseAsset,
-    rewardPriceFeed:      market.rewardPriceFeed,
-  }, {
-    displayName:          weth.displayName,
-    contractName:         weth.contractName,
-    slug:                 weth.slug,
-    isInstitutional:      weth.isInstitutional,
-    isDefault:            weth.isDefault,
-    status:               weth.status,
-    creationBlock:        weth.creationBlock,
-    collateralValueQuote: weth.collateralValueQuote,
-    capabilities:         weth.capabilities,
-    baseAsset: {
-      displayName:         weth.baseAsset.displayName,
-      isWrappedNative:     weth.baseAsset.isWrappedNative,
-      usdPriceFeedAddress: weth.baseAsset.usdPriceFeed!.address,
-    },
-    rewardPriceFeed: { address: weth.rewardAsset!.priceFeed!.address, quote: weth.rewardAsset!.priceFeedQuote },
-  }, 'every reviewed decision of a market is recovered');
+  t.same(overlays.markets.get('1/weth'), overlayOfMarket(weth), 'every reviewed decision of a market is recovered');
 
   const scroll = overlays.markets.get('534352/usdc')!;
   t.equal(scroll.rewardPriceFeed, null, 'a market with no reward feed clones without one');
@@ -195,13 +163,6 @@ t.test('cloned overlays rebuild the same snapshot', async t => {
   );
 });
 
-// validates a seeded candidate as it stands and switches it on
-async function activate(db: D1Database, versionId: string): Promise<void> {
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(orderNetworks(await readSnapshot(db, versionId))));
-  await activateVersion(db, { versionId, action: 'activate', actor: 'test-admin', reason: 'test' });
-}
-
 /*
  * What an overlay write records beside the rows it changes: one audit event
  * per scope it reviewed. An earlier attempt of a commit hands down what such
@@ -233,7 +194,7 @@ t.test('the active overlay is what an import inherits', async t => {
   );
 
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
 
   const active = await readActiveOverlays(db);
   t.equal(active.networks.size, snapshot.networks.length, 'the active version supplies network overlays');
@@ -291,7 +252,7 @@ t.test('an attempt hands down what was reviewed for it, not its copies of a vers
   const db = await freshDatabase();
 
   const before = await seedCandidate(db, snapshot, { versionId: randomUUID(), commitSha: 'b'.repeat(40) });
-  await activate(db, before.versionId);
+  await activateSeeded(db, before.versionId);
 
   // the attempt copied what was on, and a market of it was reviewed in place
   const first = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 1 });
@@ -310,7 +271,7 @@ t.test('an attempt hands down what was reviewed for it, not its copies of a vers
     db.prepare(`UPDATE registry_networks SET display_name = 'Ethereum, hotfixed' WHERE registry_version_id = ?1 AND chain_id = 1`)
       .bind(hotfix.versionId),
   ]);
-  await activate(db, hotfix.versionId);
+  await activateSeeded(db, hotfix.versionId);
 
   const second    = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
   const inherited = await readImportOverlays(db, second.versionId);
@@ -319,6 +280,84 @@ t.test('an attempt hands down what was reviewed for it, not its copies of a vers
   t.equal(inherited.networks.get(1)?.displayName, 'Ethereum, hotfixed', 'and so does a network');
   t.equal(inherited.markets.get('1/weth')?.displayName, 'WETH, reviewed for the attempt',
     'while what was reviewed for the attempt is handed down over it');
+});
+
+// renames a mainnet market of a version in place, as a review of it does
+async function rename(db: D1Database, versionId: string, deploymentKey: string, displayName: string): Promise<void> {
+  await db.prepare(
+    `UPDATE markets SET display_name = ?3 WHERE registry_version_id = ?1 AND deployment_key = ?2
+     AND network_id = (SELECT id FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = 1)`
+  ).bind(versionId, deploymentKey, displayName).run();
+}
+
+const nameOf = (deploymentKey: string) => snapshot.networks.find(network => network.chainId === 1)!.markets
+  .find(market => market.deploymentKey === deploymentKey)!.displayName;
+
+/*
+ * An attempt switched on and then off hands nothing down: what was reviewed
+ * for it was decided against when it was switched off. So was what the
+ * attempts before it reviewed, which it carried when it went on.
+ */
+t.test('an attempt switched on and then off hands down nothing that was reviewed for it', async t => {
+  const db = await freshDatabase();
+  const first = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 1 });
+  await activateSeeded(db, first.versionId);
+
+  const second = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+  await rename(db, second.versionId, 'weth', 'WETH, switched off');
+  await reviewedIn(db, second.versionId, [ [ 'market', '1/weth' ] ]);
+  await activateSeeded(db, second.versionId);
+  await activateVersion(db, { versionId: first.versionId, action: 'rollback', actor: 'test-admin', reason: 'test' });
+
+  const third = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 3 });
+  t.equal((await readImportOverlays(db, third.versionId)).markets.get('1/weth')?.displayName, nameOf('weth'),
+    'the next attempt takes what is on');
+});
+
+t.test('a review carried into an attempt switched on and then off is not handed down either', async t => {
+  const db = await freshDatabase();
+  const first = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 1 });
+  await activateSeeded(db, first.versionId);
+
+  // a draft never switched on reviewed weth
+  const second = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+  await rename(db, second.versionId, 'weth', 'WETH, reviewed for the draft');
+  await reviewedIn(db, second.versionId, [ [ 'market', '1/weth' ] ]);
+
+  // the attempt after it inherited that review, reviewed usdc, and was switched on and off
+  const third = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 3 });
+  await rename(db, third.versionId, 'weth', 'WETH, reviewed for the draft');
+  await rename(db, third.versionId, 'usdc', 'USDC, switched off');
+  await reviewedIn(db, third.versionId, [ [ 'market', '1/usdc' ] ]);
+  await activateSeeded(db, third.versionId);
+  await activateVersion(db, { versionId: first.versionId, action: 'rollback', actor: 'test-admin', reason: 'test' });
+
+  const fourth    = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 4 });
+  const inherited = await readImportOverlays(db, fourth.versionId);
+  t.equal(inherited.markets.get('1/weth')?.displayName, nameOf('weth'), 'the draft\'s review went off with the attempt that carried it');
+  t.equal(inherited.markets.get('1/usdc')?.displayName, nameOf('usdc'), 'and so did that attempt\'s own');
+});
+
+/*
+ * A review still waiting to be switched on is handed down whatever else is
+ * switched on and off meanwhile: a hotfix of another commit replacing the
+ * attempt that was on decided nothing about it.
+ */
+t.test('a review waiting to be switched on is handed down past a hotfix', async t => {
+  const db = await freshDatabase();
+  const first = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 1 });
+  await activateSeeded(db, first.versionId);
+
+  const second = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+  await rename(db, second.versionId, 'weth', 'WETH, reviewed for the draft');
+  await reviewedIn(db, second.versionId, [ [ 'market', '1/weth' ] ]);
+
+  const hotfix = await seedCandidate(db, snapshot, { versionId: randomUUID(), commitSha: 'c'.repeat(40) });
+  await activateSeeded(db, hotfix.versionId);
+
+  const third = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 3 });
+  t.equal((await readImportOverlays(db, third.versionId)).markets.get('1/weth')?.displayName, 'WETH, reviewed for the draft',
+    'the draft\'s review is still handed down');
 });
 
 /*
@@ -349,7 +388,7 @@ t.test('the overlays an import merges name one default market', async t => {
        AND network_id = (SELECT id FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = 534352)`
     ).bind(since.versionId),
   ]);
-  await activate(db, since.versionId);
+  await activateSeeded(db, since.versionId);
 
   const second    = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
   const inherited = await readImportOverlays(db, second.versionId);

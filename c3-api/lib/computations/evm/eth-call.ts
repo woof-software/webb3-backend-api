@@ -7,7 +7,7 @@ import { Contract } from '../../well-known/contracts/utils.js';
 
 import * as KnownNetwork from '../../well-known/networks/network.js';
 
-import { EvmRpc } from './rpc.js';
+import { EvmRpc, notServed } from './rpc.js';
 
 /*
  * A call the EVM reverted: the contract's answer at that block, which every
@@ -52,12 +52,10 @@ const ethCall = implement({
           return { reverted: { code: error.code, message: error.message } };
         }
         if (error) {
-          console.error({ error });
-          throw new Error(`ethCall: call error: ${JSON.stringify(error)}`);
+          throw notServed('ethCall', error);
         }
         if (!isBytesLike(result) || result === '0x') {
-          console.error({ error: { message: 'malformed result' }, result });
-          throw new Error(`ethCall: result is not byteslike`);
+          throw new Error(`ethCall: result is not byteslike`, { cause: { result } });
         }
         return result;
       },

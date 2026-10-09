@@ -285,4 +285,4 @@ async function checkChain(deps: ChainCheckDeps): Promise<ChainCheck | null> {
 }
 
 export type { ChainCheck, ChainCheckDeps, ChainDrift, UnreadNetwork };
-export { CHECK_KEY, checkChain, driftsOf, readChainCheck };
+export { CHECK_KEY, checkChain, readChainCheck };

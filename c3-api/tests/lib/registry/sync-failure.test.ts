@@ -95,13 +95,11 @@ t.test('a sync is answered by what its invocation did', async t => {
   );
 });
 
-// a database whose every statement fails as `message` says
 function failingDatabase(message: string): D1Database {
   const fail = () => { throw new Error(message); };
   return { prepare: fail, batch: fail, exec: fail, dump: fail } as unknown as D1Database;
 }
 
-// what the sync wrote to console.error, for the length of a test
 function captureErrors(t: { teardown: (fn: () => void) => void }): string[] {
   const lines: string[] = [];
   const error = console.error;
@@ -110,7 +108,6 @@ function captureErrors(t: { teardown: (fn: () => void) => void }): string[] {
   return lines;
 }
 
-// what the sync wrote to console.warn, for the length of a test
 function captureWarnings(t: { teardown: (fn: () => void) => void }): string[] {
   const lines: string[] = [];
   const warn = console.warn;
@@ -219,6 +216,160 @@ t.test('an administrative sync refused while another imports is logged under its
   t.equal(error.details.code, 'SYNC_ALREADY_RUNNING');
   t.ok(warnings.some(line => line.includes(error.requestId)), 'the log line about the refusal carries the id of the answer');
   t.same(errors, [], 'and it is a warning: nothing failed');
+});
+
+/*
+ * Through the administrative route: an import with work left answers 202,
+ * and a request that names no number of markets attempts the whole source
+ * rather than the Cron's batch. GitHub lists two roots and answers for
+ * neither, so every attempt fails before a chain is asked anything, and the
+ * counts say how many each request attempted.
+ */
+t.test('an administrative sync with work left answers 202, and attempts up to fifty markets by default', async t => {
+  captureErrors(t);
+  captureWarnings(t);
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+
+  const fetchBefore = globalThis.fetch;
+  globalThis.fetch = (async (input: Request | string, init?: RequestInit) => {
+    const { url } = new Request(input, init);
+    if (url.endsWith('/commits/main')) {
+      return new Response('c'.repeat(40));
+    }
+    if (url.includes('/git/trees/')) {
+      return new Response(JSON.stringify({
+        truncated: false,
+        tree: [ 'usdc', 'weth' ].map((key, index) => ({
+          path: `deployments/mainnet/${key}/roots.json`, type: 'blob', sha: String(index + 1).repeat(40), size: 100,
+        })),
+      }));
+    }
+    throw new TypeError('fetch failed');
+  }) as unknown as typeof globalThis.fetch;
+  t.teardown(() => { globalThis.fetch = fetchBefore; });
+
+  const env = makeTestEnv({
+    DEBUG:                             '',
+    MEMORY_CACHE_SEED:                 'registry-sync-default',
+    APP_DB:                            registry.db,
+    COMET_REGISTRY_ADMIN_TOKEN_HASH:   await sha256Hex('registry-admin-token-for-tests'),
+    REGISTRY_ADMIN_RATE_LIMITER:       { limit: async () => ({ success: true }) },
+    REGISTRY_ADMIN_AUTH_RATE_LIMITER:  { limit: async () => ({ success: true }) },
+    // the Cron's batch, which an administrative sync does not keep to
+    COMET_SYNC_MARKETS_PER_INVOCATION: '1',
+  });
+  const sync = (body: unknown) => C3Api.fetch(new Request('https://api.test.local/registry/v1/admin/sync', {
+    method:  'POST',
+    headers: { 'Authorization': 'Bearer registry-admin-token-for-tests', 'Content-Type': 'application/json' },
+    body:    JSON.stringify(body),
+  }), env);
+
+  const one = await sync({ markets: 1 });
+  t.equal(one.status, 202, 'an import with work left is accepted, for a later request to continue');
+  t.match(await one.json(), { status: 'running', processed: 1, expected: 2, outstanding: 2 },
+    'having attempted the one market it was asked for');
+
+  const all = await sync({});
+  t.equal(all.status, 202);
+  t.match(await all.json(), { status: 'running', processed: 2, expected: 2 },
+    'a request that names no number attempts every root left, not the Cron\'s one');
+
+  for (const markets of [ 0, 51, 1.5, 'x' ]) {
+    t.equal((await sync({ markets })).status, 400, `markets ${JSON.stringify(markets)} is refused`);
+  }
+});
+
+/*
+ * Through the administrative route: a cancel is answered with what its own
+ * transaction found or did. The invocation holding a run can give it back
+ * right after a cancel was refused, and the database can stop answering
+ * right after a cancel was made. Neither changes the answer: a read after
+ * the cancel would name no expiry for the first, and turn the second into a
+ * 503 that, sent again, is refused as a run that has already ended.
+ */
+t.test('a cancel is answered with what it found or did, whatever happens to the run after', async t => {
+  captureErrors(t);
+  captureWarnings(t);
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+
+  // a run an invocation holds until `until`, with a root it has not reached
+  const runId = randomUUID();
+  const until = new Date(Date.now() + 900_000).toISOString();
+  const now   = new Date().toISOString();
+  await registry.db.prepare(
+    `INSERT INTO sync_runs (
+       id, source_commit_sha, tracked_ref, trigger_kind, requested_by, status,
+       lease_owner, lease_expires_at, expected_count, started_at
+     ) VALUES (?1, ?2, 'main', 'scheduled', 'registry-cron', 'running', ?3, ?4, 1, ?5)`
+  ).bind(runId, 'a'.repeat(40), randomUUID(), until, now).run();
+  await registry.db.prepare(
+    `INSERT INTO sync_run_items (
+       id, sync_run_id, root_path, source_blob_sha, upstream_network_key, deployment_key, created_at, updated_at
+     ) VALUES (?1, ?2, 'deployments/mainnet/usdc/roots.json', ?3, 'mainnet', 'usdc', ?4, ?4)`
+  ).bind(randomUUID(), runId, 'b'.repeat(40), now).run();
+
+  // what happens once the cancel's batch has committed: the invocation gives the run back, or the database stops answering
+  let after: 'released' | 'down' = 'released';
+  let down = false;
+  const db = new Proxy(registry.db, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'prepare') {
+        return (sql: string) => {
+          if (down) {
+            throw new Error('D1_ERROR: Network connection lost.');
+          }
+          return target.prepare(sql);
+        };
+      }
+      if (property === 'batch') {
+        return async (statements: D1PreparedStatement[]) => {
+          const results = await target.batch(statements);
+          if (after === 'released') {
+            await target.prepare(`UPDATE sync_runs SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ?1`)
+              .bind(runId).run();
+          } else {
+            down = true;
+          }
+          return results;
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as D1Database;
+
+  const env = makeTestEnv({
+    DEBUG:                            '',
+    MEMORY_CACHE_SEED:                'registry-sync-cancel',
+    APP_DB:                           db,
+    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256Hex('registry-admin-token-for-tests'),
+    REGISTRY_ADMIN_RATE_LIMITER:      { limit: async () => ({ success: true }) },
+    REGISTRY_ADMIN_AUTH_RATE_LIMITER: { limit: async () => ({ success: true }) },
+  });
+  const cancel = () => C3Api.fetch(new Request(`https://api.test.local/registry/v1/admin/sync-runs/${runId}/cancel`, {
+    method:  'POST',
+    headers: { 'Authorization': 'Bearer registry-admin-token-for-tests', 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ reason: 'a stored overlay no longer parses' }),
+  }), env);
+
+  const refused = await cancel();
+  t.equal(refused.status, 409, 'a run an invocation holds is not cancelled');
+  t.equal(
+    (await refused.json() as { error: { message: string } }).error.message,
+    `an invocation holds the sync run until ${until}; cancel it once that has passed`,
+    'and the refusal names the lease the cancel found, although the run was given back right after',
+  );
+
+  after = 'down';
+  const cancelled = await cancel();
+  t.ok(down, 'the database stops answering once the cancel has been made');
+  t.equal(cancelled.status, 200, 'the cancel sent again, to the run now free, is answered as made');
+  t.match(await cancelled.json(), {
+    syncRun: { id: runId, status: 'failed', lastError: /^cancelled by registry-admin:[^:]+: a stored overlay no longer parses$/ },
+    items:   [ { deploymentKey: 'usdc', status: 'pending', attempts: 0 } ],
+  }, 'with the run and its roots as the cancel left them');
 });
 
 /*

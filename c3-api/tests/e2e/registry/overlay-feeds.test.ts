@@ -8,6 +8,7 @@ import type { Address } from '../../../lib/model/comet-registry.js';
 
 import { FeedReader, replaceMarketOverlay } from '../../../src/registry/admin.js';
 import { readFeeds } from '../../../src/registry/enrichment.js';
+import { overlayOfMarket } from '../../../src/registry/overlay.js';
 import { asApiError } from '../../../src/registry/router.js';
 
 import { applyMigrations } from '../../util/d1.js';
@@ -58,23 +59,7 @@ function rewardFeed(db: D1Database, versionId: string, readFeeds: FeedReader) {
     deploymentKey: 'usdc',
     actor:         'test-admin',
     reason:        'price the rewards with another feed',
-    overlay: {
-      displayName:          usdc.displayName,
-      contractName:         usdc.contractName,
-      slug:                 usdc.slug,
-      isInstitutional:      usdc.isInstitutional,
-      isDefault:            usdc.isDefault,
-      status:               usdc.status,
-      creationBlock:        usdc.creationBlock,
-      collateralValueQuote: usdc.collateralValueQuote,
-      capabilities:         usdc.capabilities,
-      baseAsset: {
-        displayName:         usdc.baseAsset.displayName,
-        isWrappedNative:     usdc.baseAsset.isWrappedNative,
-        usdPriceFeedAddress: usdc.baseAsset.usdPriceFeed?.address ?? null,
-      },
-      rewardPriceFeed: { address: FEED, quote: 'usd' },
-    },
+    overlay:       { ...overlayOfMarket(usdc), rewardPriceFeed: { address: FEED, quote: 'usd' } },
   }, readFeeds);
 }
 

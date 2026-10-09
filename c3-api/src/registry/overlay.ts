@@ -21,6 +21,7 @@ import {
 
 import type { MarketEnrichment } from './enrichment.js';
 import { RegistryError } from './errors.js';
+import { canonicalJson } from '../../lib/canonical-json.js';
 import { sha256Hex } from '../../lib/hash.js';
 
 /*
@@ -380,10 +381,13 @@ function overlayOfMarket(market: MarketV1): MarketOverlay {
 
 /*
  * The digest an overlay audit event records, over the normalized overlay. It
- * identifies what was applied without storing the request body.
+ * identifies what was applied without storing the request body. Written as
+ * canonical JSON, it names what the overlay says rather than the order its
+ * keys were assigned in; the parser is what makes two spellings of one
+ * address, expiry or list one overlay, so what is digested is its output.
  */
 async function overlayDigest(overlay: MarketOverlay | NetworkOverlay): Promise<string> {
-  return sha256Hex(JSON.stringify(overlay));
+  return sha256Hex(canonicalJson(overlay));
 }
 
 /*
@@ -544,10 +548,7 @@ function provisionalMarketOverlay(deploymentKey: string, baseTokenName: string):
   };
 }
 
-/*
- * The overlay of a network nobody has reviewed: named by its canonical name,
- * with no presentation data and no price exceptions.
- */
+// the overlay of a network nobody has reviewed
 function provisionalNetworkOverlay(canonicalName: string): NetworkOverlay {
   return {
     displayName:               canonicalName,

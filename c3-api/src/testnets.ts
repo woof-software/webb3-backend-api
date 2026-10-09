@@ -17,7 +17,6 @@ function testnetNotServed(named: string): ApiError {
   return new ApiError('TESTNET_NOT_SERVED', `testnets are not served: ${named}`);
 }
 
-// refuses a network a request names, when it is a testnet
 function refuseTestnet(network: KnownNetwork.Name): void {
   if (KnownNetwork.isNameOfTestnet(network)) {
     throw testnetNotServed(network);
@@ -34,4 +33,4 @@ function refuseTestnetsParameter(query: URLSearchParams): void {
   }
 }
 
-export { refuseTestnet, refuseTestnetsParameter, testnetNotServed };
+export { refuseTestnet, refuseTestnetsParameter };

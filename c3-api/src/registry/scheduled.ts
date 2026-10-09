@@ -40,7 +40,7 @@ import type { RegistryFetch } from './source/github.js';
 function registryFetch(env: Env): (input: Request | string, init?: RequestInit) => Promise<Response> {
   const overrides = env.URL_SERVICE_BINDING_OVERRIDES ?? [];
   return async (input, init) => {
-    const request  = typeof(input) === 'string' ? new Request(input, init) : new Request(input, init);
+    const request  = new Request(input, init);
     const override = overrides.find(({ host }) => host === new URL(request.url).hostname);
     if (override === undefined) {
       /*
@@ -233,7 +233,6 @@ export {
   checkRegistryChain,
   importerDeps,
   maintainRegistryCache,
-  registryFetch,
   runRegistrySync,
   transportFor,
 };

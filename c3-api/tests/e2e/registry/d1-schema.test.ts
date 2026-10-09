@@ -178,9 +178,6 @@ function priceExceptionRow(scope: Scope, overrides: Row = {}): Row {
 
 type Candidate = Scope & { marketId: string, baseTokenId: string, collateralTokenId: string };
 
-/*
- * One importing version with a network, a market, and a base asset.
- */
 async function insertCandidate(db: D1Database, versionId: string = randomUUID(), chainId: number = 1): Promise<Candidate> {
   const scope = { registry_version_id: versionId, network_id: randomUUID() };
   const marketId = randomUUID();

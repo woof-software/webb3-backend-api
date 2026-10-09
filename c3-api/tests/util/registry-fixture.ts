@@ -5,7 +5,17 @@ import type * as KnownNetwork from '../../lib/well-known/networks/network.js';
 import type { Address, MarketV1, NetworkV1, RegistryComet, RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
 import type { Catalog } from '../../src/registry/catalog.js';
 import { catalogOf } from '../../src/registry/catalog.js';
-import { createCandidate, marketWrites } from '../../src/registry/repository.js';
+import type { NetworkOverlay } from '../../src/registry/overlay.js';
+import { orderNetworks } from '../../src/registry/overlay.js';
+import {
+  activateVersion,
+  createCandidate,
+  markValidated,
+  marketWrites,
+  readSnapshot,
+  recordValidationResults,
+  snapshotChecksum,
+} from '../../src/registry/repository.js';
 
 /*
  * Loads the frozen RegistrySnapshotV1 fixture and seeds it into D1 as an
@@ -55,7 +65,6 @@ type SnapshotCounts = {
   priceExceptions: number,
 };
 
-// every token a market names: its base asset, the token it pays, and its collateral
 function tokensOf(market: MarketV1): string[] {
   return [
     market.baseAsset.token.address,
@@ -171,14 +180,53 @@ async function seedCandidate(
   };
 }
 
+/*
+ * Validates a candidate as it stands, without judging it: one passing check,
+ * and the checksum validation would store for its rows, which is the one the
+ * cache verifies a version against. A test about a version this release
+ * cannot verify states another.
+ */
+async function validateSeeded(db: D1Database, versionId: string, { checksum }: { checksum?: string } = {}): Promise<void> {
+  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
+  await markValidated(db, versionId, checksum ?? await snapshotChecksum(orderNetworks(await readSnapshot(db, versionId))));
+}
+
+async function activateSeeded(db: D1Database, versionId: string): Promise<void> {
+  await validateSeeded(db, versionId);
+  await activateVersion(db, { versionId, action: 'activate', actor: 'test-admin', reason: 'test' });
+}
+
+/*
+ * The decisions a network of a snapshot states, as the network overlay route
+ * takes them. Production reads a network's overlay from its rows rather than
+ * from the wire shape, so this mapping is the tests' own.
+ */
+function overlayOfNetwork(network: NetworkV1): NetworkOverlay {
+  return {
+    displayName:               network.displayName,
+    assetDisplayOverrides:     network.presentation.assetDisplayOverrides,
+    unwrappedCollateralAssets: network.presentation.unwrappedCollateralAssets,
+    priceExceptions:           network.priceExceptions.map(exception => exception.kind !== 'deprecated_price_remap' ? exception : {
+      kind:                        exception.kind,
+      priceFeedAddress:            exception.priceFeedAddress,
+      replacementPriceFeedAddress: exception.replacementPriceFeed.address,
+      provenance:                  exception.provenance,
+      expiresAt:                   exception.expiresAt,
+    }),
+  };
+}
+
 export type { SeedOptions, SeededCandidate };
 
 export {
+  activateSeeded,
   clearCandidateSnapshot,
   fixtureCatalog,
   fixtureComet,
   loadRegistrySnapshotFixture,
+  overlayOfNetwork,
   seedCandidate,
   sha256Hex,
+  validateSeeded,
   writeCandidateSnapshot,
 };

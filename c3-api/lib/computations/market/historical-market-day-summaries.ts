@@ -6,8 +6,9 @@ import * as Fallible from '../../fallible/fallible.js';
 
 import * as KnownNetwork from '../../well-known/networks/network.js';
 
+import type { RegistryComet } from '../../model/comet-registry.js';
+
 import { MarketDaySummary } from './market-day-summary.js';
-import { Comet, StandaloneContract } from '../../well-known/contracts/types.js';
 
 type HistoricalMarketDaySummaries = Compute.Spec<{
   name: 'historicalMarketDaySummaries';
@@ -17,7 +18,7 @@ type HistoricalMarketDaySummaries = Compute.Spec<{
     nodeHost: string;
     nodeKey: string;
     network:    KnownNetwork.Name;
-    contract:   Eth.Contract<StandaloneContract<Comet>>;
+    contract:   RegistryComet;
     daysBack:   number;
     startBlock: Eth.Block;
   };

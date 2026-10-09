@@ -23,8 +23,9 @@ npm run d1:migrate:local
 
 Run the node provider proxy on this machine, in a terminal of its own, with
 its provider keys in `../node-provider-proxy/.dev.vars` (see
-[its README](../node-provider-proxy/README.md)). It is a package of its own,
-so its dependencies are installed there, the first time, before it starts:
+[Configuration](../node-provider-proxy/README.md#configuration) in its
+README). It is a package of its own, so its dependencies are installed there,
+the first time, before it starts:
 ```sh
 cd ../node-provider-proxy
 npm install
@@ -174,9 +175,20 @@ subrequests. A `[limits]` section changes them for one Worker, as
 
 Markets, their tokens, and their price feeds come from the registry in
 `APP_DB`, not from the static constants. One activated version answers a
-whole request: the router loads it once, hands the same catalog to every
-computation of that request, and reports which version answered in
-`X-Registry-Version` and `X-Registry-Checksum` on the response.
+whole request: the router that answers it loads the version once, hands the
+same catalog to every computation of that request, and reports which version
+answered in `X-Registry-Version` and `X-Registry-Checksum` on the response.
+
+A computation takes a market in one form: the Comet the catalog materialized
+for it (`RegistryComet`, in
+[lib/model/comet-registry.ts](./lib/model/comet-registry.ts)) — the contract
+shape the static constants used, carrying the version's description of the
+market. Its units, its labels, its reward feed and the price exceptions of
+its network are read from that description, and every computation that
+reads it, or hands its market to one that does, is typed to take nothing
+else. The constants type their Comets for that: one read from them as
+`['Comet'][alias]` does not compile there. What the compiler cannot type —
+a cast, or a name computed at run time — it cannot refuse either.
 
 What that means for the endpoints:
 
@@ -199,11 +211,11 @@ What that means for the endpoints:
   constants, then those the constants cannot fully name once more, with the
   markets of the active version merged in: a target the constants do not
   know and the version does, an action bridged to another chain, and a call
-  to the Configurator, CometProxyAdmin, CometRewards or CometFactory, whose
-  arguments name the market it acts on. Almost every page has one, so the
-  list reads the registry on almost every request; when it cannot, those
-  actions keep the constants' description, and the list is answered all the
-  same.
+  to the Configurator, CometAdmin (the CometProxyAdmin), CometRewards or
+  CometFactory, whose arguments name the market it acts on. Almost every
+  page has one, so the list reads the registry on almost every request; when
+  it cannot, those actions keep the constants' description, and the list is
+  answered all the same.
 
 A commit can be imported more than once — discovery tries again after an
 attempt that did not import every root, each time later, and an operator can
@@ -230,10 +242,15 @@ validate it to close it. What an earlier attempt hands down is what an
 overlay was written for in it, which its audit events name; the rest of its
 rows are copies of the version that was on when it was imported, and come
 from the version on now instead, so a hotfix or a rollback activated between
-two attempts is not undone by the second. Where the merged decisions name two
-default markets, the one an attempt decided is kept and the other is merged as
-not the default, and an import that would still write a second default is
-refused as `OVERLAY_INVALID`, naming both.
+two attempts is not undone by the second — except where the first was
+reviewed: a document is handed down whole, with what the version on then
+decided for its network or market. Nor is the rollback of an attempt
+of the commit: once one has been switched off, neither it nor an attempt
+before it hands anything down, because what they reviewed was switched on
+with it and off again. Where the merged decisions name two default markets,
+the one an attempt decided is kept and the other is merged as not the
+default, and an import that would still write a second default is refused as
+`OVERLAY_INVALID`, naming both.
 
 ## What a request reads
 
@@ -257,7 +274,9 @@ market routes read it the same way:
 - an entry is written once and never expires: it is never wrong, only
   unwanted, and the hourly job removes those of versions nothing is about to
   serve — every version but the active one, the one an outage would fall back
-  to, and the validated ones newer than the active one;
+  to, and the validated ones newer than the active one. A version switched on
+  while the job runs is cached again, by the job, by the activation or by the
+  first read;
 - a validated candidate is cached before it is activated — by the import that
   validated it, by `POST .../validate`, and by the activation itself — so an
   activation is a pointer move and no request pays the serialization;
@@ -320,10 +339,12 @@ curl -X POST .../registry/v1/admin/versions/$VERSION/proposal/apply \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"reason": "first registry version", "digest": "<digest>"}'
 
-# 4. validate, compare with the constants, activate
+# 4. validate, compare with the constants, activate. The first activation
+#    expects nothing to be on; a later one names the version that is
 curl -X POST .../registry/v1/admin/versions/$VERSION/validate ...
 curl         .../registry/v1/admin/versions/$VERSION/shadow ...
-curl -X POST .../registry/v1/admin/versions/$VERSION/activate ...
+curl -X POST .../registry/v1/admin/versions/$VERSION/activate ... \
+  -d '{"reason": "first registry version", "expectedActiveVersionId": null}'
 ```
 
 An administrative sync imports up to fifty markets per request (`markets`
@@ -674,14 +695,24 @@ to support the new network.
 
 # Request Routing
 The server accepts requests at the Cloudflare worker
-[entrypoint](./entrypoint.ts). The entrypoint hands every request to a simple
-[router](./src/router.ts) and its handlers: the market routes in
-[./src/market.ts](./src/market.ts), the governance, account, transaction
-history and V2 routes in their directories under `./src`, and the
-registry's own routes in [./src/registry](./src/registry/router.ts). The
-router either fails the request (typically with a 4xx error because the URI
+[entrypoint](./entrypoint.ts), which decides by the path, and nowhere else,
+which of two routers answers a request:
+
+- everything under `/registry/v1` goes to the
+  [registry router](./src/registry/router.ts): the registry's public reads
+  and its administrative routes, with their preflights, their errors and
+  their CORS headers;
+- every other path goes to the legacy [router](./src/router.ts) and its
+  handlers: the market routes in [./src/market.ts](./src/market.ts), and the
+  governance, account, transaction history and V2 routes in their
+  directories under `./src`. The entrypoint answers their preflight itself,
+  and adds their CORS headers.
+
+A router either fails the request (typically with a 4xx error because the URI
 path is malformed), or passes it to a handler, which invokes the symbolic
-computation engine to produce a response.
+computation engine to produce a response. The entrypoint adds the security
+headers to every response, and what each kind of route answers a browser
+with is in [./src/http/cors.ts](./src/http/cors.ts).
 
 Basically:
 `curl /example -> entrypoint -> router -> handler -> Response`.

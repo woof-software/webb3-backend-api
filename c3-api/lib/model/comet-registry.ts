@@ -70,7 +70,6 @@ type SyncItemStatus  = (typeof SYNC_ITEM_STATUSES)[number];
  */
 const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 const SHA1_PATTERN    = /^[0-9a-f]{40}$/;
-const SHA256_PATTERN  = /^[0-9a-f]{64}$/;
 
 function isAddress(value: unknown): value is Address {
   return typeof(value) === 'string' && ADDRESS_PATTERN.test(value);
@@ -97,10 +96,6 @@ function checksumAddress(value: Address | string): Address {
 
 function isCommitSha(value: unknown): value is string {
   return typeof(value) === 'string' && SHA1_PATTERN.test(value);
-}
-
-function isChecksum(value: unknown): value is string {
-  return typeof(value) === 'string' && SHA256_PATTERN.test(value);
 }
 
 /*
@@ -515,35 +510,19 @@ type RegistryAnnotation = {
   priceExceptions: PriceExceptionV1[],
 };
 
-// a Comet as the catalog materializes it: the contract shape, and the registry's description of it
+/*
+ * A Comet as the catalog materializes it: the contract shape, and the
+ * registry's description of it.
+ *
+ * It is the only kind of market a computation takes. The routes resolve every
+ * market through the request's catalog, so a computation reads one kind of
+ * Comet, and the compiler refuses it a Comet of the static constants, the
+ * ones governance still decodes proposals against: those describe none of
+ * what a computation reads here. The refusal rests on the constants typing
+ * their Comets (WellKnownContractsByNetworkAddress); a cast, or a read the
+ * compiler cannot type, is not refused.
+ */
 type RegistryComet = Contract<StandaloneContract<Comet>> & { registry: RegistryAnnotation };
-
-/*
- * The registry description behind a contract, or null for one that came from
- * the static constants, which governance still decodes proposals against.
- * This is the one place that tells the two apart.
- */
-function registryOf(contract: unknown): RegistryAnnotation | null {
-  const annotation = (contract as { registry?: unknown } | null)?.registry;
-  return typeof(annotation) === 'object' && annotation !== null && 'digest' in annotation
-    ? annotation as RegistryAnnotation
-    : null;
-}
-
-/*
- * The registry description of a Comet a computation is handed. The routes
- * hand the computations only Comets the request's catalog materialized, so a
- * computation has one kind of market to read: one without a description is a
- * caller's mistake, refused as one rather than computed as if the registry
- * had said nothing about it.
- */
-function annotationOf(contract: { address: string }): RegistryAnnotation {
-  const annotation = registryOf(contract);
-  if (annotation === null) {
-    throw new Error(`invariant violated: ${contract.address} is not a Comet the registry materialized`);
-  }
-  return annotation;
-}
 
 export type {
   ActivationAction,
@@ -609,12 +588,9 @@ export {
   SYNC_TRIGGER_KINDS,
   VERSION_STATUSES,
   isAddress,
-  isChecksum,
   isCommitSha,
   MARKET_KEY_SEPARATOR,
   marketKey,
   normalizeAddress,
   parseMarketKey,
-  annotationOf,
-  registryOf,
 };
