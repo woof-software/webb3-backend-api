@@ -20,8 +20,8 @@ import { fixtureComet }     from '../../../util/registry-fixture.js';
 
 const network: KnownNetwork.Name = 'ethereum-mainnet';
 const contract = fixtureComet(network, '0xc3d688b66703497daa19211eedff47f25384cdc3');
-// the feed the rewards summary route reads the reward token's price from
-const rewardsTokenPriceFeed = contract.rewards!.priceFeed!;
+// the feed the rewards summary route reads the reward token's price from: the one the version states
+const rewardsTokenPriceFeed = contract.registry.market.rewardAsset!.priceFeed!;
 
 let apiHost = '';
 let nodeHost = '';

@@ -70,6 +70,16 @@ pattern of the market and governance endpoints,
 parameter of theirs is (below), with a `400` such as `Error: Bad network …`
 or `Error: Not a valid resource API`.
 
+Outside the registry, a request a node provider did not serve is a `503`
+with the code `UPSTREAM_UNAVAILABLE`: the node provider proxy failed it or
+could not be reached, or answered a call with an error that is not a revert,
+such as a rate limit. It can succeed later — after the seconds `Retry-After`
+names, when the proxy said, which a browser can read. A call the contract
+reverted is its answer instead: a price read reports it as a
+[status](#market-status), and any other call that reverts fails the request
+with a `500`. The registry's endpoints say how they answer either under
+[Registry v1](#registry-v1).
+
 A `500` is answered with the code `INTERNAL` and the message `the request
 could not be completed`, never with what failed — a database error, or what
 an upstream API such as Tally answered: that is in the log, under the
@@ -114,8 +124,9 @@ A summary lists every collateral with its own status:
 A history reports this per day, with the day's `date` and `timestamp`. A
 market is read in full again once a registry version that says how to price
 the feed is active. Only a price feed reports a status this way: a node that
-does not answer, or any other call that reverts, still fails the whole
-request.
+does not answer still fails the whole request, with `503 UPSTREAM_UNAVAILABLE`,
+and so does any other call that reverts, with `500 INTERNAL`
+([Errors](#errors)).
 
 ## Market labels
 
@@ -241,6 +252,12 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
 ]
 ```
 
+Every day reads the base asset's USD price, and the price of a collateral the
+registry version remaps to another feed (`deprecated_price_remap`), from the
+feed the active version names: a day before that feed was deployed — before
+governance moved the market to it, say — answers `error`, or `partially` for
+the collateral ([Market status](#market-status)).
+
 ## `/market/{network}/{address}/rewards/summary`
 ### description:
 
@@ -265,6 +282,7 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
 ```
 ```json
 {
+  "status": "success",
   "supply_rewards_apr": "0.01753045422122093652885",
   "borrow_rewards_apr": "0",
   "supply_rewards_rate_per_second": "0.000011574074074",
@@ -775,8 +793,8 @@ read, an overlay — carries its own code in `details.code`, such as
 `SYNC_ALREADY_RUNNING` or `OVERLAY_FEED_UNREADABLE`, under the kind of answer
 it is; a monitor matches `details.code` for those. Besides
 `REGISTRY_NOT_ACTIVE`, only a source or a node provider that did not answer,
-and a database that could not be reached, are a `503`: those are the answers
-worth trying again.
+and a database that could not be reached, are a `503`, here as on every
+endpoint ([Errors](#errors)): those are the answers worth trying again.
 
 Public reads are cacheable and carry `ETag`, `X-Registry-Version` and
 `X-Registry-Checksum`, which a browser can read, and answer `304` to an
@@ -797,8 +815,11 @@ A `{chain_id}` is written in decimal without a leading zero — `1`, never
 so that one resource has one URL.
 
 Administrative routes require `Authorization: Bearer <token>` — a `401` names
-the scheme in `WWW-Authenticate` — and answer no CORS headers at all. Every
-administrative request is rate limited twice, reads as well as commands:
+the scheme in `WWW-Authenticate` — and answer no CORS headers at all. An
+environment without a token hash it can use — none at all, or a value that is
+not 64 hex digits — answers every administrative request `403 FORBIDDEN`,
+whatever token it carries, and the message says which. Every administrative
+request is rate limited twice, reads as well as commands:
 
 - First, before its token is checked or its path is matched, by the address
   it comes from: 60 a minute for each address — for each /64 of an IPv6
@@ -873,19 +894,31 @@ can be reviewed before the version validates (a run that gave roots up leaves
 a draft that cannot validate, as below); each of the three is a decision
 rather than routine scheduling, requires a `reason`, and is acted on when it
 is sent — the daily discovery interval and the retry rules below apply only
-to a request with none of them. The first import of an environment is held
-regardless. `markets` bounds how many markets this request imports, from 1
-to 50, and defaults to 50. Answers with the run, the version it is importing
-into, and `heldForReview`: `202` while the import has work left for a later
-request (`running`), and `200` when this request is the whole answer — the
-import `completed`, or there was nothing to do (`idle`). `idle` says why in
-`reason`: discovery is not due, since the source is checked once per
-interval, or the commit's candidate is held or was rejected, as below. A
-held or rejected candidate is named in `registryVersionId`; discovery that is
-not due names none, even when the hourly job has imported a commit within the
-interval — `GET /registry/v1/admin/status` lists what it made under
-`candidates`: a held draft, such as an environment's first, under
-`importing`, and a version waiting to be switched on under `validated`.
+to a request with none of them. A `reason` without one of the three is refused
+with `400`: a routine sync has no decision to keep it with. The first import
+of an environment is held regardless. `markets` bounds how many markets this
+request imports, from 1 to 50, and defaults to 50. Answers with the run, the
+version it is importing into, and `heldForReview`: `202` while the import has
+work left for a later request (`running`), and `200` when this request is the
+whole answer — the import `completed`, or there was nothing to do (`idle`).
+`idle` says why in `reason`: discovery is not due, since the source is checked
+once per interval, or the commit's candidate is held or was rejected, as
+below. A held or rejected candidate is named in `registryVersionId`; discovery
+that is not due names none, even when the hourly job has imported a commit
+within the interval — `GET /registry/v1/admin/status` lists what it made under
+`candidates`: a held draft, such as an environment's first, under `importing`,
+and a version waiting to be switched on under `validated`.
+
+A request that does read the source, and finds its commit — the one the
+tracked ref names, or its `sourceCommitSha` — already imported as a version
+that validated, imports nothing and starts no run, unless it carries
+`forceNewAttempt`. It answers `200` `completed` with `outcome` `no_change`,
+`syncRunId` `null`, that version in `registryVersionId`, and `reason`
+`the commit is already imported`. While a newer draft of that commit is open
+— one forced and held for review over that version, say — the answer is
+`idle` instead, naming the draft, as above. Only `outcome` `imported` says
+that the request's run produced a version, so a script that acts on a new
+version branches on `outcome`, not on `status`.
 
 Discovery does not import a commit again by itself once its newest attempt
 imported every root and still ended invalid: the same source, chain and
@@ -934,7 +967,13 @@ run and carries `sourceCommitSha`, `forceNewAttempt` or `holdForReview` is
 refused with `409`, `details.code` `SYNC_ALREADY_RUNNING`, rather than
 silently ignoring them. The same answer is given, before the source is asked
 anything, to a request sent while another invocation holds the run's lease:
-send it again once that invocation has finished its part.
+send it again once that invocation has finished its part. An invocation that
+fails gives the lease back as it fails, unless the database is still not
+answering when it tries; the worker then logs `registry lease not released`,
+with the run's id. Such a lease, like that of an invocation stopped outright —
+by a deploy, or past the time or CPU a Worker is given — is held until it runs
+out (`COMET_SYNC_LEASE_SECONDS`, 15 minutes by default), and the answer is the
+same although nothing is importing.
 
 A held candidate is validated too, so its diagnostics can be read, but keeps
 its `importing` status: `checksFailed` says how many of its checks failed, and
@@ -960,7 +999,12 @@ that failed its checks is `422` with `syncRunId` and `registryVersionId` in
 — the ref, its tree, or whether the ref reaches a `sourceCommitSha` — with
 `SOURCE_REQUEST_FAILED`: both are worth trying again. So is one of those
 requests that has not answered within 20 seconds, and GitHub refusing one
-over its rate limit, whose message says until when. A market whose own reads
+over its rate limit, whose message says until when. Such a request can be
+sent again at once — after that time, for a rate limit — unless the database
+was still not answering when the invocation tried to give its run back (see
+above). One with `sourceCommitSha`, `forceNewAttempt` or `holdForReview` may
+have started its run before it failed: sent again as it was, it is refused
+with `409`, and an empty body continues the run. A market whose own reads
 fail — its root from GitHub, or the chain through the node provider proxy,
 which is given 30 seconds a batch — does not fail the request: its root
 records why (`SOURCE_REQUEST_FAILED`, `CHAIN_REQUEST_FAILED`), the request
@@ -971,6 +1015,17 @@ A setting of the environment the import does not take is `422` with
 often a database without the migrations the release needs — and answers
 `500 INTERNAL` with a `requestId`; the worker logs it whole as
 `registry sync failed unexpectedly`.
+
+An invocation that fails while it holds the run keeps why as the run's
+`lastError`, which `GET /registry/v1/admin/status` shows under
+`sync.lastRun`, unless what failed was a service that did not answer. A run
+that every invocation fails on the same way before it imports a root — on a
+decision the active version stores that a later release no longer takes,
+say — spends no attempt and never ends by itself. Every sync answers with
+that failure: `400` with `OVERLAY_INVALID` and a message that names the
+version rather than a root, for a stored decision, and `500 INTERNAL` for a
+fault, whose `lastError` is `an unexpected error interrupted the import`.
+`POST /registry/v1/admin/sync-runs/{sync_run_id}/cancel` ends such a run.
 
 ## `GET /registry/v1/admin/status`
 ### description:
@@ -1024,9 +1079,9 @@ can check that it is empty without knowing the registry's rules:
 | `candidate-awaiting-activation` | a version newer than any ever switched on validated, and is waiting to be — what the scheduled import produces for a new commit; `candidates.validated` lists it. It holds until a version at least that new is switched on |
 | `commit-rejected` | the newest version imported every root of its commit and is invalid, so discovery no longer imports that commit by itself; `sync.rejectedCommit` names it. It holds until a newer version exists — a forced attempt, or a new commit |
 | `chain-drift` | the version on stores a price feed or a collateral asset its market's Comet no longer answers with: governance changed the market on chain after the import, and the source did not move; `chainCheck.drifts` names each. It holds until a check of the version on finds it agrees with the chain — a version imported again with `forceNewAttempt`, which reads the chain anew, switched on, and checked at the next hourly invocation — or the chain changes back. A version switched on is taken to drift as the one before it did until it has been checked, and a network the check could not read keeps the drifts last found there |
-| `last-sync-failed` | the most recent import run ended failed |
-| `sync-failing` | the import that is running keeps failing: the last root it attempted failed, and the roots left failed have spent two attempts or more between them — two roots once, or one root twice. One failure raises nothing, and neither does an attempt given back because the invocation had imported a market before it lost GitHub or the node provider. An attempt whose invocation was stopped in the middle of it — a deploy, or a Worker past its time or CPU — has failed too, once that invocation's lease has run out. Each attempt moves the run, so it is never stalled, and it ends failed only once every root has spent its five attempts |
-| `sync-stalled` | a run says it is running but its lease expired, so no invocation is continuing it |
+| `last-sync-failed` | the most recent import run ended `failed`, and `sync.lastRun.lastError` says how: `validation failed` is a draft that failed its checks, which `GET /registry/v1/admin/versions/{version_id}` lists for the version `sync.lastRun.registryVersionId` names, and `cancelled by <actor>: <reason>` a run somebody cancelled. A root that fails does not fail the run, and neither do the checks of a run held for review: it completes, its draft left open |
+| `sync-failing` | the import that is running keeps failing: the last root it attempted failed, or an invocation has failed since before attempting one, and the roots left failed have spent two attempts or more between them — two roots once, or one root twice. One failure raises nothing, and neither does an attempt given back because the invocation had imported a market before it lost GitHub or the node provider. An attempt whose invocation was stopped in the middle of it — a deploy, or a Worker past its time or CPU — has failed too, once that invocation's lease has run out. Each attempt moves the run, so attempts that fail never leave it stalled. It ends once no root is left to attempt, each imported or given up after five attempts, and one that gave roots up then ends `failed`, its draft unable to validate without them, unless it is held for review: then it completes, its draft left open. An invocation that fails before it attempts a root moves nothing: a run every invocation fails on that way is `sync-stalled` as well |
+| `sync-stalled` | a run says it is running, no invocation holds its lease — given back by an invocation that left work behind or failed, or run out — and none of its roots has moved for two hours, by when two hourly invocations should have continued it |
 | `sync-overdue` | the source has not been checked for more than twice the configured interval |
 | `snapshot-not-cached` | the active version's bytes are not in the cache, so every cold isolate hydrates it from D1 again |
 | `cache-unreadable` | the KV namespace did not answer at all: there is no cache, and no fallback if the database fails next |
@@ -1050,6 +1105,7 @@ $ curl -s "$API/registry/v1/admin/status" -H "Authorization: Bearer $TOKEN" | jq
   "sync": {
     "lastRun": {
       "id": "0d0b3c4e-1d5c-4f0e-9d0a-2a2f2a9f0b61",
+      "registryVersionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
       "status": "completed", "outcome": "imported",
       "startedAt": "2026-09-20T22:00:01.117Z", "completedAt": "2026-09-21T12:00:09.528Z",
       "ageSeconds": 162751, "failedCount": 0, "expectedCount": 29, "completedCount": 29,
@@ -1096,6 +1152,48 @@ when the run becomes resumable. `requestedBy` is who started the run —
 `registry-admin:<environment>`, or the `COMET_REGISTRY_ADMIN_ACTOR` the
 environment sets, for an administrative sync, and `registry-cron:<environment>`
 for the hourly job — and `reason` the reason its request gave, if any.
+`triggerKind` is `manual` for a run a request started with
+`sourceCommitSha`, `forceNewAttempt` or `holdForReview`, and `scheduled` for
+any other: the hourly job's, and one an administrative sync with none of the
+three started because discovery was due — `requestedBy` tells those two
+apart.
+
+`lastError` is the latest failure the run recorded: an attempt at a root
+that failed, or an invocation that failed outside its attempts at roots on
+something other than a service that did not answer. An attempt at a root
+that succeeds clears it, and a run that completes with every root imported
+has none; one that gave roots up keeps the latest. A run that ended `failed`
+says why: `validation failed`, or `cancelled by <actor>: <reason>`.
+
+## `POST /registry/v1/admin/sync-runs/{sync_run_id}/cancel`
+### description:
+
+Ends a run that no invocation can finish. A run that every invocation fails
+on the same way before it imports a root spends no attempt, so it never ends
+by itself; the hourly job and every sync request take it up and fail on it
+again, and a sync with `forceNewAttempt` is refused while it is running. Its
+`lastError` says why.
+
+Takes `{"reason": "…"}` and nothing else, and spends from the same budget
+as `POST /registry/v1/admin/sync`. Only a run nobody holds is cancelled: a
+run whose lease is live is `409` until the lease has run out — the message
+says when — since the invocation that holds it may be importing into it, and
+so is a run that has already ended. An unknown id is `404`, and a missing
+`reason` is `400`.
+
+Answers with the run as `GET /registry/v1/admin/sync-runs/{sync_run_id}`
+does: `failed`, with `lastError` `cancelled by <actor>: <reason>` and
+`completedAt` set. A root still `processing`, which an invocation that was
+stopped left behind, fails as `the invocation importing this root did not
+finish`; the others keep their status and attempts.
+
+The run's draft stays `importing`, so the status raises `last-sync-failed`
+and `candidate-awaiting-review`, and discovery leaves its commit alone as
+one held for review. Fix what failed the run, then send
+`POST /registry/v1/admin/sync` with `forceNewAttempt`: a new attempt, which
+closes the draft once it succeeds. Cancelling fixes nothing by itself — a
+decision the active version stores, which a release no longer takes, fails
+the new attempt the same way until a release reads it again.
 
 ## `GET /registry/v1/admin/versions`
 ### description:
@@ -1250,14 +1348,56 @@ change to the network, and is kept.
 
 The answer names the overlay the scope now holds by its `digest`.
 `expectedDigest` — [optional] — is the digest of the overlay the document was
-decided against, or `null` for a scope nobody has reviewed: when the scope
-holds another one, the document is refused with `409`, with the current
-digest in `details`, rather than silently undoing a change made since. A
-write that another write to the same candidate lands in the middle of is
-refused with `409` too; read again and resend.
+decided against, as the `GET` below answers it, or `null` for a scope nobody
+has reviewed: when the scope holds another one, the document is refused with
+`409` rather than silently undoing a change made since. A write that another
+write to the same candidate lands in the middle of is refused with `409` too;
+read again and resend.
 
 ```json
 { "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414", "changed": true, "overlayEventId": "0d0f3f7e-...", "digest": "5f0c...", "snapshotChecksum": null }
+```
+
+The `409` of a stale `expectedDigest` names the digest the scope holds now —
+`null` for one nobody has reviewed — in `details.current`, under the scope's
+type and key: `network 1` here, `market 1/usdc` on the market route. The key
+after the type is the `scope` the scope's `GET` answers: read the scope again
+there, redo the change on what it answers, and send that with its `digest`.
+
+```json
+{ "error": { "code": "CONFLICT", "message": "the overlay of network 1 is no longer the one this was decided against; read it again", "requestId": "8419...", "details": { "current": { "network 1": "1cd5..." } } } }
+```
+
+## `GET /registry/v1/admin/versions/{version_id}/networks/{chain_id}/overlay`
+### description:
+
+The overlay a network of the version holds, in the form the `PUT` above
+takes. A network overlay is replaced whole, so a change to it starts here
+rather than from what the active version serves, which lacks whatever the
+draft has added since: read it, change what is different in its `overlay`,
+and send that back as the `overlay` of the `PUT` body with a reason and the
+answer's `digest` as `expectedDigest`. A remap names its replacement as
+`replacementPriceFeedAddress`, and an exception that has expired since it was
+written is answered as it is held, which the `PUT` keeps. A network nobody
+has reviewed answers with the provisional overlay its import wrote,
+`reviewed: false` and `digest: null`, and a chain the version has not
+imported answers `404`.
+
+```json
+{
+  "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
+  "scope": "1",
+  "reviewed": true,
+  "digest": "41c0e3c58b9a2d7f6e1b4a0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e",
+  "overlay": {
+    "displayName": "Ethereum",
+    "assetDisplayOverrides": [ { "tokenAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "displayAddress": "0x0000000000000000000000000000000000000000", "symbol": "ETH", "name": "Ether" } ],
+    "unwrappedCollateralAssets": [],
+    "priceExceptions": [
+      { "kind": "zero_price", "priceFeedAddress": "0xe3a409ed15cd53afdefdd191ad945cec528a2496", "provenance": "Deprecated wUSDM / USD feed (cUSDTv3 collateral wUSDM) reverts", "expiresAt": null }
+    ]
+  }
+}
 ```
 
 ## `PUT /registry/v1/admin/versions/{version_id}/markets/{chain_id}/{deployment_key}/overlay`
@@ -1282,7 +1422,8 @@ Within a network, no two markets that are not disabled may answer to the same
 version where they do, and a slug another market of the network keeps is
 refused with `409`. So is `isDefault: true` while another market of the
 version is the default: the default moves with both markets in one
-`PUT …/overlays`.
+`PUT …/overlays`, each decided against the `digest` its `GET` answered
+(`expectedDigests`).
 
 ## `GET /registry/v1/admin/versions/{version_id}/markets/{chain_id}/{deployment_key}/overlay`
 ### description:
@@ -1350,6 +1491,31 @@ written: what it decided was decided against what it read.
   "reason": "bootstrap: derived from the static constants against Compound-Foundation/comet@a34d9b571c83",
   "networks": { "1": { "displayName": "Ethereum", "assetDisplayOverrides": [], "unwrappedCollateralAssets": [], "priceExceptions": [] } },
   "markets":  { "1/usdc": { "displayName": "USDC", "contractName": "cUSDCv3", "...": "..." } }
+}
+```
+
+`expectedDigests` — [optional] — is `expectedDigest` for a directory: keyed as
+the documents are, by chain id for a network and by `chainId/deploymentKey`
+for a market, the digest of the overlay each was decided against, as the
+`GET` of its scope answers it, or `null` for a scope nobody has reviewed. A
+request where any scope holds another overlay is refused with `409`, and
+nothing is written. Its `details.current` names each such scope as the
+one-document routes do, with the digest it holds now: the scope's type, then
+the key the request names it by (`"market 1/usdc"`). Read each of them again
+through its `GET`, redo the change, and send the digests read. A document it
+names nothing for is written whatever its scope holds; a key that names no
+document of the request, or a value that is not a digest, is refused with
+`400`. The default or a slug moving between two markets is read from both and
+sent back this way:
+
+```json
+{
+  "reason": "open the WETH market by default",
+  "markets": {
+    "1/usdc": { "displayName": "USDC", "isDefault": false, "...": "..." },
+    "1/weth": { "displayName": "ETH", "isDefault": true, "...": "..." }
+  },
+  "expectedDigests": { "1/usdc": "9b2f...", "1/weth": "e7a4..." }
 }
 ```
 

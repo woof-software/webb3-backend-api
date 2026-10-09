@@ -1072,6 +1072,33 @@ function storedExpiry(value: string | null): string | null {
   return Number.isFinite(instant) ? storedInstant(instant) : value;
 }
 
+/*
+ * The overlay a network's rows state: its row and its price exceptions, read
+ * back through the parser as the document a PUT takes. Every reader of a
+ * stored network overlay goes through it, so the digest a read answers is the
+ * one a write compares its expectation with.
+ */
+function networkOverlayOf(
+  network: { display_name: string, metadata: string },
+  exceptions: NetworkPriceExceptionRow[],
+  scope: string,
+): NetworkOverlay {
+  const presentation = JSON.parse(network.metadata) as Record<string, unknown>;
+  return parseNetworkOverlay({
+    displayName:               network.display_name,
+    assetDisplayOverrides:     presentation.assetDisplayOverrides ?? [],
+    unwrappedCollateralAssets: presentation.unwrappedCollateralAssets ?? [],
+    priceExceptions:           exceptions.map(row => {
+      const shared = { priceFeedAddress: row.price_feed_address, provenance: row.provenance, expiresAt: storedExpiry(row.expires_at) };
+      return row.kind === 'fixed_price'
+        ? { kind: row.kind, ...shared, price: { value: row.fixed_price_value, decimals: row.fixed_price_decimals } }
+        : row.kind === 'deprecated_price_remap'
+          ? { kind: row.kind, ...shared, replacementPriceFeedAddress: row.replacement_price_feed_address }
+          : { kind: row.kind, ...shared };
+    }),
+  }, scope);
+}
+
 // a market's key as SQL computes it from the rows of its network and market: the text marketKey writes
 function marketKeyIn(network: string, market: string): string {
   return `${network}.chain_id || '${MARKET_KEY_SEPARATOR}' || ${market}.deployment_key`;
@@ -1165,28 +1192,20 @@ async function readOverlaysOf(db: D1Database, sources: string, values: SqlValue[
    * than by version: the same version can be a source twice, as the active
    * one and as an earlier attempt, and each reading carries its own.
    */
-  const exceptionsOf = new Map<string, unknown[]>();
+  const exceptionsOf = new Map<string, NetworkPriceExceptionRow[]>();
   for (const row of exceptionRows.results ?? []) {
-    const shared = { priceFeedAddress: row.price_feed_address, provenance: row.provenance, expiresAt: storedExpiry(row.expires_at) };
-    const exception = row.kind === 'fixed_price'
-      ? { kind: row.kind, ...shared, price: { value: row.fixed_price_value, decimals: row.fixed_price_decimals } }
-      : row.kind === 'deprecated_price_remap'
-        ? { kind: row.kind, ...shared, replacementPriceFeedAddress: row.replacement_price_feed_address }
-        : { kind: row.kind, ...shared };
     const key = `${row.precedence}:${row.chain_id}`;
-    exceptionsOf.set(key, [ ...(exceptionsOf.get(key) ?? []), exception ]);
+    exceptionsOf.set(key, [ ...(exceptionsOf.get(key) ?? []), row ]);
   }
 
   // rows arrive in precedence order, so a later version's review replaces an earlier one's
   const networks = new Map<number, NetworkOverlay>();
   for (const row of networkRows.results ?? []) {
-    const presentation = JSON.parse(row.metadata) as Record<string, unknown>;
-    networks.set(row.chain_id, parseNetworkOverlay({
-      displayName:               row.display_name,
-      assetDisplayOverrides:     presentation.assetDisplayOverrides ?? [],
-      unwrappedCollateralAssets: presentation.unwrappedCollateralAssets ?? [],
-      priceExceptions:           exceptionsOf.get(`${row.precedence}:${row.chain_id}`) ?? [],
-    }, `version ${row.version_id} network ${row.chain_id}`));
+    networks.set(row.chain_id, networkOverlayOf(
+      row,
+      exceptionsOf.get(`${row.precedence}:${row.chain_id}`) ?? [],
+      `version ${row.version_id} network ${row.chain_id}`,
+    ));
   }
 
   const markets = new Map<string, MarketOverlay>();
@@ -1247,6 +1266,32 @@ async function readOverlays(db: D1Database, versionId: string): Promise<ClonedOv
 }
 
 /*
+ * The overlay one network of a version holds, and whether somebody reviewed
+ * it, or null for a chain the version has not imported. A network nobody
+ * reviewed holds the provisional overlay its import wrote. Both statements
+ * find the network by its version and chain, so they are one round trip.
+ */
+async function readNetworkOverlay(
+  db: D1Database,
+  versionId: string,
+  chainId: number,
+): Promise<{ overlay: NetworkOverlay, reviewed: boolean } | null> {
+  const target = `(SELECT id FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = ?2)`;
+  const [ networkRows, exceptionRows ] = await db.batch([
+    db.prepare(`SELECT display_name, metadata, reviewed FROM registry_networks WHERE id = ${target}`),
+    db.prepare(`SELECT * FROM network_price_exceptions WHERE network_id = ${target} ORDER BY price_feed_address`),
+  ].map(statement => statement.bind(versionId, chainId))) as [
+    D1Result<{ display_name: string, metadata: string, reviewed: number }>, D1Result<NetworkPriceExceptionRow>,
+  ];
+
+  const network = networkRows.results?.[0];
+  return network === undefined ? null : {
+    overlay:  networkOverlayOf(network, exceptionRows.results ?? [], `version ${versionId} network ${chainId}`),
+    reviewed: network.reviewed === 1,
+  };
+}
+
+/*
  * The overlay of the currently active version, or empty maps when no version
  * has been activated yet, which is the first import.
  */
@@ -1271,6 +1316,15 @@ async function readActiveOverlays(db: D1Database): Promise<ClonedOverlays> {
  * since — by a hotfix, or by a rollback — so they would bring its decisions
  * back over the ones on now.
  *
+ * What an attempt reviewed stops being handed down once it, or a later
+ * attempt of the commit, has been switched on and off again. Switched on, an
+ * attempt had validated, which closed every draft before it, so the reviews
+ * it and those drafts hold were all made before it went on; the move that
+ * switched it off, a rollback or a hotfix, was made against them, or the
+ * version it put on carries them. A review still waiting to be switched on
+ * keeps being handed down past moves that switched off another commit, or an
+ * earlier attempt.
+ *
  * Every earlier attempt is read, oldest first, so the newest review of a
  * market wins and one attempt that reviewed nothing — it failed on the chain
  * before anyone saw it — does not lose the review an attempt before it
@@ -1286,7 +1340,14 @@ async function readImportOverlays(db: D1Database, versionId: string): Promise<Cl
       ON previous.source_repository = current.source_repository
      AND previous.source_commit_sha = current.source_commit_sha
      AND previous.attempt < current.attempt
-    WHERE current.id = ?1`, [ versionId ]);
+    WHERE current.id = ?1
+      AND NOT EXISTS (
+        SELECT 1 FROM registry_activations AS activation
+        JOIN registry_versions AS replaced ON replaced.id = activation.previous_version_id
+        WHERE replaced.source_repository = previous.source_repository
+          AND replaced.source_commit_sha = previous.source_commit_sha
+          AND replaced.attempt >= previous.attempt
+      )`, [ versionId ]);
 }
 
 /*
@@ -1358,7 +1419,6 @@ function validationResultsStatement(
   );
 }
 
-// appends the results of one validation attempt
 async function recordValidationResults(
   db: D1Database,
   versionId: string,
@@ -1456,7 +1516,6 @@ function endCandidateStatement(
   );
 }
 
-// moves a candidate to a terminal status on its own
 async function markValidated(db: D1Database, versionId: string, checksum: string): Promise<void> {
   const ending = { status: 'validated', checksum } as const;
   const result = await endCandidateStatement(db, versionId, ending, new Date().toISOString()).run();
@@ -1507,6 +1566,7 @@ export {
   readActiveVersionId,
   readImportOverlays,
   readMarket,
+  readNetworkOverlay,
   readOverlays,
   readRegistrySnapshot,
   readRetainedVersions,

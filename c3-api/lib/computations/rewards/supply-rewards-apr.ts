@@ -5,6 +5,8 @@ import * as Constant from '../../constants.js';
 
 import * as KnownNetwork from '../../well-known/networks/network.js';
 
+import type { RegistryComet } from '../../model/comet-registry.js';
+
 import type { GetPrice, PriceError, PriceRead } from '../comet/get-price.js';
 import type { BasePrice    } from '../comet/base-price.js';
 import type { TotalSupply  } from '../comet/total-supply.js';
@@ -12,7 +14,6 @@ import type { TotalSupply  } from '../comet/total-supply.js';
 import type { TotalsBasic                } from './totals-basic.js';
 import type { BaseMinForRewards          } from './base-min-for-rewards.js';
 import type { SupplyRewardsRatePerSecond } from './supply-rewards-rate-per-second.js';
-import { Contract } from '../../well-known/contracts/utils.js';
 import { usdBasePriceFeedFor } from './base-price-feed.js';
 
 /*
@@ -37,7 +38,7 @@ type SupplyRewardsApr = Compute.Spec<{
     nodeHost: string,
     nodeKey: string,
     network: KnownNetwork.Name,
-    contract: Contract, // comet contract
+    contract: RegistryComet, // comet contract
     blockNumber: Eth.BlockNumber,
     rewardsTokenPriceFeed: {
       address:  Eth.Address,

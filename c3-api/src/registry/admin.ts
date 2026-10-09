@@ -738,7 +738,6 @@ async function writeOverlays(
   };
 }
 
-// the answer to a one-document route, from the write of that one document
 function oneDocument(written: Omit<OverlaysResult, 'unreviewed'>): OverlayResult {
   const [ document ] = written.documents;
   return {

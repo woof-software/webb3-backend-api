@@ -26,7 +26,6 @@ async function get(path: string): Promise<Response> {
   return C3Api.fetch(new Request(`https://api.test.local${path}`), testEnv);
 }
 
-// what the worker logged, for the length of a test
 function captureLogs(t: Test): string[] {
   const lines: string[] = [];
   const { error, warn } = console;

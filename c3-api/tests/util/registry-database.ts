@@ -2,15 +2,10 @@ import { Miniflare } from 'miniflare';
 
 import type { RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
 
-import {
-  activateVersion,
-  markValidated,
-  recordValidationResults,
-  snapshotChecksum,
-} from '../../src/registry/repository.js';
+import { activateVersion } from '../../src/registry/repository.js';
 
 import { applyMigrations } from './d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from './registry-fixture.js';
+import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from './registry-fixture.js';
 
 /*
  * An APP_DB for tests that call the worker from Node.
@@ -58,8 +53,7 @@ async function activeRegistryDatabase(options: Options = {}): Promise<RegistryDa
   await applyMigrations(db);
 
   const { versionId } = await seedCandidate(db, snapshot);
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
+  await validateSeeded(db, versionId);
   if (activate) {
     await activateVersion(db, {
       versionId,

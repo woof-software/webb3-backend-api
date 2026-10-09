@@ -5,6 +5,7 @@ import { createTestHarness } from 'wrangler';
 import type { Env } from '../../../entrypoint.js';
 import type { Address, PriceFeedV1 } from '../../../lib/model/comet-registry.js';
 import { replaceMarketOverlay, validateStoredVersion } from '../../../src/registry/admin.js';
+import { overlayOfMarket } from '../../../src/registry/overlay.js';
 import { readSnapshot, snapshotChecksum } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
@@ -48,23 +49,7 @@ function rename(db: D1Database, versionId: string, displayName: string, expectat
     deploymentKey: 'usdc',
     actor:         'test-admin',
     reason:        `call it ${displayName}`,
-    overlay: {
-      displayName,
-      contractName:         usdc.contractName,
-      slug:                 usdc.slug,
-      isInstitutional:      usdc.isInstitutional,
-      isDefault:            usdc.isDefault,
-      status:               usdc.status,
-      creationBlock:        usdc.creationBlock,
-      collateralValueQuote: usdc.collateralValueQuote,
-      capabilities:         usdc.capabilities,
-      baseAsset: {
-        displayName:         usdc.baseAsset.displayName,
-        isWrappedNative:     usdc.baseAsset.isWrappedNative,
-        usdPriceFeedAddress: null,
-      },
-      rewardPriceFeed: { address: usdc.rewardAsset!.priceFeed!.address, quote: usdc.rewardAsset!.priceFeedQuote! },
-    },
+    overlay:       { ...overlayOfMarket(usdc), displayName },
     ...expectation,
   }, async () => new Map<Address, PriceFeedV1>());
 }

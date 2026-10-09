@@ -133,7 +133,6 @@ function answerFrom(request: Request, ...response: ConstructorParameters<typeof 
   return Object.defineProperty(new Response(...response), 'url', { value: request.url });
 }
 
-// what was written to the console, for the length of a test
 function captureConsole(t: { teardown: (fn: () => void) => void }): string[] {
   const lines: string[] = [];
   for (const level of [ 'log', 'warn', 'error' ] as const) {
@@ -150,15 +149,27 @@ function captureConsole(t: { teardown: (fn: () => void) => void }): string[] {
  * only as far as a log may show it: the proxy's key is a segment of the URL.
  * The library writes nothing itself, so the caller's logger decides where the
  * failure goes, whatever DEBUG says.
+ *
+ * It is a request the node did not serve, with how long the proxy asked to
+ * wait before the next one, so a route can pass that on.
  */
 t.test('a request the node fails is told by its status, without its key or its answer', async t => {
   const written  = captureConsole(t);
   const endpoint = 'https://node-provider.test.local/ethereum-mainnet/node-proxy-key';
   const call: JsonRpc.Call = { method: 'eth_blockNumber', params: [] };
-  for (const [ status, text ] of [ [ 503, 'upstream error' ], [ 401, 'key not authorized' ] ] as const) {
-    fetch.expect(endpoint, { method: 'POST' }).returns(request => answerFrom(request, text, { status }));
+  for (const [ status, text, headers, retryAfter ] of [
+    [ 503, 'upstream error',     { 'Retry-After': '5' }, 5    ],
+    [ 401, 'key not authorized', {},                     null ],
+  ] as const) {
+    fetch.expect(endpoint, { method: 'POST' }).returns(request => answerFrom(request, text, { status, headers }));
     const failure = await jsonRpc.postBatch({ endpoint, calls: [ call ] }).then(() => null, (error: Error) => error);
     t.equal(failure?.message, `JSON-RPC request failed: HTTP ${status}`);
+    t.ok(JsonRpc.isNotServed(failure), 'as a request the node did not serve');
+    t.same(
+      [ (failure as JsonRpc.NotServed).status, (failure as JsonRpc.NotServed).retryAfter ],
+      [ status, retryAfter ],
+      'with the status it answered, and the seconds it asked to wait, if it said',
+    );
     t.strictSame(failure?.cause, {
       url:        'https://node-provider.test.local/ethereum-mainnet/…',
       status,
@@ -179,12 +190,120 @@ t.test('an answer that is not JSON fails without its body', async t => {
   const failure = await jsonRpc.post({ endpoint, call: { method: 'eth_blockNumber', params: [] } })
     .then(() => null, (error: Error) => error);
   t.equal(failure?.message, 'Invalid JSON-RPC response: not JSON');
+  t.notOk(JsonRpc.isNotServed(failure), 'an answer that cannot be read, not a request the node did not serve');
   t.strictSame(failure?.cause, {
     url:        'https://node-provider.test.local/ethereum-mainnet/…',
     status:     200,
     statusText: '',
   });
   t.strictSame(written, [], 'and nothing is written to the console');
+});
+
+/*
+ * A node that could not be reached did not serve the request either. The
+ * failure says how the fetch failed, and has what failed as its cause.
+ */
+t.test('a fetch that fails is a request the node did not serve', async t => {
+  const endpoint = 'https://node-provider.test.local/ethereum-mainnet/node-proxy-key';
+  const call: JsonRpc.Call = { method: 'eth_blockNumber', params: [] };
+  const refused     = new TypeError('fetch failed');
+  const unreachable = JsonRpc.configure({ fetch: async () => { throw refused; } });
+  for (const [ send, what ] of [
+    [ () => unreachable.postBatch({ endpoint, calls: [ call ] }), 'a batch' ],
+    [ () => unreachable.post({ endpoint, call }),                 'a single call' ],
+  ] as const) {
+    const failure = await send().then(() => null, (error: Error) => error);
+    t.ok(JsonRpc.isNotServed(failure), `${what} the node did not serve`);
+    t.equal(failure?.message, 'JSON-RPC request failed: fetch failed', 'saying how the fetch failed');
+    t.equal(failure?.cause, refused, 'with what failed as its cause');
+    t.same([ (failure as JsonRpc.NotServed).status, (failure as JsonRpc.NotServed).retryAfter ], [ null, null ],
+      'and no status or wait, since nothing answered');
+  }
+});
+
+/*
+ * The Worker's limit on the subrequests of one invocation fails a fetch too,
+ * but the node was never asked. That is the caller's excess, and it stays the
+ * error it is, which a route answers as its own fault.
+ */
+t.test('a fetch past the subrequest limit is not a node that failed', async t => {
+  const endpoint = 'https://node-provider.test.local/ethereum-mainnet/node-proxy-key';
+  const call: JsonRpc.Call = { method: 'eth_blockNumber', params: [] };
+  const exceeded = new Error('Too many subrequests.');
+  const spent    = JsonRpc.configure({ fetch: async () => { throw exceeded; } });
+  for (const [ send, what ] of [
+    [ () => spent.postBatch({ endpoint, calls: [ call ] }), 'a batch' ],
+    [ () => spent.post({ endpoint, call }),                 'a single call' ],
+  ] as const) {
+    const failure = await send().then(() => null, (error: Error) => error);
+    t.equal(failure, exceeded, `${what} fails with the limit itself`);
+    t.notOk(JsonRpc.isNotServed(failure), 'not as a request the node did not serve');
+  }
+});
+
+/*
+ * An answer that breaks off after its headers — the connection lost while
+ * the body was read — was not served either, whatever status it began with.
+ * One that began with an error status keeps it, and the wait it asked for.
+ */
+t.test('an answer that breaks off is a request the node did not serve', async t => {
+  const endpoint = 'https://node-provider.test.local/ethereum-mainnet/node-proxy-key';
+  const call: JsonRpc.Call = { method: 'eth_blockNumber', params: [] };
+  const lost = new TypeError('terminated');
+  for (const [ status, headers, began ] of [
+    [ 200, {},                     [ null, null ] ],
+    [ 503, { 'Retry-After': '5' }, [ 503,  5    ] ],
+  ] as const) {
+    const cut = JsonRpc.configure({
+      fetch: async () => new Response(new ReadableStream({ pull(controller) { controller.error(lost); } }), { status, headers }),
+    });
+    for (const [ send, what ] of [
+      [ () => cut.postBatch({ endpoint, calls: [ call ] }), 'a batch' ],
+      [ () => cut.post({ endpoint, call }),                 'a single call' ],
+    ] as const) {
+      const failure = await send().then(() => null, (error: Error) => error);
+      t.ok(JsonRpc.isNotServed(failure), `${what} answered ${status} and cut off`);
+      t.equal(failure?.message, 'JSON-RPC request failed: terminated', 'saying how the answer failed');
+      t.equal(failure?.cause, lost, 'with what failed as its cause');
+      t.same([ (failure as JsonRpc.NotServed).status, (failure as JsonRpc.NotServed).retryAfter ], began,
+        'and the status and wait it began with, when the status was an error');
+    }
+  }
+});
+
+/*
+ * An error status is the node's answer only with a JSON-RPC body. JSON of
+ * another kind — an error object of the server's own, or one JSON-RPC error
+ * for a whole batch — answers none of the calls, so the request was not
+ * served. With a status that is not an error, the same body is an answer
+ * that could not be used.
+ */
+t.test('an error status with JSON that answers no call is a request the node did not serve', async t => {
+  const endpoint = 'https://node-provider.test.local/ethereum-mainnet/node-proxy-key';
+  const call: JsonRpc.Call = { method: 'eth_blockNumber', params: [] };
+  const ownError   = { error: 'upstream error' };
+  const batchError = { jsonrpc: '2.0', id: null, error: { code: -32005, message: 'request rate exceeded' } };
+  for (const [ status, body, headers, began ] of [
+    [ 503, ownError,   { 'Retry-After': '5' }, [ 503, 5    ] ],
+    [ 429, batchError, {},                     [ 429, null ] ],
+  ] as const) {
+    fetch.expect(endpoint, { method: 'POST' }).returns(JSON.stringify(body), { status, headers });
+    const failure = await jsonRpc.postBatch({ endpoint, calls: [ call ] }).then(() => null, (error: Error) => error);
+    t.ok(JsonRpc.isNotServed(failure), `${status} with ${JSON.stringify(body)}`);
+    t.equal(failure?.message, `JSON-RPC request failed: HTTP ${status}`, 'told by its status, as an answer that is not JSON is');
+    t.same([ (failure as JsonRpc.NotServed).status, (failure as JsonRpc.NotServed).retryAfter ], began);
+    t.match((failure?.cause as Error | undefined)?.message, /^Invalid JSON-RPC response/, 'with why it answers nothing as its cause');
+  }
+  // a single call reads its answer the same way
+  fetch.expect(endpoint, { method: 'POST' }).returns(JSON.stringify(ownError), { status: 503 });
+  const single = await jsonRpc.post({ endpoint, call }).then(() => null, (error: Error) => error);
+  t.ok(JsonRpc.isNotServed(single), 'a single call');
+  t.equal(single?.message, 'JSON-RPC request failed: HTTP 503');
+
+  fetch.expect(endpoint, { method: 'POST' }).returns(JSON.stringify(ownError), { status: 200 });
+  const unusable = await jsonRpc.postBatch({ endpoint, calls: [ call ] }).then(() => null, (error: Error) => error);
+  t.notOk(JsonRpc.isNotServed(unusable), 'while the same body with a 200 is an answer that cannot be used');
+  t.match(unusable?.message, /^Invalid JSON-RPC response/);
 });
 
 /*
@@ -201,7 +320,7 @@ t.test('a JSON-RPC error answered with an error status is the answer', async t =
     { jsonrpc: '2.0', id: 1, error: rateLimited },
   ];
   fetch.expect(endpoint, { method: 'POST' }).returns(JSON.stringify(answers), { status: 429 });
-  t.strictSame(Fallible.must(await jsonRpc.postBatch({ endpoint, calls })), answers);
+  t.strictSame(Fallible.must(await jsonRpc.postBatch({ endpoint, calls })), answers, 'answered, not a request it did not serve');
 });
 
 /*

@@ -110,6 +110,9 @@ const MIN_TTL_SECONDS = 60;
 // how often an isolate rewrites the pointer record while D1 keeps answering
 const POINTER_REFRESH_SECONDS = 300;
 
+// about how long an isolate waits to write the pointer record again after a write that did not land
+const POINTER_RETRY_SECONDS = 60;
+
 /*
  * What the environment configures, as registryConfig reads it. The TTL is the
  * max-age public reads advertise, and the fallback window is how old an
@@ -186,7 +189,7 @@ const held = new WeakMap<D1Database, Held>();
 // how many of the versions sessions pinned an isolate keeps, besides the active one
 const PINNED_VERSIONS = 4;
 
-// which place a read holds a version in: the active version's, or one of the pinned versions'
+// which place a read holds a version in
 type Slot = 'active' | 'pinned';
 
 function heldSnapshot(deps: CacheDeps, pointer: VersionRef): RegistrySnapshotV1 | null {
@@ -198,7 +201,7 @@ function heldSnapshot(deps: CacheDeps, pointer: VersionRef): RegistrySnapshotV1 
   return versions.active?.ref === ref ? versions.active.snapshot : versions.pinned.get(ref) ?? null;
 }
 
-// a version this isolate holds, found by its id alone
+// found by its id alone
 function heldVersion(deps: CacheDeps, versionId: string): RegistrySnapshotV1 | null {
   const versions = held.get(deps.db);
   if (versions === undefined) {
@@ -375,15 +378,25 @@ async function writeSnapshot(deps: CacheDeps, pointer: RegistryVersionRefV1, sna
 }
 
 /*
- * When this isolate last wrote the pointer record, per namespace.
+ * Which version this isolate last wrote the pointer record for, or set out
+ * to, and when it writes it again, per namespace.
  *
  * The record is what an outage falls back to, so it has to stay recent while
  * D1 is healthy — but writing it on every request would spend a KV write per
- * request on a value that almost never changes, and KV throttles repeated
- * writes to one key. An isolate therefore refreshes it at most twice per
- * fallback window, and whenever the pointer it sees is a different version.
+ * request on a value that almost never changes. An isolate therefore rewrites
+ * it once a period, min(window / 2, 5 minutes) — twelve times an hour with an
+ * hour's window — and at once when the pointer names another version.
+ *
+ * KV takes one write a second to a key, and every isolate writes this one,
+ * all of them together after an activation. So a write is claimed before it
+ * is made, and the requests that arrive while it is under way leave it to the
+ * one making it. The claim holds for the period only once the write has
+ * landed: a write KV refused, or one cut off with its request, is made again
+ * about a minute later, not by the next request and not a period later. The
+ * minute is spread at random between half a minute and a minute and a half,
+ * so isolates refused together do not try again together.
  */
-const written = new WeakMap<KVNamespace, { ref: string, at: number }>();
+const written = new WeakMap<KVNamespace, { ref: string, due: number }>();
 
 async function rememberPointer(deps: CacheDeps, pointer: RegistryVersionRefV1): Promise<void> {
   if (deps.staleSeconds <= 0) {
@@ -391,6 +404,7 @@ async function rememberPointer(deps: CacheDeps, pointer: RegistryVersionRefV1): 
     return;
   }
   const at     = now(deps).getTime();
+  const ref    = refOf(pointer);
   const last   = written.get(deps.kv);
   /*
    * The age of this record is what a fallback reports and what the window is
@@ -399,16 +413,18 @@ async function rememberPointer(deps: CacheDeps, pointer: RegistryVersionRefV1): 
    * keeps both within that few minutes, at one write per isolate per period.
    */
   const period = Math.min(Math.max(deps.staleSeconds, MIN_TTL_SECONDS) / 2, POINTER_REFRESH_SECONDS) * 1000;
-  if (last !== undefined && last.ref === refOf(pointer) && at - last.at < period) {
+  if (last !== undefined && last.ref === ref && at < last.due) {
     return;
   }
 
+  const claim = { ref, due: at + Math.min(period, POINTER_RETRY_SECONDS * 1000 * (0.5 + Math.random())) };
+  written.set(deps.kv, claim);
   const record: PointerRecord = { ...pointer, at: new Date(at).toISOString() };
   try {
     await deps.kv.put(POINTER_KEY, JSON.stringify(record), {
       expirationTtl: Math.max(deps.staleSeconds, MIN_TTL_SECONDS),
     });
-    written.set(deps.kv, { ref: refOf(pointer), at });
+    claim.due = at + period;
   } catch (error) {
     deps.debug?.warn(`registry pointer cache unwritable`, { versionId: pointer.id, error });
   }
@@ -687,8 +703,8 @@ async function cacheStatus(deps: CacheDeps, pointer: VersionRef | null): Promise
  * candidate is already immutable, so its bytes can be written while nobody is
  * waiting for them, and the activation is then only a pointer move.
  *
- * It never writes the pointer: what is warmed is not active, and must not
- * become what an outage falls back to.
+ * It never writes the pointer record: a version warmed before its activation
+ * must not become what an outage falls back to.
  */
 async function warmSnapshot(deps: CacheDeps, versionId: string): Promise<VersionRef | null> {
   /*
@@ -702,7 +718,14 @@ async function warmSnapshot(deps: CacheDeps, versionId: string): Promise<Version
     return null;
   }
   const pointer = referenceOf(version, version.snapshot_checksum);
-  if (await isCached(deps, pointer)) {
+  /*
+   * The active version's bytes are written even where a listing shows them.
+   * A listing can be up to a minute behind a delete made elsewhere, and the
+   * hourly prune may be removing the bytes of a version switched on after it
+   * read what to keep (pruneSnapshots); KV keeps the write made last.
+   */
+  const active = (await readActivePointer(deps.db))?.id === versionId;
+  if (!active && await isCached(deps, pointer)) {
     return pointer;
   }
 
@@ -733,8 +756,14 @@ type ListedPage = { keys: Array<{ name: string }>, list_complete: boolean, curso
  * by the activation or by the read.
  *
  * The keys are listed before D1 is asked what to keep, so an entry written in
- * between is either not listed or already one to keep. A D1 that cannot be
- * asked removes nothing.
+ * between is either not listed or already one to keep. A version switched on
+ * after D1 was asked is not kept, and its activation may have written its
+ * bytes before they were removed; so once the deletes are over, or one of
+ * them failed, D1 is asked again, and the active version's bytes are written
+ * again if the job reached them (cacheAgainIfSwitchedOn). The activation of a
+ * version switched on after that writes its bytes after these deletes, and KV
+ * keeps the last write (warmSnapshot). A D1 that cannot be asked first
+ * removes nothing.
  */
 async function pruneSnapshots(deps: CacheDeps): Promise<string[]> {
   const listed: string[] = [];
@@ -754,10 +783,44 @@ async function pruneSnapshots(deps: CacheDeps): Promise<string[]> {
   ]);
 
   const unwanted = listed.filter(name => !keep.has(name)).slice(0, MAX_PRUNED_PER_RUN);
-  for (const name of unwanted) {
-    await deps.kv.delete(name);
+  // a delete that failed may still have removed its entry, so it counts among those reached
+  const reached: string[] = [];
+  try {
+    for (const name of unwanted) {
+      reached.push(name);
+      await deps.kv.delete(name);
+    }
+  } finally {
+    await cacheAgainIfSwitchedOn(deps, reached);
   }
   return unwanted;
+}
+
+/*
+ * The prune's second look at D1, once its deletes are over: the bytes of a
+ * version switched on meanwhile are written again if the prune reached them.
+ * It never fails the prune, whose deletes are already made. A D1 that does
+ * not answer here leaves that version to its activation or its next read,
+ * and the log says so.
+ */
+async function cacheAgainIfSwitchedOn(deps: CacheDeps, reached: string[]): Promise<void> {
+  let active: RegistryVersionRefV1 | null;
+  try {
+    active = await readActivePointer(deps.db);
+  } catch (error) {
+    deps.debug?.warn(`registry snapshot not checked again after the prune`, { error });
+    return;
+  }
+  if (active === null || !reached.includes(snapshotKey(active))) {
+    return;
+  }
+  // logged before the write, not as its outcome: writeSnapshot warns of a write it could not make
+  deps.debug?.warn(`registry snapshot switched on while the prune removed it; caching it again`, { versionId: active.id });
+  try {
+    await warmSnapshot(deps, active.id);
+  } catch (error) {
+    deps.debug?.warn(`registry snapshot not warmed`, { versionId: active.id, error });
+  }
 }
 
 export type { CacheDeps, CachedSnapshot, PinnedVersion };

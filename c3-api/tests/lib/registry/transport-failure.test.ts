@@ -1,6 +1,7 @@
 import t from 'tap';
 
-import { RegistryError, isTransportFailure } from '../../../src/registry/errors.js';
+import { RegistryError, RegistryErrorCode, isTransportFailure } from '../../../src/registry/errors.js';
+import { ERROR_STATUS } from '../../../src/registry/router.js';
 
 /*
  * Which failures a root's five attempts are spent on.
@@ -44,4 +45,16 @@ t.test('what the source or the chain said about the root is the root', async t =
   t.equal(isTransportFailure(new Error('no such column: markets.slug')), false,
     'and so is a programming error, which must not look like a hiccup');
   t.equal(isTransportFailure('not an error at all'), false);
+});
+
+/*
+ * A carrier failure gives the root its attempt back, so a code that joins
+ * the set, or a new code, has to be decided here: ERROR_STATUS names every
+ * code there is.
+ */
+t.test('only the source and the node provider not answering are the carrier', async t => {
+  const carriers = Object.keys(ERROR_STATUS)
+    .filter(code => isTransportFailure(new RegistryError(code as RegistryErrorCode, 'x')))
+    .sort();
+  t.same(carriers, [ 'CHAIN_REQUEST_FAILED', 'SOURCE_REQUEST_FAILED' ]);
 });

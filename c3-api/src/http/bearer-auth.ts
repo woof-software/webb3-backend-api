@@ -56,11 +56,19 @@ const FINGERPRINT_LENGTH = 16;
  * defaulting to open: an unconfigured admin API is a closed one.
  */
 async function authenticateAdmin(request: Request, tokenHash: string | undefined): Promise<Credential> {
-  if (tokenHash === undefined || tokenHash.length === 0) {
+  const configured = (tokenHash ?? '').trim().toLowerCase();
+  if (configured.length === 0) {
     throw new ApiError('FORBIDDEN', `the administrative API is not configured in this environment`);
   }
+  // a value that is no hash matches no token, and a 401 would send the operator after the token
+  if (!/^[0-9a-f]{64}$/.test(configured)) {
+    throw new ApiError(
+      'FORBIDDEN',
+      `the administrative API is misconfigured in this environment: COMET_REGISTRY_ADMIN_TOKEN_HASH is not 64 hex digits`,
+    );
+  }
   const presented = await sha256Hex(bearerToken(request));
-  if (!equalsFixedTime(presented, tokenHash.toLowerCase())) {
+  if (!equalsFixedTime(presented, configured)) {
     throw unauthorized(`the bearer token is not valid`, 'Bearer error="invalid_token"');
   }
   return { fingerprint: presented.slice(0, FINGERPRINT_LENGTH) };

@@ -3,12 +3,11 @@ import t from 'tap';
 import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
-import type { MarketV1, NetworkV1 } from '../../../lib/model/comet-registry.js';
 import { sha256Hex } from '../../../src/http/bearer-auth.js';
-import { markValidated, recordValidationResults, snapshotChecksum } from '../../../src/registry/repository.js';
+import { overlayOfMarket } from '../../../src/registry/overlay.js';
 
 import { applyMigrations } from '../../util/d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { loadRegistrySnapshotFixture, overlayOfNetwork, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 
 /*
  * `PUT /registry/v1/admin/versions/{id}/overlays`: a whole reviewed directory
@@ -45,37 +44,8 @@ async function freshCandidate(): Promise<{ db: D1Database, versionId: string }> 
   return { db, versionId };
 }
 
-// the stored decisions of a fixture network and market, as a review states them
-function networkOverlay(network: NetworkV1) {
-  return {
-    displayName:               network.displayName,
-    assetDisplayOverrides:     network.presentation.assetDisplayOverrides,
-    unwrappedCollateralAssets: network.presentation.unwrappedCollateralAssets,
-    priceExceptions:           network.priceExceptions,
-  };
-}
-
 function marketOverlay(key: string) {
-  const market: MarketV1 = mainnet.markets.find(entry => entry.deploymentKey === key)!;
-  return {
-    displayName:          market.displayName,
-    contractName:         market.contractName,
-    slug:                 market.slug,
-    isInstitutional:      market.isInstitutional,
-    isDefault:            market.isDefault,
-    status:               market.status,
-    creationBlock:        market.creationBlock,
-    collateralValueQuote: market.collateralValueQuote,
-    capabilities:         market.capabilities,
-    baseAsset: {
-      displayName:         market.baseAsset.displayName,
-      isWrappedNative:     market.baseAsset.isWrappedNative,
-      usdPriceFeedAddress: market.baseAsset.usdPriceFeed?.address ?? null,
-    },
-    rewardPriceFeed: market.rewardAsset === null || market.rewardAsset.priceFeed === null
-      ? null
-      : { address: market.rewardAsset.priceFeed.address, quote: market.rewardAsset.priceFeedQuote },
-  };
+  return overlayOfMarket(mainnet.markets.find(entry => entry.deploymentKey === key)!);
 }
 
 function put(versionId: string, body: unknown, token: string = ADMIN_TOKEN): Promise<Response> {
@@ -120,7 +90,7 @@ t.test('a directory is applied in one request, and applying it again changes not
 
   const body = {
     reason:   'review the directory',
-    networks: { '1': { ...networkOverlay(mainnet), displayName: 'Ethereum Mainnet' } },
+    networks: { '1': { ...overlayOfNetwork(mainnet), displayName: 'Ethereum Mainnet' } },
     markets:  {
       '1/usdc': { ...marketOverlay('usdc'), status: 'deprecated', isDefault: false },
       '1/weth': marketOverlay('weth'),
@@ -168,8 +138,8 @@ t.test('the answer lists the networks by chain id, then the markets in the order
 
   const body = `{"reason": "review the directory", `
     + `"markets": {"1/weth": ${JSON.stringify(marketOverlay('weth'))}, "1/usdc": ${JSON.stringify(marketOverlay('usdc'))}}, `
-    + `"networks": {"534352": ${JSON.stringify(networkOverlay(scroll))}, "1": ${JSON.stringify(networkOverlay(mainnet))}, `
-    + `"8453": ${JSON.stringify(networkOverlay(base))}}}`;
+    + `"networks": {"534352": ${JSON.stringify(overlayOfNetwork(scroll))}, "1": ${JSON.stringify(overlayOfNetwork(mainnet))}, `
+    + `"8453": ${JSON.stringify(overlayOfNetwork(base))}}}`;
   const response = await server.fetch(`/registry/v1/admin/versions/${versionId}/overlays`, {
     method:  'PUT',
     headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
@@ -267,7 +237,7 @@ t.test('nothing is written unless everything can be', async t => {
   const { db, versionId } = await freshCandidate();
   const before = await mainnetState(db, versionId);
 
-  const renamed = { '1': { ...networkOverlay(mainnet), displayName: 'Ethereum Mainnet' } };
+  const renamed = { '1': { ...overlayOfNetwork(mainnet), displayName: 'Ethereum Mainnet' } };
 
   const invalid = await put(versionId, {
     reason:   'one document is wrong',
@@ -300,7 +270,7 @@ t.test('the route takes a directory and nothing else', async t => {
     [ 'a directory without a reason',         { markets: { '1/usdc': usdc } } ],
     [ 'an unknown property',                  { reason: 'x', markets: { '1/usdc': usdc }, force: true } ],
     [ 'markets that are not an object',       { reason: 'x', markets: [ usdc ] } ],
-    [ 'a network key that is not a chain id', { reason: 'x', networks: { ethereum: networkOverlay(mainnet) } } ],
+    [ 'a network key that is not a chain id', { reason: 'x', networks: { ethereum: overlayOfNetwork(mainnet) } } ],
     [ 'a market key without a deployment',    { reason: 'x', markets: { '1': usdc } } ],
   ];
   for (const [ what, body ] of refusals) {
@@ -313,7 +283,7 @@ t.test('the route takes a directory and nothing else', async t => {
    * chain id written another way is refused as no chain id at all.
    */
   for (const [ what, body, key ] of [
-    [ 'a network key',  { reason: 'x', networks: { '0x1': networkOverlay(mainnet) } }, '0x1' ],
+    [ 'a network key',  { reason: 'x', networks: { '0x1': overlayOfNetwork(mainnet) } }, '0x1' ],
     [ 'a market key',   { reason: 'x', markets: { '1/usdc': usdc, '01/usdc': usdc } }, '01' ],
   ] as const) {
     const refused = await put(versionId, body);
@@ -325,10 +295,65 @@ t.test('the route takes a directory and nothing else', async t => {
     'and it is authenticated like every administrative route');
 });
 
+/*
+ * Moving the default or a slug between two markets is read from both and sent
+ * back as one directory. Each document can say which overlay it was decided
+ * against, as a one-document route's can, so a change made to either market
+ * in between is not undone by the move.
+ */
+t.test('a directory says what each of its documents was decided against', async t => {
+  const { db, versionId } = await freshCandidate();
+  const auth = { headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` } };
+  type Read = { digest: string, overlay: Record<string, unknown> };
+  const read = async (scope: string) => await (await server.fetch(`/registry/v1/admin/versions/${versionId}/${scope}/overlay`, auth))
+    .json() as Read;
+  const defaults = async () => (await mainnetState(db, versionId)).markets!
+    .filter(market => market.is_default === 1).map(market => market.deployment_key);
+
+  const [ usdc, weth ] = [ await read('markets/1/usdc'), await read('markets/1/weth') ];
+  const move = (from: Read, to: Read, expectedDigests: Record<string, string | null>) => put(versionId, {
+    reason:   'move the default',
+    markets:  { '1/usdc': { ...from.overlay, isDefault: false }, '1/weth': { ...to.overlay, isDefault: true } },
+    expectedDigests,
+  });
+
+  // somebody renames usdc after both were read
+  t.equal((await put(versionId, { reason: 'rename usdc', markets: { '1/usdc': { ...usdc.overlay, displayName: 'USD Coin' } } })).status, 200);
+
+  const stale = await move(usdc, weth, { '1/usdc': usdc.digest, '1/weth': weth.digest });
+  t.equal(stale.status, 409, 'a directory decided against an overlay replaced since is refused');
+  const renamed = await read('markets/1/usdc');
+  t.same((await stale.json() as { error: { details: { current: Record<string, string> } } }).error.details.current,
+    { 'market 1/usdc': renamed.digest }, 'naming the market that changed, and what it holds now');
+  t.same(await defaults(), [ 'usdc' ], 'and nothing is written');
+
+  const network = await read('networks/1');
+  const moved   = await put(versionId, {
+    reason:   'move the default, and rename the network',
+    networks: { '1': { ...network.overlay, displayName: 'Ethereum Mainnet' } },
+    markets:  { '1/usdc': { ...renamed.overlay, isDefault: false }, '1/weth': { ...weth.overlay, isDefault: true } },
+    expectedDigests: { '1': network.digest, '1/usdc': renamed.digest, '1/weth': weth.digest },
+  });
+  t.equal(moved.status, 200, 'read again, the move is written');
+  t.same(await defaults(), [ 'weth' ]);
+  t.equal((await mainnetState(db, versionId)).network, 'Ethereum Mainnet', 'and so is the network, decided against its own read');
+
+  t.equal((await move(renamed, weth, { '1/weth': null })).status, 409,
+    'a document that expects a market nobody has reviewed is refused when somebody has');
+
+  for (const [ what, expectedDigests ] of [
+    [ 'an expectation of a document the request does not carry', { '1/usdt': null } ],
+    [ 'an expectation that is not a digest',                      { '1/usdc': 'abc' } ],
+    [ 'expectations that are not keyed by document',              [ null ] ],
+  ] as const) {
+    t.equal((await put(versionId, { reason: 'x', markets: { '1/usdc': renamed.overlay }, expectedDigests })).status, 400,
+      `${what} is refused rather than ignored`);
+  }
+});
+
 t.test('only an importing candidate can be reviewed', async t => {
   const { db, versionId } = await freshCandidate();
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
+  await validateSeeded(db, versionId);
 
   const response = await put(versionId, { reason: 'too late', markets: { '1/usdc': marketOverlay('usdc') } });
   t.equal(response.status, 409, 'a validated version can no longer be changed');

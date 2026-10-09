@@ -37,6 +37,8 @@ function configure<FetchFailure>({
     configure,
     formatError,
     isExecutionReverted,
+    NotServed,
+    isNotServed,
     expectBatch,
     expectRequest,
     expectResponse,
@@ -116,6 +118,74 @@ const jsonContentHeaders = {
 };
 
 /*
+ * A request the node did not serve: it answered with an error status and no
+ * JSON-RPC body, as the node proxy does when no provider served the calls, it
+ * was not reached at all, or its answer broke off. A caller raises it too for
+ * a call the node answered with an error that is not a revert. Either way the
+ * node said nothing about the call, and the same request may be answered
+ * later, unlike an answer that could not be used.
+ *
+ * `status` is the status the node answered with and `retryAfter` the seconds
+ * its Retry-After asked for, each null when it gave none.
+ */
+class NotServed extends Error {
+  readonly status:     number | null;
+  readonly retryAfter: number | null;
+
+  constructor(message: string, { status = null, retryAfter = null, cause }: {
+    status?:     number | null,
+    retryAfter?: number | null,
+    cause?:      unknown,
+  } = {}) {
+    super(message, { cause });
+    this.name       = 'NotServed';
+    this.status     = status;
+    this.retryAfter = retryAfter;
+  }
+}
+
+function isNotServed(error: unknown): error is NotServed {
+  return error instanceof NotServed;
+}
+
+/*
+ * A fetch that failed rather than answered, or an answer whose body broke off
+ * before it ended: what failed is the cause, for the caller's log, beside the
+ * status and the wait the answer began with, if one had begun.
+ *
+ * The Worker's limit on the subrequests of one invocation is the caller's, not
+ * the node's: the request was never sent. It stays the error it is, so that a
+ * caller tells its own excess from a node that failed it.
+ */
+function notReached(error: unknown, response?: Response): never {
+  if (error instanceof Error && /too many subrequests/i.test(error.message)) {
+    throw error;
+  }
+  const reason = error instanceof Error ? error.message || error.name : String(error);
+  throw new NotServed(`JSON-RPC request failed: ${reason}`, {
+    status:     response === undefined || response.ok ? null : response.status,
+    retryAfter: response === undefined ? null : retryAfterOf(response),
+    cause:      error,
+  });
+}
+
+/*
+ * An answer with an error status is the node's answer only if its body is a
+ * JSON-RPC answer to the request. Whatever else it holds — a line of text, an
+ * error page, JSON of another kind — the request was not served.
+ */
+function refused(error: unknown, response: Response): never {
+  if (response.ok || isNotServed(error)) {
+    throw error;
+  }
+  throw new NotServed(`JSON-RPC request failed: HTTP ${response.status}`, {
+    status:     response.status,
+    retryAfter: retryAfterOf(response),
+    cause:      error,
+  });
+}
+
+/*
  * postBatch sends a batch of JSON-RPC calls to an endpoint via HTTP POST.
  *
  * The resulting array of `JsonRpcResponse`s is ordered by the index of
@@ -136,11 +206,12 @@ async function postBatch({ calls, fetch = globalThis.fetch, ...rpcParameters }: 
   const outcome = await fetch(preparePostBatch({
     calls: payloads,
     ...rpcParameters,
-  }));
+  })).catch(notReached);
   if (Fallible.isFailure(outcome)) {
     return outcome;
   }
-  return expectBatch(payloads, Fallible.unwrap(outcome));
+  const answer = Fallible.unwrap(outcome);
+  return expectBatch(payloads, answer).catch((error: unknown) => refused(error, answer));
 }
 
 /*
@@ -159,11 +230,12 @@ async function post({ fetch = globalThis.fetch, ...rpcParameters }: {
   : Promise<Fallible.Outcome.OrJust<JsonRpcResponse>>
 {
   const request  = preparePost(rpcParameters);
-  const outcome  = await fetch(request);
+  const outcome  = await fetch(request).catch(notReached);
   if (Fallible.isFailure(outcome)) {
     return outcome;
   }
-  const response = await expectResponse(Fallible.unwrap(outcome));
+  const answer   = Fallible.unwrap(outcome);
+  const response = await expectResponse(answer).catch((error: unknown) => refused(error, answer));
   if (response instanceof Array) {
     throw new Error(`invariant violated! single POST returned batch ?!`);
   }
@@ -466,7 +538,13 @@ async function expectJsonBody(httpMessage: Request | Response)
   : Promise<object>
 {
   // bail if the parsed JSON of the HTTP response is not an array
-  const responseText = await httpMessage.text();
+  const responseText = await httpMessage.text().catch((error: unknown) => {
+    // an answer cut off before its body ended was not served, whatever its status said
+    if (httpMessage instanceof Response) {
+      notReached(error, httpMessage);
+    }
+    throw error;
+  });
   let json; try { json = JSON.parse(responseText) }
   catch {
     /*
@@ -474,8 +552,8 @@ async function expectJsonBody(httpMessage: Request | Response)
      * it and, for a response, the status, never the body. Nothing is logged
      * here; the caller's logger writes the failure with its other diagnostics.
      *
-     * A response with an error status and no JSON is the request failing, as
-     * when the node proxy answers 503 because no provider served the calls,
+     * A response with an error status and no JSON is the request not served,
+     * as when the node proxy answers 503 because no provider served the calls,
      * or 401 because its key is wrong. The status is not checked before the
      * body is parsed: a node can answer a JSON-RPC error with an error status
      * too, and that error is its answer to the call.
@@ -486,7 +564,11 @@ async function expectJsonBody(httpMessage: Request | Response)
       statusText: (httpMessage instanceof Response) ? httpMessage.statusText : '',
     };
     if (httpMessage instanceof Response && !httpMessage.ok) {
-      throw new Error(`JSON-RPC request failed: HTTP ${httpMessage.status}`, { cause: details });
+      throw new NotServed(`JSON-RPC request failed: HTTP ${httpMessage.status}`, {
+        status:     httpMessage.status,
+        retryAfter: retryAfterOf(httpMessage),
+        cause:      details,
+      });
     }
     throw InvalidResponse(`not JSON`, details);
   }
@@ -510,6 +592,12 @@ function redactedUrl(url: string): string {
   }
 }
 
+// the seconds a Retry-After asks for; a date, which the node proxy never sends, is none
+function retryAfterOf(response: Response): number | null {
+  const value = response.headers.get('Retry-After')?.trim() ?? '';
+  return /^\d+$/.test(value) ? Number(value) : null;
+}
+
 function InvalidResponse(message: string, cause: object|string) {
   return new Error(`Invalid JSON-RPC response: ${message}`, { cause });
 }
@@ -528,6 +616,9 @@ export {
   postBatch,
   formatError,
   isExecutionReverted,
+  // a request the node did not serve
+  NotServed,
+  isNotServed,
   // Request preparation methods
   preparePost,
   preparePostBatch,

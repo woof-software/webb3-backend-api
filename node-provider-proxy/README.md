@@ -16,18 +16,24 @@ npm install
 
 ## Configuration
 
-The node provider proxy requires several items to be configured in order to function properly. The items are configured in (`wrangler.toml`) and are used when running the proxy locally. It is recommended to configure all of the items as Cloudflare secretes in your Cloudflare worker deployment after you have deployed your proxy as a worker to Cloudflare..
+The provider keys are secrets, and never go into `wrangler.toml`: its `[vars]` keep a placeholder for each (`ALCHEMY_XXX`, `QUICK_NODE_XXX`), and a key left at its placeholder fails its network.
 
-Each of the secrets vars have the following descriptions:
+- Locally, they go in `.dev.vars` next to `wrangler.toml`, which git ignores: copy `.dev.vars.example` to `.dev.vars` and set one `NAME=value` per line. `npm start` reads it, and a value there takes the place of the placeholder of the same name.
+- A deployed worker takes each as a secret: `npx wrangler secret put <NAME> --env <environment>`, or `npx wrangler secret put <NAME> -c woof.wrangler.toml` for the Woof deployment.
 
-- `allowedAppKey` - Optional application key for the proxy to check for on all proxied requests. The proxy has the url format of `http://hostname/{network}/{optional_appkey}`. 
-- `allowedHosts` - Optional hostnames array to check for on all proxied requests. Can be used to aid in checking the origination of a proxy request comes from a known source.
-- `alchemyXXXMainnet` - Alchemy RPC Key - The proxy relies on Alchemy as the sole provider for rpc traffic.
-- `infuraKey` - Infura RPC Key (configurable) - The proxy can be configured to use quicknode for rpc traffic.
-- `quicknodeXXXMainnet` - Quicknode RPC Keys (configurable) - The proxy can be configured to use quicknode for rpc traffic.
-- `quicknodeXXXMainnetSubdomain` - Quicknode RPC Subdomian (configurable) - Used in conjuction with a Quicknode RPC keys.
+The keys, as `src/providers.ts` reads them:
+
+- `alchemyEthMainnet`, `alchemyArbMainnet`, `alchemyPolygonMainnet`, `alchemyBaseMainnet`, `alchemyScrollMainnet`, `alchemyOptMainnet`, `alchemyMantleMainnet`, `alchemyLineaMainnet`, `alchemyUnichainMainnet` and `alchemyRoninMainnet` - the Alchemy key of each network. Alchemy serves every network, and the testnet names are served from `alchemyEthMainnet`.
+- `quicknodeEthMainnet` and `quicknodeEthMainnetSubdomain` - the QuickNode key, and the subdomain of the endpoint it belongs to, for Ethereum mainnet alone: the provider it falls back to when Alchemy fails.
 
 Every provider secret named in `src/providers.ts` must be set. Without one, every request is answered `500 unexpected error`, and the worker's log names the missing secret.
+
+Two more settings restrict who may use the proxy:
+
+- `allowedAppKey` - Optional application key for the proxy to check for on all proxied requests. The proxy has the url format of `http://hostname/{network}/{optional_appkey}`; an empty key accepts any.
+- `allowedHosts` - Optional hostnames array to check for on all proxied requests. Can be used to aid in checking the origination of a proxy request comes from a known source.
+
+`allowedHosts` and `[vars.settings]` are not secrets, and stay in `wrangler.toml`: `.dev.vars` holds strings only.
 
 
 ## Running Locally

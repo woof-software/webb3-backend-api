@@ -9,8 +9,9 @@ type RegistryErrorCode = (
   | 'SOURCE_CONFIGURATION_INVALID'
   | 'SOURCE_REF_UNRESOLVED'
   | 'SOURCE_COMMIT_UNREACHABLE'
-  // upstream responded, but the response cannot be trusted
+  // the source did not answer, or refused the request with an error status
   | 'SOURCE_REQUEST_FAILED'
+  // the source answered, but the answer cannot be trusted
   | 'SOURCE_RESPONSE_INVALID'
   | 'SOURCE_TREE_TRUNCATED'
   | 'SOURCE_CONTENT_TOO_LARGE'

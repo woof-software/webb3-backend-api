@@ -38,8 +38,8 @@ const knownGovernanceContracts = (network: Extract<KnownNetwork.Name, `ethereum-
  *
  * Governance decodes against the static constants, which is everything this
  * API is built against. A proposal that configures a market the registry
- * added since knows nothing of it, so those actions — and only those — are
- * described again with the markets of the active version merged in.
+ * added since knows nothing of it, so those actions are described again
+ * with the markets of the active version merged in.
  */
 function unknownTargets(
   proposals: governanceModel.proposal.Proposal[],
@@ -71,8 +71,11 @@ function isBridged(action: governanceModel.proposal.Proposal['actions'][number])
  * addresses are static and the constants name them, but the market they act
  * on is an argument of the call — a Comet the registry may be the only source
  * for — so an action on one of them is described again as well.
+ *
+ * They are named as the constants name them: the proxy admin, the Solidity
+ * CometProxyAdmin, is `CometAdmin` on every network.
  */
-const MARKET_ADMINISTRATION = [ 'Configurator', 'CometProxyAdmin', 'CometRewards', 'CometFactory' ];
+const MARKET_ADMINISTRATION = [ 'Configurator', 'CometAdmin', 'CometRewards', 'CometFactory' ];
 
 function administersMarkets(network: KnownNetwork.Name, address: Eth.Address): boolean {
   const contracts = Eth.wellKnownContractsByNetwork[network] as Record<string, Record<string, unknown>>;
@@ -82,12 +85,15 @@ function administersMarkets(network: KnownNetwork.Name, address: Eth.Address): b
 /*
  * Describes the actions the registry can say more about again, against the
  * constants with the markets of the active version merged in: an action whose
- * target only the registry describes, and an action that bridges to another
- * chain, whose inner targets may be such markets.
+ * target only the registry describes, an action that bridges to another
+ * chain, whose inner targets may be such markets, and a call to a contract
+ * that administers markets.
  *
  * Loading the registry is deliberately last: a governance request whose
- * targets are all statically known, and which bridges nothing, never reads
- * D1 at all. A target neither source knows — a grant recipient, another
+ * targets the constants all know, and which neither bridges nor calls a
+ * contract that administers markets, never reads D1 at all, though few
+ * pages are like that.
+ * A target neither source knows — a grant recipient, another
  * protocol — would read the same described again, so it is not. If the
  * registry cannot be loaded, the actions keep the description they already
  * have, which is what they read as before the registry existed, rather than

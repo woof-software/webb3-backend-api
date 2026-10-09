@@ -1,5 +1,6 @@
 import { SyncRunRow, marketKey } from '../../lib/model/comet-registry.js';
 
+import { isUnreachable } from './cache.js';
 import { RpcTransport, enrichMarket } from './enrichment.js';
 import { RegistryError, isRegistryError, isTransportFailure } from './errors.js';
 import {
@@ -174,6 +175,39 @@ function now(clock: Clock | undefined): Date {
   return (clock ?? (() => new Date()))();
 }
 
+// diagnostics are sanitized: an upstream body or a token never reaches D1
+function diagnosticOf(error: unknown): string {
+  return isRegistryError(error) ? `${error.code}: ${error.message}` : 'an unexpected error interrupted the import';
+}
+
+/*
+ * Runs what an invocation does while it holds the run, and gives the run back
+ * if that fails: the next request, or the Cron, then continues it at once,
+ * rather than being told for the rest of the lease that another invocation
+ * is importing when none is. The release is fenced, so a lease another
+ * invocation has taken over, and a run that has ended, are left as they are.
+ *
+ * A failure about the work rather than its carrier — a stored overlay a
+ * parser refuses, or a fault — fails every invocation the same way, often
+ * before any root records anything, so the run keeps it as its error. A
+ * source, a provider or a database that did not answer says nothing about
+ * the run, and leaves the error as it was.
+ */
+async function underFence<T>(deps: ImporterDeps, fence: Fence, work: (fence: Fence) => Promise<T>): Promise<T> {
+  try {
+    return await work(fence);
+  } catch (error) {
+    const carrier = isTransportFailure(error) || isUnreachable(error);
+    try {
+      await releaseLease(deps.db, fence, carrier ? {} : { error: diagnosticOf(error) });
+    } catch (unreleased) {
+      // the lease then runs out, as it does for an invocation stopped outright
+      deps.debug?.warn(`registry lease not released`, { runId: fence.runId, error: unreleased });
+    }
+    throw error;
+  }
+}
+
 /*
  * Whether a request is an operator's decision rather than routine scheduling:
  * it names a commit, rebuilds an attempt, or holds the candidate open. Each
@@ -229,7 +263,6 @@ async function startImport(
 
   const commitSha = request.sourceCommitSha ?? await resolveRef(source);
   if (request.sourceCommitSha !== undefined) {
-    // an explicitly requested commit must belong to the tracked ref
     await assertReachableFromRef(source, commitSha);
   }
 
@@ -347,7 +380,7 @@ async function startImport(
    * GitHub failure between here and there must not silence discovery for the
    * rest of the interval.
    */
-  await recordUpstreamCheck(db, { now: deps.now });
+  await underFence(deps, fence, () => recordUpstreamCheck(db, { now: deps.now }));
 
   /*
    * The run is created with its lease already held, so the fence travels back
@@ -478,8 +511,15 @@ async function finishCandidate(deps: ImporterDeps, fence: Fence, versionId: stri
   const held    = run?.holdForReview === true || await readActiveVersionId(deps.db) === null;
   const failed  = failures(verdict.results).length;
 
+  /*
+   * A run that completes with every root imported has no failure left to
+   * report. An attempt that succeeds clears the run's error, so all it can
+   * still carry is that of an invocation that failed outside its attempts —
+   * one deciding this candidate, say — which the run has since got past. A
+   * run that gave roots up keeps the latest error, which says why.
+   */
   const finish: RunFinish = held || failed === 0
-    ? { status: 'completed', outcome: 'imported', registryVersionId: versionId }
+    ? { status: 'completed', outcome: 'imported', registryVersionId: versionId, ...(verdict.complete ? { error: null } : {}) }
     : { status: 'failed', registryVersionId: versionId, error: 'validation failed' };
   const results = await deps.db.batch([
     ...verdictStatements(deps.db, verdict, { hold: held, when: leaseHeld(fence), at: now(deps.now).toISOString() }),
@@ -569,7 +609,8 @@ async function closeEndedRun(
     fence,
     status === 'invalid'
       ? { status: 'failed', registryVersionId: versionId, error: 'validation failed' }
-      : { status: 'completed', outcome: 'imported', registryVersionId: versionId },
+      // a version validates only with every root imported, which leaves the run nothing to report (finishCandidate)
+      : { status: 'completed', outcome: 'imported', registryVersionId: versionId, error: null },
     { now: deps.now },
   );
   if (!closed) {
@@ -639,6 +680,14 @@ async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): P
     }
     fence = started.fence;
   }
+
+  return underFence(deps, fence, held => continueRun(deps, held, request));
+}
+
+// what an invocation does with the run it holds: import a batch of its roots, or decide its candidate
+async function continueRun(deps: ImporterDeps, fence: Fence, request: ManualRequest): Promise<InvocationResult> {
+  const { db, config } = deps;
+  const lease = { leaseSeconds: config.leaseSeconds, now: deps.now };
 
   const run = await readRun(db, fence.runId);
   if (run === null) {
@@ -711,8 +760,7 @@ async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): P
       });
       imported += 1;
     } catch (error) {
-      // diagnostics are sanitized: an upstream body or a token never reaches D1
-      const message = isRegistryError(error) ? `${error.code}: ${error.message}` : 'an unexpected error interrupted the import';
+      const message = diagnosticOf(error);
       /*
        * D1 keeps the sanitized code, because an upstream body or a token
        * must never be written where diagnostics are read. The cause itself
@@ -759,8 +807,13 @@ async function runInvocation(deps: ImporterDeps, request: ManualRequest = {}): P
     return { kind: 'running', runId: fence.runId, versionId, processed, ...progress };
   }
 
+  /*
+   * Deciding the candidate changes none of these counts, so they are not
+   * read again: once the run is closed the import has happened, and a
+   * database that stops answering now must not answer it as a failure.
+   */
   const finished = await finishCandidate(deps, fence, versionId);
-  return { ...finished, processed, ...await progressOf(db, fence.runId) };
+  return { ...finished, processed, ...progress };
 }
 
 export type { ImporterDeps, InvocationResult, ManualRequest };

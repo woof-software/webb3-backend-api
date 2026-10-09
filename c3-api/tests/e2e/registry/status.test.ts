@@ -9,17 +9,11 @@ import type { Address } from '../../../lib/model/comet-registry.js';
 import { sha256Hex } from '../../../src/http/bearer-auth.js';
 import { activeSnapshot, cacheDepsOf } from '../../../src/registry/cache.js';
 import { CHECK_KEY, checkChain } from '../../../src/registry/drift.js';
-import {
-  activateVersion,
-  markInvalid,
-  markValidated,
-  recordValidationResults,
-  snapshotChecksum,
-} from '../../../src/registry/repository.js';
+import { activateVersion, markInvalid, recordValidationResults } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
 import { FakeChain, fakeChain } from '../../util/fake-chain.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { activateSeeded, loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 
 /*
  * The status route: one answer a monitor polls and an operator reads.
@@ -91,12 +85,6 @@ async function status(): Promise<Status> {
   return await response.json() as Status;
 }
 
-async function activate(db: D1Database, versionId: string, networks = snapshot.networks): Promise<void> {
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(networks));
-  await activateVersion(db, { versionId, action: 'activate', actor: 'test-admin', reason: 'bringing it up' });
-}
-
 const COMMIT = 'a34d9b571c833b5d77f052ab8e2dbdbe10df726d';
 
 async function recordRun(
@@ -137,7 +125,7 @@ t.test('a registry with nothing in it says exactly what is missing', async t => 
 t.test('a healthy registry raises nothing', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
   await recordRun(db, { status: 'completed', outcome: 'no_change' });
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
@@ -159,7 +147,7 @@ t.test('a healthy registry raises nothing', async t => {
 t.test('a candidate nobody has reviewed is reported as work waiting', async t => {
   const db = await freshDatabase();
   const { versionId: active } = await seedCandidate(db, snapshot);
-  await activate(db, active);
+  await activateSeeded(db, active);
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
@@ -194,14 +182,13 @@ async function switchOn(db: D1Database, versionId: string): Promise<void> {
 t.test('a validated version newer than the active one is reported as waiting to be switched on', async t => {
   const db = await freshDatabase();
   const { versionId: active } = await seedCandidate(db, snapshot);
-  await activate(db, active);
+  await activateSeeded(db, active);
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
 
   const newer = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
-  await recordValidationResults(db, newer.versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, newer.versionId, await snapshotChecksum(snapshot.networks));
+  await validateSeeded(db, newer.versionId);
   await recordRun(db, { status: 'completed', outcome: 'imported' });
 
   const waiting = await status();
@@ -220,15 +207,14 @@ t.test('a validated version newer than the active one is reported as waiting to 
 t.test('a version skipped for a newer one is not raised again by a rollback past both', async t => {
   const db = await freshDatabase();
   const { versionId: first } = await seedCandidate(db, snapshot);
-  await activate(db, first);
+  await activateSeeded(db, first);
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
 
   const validated = async (attempt: number) => {
     const version = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt });
-    await recordValidationResults(db, version.versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-    await markValidated(db, version.versionId, await snapshotChecksum(snapshot.networks));
+    await validateSeeded(db, version.versionId);
     return version.versionId;
   };
   await validated(2);
@@ -245,7 +231,7 @@ t.test('a version skipped for a newer one is not raised again by a rollback past
 t.test('a run that failed, and one nobody is continuing, each name themselves', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
@@ -292,7 +278,7 @@ t.test('a run that failed, and one nobody is continuing, each name themselves', 
 t.test('an import that keeps failing is named while it runs', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
@@ -319,6 +305,13 @@ t.test('an import that keeps failing is named while it runs', async t => {
   // an attempt that succeeds clears the run's error, as every completed checkpoint does
   await db.prepare(`UPDATE sync_runs SET last_error = NULL WHERE id = ?1`).bind(runId).run();
   t.same((await status()).alerts, [], 'an import whose latest attempt succeeded is not failing, with roots to try again or not');
+
+  // an invocation that fails before it attempts a root says why as the run's error too, here a decision the version on stores
+  await db.prepare(`UPDATE sync_runs SET last_error = ?1 WHERE id = ?2`).bind(
+    `OVERLAY_INVALID: version ${versionId} market 1/usdc.displayName must be a non-empty string of at most 200 characters`,
+    runId,
+  ).run();
+  t.same((await status()).alerts, [ 'sync-failing' ], 'which is then the import\'s latest failure');
 });
 
 /*
@@ -333,7 +326,7 @@ t.test('an import that keeps failing is named while it runs', async t => {
 t.test('one failure, or one given back, is not an import that keeps failing', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
@@ -390,7 +383,7 @@ t.test('one failure, or one given back, is not an import that keeps failing', as
 t.test('an attempt whose invocation stopped is a failed one, and an attempt under way is not yet', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
@@ -446,7 +439,7 @@ t.test('an attempt whose invocation stopped is a failed one, and an attempt unde
 t.test('a commit discovery stopped importing is named', async t => {
   const db = await freshDatabase();
   const { versionId: active } = await seedCandidate(db, snapshot);
-  await activate(db, active);
+  await activateSeeded(db, active);
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
@@ -491,7 +484,7 @@ t.test('a commit discovery stopped importing is named', async t => {
 t.test('a version the chain has drifted from is raised, until the version on agrees with it', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
@@ -512,8 +505,8 @@ t.test('a version the chain has drifted from is raised, until the version on agr
     });
   };
   // switches a version on, and serves it once, as the first request after the switch would
-  const switchOn = async (version: string, networks = snapshot.networks) => {
-    await activate(db, version, networks);
+  const switchOn = async (version: string) => {
+    await activateSeeded(db, version);
     t.equal((await server.fetch('/registry/v1/active')).status, 200);
   };
 
@@ -587,7 +580,7 @@ t.test('a version the chain has drifted from is raised, until the version on agr
     })),
   };
   const fixed = await seedCandidate(db, reimported, { versionId: randomUUID(), attempt: 3 });
-  await switchOn(fixed.versionId, reimported.networks);
+  await switchOn(fixed.versionId);
   t.same((await status()).alerts, [ 'chain-drift' ], 'a version that agrees is no exception until it is checked');
   await check(baseMoved);
   const cleared = await status();
@@ -598,7 +591,7 @@ t.test('a version the chain has drifted from is raised, until the version on agr
 t.test('the source going unchecked is an alert of its own', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
 
   const long = new Date(Date.now() - 5 * 86_400_000).toISOString();
@@ -619,7 +612,7 @@ t.test('the source going unchecked is an alert of its own', async t => {
 t.test('a setting the environment does not take is raised at once, by name', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
   await db.prepare(`UPDATE registry_state SET last_upstream_checked_at = ?1 WHERE singleton_id = 1`)
     .bind(new Date().toISOString()).run();
   t.equal((await server.fetch('/registry/v1/active')).status, 200);

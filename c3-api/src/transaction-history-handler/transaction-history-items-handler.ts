@@ -296,7 +296,6 @@ function readsSameStreams(payload: CursorPayload, streams: StreamEvent[]): boole
   return streamsOf(payload.streamEvents) === streamsOf(read);
 }
 
-// every network a cursor reads, holds a position on, or filters by
 function cursorNetworksOf(payload: CursorPayload): KnownNetwork.Name[] {
   return [ ...new Set([
     ...payload.streamEvents.map(stream => stream.network),

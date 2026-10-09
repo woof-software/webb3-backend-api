@@ -14,10 +14,6 @@ import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
  */
 const snapshot = loadRegistrySnapshotFixture();
 
-/*
- * Applies one mutation to a copy of the fixture and reports which checks the
- * snapshot pass fails.
- */
 function failingChecks(mutate: (networks: NetworkV1[]) => void, input: Omit<CandidateInput, 'networks'> = {}): string[] {
   const networks = structuredClone(snapshot.networks) as NetworkV1[];
   mutate(networks);
