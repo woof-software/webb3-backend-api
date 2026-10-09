@@ -33,6 +33,17 @@ import { HexAddress } from './evm/address.js';
 // already accepts this object as.
 import type { WellKnownContractsByNetworkAddress } from './well-known/contracts/utils.js';
 
+/*
+ * These are the contracts this API is built against: governors, COMP, the V2
+ * protocol, the bridges, the migrators.
+ *
+ * The Comet entries among them are no longer the runtime market registry.
+ * Markets, their tokens, and their feeds are resolved from the activated
+ * registry version through the request catalog; what remains here is used to
+ * name governance targets and to compare the two sources while both exist
+ * (src/registry/shadow.ts).
+ */
+
 const wellKnownContractsByNetwork: WellKnownContractsByNetworkAddress = {
   ...sepoliaContracts,
   ...mainnetContracts,
