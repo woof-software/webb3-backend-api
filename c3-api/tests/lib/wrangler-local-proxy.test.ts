@@ -32,7 +32,6 @@ function without(fields: object, names: string[]): Record<string, unknown> {
   return Object.fromEntries(Object.entries(fields).filter(([ name ]) => !names.includes(name)));
 }
 
-// everything Wrangler reads from a file, but for what differs by design
 function settingsOf(config: ReturnType<typeof read>): Record<string, unknown> {
   return { ...without(config, BY_DESIGN), vars: without(config.vars, PROXY_SETTINGS) };
 }

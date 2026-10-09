@@ -88,7 +88,49 @@ function MemoryKv({ seed = {} }: { seed?: CacheSeed | StorageMap }): KVNamespace
   return memoryKv as unknown as KVNamespace<string>;
 }
 
+type KvMethod = 'get' | 'getWithMetadata' | 'list' | 'put' | 'delete';
+
+/*
+ * What the binding throws when KV does not take a call: `KV <method> failed:`
+ * and the status KV answered. A listing is a GET to it, and a write past one a
+ * second to a key is answered 429.
+ */
+const REFUSALS: Record<KvMethod, string> = {
+  get:             'KV GET failed: 503 Service Unavailable',
+  getWithMetadata: 'KV GET failed: 503 Service Unavailable',
+  list:            'KV GET failed: 503 Service Unavailable',
+  put:             'KV PUT failed: 429 Too Many Requests',
+  delete:          'KV DELETE failed: 503 Service Unavailable',
+};
+
+/*
+ * A namespace that fails the calls `refuses` names, as the binding fails
+ * them, and hands every other call to `kv`. It asks on each call, with what
+ * the call was given, so a test can refuse one key or have KV come back.
+ */
+function refusingKv(
+  kv: KVNamespace = MemoryKv({}),
+  refuses: (method: KvMethod, parameters: unknown[]) => boolean = () => true,
+): KVNamespace {
+  return new Proxy(kv, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof(property) === 'string' && Object.hasOwn(REFUSALS, property) && typeof(value) === 'function') {
+        const method = property as KvMethod;
+        return async (...parameters: unknown[]) => {
+          if (refuses(method, parameters)) {
+            throw new Error(REFUSALS[method]);
+          }
+          return (value as (...parameters: unknown[]) => unknown).apply(target, parameters);
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as KVNamespace;
+}
+
 export {
   MemoryKv,
   encodeSeed,
+  refusingKv,
 };

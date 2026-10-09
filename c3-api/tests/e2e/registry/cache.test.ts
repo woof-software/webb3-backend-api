@@ -12,16 +12,18 @@ import type { CacheDeps, CachedSnapshot } from '../../../src/registry/cache.js';
 import {
   POINTER_KEY,
   activeSnapshot,
+  cacheStatus,
   pruneSnapshots,
   snapshotKey,
   versionSnapshot,
   warmSnapshot,
 } from '../../../src/registry/cache.js';
 import { CHECK_KEY } from '../../../src/registry/drift.js';
-import { activateVersion, markValidated, recordValidationResults, snapshotChecksum } from '../../../src/registry/repository.js';
+import { activateVersion, snapshotChecksum } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { refusingKv } from '../../util/kv.js';
+import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 
 /*
  * The snapshot cache against real local D1 and KV.
@@ -60,11 +62,6 @@ async function freshEnvironment(): Promise<{ db: D1Database, kv: KVNamespace }> 
   return { db: APP_DB, kv: kv_registry };
 }
 
-async function validate(db: D1Database, versionId: string): Promise<void> {
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
-}
-
 async function activate(db: D1Database, versionId: string): Promise<void> {
   await activateVersion(db, { versionId, action: 'activate', actor: 'test-admin', reason: 'test' });
 }
@@ -91,7 +88,6 @@ function counting(db: D1Database): { db: D1Database, statements: string[] } {
   return { db: proxy as D1Database, statements };
 }
 
-// a namespace that records the keys written to it
 function recordingWrites(kv: KVNamespace): { kv: KVNamespace, written: string[] } {
   const written: string[] = [];
   const proxy = new Proxy(kv, {
@@ -109,7 +105,6 @@ function recordingWrites(kv: KVNamespace): { kv: KVNamespace, written: string[] 
   return { kv: proxy, written };
 }
 
-// a namespace that counts the values read from it
 function countingReads(kv: KVNamespace): { kv: KVNamespace, reads: () => number } {
   let reads = 0;
   const proxy = new Proxy(kv, {
@@ -125,6 +120,73 @@ function countingReads(kv: KVNamespace): { kv: KVNamespace, reads: () => number 
     },
   }) as KVNamespace;
   return { kv: proxy, reads: () => reads };
+}
+
+// a namespace whose writes of `key` land only once the test releases them, so that reads arrive while one is under way
+function heldWrites(kv: KVNamespace, key: string): { kv: KVNamespace, release: () => void } {
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const proxy = new Proxy(kv, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'put' && typeof(value) === 'function') {
+        return async (...parameters: unknown[]) => {
+          if (parameters[0] === key) {
+            await released;
+          }
+          return (value as (...parameters: unknown[]) => unknown).apply(target, parameters);
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as KVNamespace;
+  return { kv: proxy, release };
+}
+
+// a namespace whose first write of `key` never finishes, as a write cut off with its request
+function unfinishedWrite(kv: KVNamespace, key: string): KVNamespace {
+  let cut = false;
+  return new Proxy(kv, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'put' && typeof(value) === 'function') {
+        return (...parameters: unknown[]) => {
+          if (parameters[0] === key && !cut) {
+            cut = true;
+            return new Promise(() => {});
+          }
+          return (value as (...parameters: unknown[]) => unknown).apply(target, parameters);
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as KVNamespace;
+}
+
+/*
+ * Waits until each of `reads` has either set out on its write, which `writes`
+ * counts, or been answered. It turns the event loop rather than a clock, so
+ * what a test sees does not depend on how long anything takes.
+ */
+async function writingOrAnswered(reads: Array<Promise<unknown>>, writes: () => number): Promise<void> {
+  let settled = 0;
+  for (const read of reads) {
+    read.then(() => { settled += 1; }, () => { settled += 1; });
+  }
+  while (writes() + settled < reads.length) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
+function capturedLog(): { error: unknown[], warn: unknown[], debug: NonNullable<CacheDeps['debug']> } {
+  const lines = { error: [] as unknown[], warn: [] as unknown[] };
+  return {
+    ...lines,
+    debug: {
+      error: (message: unknown) => lines.error.push(message),
+      warn:  (message: unknown) => lines.warn.push(message),
+    },
+  };
 }
 
 // D1 that cannot be reached at all, which is what the fallback exists for
@@ -160,7 +222,7 @@ async function answeredFrom(
 async function activeFixture(): Promise<{ db: D1Database, kv: KVNamespace, versionId: string }> {
   const { db, kv } = await freshEnvironment();
   const { versionId } = await seedCandidate(db, snapshot);
-  await validate(db, versionId);
+  await validateSeeded(db, versionId);
   await activate(db, versionId);
   return { db, kv, versionId };
 }
@@ -216,7 +278,7 @@ t.test('the versions sessions pin do not push the active one out of memory', asy
   const pinned: string[] = [];
   for (let attempt = 2; attempt <= 6; attempt += 1) {
     const { versionId } = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt });
-    await validate(db, versionId);
+    await validateSeeded(db, versionId);
     pinned.push(versionId);
   }
 
@@ -243,6 +305,7 @@ t.test('the bytes of a version are written once, and never again while they are 
   const { db, kv } = await activeFixture();
   const recorded = recordingWrites(kv);
   const snapshots = () => recorded.written.filter(key => key.startsWith('snapshot:'));
+  const pointers  = () => recorded.written.filter(key => key === POINTER_KEY);
 
   const start = Date.parse('2026-09-23T12:00:00.000Z');
   await activeSnapshot(depsOf(counting(db).db, recorded.kv, () => new Date(start)));
@@ -261,15 +324,133 @@ t.test('the bytes of a version are written once, and never again while they are 
     t.equal(later.from, 'cache', `${hours} hours later another isolate still reads it from KV`);
   }
   t.equal(snapshots().length, 1, 'and no read wrote the snapshot again');
+  t.equal(pointers().length, 4, 'while the pointer record is written by the first read of each of the four isolates');
 
   const [ entry ] = (await kv.list({ prefix: 'snapshot:' })).keys;
   t.equal(entry?.expiration, undefined, 'the bytes have no expiry');
 });
 
+/*
+ * Every isolate writes the pointer record, to the one key, which KV takes one
+ * write a second to. An isolate writes it on its first read, then once a
+ * period — five minutes with an hour's window — and at once when the pointer
+ * names another version. The reads of a test share one namespace, as the
+ * requests of one isolate do.
+ */
+t.test('an isolate writes the pointer record once a period, and at once for another version', async t => {
+  const { db, kv } = await activeFixture();
+  const isolate  = { db: counting(db).db, ...recordingWrites(kv) };
+  const pointers = () => isolate.written.filter(key => key === POINTER_KEY).length;
+  const record   = async () => await kv.get(POINTER_KEY, 'json') as { id: string, at: string } | null;
+  const start    = Date.parse('2026-09-23T12:00:00.000Z');
+  const readAt   = (seconds: number) => activeSnapshot(depsOf(isolate.db, isolate.kv, () => new Date(start + seconds * 1000)));
+
+  for (const seconds of [ 0, 10, 299 ]) {
+    await readAt(seconds);
+  }
+  t.equal(pointers(), 1, 'the reads of one period write it once');
+
+  await readAt(300);
+  t.equal(pointers(), 2, 'and the first read of the next period writes it again');
+  t.equal((await record())?.at, new Date(start + 300_000).toISOString(), 'dated by that read');
+
+  const { versionId: next } = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+  await validateSeeded(db, next);
+  await activate(db, next);
+  await readAt(301);
+  t.equal(pointers(), 3, 'a read that finds another version on writes it at once');
+  t.equal((await record())?.id, next, 'naming that version');
+});
+
+/*
+ * After an activation, or when a deploy starts many isolates, they all write
+ * the record together, and KV refuses what exceeds its one write a second. An
+ * isolate whose write was refused writes again a minute or so later — at a
+ * random point between half a minute and a minute and a half, so that those
+ * refused together do not try again together — not on every read it answers.
+ */
+t.test('a pointer record KV refused is written again a minute or so later, not by every read', async t => {
+  const { db, kv, versionId } = await activeFixture();
+  let refusing = true;
+  const isolate  = { db: counting(db).db, ...recordingWrites(refusingKv(kv, method => method === 'put' && refusing)) };
+  const pointers = () => isolate.written.filter(key => key === POINTER_KEY).length;
+  const log      = capturedLog();
+  const start    = Date.parse('2026-09-23T12:00:00.000Z');
+  const readAt   = (seconds: number) => activeSnapshot({
+    ...depsOf(isolate.db, isolate.kv, () => new Date(start + seconds * 1000)),
+    debug: log.debug,
+  });
+
+  for (const seconds of [ 0, 1, 10, 29 ]) {
+    t.equal((await readAt(seconds))?.snapshot.registryVersion.id, versionId, `a read ${seconds} seconds in is answered`);
+  }
+  t.equal(pointers(), 1, 'and the write was tried once');
+  t.same(log.warn.filter(line => line === 'registry pointer cache unwritable'), [ 'registry pointer cache unwritable' ],
+    'which the log warns of once');
+  t.same(log.error, [], 'and not as an error');
+
+  refusing = false;
+  await readAt(91);
+  t.equal(pointers(), 2, 'a read a minute and a half later writes it again');
+  t.equal((await kv.get(POINTER_KEY, 'json') as { at: string } | null)?.at, new Date(start + 91_000).toISOString(),
+    'and the record is written');
+  await readAt(92);
+  t.equal(pointers(), 2, 'after which the period runs as it does for any write');
+});
+
+/*
+ * A write that never finishes — its request cancelled when the client went
+ * away — is as good as refused. A claim lasts the period only once its write
+ * has landed, so the write is made again a minute or so later rather than a
+ * period later: after an activation, the record would name the version before
+ * for that long.
+ */
+t.test('a pointer record whose write never finished is written again a minute or so later', async t => {
+  const { db, kv } = await activeFixture();
+  const isolate  = { db: counting(db).db, ...recordingWrites(unfinishedWrite(kv, POINTER_KEY)) };
+  const pointers = () => isolate.written.filter(key => key === POINTER_KEY).length;
+  const start    = Date.parse('2026-09-23T12:00:00.000Z');
+  const readAt   = (seconds: number) => activeSnapshot(depsOf(isolate.db, isolate.kv, () => new Date(start + seconds * 1000)));
+
+  // the read whose write never finishes is never answered either
+  await writingOrAnswered([ readAt(0) ], pointers);
+  for (const seconds of [ 1, 10, 29 ]) {
+    await readAt(seconds);
+  }
+  t.equal(pointers(), 1, 'the reads that come while it is under way leave the write to it');
+
+  await readAt(91);
+  t.equal(pointers(), 2, 'and a read a minute and a half later writes it again');
+  t.equal((await kv.get(POINTER_KEY, 'json') as { at: string } | null)?.at, new Date(start + 91_000).toISOString(),
+    'so the record is written');
+});
+
+/*
+ * The reads an isolate answers at once all find the record due, and each
+ * would write it while the first write is still under way. The first claims
+ * it, and the others leave it to that one. The write is held until every
+ * read has set out on it or been answered, whatever the timing.
+ */
+t.test('the reads an isolate answers together write the pointer record once', async t => {
+  const { db, kv } = await activeFixture();
+  const held     = heldWrites(kv, POINTER_KEY);
+  const isolate  = { db: counting(db).db, ...recordingWrites(held.kv) };
+  const pointers = () => isolate.written.filter(key => key === POINTER_KEY).length;
+  const start    = Date.parse('2026-09-23T12:00:00.000Z');
+
+  const reads = [ 1, 2, 3, 4, 5 ].map(() => activeSnapshot(depsOf(isolate.db, isolate.kv, () => new Date(start))));
+  await writingOrAnswered(reads, pointers);
+  held.release();
+
+  const answers = await Promise.all(reads);
+  t.ok(answers.every(answer => answer !== null), 'every read is answered');
+  t.equal(pointers(), 1, 'and one of them writes the record');
+});
+
 t.test('a version that is not active yet can be warmed', async t => {
   const { db, kv } = await freshEnvironment();
   const { versionId } = await seedCandidate(db, snapshot);
-  await validate(db, versionId);
+  await validateSeeded(db, versionId);
 
   const warmed = await warmSnapshot(depsOf(db, kv), versionId);
   t.equal(warmed?.id, versionId, 'the validated candidate is serialized');
@@ -281,6 +462,38 @@ t.test('a version that is not active yet can be warmed', async t => {
   const served = await answeredFrom(first, kv);
   t.equal(served.from, 'cache', 'so the first request after the activation pays the pointer read only');
   t.equal(first.statements.length, 1);
+});
+
+/*
+ * A listing can be a minute behind a delete made in another location, and
+ * the hourly job may be removing the bytes of a version switched on after it
+ * read what to keep. So the bytes of the version on are written whatever KV
+ * lists, while a version not on yet is taken as cached when it is listed.
+ */
+t.test('the bytes of the version on are written whatever a listing says', async t => {
+  const { db, kv, versionId } = await activeFixture();
+  const { versionId: waiting } = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+  await validateSeeded(db, waiting);
+
+  // a listing that names every key it is asked for, as one behind a delete may
+  const behind = new Proxy(kv, {
+    get(target, property, receiver) {
+      if (property === 'list') {
+        return async ({ prefix }: { prefix: string }) => ({ keys: [ { name: prefix } ], list_complete: true, cacheStatus: null });
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as KVNamespace;
+  const recorded = recordingWrites(behind);
+
+  const on = await warmSnapshot(depsOf(db, recorded.kv), versionId);
+  t.ok(await kv.get(snapshotKey(on!)) !== null, 'the version on is written, though the listing names it');
+
+  const off = await warmSnapshot(depsOf(db, recorded.kv), waiting);
+  t.equal(off?.id, waiting);
+  t.equal(await kv.get(snapshotKey(off!)), null, 'and a version not on yet is taken as cached');
+  t.same(recorded.written, [ snapshotKey(on!) ], 'with nothing written for it');
 });
 
 t.test('when D1 does not answer, the last version it named is served, and says how old it is', async t => {
@@ -467,8 +680,7 @@ t.test('only what was checked of an entry is served', async t => {
 t.test('a version this release cannot verify is served, but not cached', async t => {
   const { db, kv } = await freshEnvironment();
   const { versionId } = await seedCandidate(db, snapshot);
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, 'f'.repeat(64));
+  await validateSeeded(db, versionId, { checksum: 'f'.repeat(64) });
   await activate(db, versionId);
 
   const isolate = counting(db);
@@ -501,6 +713,56 @@ t.test('a database that answers with a fault is not masked by the cache', async 
   );
   t.not((await activeSnapshot(depsOf(unreachable(), kv)))?.staleFor ?? null, null,
     'while a database that could not be reached is what the fallback is for');
+});
+
+/*
+ * KV is an optimization. A namespace that does not answer, or refuses what is
+ * written to it, leaves a read to D1: slower, with the same answer. What it
+ * takes away is the fallback, so an outage of D1 then has nothing to be
+ * answered from.
+ */
+t.test('a namespace that does not answer slows a read, never fails it', async t => {
+  const { db, kv, versionId } = await activeFixture();
+
+  const unwritable = capturedLog();
+  const writer     = counting(db);
+  const written    = await activeSnapshot({ ...depsOf(writer.db, refusingKv(kv, method => method === 'put')), debug: unwritable.debug });
+  t.equal(written?.snapshot.registryVersion.id, versionId, 'a namespace that refuses writes leaves the version on served');
+  t.ok(writer.statements.length > 1, 'out of D1');
+  t.same(unwritable.warn, [ 'registry pointer cache unwritable', 'registry snapshot cache unwritable' ],
+    'with a warning for each write it refused');
+  t.same(unwritable.error, [], 'and no error');
+
+  const unreadable = capturedLog();
+  const reader     = counting(db);
+  const served     = await activeSnapshot({ ...depsOf(reader.db, refusingKv(kv)), debug: unreadable.debug });
+  t.same(served?.snapshot, written?.snapshot, 'a namespace that answers nothing leaves it served all the same');
+  t.equal(served?.staleFor, null, 'as the version on');
+  t.ok(reader.statements.length > 1, 'out of D1');
+  t.same(unreadable.warn, [ 'registry pointer cache unwritable', 'registry snapshot cache unreadable', 'registry snapshot cache unwritable' ],
+    'with a warning for each call it refused');
+  t.same(unreadable.error, [], 'and no error');
+
+  const pinned = await versionSnapshot(depsOf(counting(db).db, refusingKv(kv)), versionId);
+  t.same(await pinned?.snapshot(), written?.snapshot, 'and a version named by id is read out of D1 too');
+
+  // a fresh isolate's read caches the version, and the pointer record that names it
+  await activeSnapshot(depsOf(counting(db).db, countingReads(kv).kv));
+  t.not((await activeSnapshot(depsOf(unreachable(), kv)))?.staleFor ?? null, null,
+    'with the namespace answering, an outage of D1 is answered from it');
+  await t.rejects(
+    activeSnapshot(depsOf(unreachable(), refusingKv(kv))),
+    { name: 'RegistryUnavailable', reason: 'unreadable' },
+    'while one that answers nothing leaves it nothing to be answered from',
+  );
+
+  const { versionId: waiting } = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
+  await validateSeeded(db, waiting);
+  const unlisted = refusingKv(kv, method => method === 'list');
+  await t.rejects(warmSnapshot(depsOf(db, unlisted), waiting), { message: /^KV GET failed/ },
+    'a warm-up that cannot list the namespace fails, which is why the router and the import catch it');
+  t.equal((await warmSnapshot(depsOf(db, unlisted), versionId))?.id, versionId,
+    'while the warm-up of the version on lists nothing');
 });
 
 /*
@@ -543,7 +805,7 @@ t.test('the scheduled job removes the bytes nothing is about to serve', async t 
   const later = () => new Promise(resolve => setTimeout(resolve, 5));
   const seed  = async () => {
     const { versionId } = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 1 });
-    await validate(db, versionId);
+    await validateSeeded(db, versionId);
     await later();
     return versionId;
   };
@@ -575,6 +837,182 @@ t.test('the scheduled job removes the bytes nothing is about to serve', async t 
 
   await t.rejects(pruneSnapshots(depsOf(unreachable(), kv)), /D1_ERROR/, 'and with D1 unreachable');
   t.equal((await kv.list({ prefix: 'snapshot:' })).keys.length, 3, 'nothing is removed');
+});
+
+/*
+ * The job reads what to keep before it deletes. A version switched on in
+ * between — a rollback to an older version — is not among what it keeps, and
+ * its activation may write its bytes before the job deletes them. The job
+ * asks D1 again once its deletes are over, and writes back the bytes of the
+ * version on.
+ *
+ * Each case starts from two versions, the older one replaced by the one on,
+ * both cached, with the pointer record naming the version on. `switching`
+ * wraps the namespace the job is given: just before it deletes the older
+ * version's bytes, the rollback to that version commits and its activation
+ * warms them.
+ */
+async function rollbackDuringPrune(): Promise<{
+  db:        D1Database,
+  kv:        KVNamespace,
+  older:     { id: string, checksum: string },
+  switching: (namespace: KVNamespace) => KVNamespace,
+  switched:  () => boolean,
+}> {
+  const { db, kv } = await freshEnvironment();
+  const seed = async (attempt: number) => {
+    const { versionId } = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt });
+    await validateSeeded(db, versionId);
+    return versionId;
+  };
+  const older = await seed(1);
+  await activate(db, older);
+  const active = await seed(2);
+  await activate(db, active);
+  for (const versionId of [ older, active ]) {
+    await warmSnapshot(depsOf(db, kv), versionId);
+  }
+  // a fresh isolate's read, which has the pointer record name the version on
+  await activeSnapshot(depsOf(counting(db).db, countingReads(kv).kv));
+
+  const ref = { id: older, checksum: await snapshotChecksum(snapshot.networks) };
+  let switched = false;
+  const switching = (namespace: KVNamespace) => new Proxy(namespace, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'delete' && typeof(value) === 'function') {
+        return async (name: string) => {
+          if (name === snapshotKey(ref)) {
+            await activateVersion(db, { versionId: older, action: 'rollback', actor: 'test-admin', reason: 'test' });
+            await warmSnapshot(depsOf(db, kv), older);
+            switched = true;
+          }
+          return (value as (name: string) => Promise<void>).call(target, name);
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as KVNamespace;
+  return { db, kv, older: ref, switching, switched: () => switched };
+}
+
+const SWITCHED_ON = 'registry snapshot switched on while the prune removed it; caching it again';
+
+t.test('a version switched on while the scheduled job removes its bytes is cached again', async t => {
+  const { db, kv, older, switching } = await rollbackDuringPrune();
+
+  const log    = capturedLog();
+  const pruned = await pruneSnapshots({ ...depsOf(db, switching(kv)), debug: log.debug });
+  t.same(pruned, [ snapshotKey(older) ], 'the job removes the bytes of the version it read as unwanted');
+  t.ok(await kv.get(snapshotKey(older)) !== null, 'yet that version, switched on meanwhile, is cached');
+  t.equal((await cacheStatus(depsOf(db, kv), older)).snapshotCached, true, 'as the status says');
+  t.same(log.warn, [ SWITCHED_ON ], 'and the log says why');
+});
+
+/*
+ * A delete the namespace refuses ends the run, and leaves what it did not
+ * reach to the next hour. What it did delete is checked all the same.
+ */
+t.test('the bytes the job removed are checked though a later delete fails', async t => {
+  const { db, kv, older, switching, switched } = await rollbackDuringPrune();
+  // an entry of another schema, listed after the older version's bytes
+  const foreign = `snapshot:v2:${randomUUID()}:${'a'.repeat(64)}`;
+  await kv.put(foreign, '{}');
+  const refused = refusingKv(kv, (method, [ name ]) => method === 'delete' && name === foreign);
+
+  const log = capturedLog();
+  await t.rejects(pruneSnapshots({ ...depsOf(db, switching(refused)), debug: log.debug }), { message: /^KV DELETE failed/ },
+    'the job fails on the delete the namespace refused');
+  t.ok(switched(), 'after removing the bytes of the version switched on meanwhile');
+  t.ok(await kv.get(snapshotKey(older)) !== null, 'which are cached again all the same');
+  t.same(log.warn, [ SWITCHED_ON ], 'as the log says');
+  t.ok(await kv.get(foreign) !== null, 'while the entry it could not delete is left to the next run');
+});
+
+// KV may remove an entry and still answer its delete as failed, so that delete is checked too
+t.test('the bytes of a delete that failed are checked too', async t => {
+  const { db, kv, older, switching } = await rollbackDuringPrune();
+  const lost = new Proxy(kv, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'delete' && typeof(value) === 'function') {
+        return async (name: string) => {
+          await (value as (name: string) => Promise<void>).call(target, name);
+          throw new Error('KV DELETE failed: 503 Service Unavailable');
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as KVNamespace;
+
+  const log = capturedLog();
+  await t.rejects(pruneSnapshots({ ...depsOf(db, switching(lost)), debug: log.debug }), { message: /^KV DELETE failed/ },
+    'the job fails on a delete that removed its entry and answered as failed');
+  t.ok(await kv.get(snapshotKey(older)) !== null, 'and caches again the bytes of the version switched on meanwhile');
+  t.same(log.warn, [ SWITCHED_ON ], 'as the log says');
+});
+
+// a database that, once the rollback has switched, does not answer the statements `fails` picks
+function downOnceSwitched(db: D1Database, switched: () => boolean, fails: (query: string) => boolean = () => true): D1Database {
+  return new Proxy(db, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'prepare' && typeof(value) === 'function') {
+        return (query: string) => {
+          if (switched() && fails(query)) {
+            throw new Error(`D1_ERROR: network connection lost`);
+          }
+          return (value as (query: string) => D1PreparedStatement).call(target, query);
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as D1Database;
+}
+
+/*
+ * The deletes are over when the job asks D1 again, so a database that does
+ * not answer then fails that check, not the job: the job still answers with
+ * what it removed. A version switched on meanwhile is left to the first read
+ * that hydrates it.
+ */
+t.test('a database that stops answering once the job deletes leaves the job its answer', async t => {
+  const { db, kv, older, switching, switched } = await rollbackDuringPrune();
+
+  const log    = capturedLog();
+  const pruned = await pruneSnapshots({ ...depsOf(downOnceSwitched(db, switched), switching(kv)), debug: log.debug });
+  t.same(pruned, [ snapshotKey(older) ], 'the job answers with what it removed');
+  t.same(log.warn, [ 'registry snapshot not checked again after the prune' ], 'and warns that it could not ask again');
+  t.equal(await kv.get(snapshotKey(older)), null, 'so the version switched on meanwhile is not cached');
+
+  await activeSnapshot(depsOf(counting(db).db, kv));
+  t.ok(await kv.get(snapshotKey(older)) !== null, 'until a read hydrates it');
+});
+
+// D1 says which version is on, and does not answer the warm-up that would cache it again
+t.test('a warm-up D1 does not answer once the job deletes leaves the job its answer', async t => {
+  const { db, kv, older, switching, switched } = await rollbackDuringPrune();
+  const hydrating = downOnceSwitched(db, switched, query => !/registry_state/.test(query));
+
+  const log    = capturedLog();
+  const pruned = await pruneSnapshots({ ...depsOf(hydrating, switching(kv)), debug: log.debug });
+  t.same(pruned, [ snapshotKey(older) ], 'the job answers with what it removed');
+  t.same(log.warn, [ SWITCHED_ON, 'registry snapshot not warmed' ], 'and warns that the bytes were not cached again');
+  t.equal(await kv.get(snapshotKey(older)), null, 'as they are not');
+});
+
+/*
+ * The log says the job sets out to cache the bytes again, not that it did:
+ * writeSnapshot says so when the namespace refuses the write.
+ */
+t.test('a write the namespace refuses is not logged as the bytes cached again', async t => {
+  const { db, kv, older, switching } = await rollbackDuringPrune();
+  const unwritable = refusingKv(kv, method => method === 'put');
+
+  const log = capturedLog();
+  await pruneSnapshots({ ...depsOf(db, switching(unwritable)), debug: log.debug });
+  t.same(log.warn, [ SWITCHED_ON, 'registry snapshot cache unwritable' ], 'the log says the job tried, and that the write was refused');
+  t.equal(await kv.get(snapshotKey(older)), null, 'and the bytes are not cached');
 });
 
 /*

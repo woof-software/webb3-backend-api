@@ -143,7 +143,7 @@ test.afterEach(() => fetch.satisfy(assert));
  * - include proper CORS headers on 200s
  * - block invalid JSON-RPC payload, w/o sending to provider -> 400
  * - respond to eth_chainId, w/o sending to provider
- * - fallback to alchemyEthMainnet -> 503, Retry-After 0
+ * - fallback to alchemyEthMainnet -> 503, Retry-After as configured
  *   - persist fallback to alchemyEthMainnet on subsequent requests
  *   - expire fallback to alchemyEthMainnet
  * - fail w/ no available fallback -> 503, Retry-After >=10s

@@ -1,5 +1,6 @@
 import * as Eth      from '../lib/eth-constants.js';
 import * as Fallible from '../lib/fallible/fallible.js';
+import * as jsonRpc  from '../lib/json-rpc.js';
 
 import * as KnownNetwork  from '../lib/well-known/networks/network.js';
 import * as ContractUtils from '../lib/well-known/contracts/utils.js';
@@ -13,7 +14,7 @@ import * as transactionHistoryHandler from './transaction-history-handler/transa
 import type { Contract } from '../lib/well-known/contracts/types.js';
 import type { RegistryComet } from '../lib/model/comet-registry.js';
 
-import { ApiError, failureResponse, isApiError } from './http/errors.js';
+import { ApiError, failureResponse, isApiError, nodeUnavailable } from './http/errors.js';
 import { refuseTestnet, refuseTestnetsParameter } from './testnets.js';
 import type { Catalog } from './registry/catalog.js';
 import {
@@ -102,8 +103,11 @@ interface GovernanceRouteData {
   queryParams: URL['searchParams'];
   /*
    * The registry, not loaded. Governance resolves its own contracts
-   * statically; only proposal action targets the constants do not know are
-   * looked up here, so a governance request that needs none never reads D1.
+   * statically. The proposal list reads it for three kinds of action it may
+   * describe again — a target the constants do not know, an action bridged
+   * to another chain, and a call to a contract that administers markets —
+   * so almost every page reads it, and only a page with none of them never
+   * reads D1.
    */
   registry: RequestCatalog;
 }
@@ -190,11 +194,16 @@ async function route(
        * without rewards, a cursor of another version — says it; a route that
        * needs the registry cannot be answered from anywhere else, since after
        * the cutover there is no static market list to fall back to, so it
-       * fails with 503 while the rest of the API keeps working. Anything else
-       * is a 500 that tells the client nothing but the id, while the log
-       * gets the whole of it.
+       * fails with 503 while the rest of the API keeps working. So does a
+       * node provider that did not serve the request, which a client may ask
+       * again; a call the contract reverted is its answer, not the node's
+       * failure. Anything else is a 500 that tells the client nothing but the
+       * id, while the log gets the whole of it.
        */
-      const said = isApiError(e) ? e : isRegistryUnavailable(e) ? unavailableError(e) : null;
+      const said = isApiError(e) ? e
+        : isRegistryUnavailable(e) ? unavailableError(e)
+        : jsonRpc.isNotServed(e) ? nodeUnavailable(e)
+        : null;
       return failureResponse(said, e, {
         requestId,
         pathname: new URL(request.url).pathname,

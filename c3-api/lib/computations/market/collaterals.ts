@@ -97,10 +97,6 @@ const collaterals = implement({
   },
 });
 
-/*
- * The value of the collateral a market holds, over the assets whose price
- * could be read.
- */
 function collateralValue(collaterals: Collateral[]): BigFixnum {
   return collaterals.reduce(
     (sum, { totalCollateral, price }) => price.status === 'success'

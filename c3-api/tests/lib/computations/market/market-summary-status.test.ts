@@ -44,9 +44,6 @@ const one = (decimals = 8) => BigFixnum.from({ decimals, value: BigNumber.from(1
 const read     = (price: BigFixnum) => ({ status: 'success' as const, price });
 const reverted = { status: 'error' as const, message: 'execution reverted' };
 
-/*
- * A computation that answers from `answer` without reading anything.
- */
 function stub(answer: (context: any) => unknown) {
   return Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
 }

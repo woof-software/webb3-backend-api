@@ -28,7 +28,6 @@ const UNKNOWN     = '0x1111111111111111111111111111111111111111';
 
 type Envelope = { error: { code: string, message: string, requestId: string } };
 
-// a database whose every statement fails as `message` says
 function failing(message: string): D1Database {
   const fail = () => { throw new Error(message); };
   return { prepare: fail, batch: fail, exec: fail, dump: fail } as unknown as D1Database;
@@ -48,7 +47,6 @@ async function get(env: Env, path: string, headers: Record<string, string> = {})
   return C3Api.fetch(new Request(`https://api.test.local${path}`, { headers }), env);
 }
 
-// what the worker logged, for the length of a test, each line after its level
 function captureLogs(t: Test): string[] {
   const lines: string[] = [];
   const { error, warn } = console;

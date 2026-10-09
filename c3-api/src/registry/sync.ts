@@ -180,17 +180,26 @@ async function acquireRun(db: D1Database, options: LeaseOptions): Promise<Fence 
 
 /*
  * Releases the lease without finishing the run, so the next invocation can
- * continue immediately instead of waiting for the lease to expire.
+ * continue immediately instead of waiting for the lease to expire. `error`
+ * is why the invocation stopped, where that is the run's to report, and
+ * replaces the run's error under the same fence.
  */
-async function releaseLease(db: D1Database, fence: Fence): Promise<boolean> {
+async function releaseLease(db: D1Database, fence: Fence, options: { error?: string } = {}): Promise<boolean> {
   const result = await db.prepare(
-    `UPDATE sync_runs SET lease_owner = NULL, lease_expires_at = NULL
+    `UPDATE sync_runs SET lease_owner = NULL, lease_expires_at = NULL, last_error = COALESCE(?3, last_error)
      WHERE id = ?1 AND status = 'running' AND lease_owner = ?2`
-  ).bind(fence.runId, fence.owner).run();
+  ).bind(fence.runId, fence.owner, options.error ?? null).run();
   return changedRows(result) === 1;
 }
 
-// the run is still running, and this invocation still holds it
+/*
+ * The run is still running and this invocation still holds it, though its
+ * lease may have run out: unlike checkpointHeld, this leaves the expiry
+ * unread. It guards the verdict that ends the run, committed with
+ * finishRunStatement, which reads the owner alone as well; an invocation
+ * whose lease ran out holds the run until another takes it over (acquireRun)
+ * or an operator cancels it (cancelRun).
+ */
 function leaseHeld(fence: Fence): Condition {
   return {
     sql: first => `EXISTS (
@@ -404,14 +413,16 @@ async function bindCandidate(
 }
 
 /*
- * Finishes the run. `completed` requires an outcome, which distinguishes an
- * import that produced a version from one that found the source unchanged.
+ * Finishes the run. `completed` requires an outcome, as the schema does, and
+ * a run only ever completes `imported`: a commit already imported starts no
+ * run, and `no_change` is only what a sync answers then (admin-router.ts).
  */
 type RunFinish = {
   status:             Exclude<SyncRunStatus, 'running'>,
   outcome?:           SyncOutcome,
   registryVersionId?: string,
-  error?:             string,
+  // replaces the run's error, and null clears it; left out, the run keeps the error it has
+  error?:             string | null,
 };
 
 /*
@@ -428,8 +439,8 @@ function finishRunStatement(
     db,
     `UPDATE sync_runs
      SET status = ?1, outcome = ?2, registry_version_id = COALESCE(?3, registry_version_id),
-         last_error = COALESCE(?4, last_error), lease_owner = NULL, lease_expires_at = NULL,
-         completed_at = ?5
+         last_error = CASE WHEN ?8 = 1 THEN ?4 ELSE last_error END,
+         lease_owner = NULL, lease_expires_at = NULL, completed_at = ?5
      WHERE id = ?6 AND status = 'running' AND lease_owner = ?7`,
     [
       finish.status,
@@ -438,6 +449,7 @@ function finishRunStatement(
       finish.error ?? null,
       at(options.now),
       fence.runId, fence.owner,
+      finish.error === undefined ? 0 : 1,
     ],
     options.when,
   );
@@ -445,6 +457,60 @@ function finishRunStatement(
 
 async function finishRun(db: D1Database, fence: Fence, finish: RunFinish, options: ClockOption = {}): Promise<boolean> {
   return changedRows(await finishRunStatement(db, fence, finish, options).run()) === 1;
+}
+
+/*
+ * Ends a run no invocation can finish: one whose every invocation fails the
+ * same way before it gets anywhere, which the hourly job and every request
+ * would otherwise keep taking up. An operator ends it, with why.
+ *
+ * Only a run nobody holds is ended — its lease given back, or run out — since
+ * an invocation holding a live one may be importing into it. A root still in
+ * progress was left by an invocation that stopped, and is failed as the
+ * invocation taking the run over would fail it (acquireRun). Every statement
+ * carries the same condition in one transaction, so all of it happens, or
+ * none does.
+ *
+ * The run and its roots are read back in that transaction too. The caller
+ * answers with what the cancel found or did, which a read after it could
+ * contradict — a lease given back in between — or fail on, once the run
+ * has already ended.
+ */
+async function cancelRun(
+  db: D1Database,
+  runId: string,
+  cancel: { actor: string, reason: string },
+  options: ClockOption = {},
+): Promise<{ cancelled: boolean, run: SyncRunRow | null, items: SyncRunItemRow[] }> {
+  const timestamp = at(options.now);
+  const idle      = `id = ?1 AND status = 'running' AND (lease_owner IS NULL OR lease_expires_at <= ?2)`;
+  const [ , , ended, run, items ] = await db.batch([
+    // the counter first, while the roots it counts are still in progress
+    db.prepare(
+      `UPDATE sync_runs
+       SET failed_count = failed_count + (
+             SELECT COUNT(*) FROM sync_run_items
+             WHERE sync_run_id = sync_runs.id AND status = 'processing' AND attempts >= ${MAX_ITEM_ATTEMPTS}
+           )
+       WHERE ${idle}`
+    ).bind(runId, timestamp),
+    db.prepare(
+      `UPDATE sync_run_items SET status = 'failed', last_error = ?3, updated_at = ?2
+       WHERE sync_run_id = ?1 AND status = 'processing' AND EXISTS (SELECT 1 FROM sync_runs WHERE ${idle})`
+    ).bind(runId, timestamp, ABANDONED),
+    db.prepare(
+      `UPDATE sync_runs
+       SET status = 'failed', last_error = ?3, lease_owner = NULL, lease_expires_at = NULL, completed_at = ?2
+       WHERE ${idle}`
+    ).bind(runId, timestamp, `cancelled by ${cancel.actor}: ${cancel.reason}`),
+    db.prepare(`SELECT * FROM sync_runs WHERE id = ?1`).bind(runId),
+    db.prepare(`SELECT * FROM sync_run_items WHERE sync_run_id = ?1 ORDER BY root_path`).bind(runId),
+  ]);
+  return {
+    cancelled: changedRows(ended!) === 1,
+    run:       (run!.results?.[0] ?? null) as SyncRunRow | null,
+    items:     (items!.results ?? []) as SyncRunItemRow[],
+  };
 }
 
 async function runningRun(db: D1Database): Promise<SyncRunRow | null> {
@@ -502,13 +568,6 @@ async function importOf(db: D1Database, versionId: string): Promise<ImportRun | 
       .filter(item => item.upstream_network_key !== null && item.deployment_key !== null)
       .map(item => ({ upstreamNetworkKey: item.upstream_network_key!, deploymentKey: item.deployment_key! })),
   };
-}
-
-async function pendingItems(db: D1Database, runId: string): Promise<number> {
-  const value = await db.prepare(
-    `SELECT COUNT(*) AS n FROM sync_run_items WHERE sync_run_id = ?1 AND ${OUTSTANDING}`
-  ).bind(runId).first<number>('n');
-  return value ?? 0;
 }
 
 /*
@@ -570,6 +629,7 @@ export {
   MAX_ITEM_ATTEMPTS,
   acquireRun,
   bindCandidate,
+  cancelRun,
   checkpointsOf,
   claimItem,
   completeItem,
@@ -581,7 +641,6 @@ export {
   lastStartedAt,
   leaseHeld,
   noRunImporting,
-  pendingItems,
   progressOf,
   readRun,
   recordUpstreamCheck,

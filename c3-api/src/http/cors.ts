@@ -23,8 +23,9 @@
  *
  * The ETag too: the preflight allows If-None-Match, and a script that keeps
  * its own copy of a snapshot can only send the tag back if it can read it.
+ * And Retry-After, which says when a 503 is worth asking again.
  */
-const EXPOSED_HEADERS = 'ETag, X-Registry-Version, X-Registry-Checksum, X-Registry-Stale';
+const EXPOSED_HEADERS = 'ETag, X-Registry-Version, X-Registry-Checksum, X-Registry-Stale, Retry-After';
 
 
 const PUBLIC_CORS: Record<string, string> = {

@@ -246,6 +246,51 @@ t.test('WorkingsetEvaluator: a failed cache read still fails the evaluation', as
   t.strictSame(unobserved, [], 'no read rejects unobserved');
 });
 
+/*
+ * A node error reaches an evaluation as a computation that throws, or as a
+ * receiver that throws on what a batched call answered, as ethCall's does.
+ * Either fails the whole evaluation, whichever item of a split it is in:
+ * the summary and dapp-data routes and account rewards evaluate their lists
+ * on this evaluator, and a list is never answered without a market whose
+ * read failed.
+ */
+t.test('WorkingsetEvaluator: a computation that throws fails the evaluation', async t => {
+  type Read = Compute.Spec<{ name: 'read', expects: number, returns: number }>;
+  const read = Compute.Functor<Read>({}).implement({
+    version: 1,
+    compute: v => {
+      if (v === 2) {
+        throw new Error('the node did not answer');
+      }
+      return v;
+    },
+  });
+  const evaluator = Workingset.Evaluator<Read>({ read }, { flags: Flags.parse(process.env) });
+  await t.rejects(
+    evaluator.evaluate(evaluator.split([ 1, 2, 3 ].map(v => evaluator.pull1({ read: v })))),
+    /the node did not answer/,
+  );
+});
+
+t.test('WorkingsetEvaluator: a receiver that throws fails the evaluation', async t => {
+  type Checked = Compute.Spec<{ name: 'checked', depends: [ Increment ], expects: number, returns: number }>;
+  const { implement, pipe1 } = Compute.Functor<Checked>({});
+  const checked = implement({
+    version: 1,
+    compute: v => pipe1([ { increment: v }, result => {
+      if (v === 2) {
+        throw new Error('call error: header not found');
+      }
+      return result;
+    } ]),
+  });
+  const evaluator = Workingset.Evaluator<Checked>({ checked, increment }, { flags: Flags.parse(process.env) });
+  await t.rejects(
+    evaluator.evaluate(evaluator.split([ 1, 2, 3 ].map(v => evaluator.pull1({ checked: v })))),
+    /header not found/,
+  );
+});
+
 t.test('WorkingsetEvaluator: a computation that fails says why', async t => {
   type Refuse = Compute.Spec<{ name: 'refuse', expects: number, returns: number }>;
   const refuse = Compute.Functor<Refuse>({}).implement({

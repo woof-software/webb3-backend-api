@@ -78,7 +78,6 @@ type SyncItemStatus  = (typeof SYNC_ITEM_STATUSES)[number];
  */
 const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 const SHA1_PATTERN    = /^[0-9a-f]{40}$/;
-const SHA256_PATTERN  = /^[0-9a-f]{64}$/;
 
 function isAddress(value: unknown): value is Address {
   return typeof(value) === 'string' && ADDRESS_PATTERN.test(value);
@@ -105,10 +104,6 @@ function checksumAddress(value: Address | string): Address {
 
 function isCommitSha(value: unknown): value is string {
   return typeof(value) === 'string' && SHA1_PATTERN.test(value);
-}
-
-function isChecksum(value: unknown): value is string {
-  return typeof(value) === 'string' && SHA256_PATTERN.test(value);
 }
 
 /*
@@ -993,7 +988,6 @@ export {
   SYNC_TRIGGER_KINDS,
   VERSION_STATUSES,
   isAddress,
-  isChecksum,
   isCommitSha,
   MARKET_KEY_SEPARATOR,
   marketKey,

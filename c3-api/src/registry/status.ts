@@ -53,17 +53,19 @@ type RegistryStatus = {
   },
   sync: {
     lastRun: {
-      id:             string,
-      status:         string,
-      outcome:        string | null,
-      startedAt:      string,
-      completedAt:    string | null,
-      ageSeconds:     number,
-      failedCount:    number,
-      expectedCount:  number,
-      completedCount: number,
-      lastError:      string | null,
-      leaseExpiresAt: string | null,
+      id:                string,
+      // the version the run imports into, null until it has created one
+      registryVersionId: string | null,
+      status:            string,
+      outcome:           string | null,
+      startedAt:         string,
+      completedAt:       string | null,
+      ageSeconds:        number,
+      failedCount:       number,
+      expectedCount:     number,
+      completedCount:    number,
+      lastError:         string | null,
+      leaseExpiresAt:    string | null,
     } | null,
     upstreamCheckedAt: string | null,
     upstreamAgeSeconds: number | null,
@@ -122,8 +124,8 @@ type ActiveRow = {
 };
 
 type RunRow = {
-  id: string, status: string, outcome: string | null, started_at: string,
-  completed_at: string | null, failed_count: number, expected_count: number,
+  id: string, registry_version_id: string | null, status: string, outcome: string | null,
+  started_at: string, completed_at: string | null, failed_count: number, expected_count: number,
   completed_count: number, last_error: string | null, lease_expires_at: string | null,
 };
 
@@ -195,6 +197,12 @@ function stalled(run: RunRow | null, lastItemAt: string | null, now: Date): bool
  * one succeeded. The attempt a live invocation is making counts for nothing
  * yet, and the ones before it on the same root count as the failures they
  * were.
+ *
+ * The run's error can also be that of an invocation that failed before it
+ * attempted a root — on a decision a version stores that a parser refuses,
+ * or on a fault (importer.ts, underFence) — and it counts as the latest
+ * failure all the same. Such an invocation moves no root, so a run that
+ * every invocation fails on that way is stalled as well, in time.
  */
 const FAILING_AFTER_ATTEMPTS = 2;
 
@@ -249,8 +257,8 @@ async function registryStatus(env: Env, deps: CacheDeps): Promise<RegistryStatus
        WHERE state.singleton_id = 1`
     ),
     db.prepare(
-      `SELECT id, status, outcome, started_at, completed_at, failed_count, expected_count,
-              completed_count, last_error, lease_expires_at
+      `SELECT id, registry_version_id, status, outcome, started_at, completed_at, failed_count,
+              expected_count, completed_count, last_error, lease_expires_at
        FROM sync_runs ORDER BY started_at DESC LIMIT 1`
     ),
     /*
@@ -448,17 +456,18 @@ async function registryStatus(env: Env, deps: CacheDeps): Promise<RegistryStatus
     cache,
     sync: {
       lastRun: runRow === null ? null : {
-        id:             runRow.id,
-        status:         runRow.status,
-        outcome:        runRow.outcome,
-        startedAt:      runRow.started_at,
-        completedAt:    runRow.completed_at,
-        ageSeconds:     ageOf(runRow.completed_at ?? runRow.started_at, now) ?? 0,
-        failedCount:    runRow.failed_count,
-        expectedCount:  runRow.expected_count,
-        completedCount: runRow.completed_count,
-        lastError:      runRow.last_error,
-        leaseExpiresAt: runRow.lease_expires_at,
+        id:                runRow.id,
+        registryVersionId: runRow.registry_version_id,
+        status:            runRow.status,
+        outcome:           runRow.outcome,
+        startedAt:         runRow.started_at,
+        completedAt:       runRow.completed_at,
+        ageSeconds:        ageOf(runRow.completed_at ?? runRow.started_at, now) ?? 0,
+        failedCount:       runRow.failed_count,
+        expectedCount:     runRow.expected_count,
+        completedCount:    runRow.completed_count,
+        lastError:         runRow.last_error,
+        leaseExpiresAt:    runRow.lease_expires_at,
       },
       upstreamCheckedAt:  stateRow?.last_upstream_checked_at ?? null,
       upstreamAgeSeconds: upstreamAge,

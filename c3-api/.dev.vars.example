@@ -22,8 +22,8 @@
 # Optional Blocknative API key for /legacy/mainnet/gas-price
 # BLOCK_NATIVE_API_KEY=
 
-# Comet registry admin API: lowercase hex SHA-256 of the admin bearer token,
-# never the token itself
+# Comet registry admin API: the SHA-256 of the admin bearer token, as 64 hex
+# digits, never the token itself
 # COMET_REGISTRY_ADMIN_TOKEN_HASH=
 
 # Optional name the registry records as the actor of every administrative

@@ -25,6 +25,7 @@ import {
   readActivationHistory,
   readActiveVersionId,
   readMarket,
+  readNetworkOverlay,
   readRegistrySnapshot,
   readSnapshot,
   readUnreviewed,
@@ -39,6 +40,7 @@ import { orderNetworks, overlayDigest, overlayOfMarket, parseMarketOverlay } fro
 import { compareWithStatic } from './shadow.js';
 import { replaceOverlays, validateStoredVersion } from './admin.js';
 import type { FeedReader } from './admin.js';
+import { cancelRun } from './sync.js';
 
 /*
  * The registry HTTP handlers. They resolve a version, shape the response, and
@@ -500,13 +502,7 @@ async function getVersionDetail(context: RegistryContext, versionId: string): Pr
  * resumable.
  */
 async function getSyncRun(context: RegistryContext, syncRunId: string): Promise<Response> {
-  const run = await context.db.prepare(`SELECT * FROM sync_runs WHERE id = ?1`).bind(syncRunId).first<{
-    id: string, source_commit_sha: string, tracked_ref: string | null, registry_version_id: string | null,
-    trigger_kind: string, requested_by: string | null, reason: string | null, status: string,
-    outcome: string | null, lease_expires_at: string | null, expected_count: number,
-    completed_count: number, failed_count: number, last_error: string | null,
-    started_at: string, completed_at: string | null,
-  }>();
+  const run = await context.db.prepare(`SELECT * FROM sync_runs WHERE id = ?1`).bind(syncRunId).first<SyncRunRecord>();
   if (run === null || run === undefined) {
     throw new ApiError('NOT_FOUND', `no sync run with that id`);
   }
@@ -515,12 +511,30 @@ async function getSyncRun(context: RegistryContext, syncRunId: string): Promise<
     `SELECT root_path, upstream_network_key, deployment_key, status, attempts,
             completed_at, last_error, updated_at
      FROM sync_run_items WHERE sync_run_id = ?1 ORDER BY root_path`
-  ).bind(syncRunId).all<{
-    root_path: string, upstream_network_key: string, deployment_key: string,
-    status: string, attempts: number, completed_at: string | null,
-    last_error: string | null, updated_at: string,
-  }>();
+  ).bind(syncRunId).all<SyncRunItemRecord>();
 
+  return syncRunResponse(run, items.results ?? []);
+}
+
+type SyncRunRecord = {
+  id: string, source_commit_sha: string, tracked_ref: string | null, registry_version_id: string | null,
+  trigger_kind: string, requested_by: string | null, reason: string | null, status: string,
+  outcome: string | null, lease_expires_at: string | null, expected_count: number,
+  completed_count: number, failed_count: number, last_error: string | null,
+  started_at: string, completed_at: string | null,
+};
+
+type SyncRunItemRecord = {
+  root_path: string, upstream_network_key: string, deployment_key: string,
+  status: string, attempts: number, completed_at: string | null,
+  last_error: string | null, updated_at: string,
+};
+
+/*
+ * What both sync run routes answer: the run read by id, or as a cancel left
+ * it. Every field is named, so neither owner a row carries leaves the worker.
+ */
+function syncRunResponse(run: SyncRunRecord, items: SyncRunItemRecord[]): Response {
   return jsonResponse({
     syncRun: {
       id:                run.id,
@@ -540,7 +554,7 @@ async function getSyncRun(context: RegistryContext, syncRunId: string): Promise<
       startedAt:         run.started_at,
       completedAt:       run.completed_at,
     },
-    items: (items.results ?? []).map(item => ({
+    items: items.map(item => ({
       rootPath:           item.root_path,
       upstreamNetworkKey: item.upstream_network_key,
       deploymentKey:      item.deployment_key,
@@ -551,6 +565,25 @@ async function getSyncRun(context: RegistryContext, syncRunId: string): Promise<
       updatedAt:          item.updated_at,
     })),
   });
+}
+
+/*
+ * Ends a run no invocation can finish (cancelRun), answered with the run as
+ * the cancel left it. A run that has ended is refused, and so is one an
+ * invocation holds, which may be importing into it, until its lease has run
+ * out.
+ */
+async function cancelSyncRun(context: RegistryContext, syncRunId: string, reason: string): Promise<Response> {
+  const { cancelled, run, items } = await cancelRun(context.db, syncRunId, { actor: context.actor, reason });
+  if (run === null) {
+    throw new ApiError('NOT_FOUND', `no sync run with that id`);
+  }
+  if (!cancelled) {
+    throw new ApiError('CONFLICT', run.status !== 'running'
+      ? `the sync run has already ended; it is ${run.status}`
+      : `an invocation holds the sync run until ${run.lease_expires_at}; cancel it once that has passed`);
+  }
+  return syncRunResponse(run, items);
 }
 
 /*
@@ -654,6 +687,31 @@ async function getMarketOverlay(
     reviewed,
     digest: reviewed ? await overlayDigest(parseMarketOverlay(overlay, scope)) : null,
     overlay,
+  });
+}
+
+/*
+ * The same for one network. A network overlay is replaced whole, so a change
+ * to it starts from what the version holds: one built from what another
+ * version serves would drop every exception this one has and that one lacks.
+ */
+async function getNetworkOverlay(context: RegistryContext, versionId: string, chainId: number): Promise<Response> {
+  const [ version, network ] = await Promise.all([
+    readVersion(context.db, versionId),
+    readNetworkOverlay(context.db, versionId, chainId),
+  ]);
+  if (version === null) {
+    throw new ApiError('NOT_FOUND', `no registry version with that id`);
+  }
+  if (network === null) {
+    throw new ApiError('NOT_FOUND', `chain ${chainId} is not in this registry version`);
+  }
+  return jsonResponse({
+    versionId,
+    scope:    String(chainId),
+    reviewed: network.reviewed,
+    digest:   network.reviewed ? await overlayDigest(network.overlay) : null,
+    overlay:  network.overlay,
   });
 }
 
@@ -787,6 +845,7 @@ async function postActivation(
 export type { RegistryContext };
 
 export {
+  cancelSyncRun,
   chainIdOf,
   getActive,
   getChanges,
@@ -794,6 +853,7 @@ export {
   applyProposal,
   getMarketOverlay,
   getMarkets,
+  getNetworkOverlay,
   getProposal,
   getProposalReview,
   getNetworks,

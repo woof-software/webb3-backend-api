@@ -6,8 +6,6 @@ import type { MarketV1, NetworkV1, PriceExceptionV1, RegistrySnapshotV1 } from '
 import type { RawTransactionHistoryItem } from '../../../lib/model/transaction-history/item.js';
 
 import { BigFixnum } from '../../../lib/bigfixnum.js';
-import { balanceOf } from '../../../lib/computations/comet/balance-of.js';
-import { borrowBalanceOf } from '../../../lib/computations/comet/borrow-balance-of.js';
 import { enrichTransactionHistoryItem, isBulker } from '../../../lib/computations/account/enrich-transaction-history-items.js';
 import { rawTransactionHistoryItems, tokenSymbol } from '../../../lib/computations/account/raw-transaction-history-items.js';
 import { baseAssetLabel, marketRewards } from '../../../lib/computations/market/market-rewards.js';
@@ -561,8 +559,8 @@ t.test('history is keyed by what its network says, not by the whole version', as
  * them to, and each market's contracts and creation block: nothing else a
  * version says about a market reaches an item. So a new feed, an exception or
  * a capability keeps every page computed so far — the raw items name their
- * contracts by address, and the balances enrichment reads are a Comet's at
- * its base scale — while a symbol or a scale an amount is read at does not.
+ * contracts by address — while a symbol or a scale an amount is read at does
+ * not.
  */
 t.test('history is keyed by what it reads of a market, not by everything the market says', async t => {
   const onMainnet = (change: (market: MarketV1) => MarketV1, network: (network: NetworkV1) => NetworkV1 = same => same) => catalogOf({
@@ -623,20 +621,6 @@ t.test('history is keyed by what it reads of a market, not by everything the mar
     'a new feed is a new market to the computations that price it');
   t.equal(await rawKey(refed), await rawKey(catalog), 'but the same raw history');
   t.not(await rawKey(resymboled), await rawKey(catalog), 'unlike a new symbol');
-
-  const balanceKeys = async (lookup: Catalog) => {
-    const context = {
-      apiHost: '', nodeHost: '', nodeKey: '', network: MAINNET, address: account as `0x${string}`,
-      blockNumber: 19_000_000, contract: lookup.marketAt(MAINNET, USDC)!.comet,
-    };
-    return [ await balanceOf.key('balanceOf', context), await borrowBalanceOf.key('borrowBalanceOf', context) ];
-  };
-  t.same(await balanceKeys(refed), await balanceKeys(catalog), 'and the same balances, which enrichment reads');
-  const rebased = usdcOnly(market => ({
-    ...market,
-    baseAsset: { ...market.baseAsset, token: { ...market.baseAsset.token, decimals: 18 } },
-  }));
-  t.notSame(await balanceKeys(rebased), await balanceKeys(catalog), 'unless the base scale they are read at changed');
 
   /*
    * An enriched item is kept under the history of its network too: what it
@@ -794,8 +778,9 @@ t.test('a proposal names the collateral and the feeds the version describes, at 
 /*
  * Governance describes a proposal against the constants, and again against
  * the registry only where the registry can say more: an action whose target
- * only the registry describes, and a bridge whose inner actions may target
- * one. A target neither knows is left as it was.
+ * only the registry describes, a bridge whose inner actions may target one,
+ * and a call to a contract that administers markets. A target neither knows
+ * is left as it was.
  */
 t.test('proposal actions are described again where the registry says more', async t => {
   const NEW_MAINNET = '0x3333333333333333333333333333333333333333';
@@ -844,16 +829,26 @@ t.test('proposal actions are described again where the registry says more', asyn
   const configurator = (Object.values((Eth.wellKnownContractsByNetwork[MAINNET] as any)['Configurator'])[0] as { address: string }).address;
   const speed        = 'setBaseTrackingSupplySpeed(address,uint64)';
   const speedData    = defaultAbiCoder.encode([ 'address', 'uint64' ], [ NEW_MAINNET, 1000 ]);
+  // its upgrade goes through the proxy admin, which the constants call CometAdmin, and its reward token through CometRewards
+  const cometAdmin   = (Object.values((Eth.wellKnownContractsByNetwork[MAINNET] as any)['CometAdmin'])[0] as { address: string }).address;
+  const cometRewards = (Object.values((Eth.wellKnownContractsByNetwork[MAINNET] as any)['CometRewards'])[0] as { address: string }).address;
+  const comp         = (Eth.wellKnownContractsByNetwork[MAINNET] as any)['COMP']['default'].address;
+  const upgrade      = defaultAbiCoder.encode([ 'address', 'address' ], [ configurator, NEW_MAINNET ]);
+  const rewardConfig = defaultAbiCoder.encode([ 'address', 'address' ], [ NEW_MAINNET, comp ]);
 
   const proposals = [ { actions: [
     action(NEW_MAINNET, pause, paused),
     action(NOBODY, pause, paused),
     action(messenger, 'sendMessage(address,bytes,uint32)', bridged),
     action(configurator, speed, speedData),
+    action(cometAdmin, 'deployAndUpgradeTo(address,address)', upgrade),
+    action(cometRewards, 'setRewardConfig(address,address)', rewardConfig),
   ] } ] as never as Parameters<typeof describeRegistryTargets>[0];
-  const [ onRegistry, onNobody, onBridge, onConfigurator ] = (proposals[0] as any).actions;
+  const [ onRegistry, onNobody, onBridge, onConfigurator, onCometAdmin, onCometRewards ] = (proposals[0] as any).actions;
   t.notMatch([ onConfigurator.title, ...onConfigurator.subtitles ].join(' '), /cMAINv3/,
     'which the constants alone cannot name');
+  t.notMatch(onCometAdmin.title, /cMAINv3/, 'nor the market an upgrade deploys');
+  t.notMatch(onCometRewards.title, /cMAINv3/, 'nor the market a reward token is set for');
   const before = { nobody: onNobody.title, bridge: onBridge.subtitles.join(' ') };
   t.match(onBridge.title, /^Bridge wrapped actions to Base/, 'the constants decode the bridge');
   t.notMatch(before.bridge, /cNEWv3/, 'but not the market it configures');
@@ -870,6 +865,10 @@ t.test('proposal actions are described again where the registry says more', asyn
   t.match(onBridge.subtitles.join(' '), /cNEWv3/, 'and a bridged action names the market it configures on the other chain');
   t.match([ onConfigurator.title, ...onConfigurator.subtitles ].join(' '), /cMAINv3/,
     'and an action on the Configurator names the market it configures');
+  t.match(onCometAdmin.title, /^Deploy and upgrade new implementation for \[cMAINv3\]/,
+    'as an upgrade through the CometAdmin names the market it deploys');
+  t.match(onCometRewards.title, /^Set reward token for market \[cMAINv3\]/,
+    'and a reward token set through CometRewards the market it is set for');
 
   let unread = 0;
   const known = [ { actions: [ action(USDC, pause, paused) ] } ] as never as Parameters<typeof describeRegistryTargets>[0];

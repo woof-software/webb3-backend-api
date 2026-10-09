@@ -1,5 +1,14 @@
 import t from 'tap';
 
+import * as Debug    from '../../lib/debug-log.js';
+import * as Flags    from '../../lib/flags.js';
+import { BigNumber } from '../../lib/bignumber.js';
+import { BigFixnum } from '../../lib/bigfixnum.js';
+
+import * as Compute    from '../../lib/symbolic/computation.js';
+import * as Evaluator  from '../../lib/symbolic/evaluator.js';
+import { MemoryCache } from '../../lib/symbolic/cache.js';
+
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
 import * as rewards from '../../lib/computations/rewards.js';
@@ -9,6 +18,7 @@ import { rewardsSummary as accountRewardsSummary } from '../../src/account-handl
 import {
   AllContracts,
   AllNetworks,
+  type AccountRouteData,
   type Context,
   type MarketRouteData,
   type UninstantiatedContext,
@@ -23,6 +33,9 @@ import '../../shim/node-self.js';
  * a Comet reading a price feed Chainlink retired is `error` and only what
  * identifies it — and a node that fails still fails the request.
  */
+const flags = Flags.parseWithDefaults(process.env);
+const debug = Debug.MakeLogger([]).configure(process.env);
+
 const catalog = fixtureCatalog();
 
 const MAINNET = 'ethereum-mainnet' as const;
@@ -39,38 +52,31 @@ function comet(network: KnownNetwork.Name, address: string) {
 }
 
 /*
- * An evaluator shaped like the one the router hands a handler. pipe1, pull1,
- * split and value describe the work; evaluate walks it and answers every
- * computation from `answer` instead of a node.
+ * The evaluator the router hands a handler, over computations that answer
+ * from `answer` instead of a node: the real one, so what a route answers is
+ * what the evaluator makes of what each computation answered, or threw. A
+ * lookup of a computation not named here fails, as one a handler's scope
+ * lacks would.
  */
-class Pipe  { constructor(readonly lookup: Record<string, unknown>, readonly receiver: (value: any) => unknown) {} }
-class Pull  { constructor(readonly lookup: Record<string, unknown>) {} }
-class Split { constructor(readonly items: unknown[]) {} }
-class Value { constructor(readonly value: unknown) {} }
+type Answer = (name: string, context: any) => unknown;
 
-function stubEvaluator(answer: (name: string, context: any) => unknown) {
-  const lookup = async (entries: Record<string, unknown>) => {
-    const [ [ name, context ] ] = Object.entries(entries);
-    return answer(name, context);
-  };
-  const walk = async (work: unknown): Promise<unknown> => {
-    if (work instanceof Value) return work.value;
-    if (work instanceof Pull)  return lookup(work.lookup);
-    if (work instanceof Split) return Promise.all(work.items.map(walk));
-    if (work instanceof Pipe)  return walk(work.receiver(await lookup(work.lookup)));
-    return work;
-  };
-  const evaluator = {
-    evaluations: 0,
-    pipe1: ([ lookup, receiver ]: [ Record<string, unknown>, (value: any) => unknown ]) => new Pipe(lookup, receiver),
-    pull1: (lookup: Record<string, unknown>) => new Pull(lookup),
-    split: (items: unknown[]) => new Split(items),
-    value: (value: unknown) => new Value(value),
-    evaluate: async (work: unknown) => {
-      evaluator.evaluations++;
-      return walk(work);
-    },
-  };
+const COMPUTATIONS = [
+  'ethGetBlock', 'marketMinutelySummary', 'historicalMarketDaySummaries', 'marketRewards',
+  'getRewardConfigsSleuth', 'accountRewards', 'rewardsSummary',
+] as const;
+
+function evaluatorOf(answer: Answer, overrides: Flags.SomeFlags = {}) {
+  const computations = Object.fromEntries(COMPUTATIONS.map(name => [
+    name, Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(name, context) }),
+  ]));
+  const cache     = new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]);
+  const evaluator = Object.assign(
+    Evaluator.instantiate<any>(computations as any, { cache, debug, flags: { ...flags, ...overrides } }),
+    { evaluations: 0 },
+  );
+  // a handler takes evaluate off the evaluator, so the count is put where it reads it
+  const evaluate = evaluator.evaluate;
+  evaluator.evaluate = (redex => { evaluator.evaluations++; return evaluate(redex); }) as typeof evaluate;
   return evaluator;
 }
 
@@ -109,19 +115,31 @@ function routeData(network: MarketRouteData['network'], contract: MarketRouteDat
   return { apiHost: '', nodeHost: '', nodeKey: '', network, contract, catalog, queryParams: new URLSearchParams() };
 }
 
-function uninstantiated(evaluator: ReturnType<typeof stubEvaluator>): UninstantiatedContext {
-  return { flags: {}, instantiateEvaluator: () => evaluator } as unknown as UninstantiatedContext;
+// as the router hands a handler that makes its own evaluator, with the flags it asks for
+function uninstantiated(answer: Answer) {
+  const made: Array<ReturnType<typeof evaluatorOf>> = [];
+  const context = {
+    flags,
+    instantiateEvaluator: (_: string, overrides: { flags?: Flags.SomeFlags } = {}) => {
+      const evaluator = evaluatorOf(answer, overrides.flags);
+      made.push(evaluator);
+      return evaluator;
+    },
+    evaluations: () => made.reduce((total, evaluator) => total + evaluator.evaluations, 0),
+  };
+  return context as unknown as UninstantiatedContext & { evaluations(): number };
 }
 
-function instantiated(evaluator: ReturnType<typeof stubEvaluator>): Context {
-  return { flags: { environment: 'local' }, evaluator } as unknown as Context;
+// as the router hands a handler an evaluator it made: with the request's flags, and those it sets for the route
+function instantiated(answer: Answer, overrides: Flags.SomeFlags = {}): Context {
+  return { flags: { ...flags, environment: 'local' }, evaluator: evaluatorOf(answer, overrides) } as unknown as Context;
 }
+
+// what the router sets for account rewards (router.ts)
+const BATCHED = { batchingEnabled: true, evaluatorAlgorithm: 'workingset' } as const;
 
 type Entry = { chain_id: number, comet: { address: string }, status: string, message?: string };
 
-/*
- * The status each market of a response reports, by lowercased Comet address.
- */
 function statuses(body: unknown): Record<string, string> {
   return Object.fromEntries((body as Entry[]).map(entry => [ entry.comet.address.toLowerCase(), entry.status ]));
 }
@@ -138,7 +156,7 @@ function errorOf(address: string) {
 t.test('the summary of every market passes on the status of each', async t => {
   const response = await marketHandlers.latestSummary(
     routeData(AllNetworks, AllContracts),
-    uninstantiated(stubEvaluator(answers([ WBTC ]))),
+    uninstantiated(answers([ WBTC ])),
   );
 
   t.equal(response.status, 200);
@@ -152,7 +170,7 @@ t.test('the summary of every market passes on the status of each', async t => {
 t.test('the summary of one market is its status', async t => {
   const response = await marketHandlers.latestSummary(
     routeData(MAINNET, comet(MAINNET, WBTC)),
-    uninstantiated(stubEvaluator(answers([ WBTC ]))),
+    uninstantiated(answers([ WBTC ])),
   );
   t.equal(response.status, 200);
   t.strictSame(await response.json(), errorOf(WBTC), 'answered as an object, as one market always was');
@@ -161,7 +179,7 @@ t.test('the summary of one market is its status', async t => {
 t.test('history passes on the status of each day', async t => {
   const response = await marketHandlers.historicalSummary(
     routeData(MAINNET, AllContracts),
-    instantiated(stubEvaluator(answers([ WBTC ]))),
+    instantiated(answers([ WBTC ])),
   );
   t.equal(response.status, 200);
   const body = await response.json() as Array<Entry & { timestamp: number }>;
@@ -170,14 +188,14 @@ t.test('history passes on the status of each day', async t => {
 });
 
 t.test('the rewards of every market pass on the status of each', async t => {
-  const evaluator = stubEvaluator(answers([ WBTC ]));
-  const response = await marketHandlers.rewardsDappData(routeData(MAINNET, AllContracts), uninstantiated(evaluator));
+  const context  = uninstantiated(answers([ WBTC ]));
+  const response = await marketHandlers.rewardsDappData(routeData(MAINNET, AllContracts), context);
 
   t.equal(response.status, 200);
   const body = await response.json() as Entry[];
   t.strictSame(body.find(entry => entry.comet.address.toLowerCase() === WBTC), errorOf(WBTC));
   t.equal(statuses(body)[USDC], 'success');
-  t.equal(evaluator.evaluations, 1, 'the markets of a network still share one evaluation');
+  t.equal(context.evaluations(), 1, 'the markets of a network still share one evaluation');
 });
 
 /*
@@ -190,13 +208,13 @@ t.test('the rewards summary reads the reward feed its version states', async t =
   const usdc  = comet(MAINNET, USDC);
   const feed  = usdc.registry.market.rewardAsset!.priceFeed!;
   const asked: any[] = [];
-  const evaluator = stubEvaluator((name, context) => {
+  const answer: Answer = (name, context) => {
     if (name === 'rewardsSummary') {
       asked.push(context);
     }
     return answers([])(name, context);
-  });
-  const response = await marketHandlers.latestRewardsSummary(routeData(MAINNET, usdc), uninstantiated(evaluator));
+  };
+  const response = await marketHandlers.latestRewardsSummary(routeData(MAINNET, usdc), uninstantiated(answer));
 
   t.equal(response.status, 200);
   t.equal(asked.length, 1, 'one summary is asked for');
@@ -212,7 +230,7 @@ t.test('the rewards summary reads the reward feed its version states', async t =
 t.test('the rewards of an account format only the markets that were valued', async t => {
   const response = await accountRewardsSummary(
     { apiHost: '', nodeHost: '', nodeKey: '', account: ACCOUNT, catalog },
-    instantiated(stubEvaluator(answers([ WBTC ]))),
+    instantiated(answers([ WBTC ]), BATCHED),
   );
 
   t.equal(response.status, 200);
@@ -223,9 +241,33 @@ t.test('the rewards of an account format only the markets that were valued', asy
 });
 
 t.test('a node that fails still fails the list', async t => {
-  const evaluator = stubEvaluator(() => { throw new Error('bad vibes'); });
   await t.rejects(
-    marketHandlers.latestSummary(routeData(MAINNET, AllContracts), uninstantiated(evaluator)),
+    marketHandlers.latestSummary(routeData(MAINNET, AllContracts), uninstantiated(() => { throw new Error('bad vibes'); })),
     /bad vibes/,
   );
+});
+
+/*
+ * The read that fails can be one market's, after the block every market
+ * shares was read: every route that lists markets fails then too, rather
+ * than answer the list without that market.
+ */
+t.test('a node that fails one market still fails the list', async t => {
+  const failing: Answer = (name, context) => {
+    if (context.contract?.address.toLowerCase() === USDC) {
+      throw new Error('the node did not serve usdc');
+    }
+    return answers([])(name, context);
+  };
+  const account: AccountRouteData = { apiHost: '', nodeHost: '', nodeKey: '', account: ACCOUNT, catalog };
+
+  for (const [ what, answered ] of [
+    [ 'the summary of a network',     () => marketHandlers.latestSummary(routeData(MAINNET, AllContracts), uninstantiated(failing)) ],
+    [ 'the summary of every network', () => marketHandlers.latestSummary(routeData(AllNetworks, AllContracts), uninstantiated(failing)) ],
+    [ 'the rewards of a network',     () => marketHandlers.rewardsDappData(routeData(MAINNET, AllContracts), uninstantiated(failing)) ],
+    [ 'the history of a network',     () => marketHandlers.historicalSummary(routeData(MAINNET, AllContracts), instantiated(failing)) ],
+    [ 'the rewards of an account',    () => accountRewardsSummary(account, instantiated(failing, BATCHED)) ],
+  ] as const) {
+    await t.rejects(answered(), /the node did not serve usdc/, what);
+  }
 });

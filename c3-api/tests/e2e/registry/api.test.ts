@@ -7,14 +7,11 @@ import { createTestHarness } from 'wrangler';
 import type { Env } from '../../../entrypoint.js';
 import type { ActiveSnapshotV1 } from '../../../lib/model/comet-registry.js';
 import { sha256Hex } from '../../../src/http/bearer-auth.js';
-import {
-  markValidated,
-  recordValidationResults,
-  snapshotChecksum,
-} from '../../../src/registry/repository.js';
+import { overlayOfMarket } from '../../../src/registry/overlay.js';
+import { recordValidationResults } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { loadRegistrySnapshotFixture, overlayOfNetwork, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 
 /*
  * The registry HTTP API, served by the real worker in workerd over local D1.
@@ -58,8 +55,7 @@ async function freshDatabase(): Promise<D1Database> {
  */
 async function seedValidated(db: D1Database, versionId?: string): Promise<string> {
   const { versionId: id } = await seedCandidate(db, snapshot, versionId === undefined ? {} : { versionId, attempt: 2 });
-  await recordValidationResults(db, id, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, id, await snapshotChecksum(snapshot.networks));
+  await validateSeeded(db, id);
   return id;
 }
 
@@ -215,6 +211,7 @@ t.test('a chain id in a path is read in its one spelling only', async t => {
     [ `/registry/v1/networks/${chainId}/markets`, {} ],
     [ `/registry/v1/networks/${chainId}/markets/${comet}`, {} ],
     [ `/registry/v1/admin/versions/${draft}/markets/${chainId}/usdc/overlay`, auth ],
+    [ `/registry/v1/admin/versions/${draft}/networks/${chainId}/overlay`, auth ],
   ];
 
   for (const [ path, init ] of paths('1')) {
@@ -291,8 +288,7 @@ t.test('a disabled market is not served by any public read', async t => {
     `UPDATE markets SET status = 'disabled'
      WHERE registry_version_id = ?1 AND deployment_key = 'weth'`
   ).bind(versionId).run();
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, 'f'.repeat(64));
+  await validateSeeded(db, versionId);
   await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/activate`, { reason: 'activate' }));
 
   const weth = '0xa17581a9e3356d9a858b789d68b4d866e593ae94';
@@ -573,6 +569,19 @@ t.test('administrative commands validate their bodies', async t => {
   t.match((await held.json() as { error: { message: string } }).error.message, /reason/);
   const notBoolean = await server.fetch(...admin('/registry/v1/admin/sync', { holdForReview: 'yes', reason: 'x' }));
   t.equal(notBoolean.status, 400, 'and it is a boolean');
+
+  /*
+   * A routine sync has no decision to keep a reason with, and one that
+   * continues a run nowhere to keep it, so a reason without a decision is
+   * refused rather than dropped from the audit.
+   */
+  const bare = await server.fetch(...admin('/registry/v1/admin/sync', { reason: 'x' }));
+  t.equal(bare.status, 400, 'a reason without a decision is refused');
+  t.match((await bare.json() as { error: { message: string } }).error.message, /reason/);
+  const declined = await server.fetch(...admin('/registry/v1/admin/sync', { forceNewAttempt: false, reason: 'x' }));
+  t.equal(declined.status, 400, 'and so is one beside a decision not taken');
+  const long = await server.fetch(...admin('/registry/v1/admin/sync', { forceNewAttempt: true, reason: 'x'.repeat(1001) }));
+  t.equal(long.status, 400, 'a reason is at most 1,000 characters here too');
 });
 
 function put(path: string, body: unknown): [ string, AdminRequest ] {
@@ -587,13 +596,7 @@ t.test('an overlay is replaced completely, and only while importing', async t =>
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
 
-  const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
-  const current = {
-    displayName:               mainnet.displayName,
-    assetDisplayOverrides:     mainnet.presentation.assetDisplayOverrides,
-    unwrappedCollateralAssets: mainnet.presentation.unwrappedCollateralAssets,
-    priceExceptions:           mainnet.priceExceptions,
-  };
+  const current = overlayOfNetwork(snapshot.networks.find(network => network.chainId === 1)!);
 
   const unchanged = await server.fetch(...put(
     `/registry/v1/admin/versions/${versionId}/networks/1/overlay`,
@@ -742,6 +745,88 @@ t.test('a market overlay read and sent back says what it was decided against', a
 });
 
 /*
+ * A network overlay is replaced whole, so a change to it starts from what the
+ * draft holds: one built from what the version on serves would drop whatever
+ * the draft has that it lacks. Read here, it is the document the PUT takes,
+ * with the digest the PUT decides an expectation against.
+ */
+t.test('a network overlay reads back as the draft holds it, and says what a change is decided against', async t => {
+  const db = await freshDatabase();
+  const { versionId } = await seedCandidate(db, snapshot);
+  const auth = { headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` } };
+  const path = `/registry/v1/admin/versions/${versionId}/networks/1/overlay`;
+  type Read = {
+    versionId: string, scope: string, reviewed: boolean, digest: string | null,
+    overlay: { displayName: string, priceExceptions: Array<{ kind: string, priceFeedAddress: string, expiresAt: string | null }> },
+  };
+  const read = async (at: string = path) => await (await server.fetch(at, auth)).json() as Read;
+
+  // the draft remaps a feed to one it knows on the chain, and holds an exception that has expired since it was written
+  const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
+  const remap   = {
+    kind:                        'deprecated_price_remap',
+    priceFeedAddress:            '0x00000000000000000000000000000000000000f2',
+    replacementPriceFeedAddress: mainnet.markets[0]!.collateralAssets[0]!.priceFeed.address,
+    provenance:                  'the feed was replaced',
+    expiresAt:                   null,
+  };
+  const before = await read();
+  t.equal((await server.fetch(...put(path, {
+    reason: 'remap a feed', overlay: { ...before.overlay, priceExceptions: [ ...before.overlay.priceExceptions, remap ] },
+  }))).status, 200);
+  const [ expired ] = mainnet.priceExceptions;
+  await db.prepare(
+    `UPDATE network_price_exceptions SET expires_at = '2020-01-01T00:00:00.000Z'
+     WHERE registry_version_id = ?1 AND price_feed_address = ?2`
+  ).bind(versionId, expired!.priceFeedAddress).run();
+
+  const held = await read();
+  t.same({ versionId: held.versionId, scope: held.scope, reviewed: held.reviewed }, { versionId, scope: '1', reviewed: true });
+  t.match(held.digest, /^[0-9a-f]{64}$/, 'a reviewed network answers the digest of its overlay');
+  t.same(held.overlay.priceExceptions.find(exception => exception.kind === 'deprecated_price_remap'), remap,
+    'a remap names the feed it reads instead, as the PUT takes it');
+  t.equal(held.overlay.priceExceptions.find(exception => exception.priceFeedAddress === expired!.priceFeedAddress)?.expiresAt,
+    '2020-01-01T00:00:00.000Z', 'and an exception that has expired since is answered as it is held');
+
+  const same = await server.fetch(...put(path, { reason: 'write back what was read', overlay: held.overlay, expectedDigest: held.digest }));
+  t.equal(same.status, 200, 'the document it answers is one the PUT accepts, decided against what it answered');
+  t.equal((await same.json() as { changed: boolean }).changed, false, 'and it changes nothing');
+
+  const renamed = await server.fetch(...put(path, {
+    reason: 'rename it', overlay: { ...held.overlay, displayName: 'Ethereum Mainnet' }, expectedDigest: held.digest,
+  }));
+  t.equal(renamed.status, 200, 'a change decided against what is stored is written');
+  const written = await renamed.json() as { changed: boolean, digest: string };
+  t.equal(written.changed, true);
+  t.equal((await read()).digest, written.digest, 'and the digest it answers is the one the network is read with next');
+
+  const stale = await server.fetch(...put(path, {
+    reason: 'rename it differently', overlay: { ...held.overlay, displayName: 'Mainnet' }, expectedDigest: held.digest,
+  }));
+  t.equal(stale.status, 409, 'a change decided against the overlay it replaced is refused');
+  t.equal(
+    (await stale.json() as { error: { details: { current: Record<string, string> } } }).error.details.current['network 1'],
+    written.digest,
+    'naming the overlay the network holds now',
+  );
+
+  await db.prepare(`UPDATE registry_networks SET reviewed = 0, display_name = 'scroll-mainnet' WHERE registry_version_id = ?1 AND chain_id = 534352`)
+    .bind(versionId).run();
+  const unreviewed = await read(`/registry/v1/admin/versions/${versionId}/networks/534352/overlay`);
+  t.same([ unreviewed.reviewed, unreviewed.digest, unreviewed.overlay.displayName ], [ false, null, 'scroll-mainnet' ],
+    'a network nobody has reviewed answers with what its import wrote, and has no reviewed overlay to name');
+
+  t.equal((await server.fetch(`/registry/v1/admin/versions/${versionId}/networks/999/overlay`, auth)).status, 404,
+    'a chain the version has not imported is not found');
+  t.equal((await server.fetch(`/registry/v1/admin/versions/${randomUUID()}/networks/1/overlay`, auth)).status, 404,
+    'and neither is a version that does not exist');
+  t.equal((await server.fetch(path)).status, 401, 'and the route is authenticated');
+  const wrongMethod = await server.fetch(path, { method: 'POST', headers: auth.headers });
+  t.equal(wrongMethod.status, 405);
+  t.equal(wrongMethod.headers.get('allow'), 'PUT, GET, OPTIONS', 'the path takes both verbs');
+});
+
+/*
  * An expiry decides when a live feed is read again. It is an instant with its
  * offset, stored as the moment it names; one already past is refused when it
  * is written, because it would be stored, carried into every later version,
@@ -750,13 +835,11 @@ t.test('a market overlay read and sent back says what it was decided against', a
 t.test('a price exception expires at an instant that is still to come', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
-  const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
-  const path    = `/registry/v1/admin/versions/${versionId}/networks/1/overlay`;
+  const overlay  = overlayOfNetwork(snapshot.networks.find(network => network.chainId === 1)!);
+  const path     = `/registry/v1/admin/versions/${versionId}/networks/1/overlay`;
   const expiring = (expiresAt: string) => ({
-    displayName:               mainnet.displayName,
-    assetDisplayOverrides:     mainnet.presentation.assetDisplayOverrides,
-    unwrappedCollateralAssets: mainnet.presentation.unwrappedCollateralAssets,
-    priceExceptions:           mainnet.priceExceptions.map(exception => ({ ...exception, expiresAt })),
+    ...overlay,
+    priceExceptions: overlay.priceExceptions.map(exception => ({ ...exception, expiresAt })),
   });
 
   const loose = await server.fetch(...put(path, { reason: 'x', overlay: expiring('Sep 21 2099') }));
@@ -793,13 +876,14 @@ t.test('an exception that has expired since it was written is kept as it is', as
      WHERE registry_version_id = ?1 AND price_feed_address = ?2`
   ).bind(versionId, expired!.priceFeedAddress).run();
 
-  const path = `/registry/v1/admin/versions/${versionId}/networks/1/overlay`;
+  const path    = `/registry/v1/admin/versions/${versionId}/networks/1/overlay`;
+  const overlay = overlayOfNetwork(mainnet);
   const withExpiry = (expiresAt: string) => ({
-    displayName:               mainnet.displayName,
-    assetDisplayOverrides:     mainnet.presentation.assetDisplayOverrides,
-    unwrappedCollateralAssets: mainnet.presentation.unwrappedCollateralAssets,
+    ...overlay,
     priceExceptions: [
-      ...mainnet.priceExceptions.map(exception => exception === expired ? { ...exception, expiresAt } : exception),
+      ...overlay.priceExceptions.map(exception => (
+        exception.priceFeedAddress === expired!.priceFeedAddress ? { ...exception, expiresAt } : exception
+      )),
       { kind: 'zero_price', priceFeedAddress: '0x00000000000000000000000000000000000000f1', provenance: 'reverts', expiresAt: null },
     ],
   });
@@ -819,27 +903,8 @@ t.test('a market overlay carries the reviewed decisions', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
 
-  const market  = snapshot.networks.find(network => network.chainId === 1)!.markets
-    .find(entry => entry.deploymentKey === 'usdc')!;
-  const overlay = {
-    displayName:          market.displayName,
-    contractName:         market.contractName,
-    slug:                 market.slug,
-    isInstitutional:      market.isInstitutional,
-    isDefault:            market.isDefault,
-    status:               market.status,
-    creationBlock:        market.creationBlock,
-    collateralValueQuote: market.collateralValueQuote,
-    capabilities:         market.capabilities,
-    baseAsset: {
-      displayName:         market.baseAsset.displayName,
-      isWrappedNative:     market.baseAsset.isWrappedNative,
-      usdPriceFeedAddress: market.baseAsset.usdPriceFeed?.address ?? null,
-    },
-    rewardPriceFeed: market.rewardAsset?.priceFeed === null || market.rewardAsset === null
-      ? null
-      : { address: market.rewardAsset.priceFeed.address, quote: market.rewardAsset.priceFeedQuote },
-  };
+  const overlay = overlayOfMarket(snapshot.networks.find(network => network.chainId === 1)!.markets
+    .find(entry => entry.deploymentKey === 'usdc')!);
 
   const unchanged = await server.fetch(...put(
     `/registry/v1/admin/versions/${versionId}/markets/1/usdc/overlay`,
@@ -890,25 +955,7 @@ t.test('a market overlay carries the reviewed decisions', async t => {
     .find(entry => entry.deploymentKey === 'weth')!;
   const reviewedWeth = await server.fetch(...put(
     `/registry/v1/admin/versions/${versionId}/markets/1/weth/overlay`,
-    { reason: 'review the market the import could not decide about', overlay: {
-      displayName:          weth.displayName,
-      contractName:         weth.contractName,
-      slug:                 weth.slug,
-      isInstitutional:      weth.isInstitutional,
-      isDefault:            false,
-      status:               'enabled',
-      creationBlock:        weth.creationBlock,
-      collateralValueQuote: weth.collateralValueQuote,
-      capabilities:         weth.capabilities,
-      baseAsset: {
-        displayName:         weth.baseAsset.displayName,
-        isWrappedNative:     weth.baseAsset.isWrappedNative,
-        usdPriceFeedAddress: weth.baseAsset.usdPriceFeed?.address ?? null,
-      },
-      rewardPriceFeed: weth.rewardAsset?.priceFeed === null || weth.rewardAsset === null
-        ? null
-        : { address: weth.rewardAsset.priceFeed.address, quote: weth.rewardAsset.priceFeedQuote },
-    } },
+    { reason: 'review the market the import could not decide about', overlay: { ...overlayOfMarket(weth), isDefault: false, status: 'enabled' } },
   ));
   t.equal(reviewedWeth.status, 200, 'reviewing it edits the rows the import wrote');
   const after = await (await server.fetch(`/registry/v1/admin/versions/${versionId}`, {
@@ -935,8 +982,7 @@ t.test('a market overlay carries the reviewed decisions', async t => {
   t.equal(crossChain.status, 503, 'the decimals are read from the market\'s own chain, not from another version row');
 
   // a terminal version is not writable
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
+  await validateSeeded(db, versionId);
   const terminal = await server.fetch(...put(
     `/registry/v1/admin/versions/${versionId}/markets/1/usdc/overlay`,
     { reason: 'too late', overlay },
@@ -1067,6 +1113,83 @@ t.test('a sync run reports its checkpoints without its lease owner', async t => 
 });
 
 /*
+ * A run no invocation can finish is ended by an operator, with why. Only a
+ * run nobody holds is: one under a live lease is left to the invocation that
+ * holds it, which may be importing into it, and one that has ended is
+ * history.
+ */
+t.test('a sync run nobody holds can be cancelled, with a reason', async t => {
+  const db              = await freshDatabase();
+  const { ENVIRONMENT } = await server.getWorker<Env>().getEnv();
+  const runId           = randomUUID();
+  const now             = new Date().toISOString();
+  const past            = new Date(Date.now() - 60_000).toISOString();
+
+  // a run whose invocation was stopped in the middle of usdc's last attempt, and whose lease has run out; weth was never reached
+  await db.prepare(
+    `INSERT INTO sync_runs (
+       id, source_commit_sha, tracked_ref, trigger_kind, requested_by, status,
+       lease_owner, lease_expires_at, expected_count, started_at
+     ) VALUES (?1, ?2, 'main', 'scheduled', 'registry-cron', 'running', 'stopped-invocation', ?3, 2, ?4)`
+  ).bind(runId, 'a'.repeat(40), past, now).run();
+  for (const [ key, status, attempts, owner ] of [
+    [ 'usdc', 'processing', 5, 'stopped-invocation' ],
+    [ 'weth', 'pending',    0, null ],
+  ] as const) {
+    await db.prepare(
+      `INSERT INTO sync_run_items (
+         id, sync_run_id, root_path, source_blob_sha, upstream_network_key, deployment_key,
+         status, attempts, claim_owner, created_at, updated_at
+       ) VALUES (?1, ?2, ?3, ?4, 'mainnet', ?5, ?6, ?7, ?8, ?9, ?9)`
+    ).bind(randomUUID(), runId, `deployments/mainnet/${key}/roots.json`, 'b'.repeat(40), key, status, attempts, owner, now).run();
+  }
+  const cancel = (id: string, body: unknown) => server.fetch(...admin(`/registry/v1/admin/sync-runs/${id}/cancel`, body));
+  const messageOf = async (response: { json(): Promise<unknown> }) => (await response.json() as { error: { message: string } }).error.message;
+
+  const bare = await cancel(runId, {});
+  t.equal(bare.status, 400, 'a cancel needs a reason');
+  t.match(await messageOf(bare), /reason/);
+  t.equal((await cancel(runId, { reason: 'x', force: true })).status, 400, 'and takes nothing else');
+  t.equal((await cancel(randomUUID(), { reason: 'x' })).status, 404, 'a run that does not exist is not found');
+
+  await db.prepare(`UPDATE sync_runs SET lease_expires_at = ?1 WHERE id = ?2`)
+    .bind(new Date(Date.now() + 900_000).toISOString(), runId).run();
+  const held = await cancel(runId, { reason: 'x' });
+  t.equal(held.status, 409, 'a run an invocation holds is left to it');
+  t.match(await messageOf(held), /holds the sync run until/, 'until its lease runs out');
+  t.equal(
+    await db.prepare(`SELECT status FROM sync_run_items WHERE sync_run_id = ?1 AND deployment_key = 'usdc'`)
+      .bind(runId).first<string>('status'),
+    'processing',
+    'and nothing of it changes',
+  );
+  await db.prepare(`UPDATE sync_runs SET lease_expires_at = ?1 WHERE id = ?2`).bind(past, runId).run();
+
+  const cancelled = await cancel(runId, { reason: 'a stored overlay no longer parses' });
+  t.equal(cancelled.status, 200, 'one whose lease has run out is cancelled');
+  const { syncRun, items } = await cancelled.json() as {
+    syncRun: Record<string, unknown>,
+    items:   Array<{ deploymentKey: string, status: string, lastError: string | null }>,
+  };
+  t.same(
+    [ syncRun.status, syncRun.outcome, syncRun.lastError, syncRun.leaseExpiresAt ],
+    [ 'failed', null, `cancelled by registry-admin:${ENVIRONMENT}: a stored overlay no longer parses`, null ],
+    'answered with the run, failed, saying who cancelled it and why',
+  );
+  t.ok(syncRun.completedAt, 'and when');
+  t.equal(syncRun.failedCount, 1, 'a root that had spent its last attempt counts among the roots the run gave up');
+  t.same(items.map(item => [ item.deploymentKey, item.status, item.lastError ]), [
+    [ 'usdc', 'failed', 'the invocation importing this root did not finish' ],
+    [ 'weth', 'pending', null ],
+  ], 'the root left in progress fails as an invocation taking the run over would fail it');
+  t.notMatch(JSON.stringify({ syncRun, items }), /stopped-invocation/, 'and neither the lease nor the claim owner leaves the worker');
+
+  const ended = await cancel(runId, { reason: 'x' });
+  t.equal(ended.status, 409, 'a run that has ended is not cancelled again');
+  t.match(await messageOf(ended), /already ended/);
+});
+
+/*
  * Validation decides over the stored rows. An earlier attempt is history: a
  * check it failed is decided again, and nothing it recorded is carried into
  * the next one — what the chain says about a market is not a check, because a
@@ -1175,10 +1298,6 @@ t.test('an administrative sync says whether it is the whole answer', async t => 
     'as a conflict, whose details name the registry\'s own reason');
 });
 
-/*
- * The shadow comparison as an operator reads it: against the active version
- * by default, or against a validated candidate before activating it.
- */
 /*
  * Before a newer version is switched on, the question is what switching
  * changes. The candidate is readable while it still imports, because that is

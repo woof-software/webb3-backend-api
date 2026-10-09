@@ -9,11 +9,11 @@ import type { Env } from '../../../entrypoint.js';
 import type { RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
 import { snapshotKey } from '../../../src/registry/cache.js';
-import { activateVersion, markValidated, recordValidationResults, snapshotChecksum } from '../../../src/registry/repository.js';
+import { snapshotChecksum } from '../../../src/registry/repository.js';
 import { requestCatalog } from '../../../src/registry/request-catalog.js';
 
 import { applyMigrations } from '../../util/d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { activateSeeded, loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
 
 /*
  * What a request pays for the registry, against real local D1.
@@ -38,19 +38,8 @@ async function freshDatabase(): Promise<D1Database> {
   return APP_DB;
 }
 
-/*
- * The environment a request reads the registry through: the worker's own, as
- * wrangler.toml configures it, with the D1 binding the test reads through.
- */
 async function environmentOf(db: D1Database): Promise<Env> {
   return { ...await server.getWorker<Env>().getEnv(), APP_DB: db };
-}
-
-// validates a seeded candidate of `source` and switches it on
-async function activate(db: D1Database, versionId: string, source: RegistrySnapshotV1 = snapshot): Promise<void> {
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(source.networks));
-  await activateVersion(db, { versionId, action: 'activate', actor: 'test-admin', reason: 'test' });
 }
 
 t.test('the active version is built once and reused, until another one is activated', async t => {
@@ -60,7 +49,7 @@ t.test('the active version is built once and reused, until another one is activa
   await t.rejects(requestCatalog(env).load(), { name: 'RegistryUnavailable' }, 'with nothing active there is nothing to serve');
 
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
 
   const first  = await requestCatalog(env).load();
   const second = await requestCatalog(env).load();
@@ -68,7 +57,7 @@ t.test('the active version is built once and reused, until another one is activa
   t.equal(second.versionId, versionId);
 
   const next = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
-  await activate(db, next.versionId);
+  await activateSeeded(db, next.versionId);
 
   const activated = await requestCatalog(env).load();
   t.not(activated, first, 'activating another version builds the catalog again');
@@ -94,7 +83,7 @@ t.test('a catalog is built again once an exception it applies has expired', asyn
     }),
   };
   const { versionId } = await seedCandidate(db, expiring);
-  await activate(db, versionId, expiring);
+  await activateSeeded(db, versionId);
 
   const applied = await requestCatalog(env).load();
   t.equal(applied.validUntil, Date.parse(expiresAt), 'a catalog that applies the exception is kept until it expires');
@@ -116,7 +105,7 @@ t.test('a catalog is built again once an exception it applies has expired', asyn
 t.test('the worker serves the next request of an isolate from what the first one read', async t => {
   const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
   const { kv_registry: kv } = await server.getWorker<Env>().getEnv();
 
   // a market of no version: refused once the request has read the version, before any chain is asked
@@ -139,7 +128,7 @@ t.test('one request resolves everything from the version it loaded', async t => 
   const env = await environmentOf(db);
 
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
 
   const request = requestCatalog(env);
   t.equal(request.loaded(), null, 'a route that needs no registry loads none');
@@ -149,7 +138,7 @@ t.test('one request resolves everything from the version it loaded', async t => 
   t.equal(request.loaded(), loaded, 'which the response headers then name');
 
   const next = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
-  await activate(db, next.versionId);
+  await activateSeeded(db, next.versionId);
   t.equal(await request.load(), loaded, 'a version activated mid-request does not change what it answers with');
 });
 
@@ -163,7 +152,7 @@ t.test('a request that cannot reach D1 is served the last version it named', asy
   const env = await environmentOf(db);
 
   const { versionId } = await seedCandidate(db, snapshot);
-  await activate(db, versionId);
+  await activateSeeded(db, versionId);
 
   /*
    * One binding that stops answering, rather than a second one: an isolate

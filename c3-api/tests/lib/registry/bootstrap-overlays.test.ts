@@ -174,11 +174,6 @@ t.test('a reward feed is quoted in the unit it answers in, whatever its decimals
 });
 
 /*
- * A market the constants do not describe cannot be proposed at all. Saying so
- * is the point: the operator has to decide, and a placeholder that looked
- * plausible would be reviewed as if it were the current behaviour.
- */
-/*
  * The constants and the APR branches offer AERO and USDe a USD feed, but the
  * feeds of both markets already answer in USD. Taking the offer would state a
  * base quote the chain contradicts, and validation refuses a USD-quoted market
@@ -231,6 +226,12 @@ t.test('only the markets whose feeds answer in their base asset are quoted in it
   ], 'the constant-priced WETH and wstETH markets and WBTC, priced in BTC');
 });
 
+/*
+ * A market the constants do not describe has nothing to propose from, so
+ * every field is a placeholder. Saying so is the point: the operator has to
+ * decide, and a placeholder that looked plausible would be reviewed as if it
+ * were the current behaviour.
+ */
 t.test('a market no source describes is proposed as placeholders, loudly', async t => {
   const { overlay, notes } = overlayFor('ethereum-mainnet', 'brand-new', null);
 

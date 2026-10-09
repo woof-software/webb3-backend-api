@@ -299,7 +299,8 @@ export async function handleRequest(
      * expected to retry until it succeeds. By default, failure responses
      * will set a Retry-After header asking the client to wait some time.
      *
-     * If a fallback is set, the Retry-After header will be set to 0s.
+     * A fallback set here does not shorten the wait: a 503 asks for the
+     * same Retry-After, and the client's retry goes to the fallback.
      *
      */
     // TODO: per-app-key configurable settings.

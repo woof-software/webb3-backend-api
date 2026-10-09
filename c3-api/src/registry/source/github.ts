@@ -128,8 +128,9 @@ function requestHeaders(config: SourceConfig, accept: string): HeadersInit {
 }
 
 /*
- * Performs one bounded GitHub request. Upstream status and body are never
- * echoed into the error, only the request that failed and its status.
+ * Performs one bounded GitHub request. The error never carries the body
+ * GitHub answered: a refusal names its status, and the rate limit when that
+ * is why (refusalOf).
  */
 type ReadOptions = {
   accept:   string,

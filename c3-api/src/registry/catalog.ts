@@ -86,20 +86,16 @@ type Catalog = {
    * resolve one.
    */
   markets(): CatalogMarket[],
-  discoverable(): CatalogMarket[],
   // the networks the API serves: those with a market it may resolve
   networks(): NetworkV1[],
-  networkOf(network: KnownNetwork.Name): NetworkV1 | null,
   marketAt(network: KnownNetwork.Name, cometAddress: Address): CatalogMarket | null,
   marketsOn(network: KnownNetwork.Name): CatalogMarket[],
-  defaultMarket(): CatalogMarket | null,
   /*
    * Every token of a version, by network and address: base, collateral, and
    * reward assets alike. A transaction log names a token by address only, so
    * this is what turns one into a symbol and a scale.
    */
   tokenAt(network: KnownNetwork.Name, address: Address): TokenV1 | null,
-  // the base token of a market, addressed by its Comet
   baseTokenAt(network: KnownNetwork.Name, cometAddress: Address): TokenV1 | null,
   /*
    * The symbol a network's presentation renames a token to, where it keeps
@@ -258,7 +254,6 @@ function expiryOf(exception: PriceExceptionV1): number | null {
   return Number.isFinite(expiresAt) ? expiresAt : Number.NEGATIVE_INFINITY;
 }
 
-// every token a market names: its base asset, the token it pays, and its collateral
 function tokensOf(market: MarketV1): TokenV1[] {
   return [
     market.baseAsset.token,
@@ -366,8 +361,6 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
     }
   }
 
-  const byNetwork = new Map<string, NetworkV1>(networks.map(network => [ network.key, network ]));
-
   const renamed = new Map<string, string>(networks.flatMap(network => renamesOf(network)
     .map(override => [ `${network.key}:${override.tokenAddress}`, override.symbol ] as const)));
 
@@ -382,17 +375,8 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
     tokenAt:     (network, address) => tokens.get(`${network}:${address.toLowerCase()}`) ?? null,
     baseTokenAt: (network, address) => bases.get(`${network}:${address.toLowerCase()}`) ?? null,
     renamedSymbolAt: (network, address) => renamed.get(`${network}:${address.toLowerCase()}`) ?? null,
-    // discovery and defaults ignore deprecated markets, which stay readable
-    discoverable: () => markets.filter(entry => entry.market.status === 'enabled'),
-    networkOf:    network => byNetwork.get(network) ?? null,
-    marketsOn:    network => byNetworkMarkets.get(network) ?? [],
-    marketAt:     (network, cometAddress) => byComet.get(`${network}:${cometAddress.toLowerCase()}`) ?? null,
-    /*
-     * The default is a market the API offers, so a deprecated one is not it,
-     * for the same reason it is not discoverable: the unique index that keeps
-     * one default per version does not care about status.
-     */
-    defaultMarket: () => markets.find(entry => entry.market.isDefault && entry.market.status === 'enabled') ?? null,
+    marketsOn: network => byNetworkMarkets.get(network) ?? [],
+    marketAt:  (network, cometAddress) => byComet.get(`${network}:${cometAddress.toLowerCase()}`) ?? null,
   };
 }
 

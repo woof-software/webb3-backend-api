@@ -303,3 +303,27 @@ t.test('the digest identifies an overlay, not its spelling', async t => {
   const changed = await overlayDigest(parseNetworkOverlay({ ...networkOverlay, displayName: 'Ethereum Mainnet' }));
   t.not(changed, digest, 'a reviewed change does change the digest');
 });
+
+/*
+ * The parser builds every object in one order, but an overlay that says the
+ * same with its keys assigned in another — built by a later release, or by a
+ * route that does not parse — is the same decision, and an expectation read
+ * from one has to hold against the other.
+ */
+t.test('the digest does not depend on the order an overlay assigns its keys in', async t => {
+  // the same value, with the keys of every object in it assigned the other way round
+  const reversed = (value: unknown): unknown => Array.isArray(value)
+    ? value.map(reversed)
+    : typeof(value) === 'object' && value !== null
+      ? Object.fromEntries(Object.entries(value).reverse().map(([ key, entry ]) => [ key, reversed(entry) ]))
+      : value;
+
+  for (const [ overlay, what ] of [
+    [ parseMarketOverlay(marketOverlay), 'a market overlay' ],
+    [ parseNetworkOverlay(networkOverlay), 'a network overlay' ],
+  ] as const) {
+    const copy = reversed(overlay) as typeof overlay;
+    t.not(JSON.stringify(copy), JSON.stringify(overlay), `${what} written in another order`);
+    t.equal(await overlayDigest(copy), await overlayDigest(overlay), 'has the same digest');
+  }
+});

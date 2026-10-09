@@ -67,7 +67,6 @@ function read(feed: Feed = priceFeed) {
   }));
 }
 
-// what was written as a warning, for the length of a test
 function captureWarnings(t: { teardown: (fn: () => void) => void }): string[] {
   const logged: string[] = [];
   const consoleWarn = console.warn;

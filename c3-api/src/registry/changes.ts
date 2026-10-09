@@ -73,7 +73,6 @@ function withoutMarkets({ markets: _markets, ...network }: NetworkV1): Omit<Netw
   return network;
 }
 
-// a market with the chain it is on, by its key
 type Scoped = { chainId: number, market: MarketV1 };
 
 function marketsByScope(networks: NetworkV1[]): Map<string, Scoped> {
@@ -82,7 +81,6 @@ function marketsByScope(networks: NetworkV1[]): Map<string, Scoped> {
   ))));
 }
 
-// the keys of some markets, chain ids in numeric order and then deployment keys
 function inScopeOrder(markets: Map<string, Scoped>, scopes: string[]): string[] {
   const order = (left: Scoped, right: Scoped) => left.chainId - right.chainId || (
     left.market.deploymentKey < right.market.deploymentKey ? -1 : left.market.deploymentKey > right.market.deploymentKey ? 1 : 0

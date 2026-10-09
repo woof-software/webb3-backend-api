@@ -305,7 +305,7 @@ t.test('every answer of the token list names the version it read, and only that'
   };
   const readable = {
     'access-control-allow-origin':   '*',
-    'access-control-expose-headers': 'ETag, X-Registry-Version, X-Registry-Checksum, X-Registry-Stale',
+    'access-control-expose-headers': 'ETag, X-Registry-Version, X-Registry-Checksum, X-Registry-Stale, Retry-After',
   };
   const json    = { 'content-type': 'application/json; charset=utf-8' };
   const version = { 'x-registry-version': registry.versionId, 'x-registry-checksum': fixture.registryVersion.checksum };

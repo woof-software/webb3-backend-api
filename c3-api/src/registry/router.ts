@@ -1,5 +1,7 @@
+import * as jsonRpc from '../../lib/json-rpc.js';
+
 import { corsHeaders } from '../http/cors.js';
-import { ApiError, ApiErrorCode, failureResponse, isApiError } from '../http/errors.js';
+import { ApiError, ApiErrorCode, failureResponse, isApiError, nodeUnavailable } from '../http/errors.js';
 
 import type * as Evaluator from '../evaluator.js';
 
@@ -125,6 +127,10 @@ function asApiError(error: unknown): ApiError | null {
   }
   if (isRegistryUnavailable(error)) {
     return unavailableError(error);
+  }
+  // a node provider that did not serve a call no registry code names: a 503, as on every route
+  if (jsonRpc.isNotServed(error)) {
+    return nodeUnavailable(error);
   }
   /*
    * A database that could not be reached, wherever a route read it, is the

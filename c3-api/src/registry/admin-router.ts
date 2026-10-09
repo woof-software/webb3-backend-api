@@ -20,9 +20,11 @@ import {
 import {
   RegistryContext,
   applyProposal,
+  cancelSyncRun,
   chainIdOf,
   getChanges,
   getMarketOverlay,
+  getNetworkOverlay,
   getProposal,
   getProposalReview,
   getShadow,
@@ -86,6 +88,7 @@ function feedReader(env: Env): FeedReader {
 const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/sync$/,                                                  method: 'POST', handler: 'sync',           family: 'sync' },
   { pattern: /^\/registry\/v1\/admin\/sync-runs\/([^/]+)$/,                                    method: 'GET',  handler: 'syncRun',        family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/sync-runs\/([^/]+)\/cancel$/,                            method: 'POST', handler: 'cancelSyncRun',  family: 'sync' },
   { pattern: /^\/registry\/v1\/admin\/shadow$/,                                                method: 'GET',  handler: 'shadow',         family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/status$/,                                                method: 'GET',  handler: 'status',         family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/versions$/,                                              method: 'GET',  handler: 'versions',       family: 'read' },
@@ -96,6 +99,7 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/activate$/,                           method: 'POST', handler: 'activate',       family: 'activate' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/rollback$/,                           method: 'POST', handler: 'rollback',       family: 'activate' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/networks\/([^/]+)\/overlay$/,         method: 'PUT',  handler: 'networkOverlay', family: 'overlay' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/networks\/([^/]+)\/overlay$/,         method: 'GET',  handler: 'readNetworkOverlay', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/markets\/([^/]+)\/([^/]+)\/overlay$/, method: 'PUT',  handler: 'marketOverlay',  family: 'overlay' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/markets\/([^/]+)\/([^/]+)\/overlay$/, method: 'GET',  handler: 'readMarketOverlay', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/overlays$/,                            method: 'PUT',  handler: 'overlays',       family: 'overlay' },
@@ -224,8 +228,10 @@ function optionalExpectation(body: Record<string, unknown>, name: string, shape:
   return { value };
 }
 
+const OVERLAY_DIGEST = /^[0-9a-f]{64}$/;
+
 function expectedDigestOf(body: Record<string, unknown>): { expectedDigest?: string | null } {
-  const { value } = optionalExpectation(body, 'expectedDigest', /^[0-9a-f]{64}$/, 'the 64 hex characters of an overlay digest');
+  const { value } = optionalExpectation(body, 'expectedDigest', OVERLAY_DIGEST, 'the 64 hex characters of an overlay digest');
   return value === undefined ? {} : { expectedDigest: value };
 }
 
@@ -291,7 +297,6 @@ async function limit(env: Env, fingerprint: string, family: string): Promise<voi
   }
 }
 
-// an invocation an administrative sync answers with an error
 type SyncFailure = Extract<InvocationResult, { kind: 'invalid' | 'failed' }>;
 
 /*
@@ -383,6 +388,14 @@ async function postSync(
     requestedBy: actor,
   };
   /*
+   * A routine sync has no decision to keep a reason with, and one that
+   * continues a run has nowhere to keep it, so the reason is refused rather
+   * than dropped where the audit would never show it.
+   */
+  if (body.reason !== undefined && !isExplicit(request)) {
+    throw new ApiError('BAD_REQUEST', `a reason is taken only with sourceCommitSha, forceNewAttempt or holdForReview`);
+  }
+  /*
    * Holding a candidate open leaves the commit unimported until someone acts
    * on it, which is a decision like the other two. The importer asks the
    * same question, so what needs a reason here is also what it acts on at
@@ -436,28 +449,54 @@ function documentsOf(value: unknown, name: string): Array<[ string, unknown ]> {
 }
 
 /*
+ * `expectedDigests` is to a directory what `expectedDigest` is to one
+ * document, keyed as the documents are: a chain id for a network, and
+ * `chainId/deploymentKey` for a market, which no chain id can be. A document
+ * it names nothing for is written whatever its scope holds. A key that names
+ * no document of the request is refused, as a digest of the wrong shape is:
+ * ignored, it would drop the precondition its sender relied on.
+ */
+function expectedDigestsOf(body: Record<string, unknown>, documents: string[]): Map<string, { expectedDigest: string | null }> {
+  return new Map(documentsOf(body.expectedDigests, 'expectedDigests').map(([ key, digest ]) => {
+    if (!documents.includes(key)) {
+      throw new ApiError('BAD_REQUEST', `expectedDigests names ${key}, which this request has no overlay for`);
+    }
+    if (digest !== null && (typeof(digest) !== 'string' || !OVERLAY_DIGEST.test(digest))) {
+      throw new ApiError('BAD_REQUEST', `expectedDigests.${key} must be null or the 64 hex characters of an overlay digest`);
+    }
+    return [ key, { expectedDigest: digest } ];
+  }));
+}
+
+/*
  * The body of `PUT /versions/{id}/overlays`: network overlays keyed by chain
- * id, market overlays keyed by `chainId/deploymentKey`, and the one reason
- * every audit event of the request is stored with.
+ * id, market overlays keyed by `chainId/deploymentKey`, what each was decided
+ * against, and the one reason every audit event of the request is stored
+ * with.
  *
  * A key spells its chain id the one way a path does (chainIdOf), which is
  * how the proposal's bundle writes it, so a key names its scope as written:
  * no two keys of one document review the same network or market.
  */
 function overlayDocuments(body: Record<string, unknown>, versionId: string, actor: string): OverlayDocuments {
-  requireExactKeys(body, [ 'reason', 'networks', 'markets' ]);
+  requireExactKeys(body, [ 'reason', 'networks', 'markets', 'expectedDigests' ]);
   const reason = requireReason(body);
 
-  const networks = documentsOf(body.networks, 'networks').map(([ key, overlay ]) => ({
+  const networkDocuments = documentsOf(body.networks, 'networks');
+  const marketDocuments  = documentsOf(body.markets, 'markets');
+  const expected = expectedDigestsOf(body, [ ...networkDocuments, ...marketDocuments ].map(([ key ]) => key));
+
+  const networks = networkDocuments.map(([ key, overlay ]) => ({
     chainId: chainIdOf(key),
     overlay,
+    ...expected.get(key),
   }));
-  const markets = documentsOf(body.markets, 'markets').map(([ key, overlay ]) => {
+  const markets = marketDocuments.map(([ key, overlay ]) => {
     const market = parseMarketKey(key);
     if (market === null) {
       throw new ApiError('BAD_REQUEST', `${key} must name a market as chainId/deploymentKey`);
     }
-    return { chainId: chainIdOf(market.chainId), deploymentKey: market.deploymentKey, overlay };
+    return { chainId: chainIdOf(market.chainId), deploymentKey: market.deploymentKey, overlay, ...expected.get(key) };
   });
 
   const count = networks.length + markets.length;
@@ -676,6 +715,9 @@ async function routeAdmin(
       return await postSync(env, body, context);
     case 'syncRun':
       return await getSyncRun(context, versionId!);
+    case 'cancelSyncRun':
+      requireExactKeys(body, [ 'reason' ]);
+      return await cancelSyncRun(context, versionId!, requireReason(body));
     case 'versions':
       return await getVersions(context, new URL(request.url).searchParams);
     case 'version':
@@ -692,6 +734,8 @@ async function routeAdmin(
       }
       return await applyProposal(context, versionId!, { digest: body.digest, reason }, feedReader(env));
     }
+    case 'readNetworkOverlay':
+      return await getNetworkOverlay(context, versionId!, chainIdOf(second!));
     case 'readMarketOverlay':
       return await getMarketOverlay(context, versionId!, chainIdOf(second!), third!);
     case 'changes':

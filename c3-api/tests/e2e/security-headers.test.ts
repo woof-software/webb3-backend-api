@@ -92,7 +92,7 @@ t.test(`GET response includes security headers`, async t => {
  */
 const READABLE: Record<string, string> = {
   'Access-Control-Allow-Origin':   '*',
-  'Access-Control-Expose-Headers': 'ETag, X-Registry-Version, X-Registry-Checksum, X-Registry-Stale',
+  'Access-Control-Expose-Headers': 'ETag, X-Registry-Version, X-Registry-Checksum, X-Registry-Stale, Retry-After',
 };
 
 const CORS = {

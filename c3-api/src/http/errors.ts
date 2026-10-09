@@ -1,3 +1,5 @@
+import type { NotServed } from '../../lib/json-rpc.js';
+
 /*
  * Typed HTTP errors with one JSON envelope.
  *
@@ -68,9 +70,6 @@ class ApiError extends Error {
   }
 }
 
-/*
- * The answer to a request that addressed a real route with the wrong verb.
- */
 function methodNotAllowed(method: string, pathname: string, allowed: string[]): ApiError {
   const allow = allowed.join(', ');
   return new ApiError(
@@ -79,6 +78,15 @@ function methodNotAllowed(method: string, pathname: string, allowed: string[]): 
     { allowed },
     { 'Allow': allow },
   );
+}
+
+/*
+ * The answer to a request a node provider did not serve, on every route: worth
+ * trying again, after as long as the node provider proxy asked, when it said.
+ */
+function nodeUnavailable(error: NotServed): ApiError {
+  const retryAfter: Record<string, string> = error.retryAfter === null ? {} : { 'Retry-After': String(error.retryAfter) };
+  return new ApiError('UPSTREAM_UNAVAILABLE', `a node provider did not answer`, undefined, retryAfter);
 }
 
 function isApiError(error: unknown): error is ApiError {
@@ -152,4 +160,4 @@ function failureResponse(
 }
 
 export type { ApiErrorCode, FailureLog };
-export { ApiError, errorBody, failureResponse, isApiError, methodNotAllowed };
+export { ApiError, failureResponse, isApiError, methodNotAllowed, nodeUnavailable };

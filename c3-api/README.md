@@ -23,8 +23,9 @@ npm run d1:migrate:local
 
 Run the node provider proxy on this machine, in a terminal of its own, with
 its provider keys in `../node-provider-proxy/.dev.vars` (see
-[its README](../node-provider-proxy/README.md)). It is a package of its own,
-so its dependencies are installed there, the first time, before it starts:
+[Configuration](../node-provider-proxy/README.md#configuration) in its
+README). It is a package of its own, so its dependencies are installed there,
+the first time, before it starts:
 ```sh
 cd ../node-provider-proxy
 npm install
@@ -224,14 +225,14 @@ What that means for the endpoints:
   markets of the active version merged in, with every token they name and
   every feed they read: a target the constants do not know and the version
   does, an action bridged to another chain, and a call to the Configurator,
-  CometProxyAdmin, CometRewards or CometFactory, whose arguments name the
-  market it acts on. A token both know keeps the constants' name and takes
-  the version's decimals, which the constants have wrong for cbBTC on Base.
-  Almost every page has one, so the list reads the registry on almost every
-  request; when it cannot, the bridged actions and the calls that configure a
-  market are described against the constants alone, by the build answering
-  rather than the one that cached them, and the list is answered all the
-  same.
+  CometAdmin (the CometProxyAdmin), CometRewards or CometFactory, whose
+  arguments name the market it acts on. A token both know keeps the
+  constants' name and takes the version's decimals, which the constants have
+  wrong for cbBTC on Base. Almost every page has one, so the list reads the
+  registry on almost every request; when it cannot, the bridged actions and
+  the calls that configure a market are described against the constants
+  alone, by the build answering rather than the one that cached them, and
+  the list is answered all the same.
 
 A commit can be imported more than once — discovery tries again after an
 attempt that did not import every root, each time later, and an operator can
@@ -258,10 +259,15 @@ validate it to close it. What an earlier attempt hands down is what an
 overlay was written for in it, which its audit events name; the rest of its
 rows are copies of the version that was on when it was imported, and come
 from the version on now instead, so a hotfix or a rollback activated between
-two attempts is not undone by the second. Where the merged decisions name two
-default markets, the one an attempt decided is kept and the other is merged as
-not the default, and an import that would still write a second default is
-refused as `OVERLAY_INVALID`, naming both.
+two attempts is not undone by the second — except where the first was
+reviewed: a document is handed down whole, with what the version on then
+decided for its network or market. Nor is the rollback of an attempt
+of the commit: once one has been switched off, neither it nor an attempt
+before it hands anything down, because what they reviewed was switched on
+with it and off again. Where the merged decisions name two default markets,
+the one an attempt decided is kept and the other is merged as not the
+default, and an import that would still write a second default is refused as
+`OVERLAY_INVALID`, naming both.
 
 ## What a request reads
 
@@ -285,7 +291,9 @@ market routes read it the same way:
 - an entry is written once and never expires: it is never wrong, only
   unwanted, and the hourly job removes those of versions nothing is about to
   serve — every version but the active one, the one an outage would fall back
-  to, and the validated ones newer than the active one;
+  to, and the validated ones newer than the active one. A version switched on
+  while the job runs is cached again, by the job, by the activation or by the
+  first read;
 - a validated candidate is cached before it is activated — by the import that
   validated it, by `POST .../validate`, and by the activation itself — so an
   activation is a pointer move and no request pays the serialization;
@@ -374,10 +382,12 @@ curl -X POST .../registry/v1/admin/versions/$VERSION/proposal/apply \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"reason": "first registry version", "digest": "<digest>"}'
 
-# 4. validate, compare with the constants, activate
+# 4. validate, compare with the constants, activate. The first activation
+#    expects nothing to be on; a later one names the version that is
 curl -X POST .../registry/v1/admin/versions/$VERSION/validate ...
 curl         .../registry/v1/admin/versions/$VERSION/shadow ...
-curl -X POST .../registry/v1/admin/versions/$VERSION/activate ...
+curl -X POST .../registry/v1/admin/versions/$VERSION/activate ... \
+  -d '{"reason": "first registry version", "expectedActiveVersionId": null}'
 ```
 
 An administrative sync imports up to fifty markets per request (`markets`

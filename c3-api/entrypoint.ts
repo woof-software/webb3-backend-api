@@ -146,11 +146,10 @@ function prepare(env: Env, executionContext?: ExecutionContext) {
    * which fetches and KV operations count against (README, "Workers Plan").
    */
   const quota = Quota.initialize({
-    // cache operations, reads and writes alike: QUOTA_CACHE_OPERATIONS
     ops:    env.QUOTA_CACHE_OPERATIONS ?? Infinity,
     reads:  env.QUOTA_CACHE_OPERATIONS ?? Infinity,
     writes: env.QUOTA_CACHE_OPERATIONS ?? Infinity,
-    // subrequests made with fetch(..): QUOTA_SUBREQUESTS
+
     subrequests: env.QUOTA_SUBREQUESTS ?? Infinity,
   });
   fetch.configure(env, quota);
