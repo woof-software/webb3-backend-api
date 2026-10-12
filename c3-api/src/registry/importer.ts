@@ -1,4 +1,4 @@
-import { SyncRunRow, marketKey } from '../../lib/model/comet-registry.js';
+import { marketKey } from '../../lib/model/comet-registry.js';
 
 import { isUnreachable } from './cache.js';
 import { RpcTransport, enrichMarket } from './enrichment.js';
@@ -13,20 +13,19 @@ import {
   provisionalMarketOverlay,
   provisionalNetworkOverlay,
 } from './overlay.js';
+import { readImportOverlays } from './overlay-store.js';
 import {
   ImportedMarket,
   candidateRow,
-  changedRows,
-  failedChecks,
   findAttemptsByCommit,
   marketWrites,
   readActiveVersionId,
-  readImportOverlays,
   readVersion,
-  recorded,
   supersedeEarlierAttempts,
   supersedeStaleAttempts,
 } from './repository.js';
+import type { SyncRunRow } from './rows.js';
+import { changedRows } from './sql-condition.js';
 import {
   Clock,
   Fence,
@@ -60,6 +59,7 @@ import {
 import { sourceChecksum } from './source/roots.js';
 import { ALL_ROOTS_CHECK, failures, judgeVersion, verdictStatements } from './validation.js';
 import type { Verdict } from './validation.js';
+import { failedChecks, recorded } from './validation-store.js';
 
 /*
  * One registry import, driven by the Cron trigger a few markets at a time.

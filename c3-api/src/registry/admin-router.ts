@@ -1,6 +1,6 @@
 import type { Env } from '../../entrypoint.js';
 
-import { SyncOutcome, isAddress, normalizeAddress, parseMarketKey } from '../../lib/model/comet-registry.js';
+import { isAddress, normalizeAddress, parseMarketKey } from '../../lib/model/comet-registry.js';
 
 import { authenticateAdmin } from '../http/bearer-auth.js';
 import { clientOf } from '../http/client-address.js';
@@ -17,6 +17,17 @@ import {
   replaceNetworkOverlay,
   replaceOverlays,
 } from './admin.js';
+import {
+  getDeprecatedCollateral,
+  getDeprecatedCollateralExport,
+  patchDeprecatedCollateral,
+  postDeprecatedCollateralApply,
+  postDeprecatedCollateralReview,
+} from './deprecated-collateral-handlers.js';
+import type {
+  DecisionList as DeprecatedDecisionList,
+  ListedDecision as ListedDeprecatedDecision,
+} from './deprecated-collateral-repository.js';
 import {
   RegistryContext,
   applyProposal,
@@ -36,17 +47,7 @@ import {
 } from './handlers.js';
 import { isExplicit } from './importer.js';
 import type { InvocationResult } from './importer.js';
-import {
-  getLegacyCollateral,
-  getLegacyCollateralExport,
-  patchLegacyCollateral,
-  postLegacyCollateralApply,
-  postLegacyCollateralReview,
-} from './legacy-collateral-handlers.js';
-import type {
-  DecisionList as LegacyDecisionList,
-  ListedDecision as ListedLegacyDecision,
-} from './legacy-collateral-repository.js';
+import type { SyncOutcome } from './rows.js';
 import { runRegistrySync, transportFor } from './scheduled.js';
 import {
   getTokenPolicies,
@@ -112,11 +113,11 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/token-policies$/,                                       method: 'GET',  handler: 'exportTokenPolicies', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/token-policies\/review$/,                               method: 'POST', handler: 'reviewTokenPolicies', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/token-policies\/apply$/,                                method: 'POST', handler: 'applyTokenPolicies',  family: 'policy' },
-  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/legacy$/, method: 'GET',   handler: 'legacyCollateral',    family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/legacy$/, method: 'PATCH', handler: 'setLegacyCollateral', family: 'policy' },
-  { pattern: /^\/registry\/v1\/admin\/legacy-collaterals$/,                                   method: 'GET',  handler: 'exportLegacyCollaterals', family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/legacy-collaterals\/review$/,                           method: 'POST', handler: 'reviewLegacyCollaterals', family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/legacy-collaterals\/apply$/,                            method: 'POST', handler: 'applyLegacyCollaterals',  family: 'policy' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/deprecated$/, method: 'GET',   handler: 'deprecatedCollateral',    family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/deprecated$/, method: 'PATCH', handler: 'setDeprecatedCollateral', family: 'policy' },
+  { pattern: /^\/registry\/v1\/admin\/deprecated-collaterals$/,                               method: 'GET',  handler: 'exportDeprecatedCollaterals', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/deprecated-collaterals\/review$/,                       method: 'POST', handler: 'reviewDeprecatedCollaterals', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/deprecated-collaterals\/apply$/,                        method: 'POST', handler: 'applyDeprecatedCollaterals',  family: 'policy' },
 ] as const;
 
 const MAX_REASON = 1000;
@@ -146,7 +147,7 @@ const MAX_OVERLAYS_PER_REQUEST = 100;
 const MAX_OVERLAYS_BODY_BYTES  = 512 * 1024;
 
 /*
- * A list of decisions in one request, of token policies or of legacy
+ * A list of decisions in one request, of token policies or of deprecated
  * collaterals: every token, or every collateral, of every network of a
  * registry fits, with a reason on each row. The list is written as a handful
  * of statements whatever its length, so the bound is the body, not D1.
@@ -156,11 +157,11 @@ const MAX_DECISIONS_BODY_BYTES  = 1024 * 1024;
 
 // the bodies larger than an ordinary command, by the route that takes them
 const BODY_BYTES: Partial<Record<string, number>> = {
-  overlays:                MAX_OVERLAYS_BODY_BYTES,
-  reviewTokenPolicies:     MAX_DECISIONS_BODY_BYTES,
-  applyTokenPolicies:      MAX_DECISIONS_BODY_BYTES,
-  reviewLegacyCollaterals: MAX_DECISIONS_BODY_BYTES,
-  applyLegacyCollaterals:  MAX_DECISIONS_BODY_BYTES,
+  overlays:                    MAX_OVERLAYS_BODY_BYTES,
+  reviewTokenPolicies:         MAX_DECISIONS_BODY_BYTES,
+  applyTokenPolicies:          MAX_DECISIONS_BODY_BYTES,
+  reviewDeprecatedCollaterals: MAX_DECISIONS_BODY_BYTES,
+  applyDeprecatedCollaterals:  MAX_DECISIONS_BODY_BYTES,
 };
 
 /*
@@ -581,17 +582,17 @@ function decisionList(body: Record<string, unknown>): DecisionList {
   return { reason, decisions };
 }
 
-const LEGACY_DECISION_KEYS = [ 'chainId', 'cometAddress', 'deploymentKey', 'tokenAddress', 'symbol', 'isLegacy', 'reason' ];
+const DEPRECATED_DECISION_KEYS = [ 'chainId', 'cometAddress', 'deploymentKey', 'tokenAddress', 'symbol', 'isDeprecated', 'reason' ];
 
 /*
- * The body of `POST /legacy-collaterals/review` and `/apply`: a list as the
- * export answers it, edited, read as a list of token policies is read.
+ * The body of `POST /deprecated-collaterals/review` and `/apply`: a list as
+ * the export answers it, edited, read as a list of token policies is read.
  * `registryVersion` and `retained` say where it was exported from and which
  * decisions the active version does not hold, and are not read, since a
  * decision belongs to no version. Every problem of every row is reported at
  * once, so a file is fixed in one pass.
  */
-function legacyCollateralList(body: Record<string, unknown>): LegacyDecisionList {
+function deprecatedCollateralList(body: Record<string, unknown>): DeprecatedDecisionList {
   requireExactKeys(body, [ 'registryVersion', 'reason', 'collaterals', 'retained' ]);
   const problems: string[] = [];
   const reason = optionalReason(body.reason, 'reason', problems);
@@ -602,7 +603,7 @@ function legacyCollateralList(body: Record<string, unknown>): LegacyDecisionList
   }
 
   const seen = new Map<string, number>();
-  const decisions: ListedLegacyDecision[] = [];
+  const decisions: ListedDeprecatedDecision[] = [];
   collaterals.forEach((entry: unknown, index: number) => {
     const row = `row ${index + 1}`;
     if (typeof(entry) !== 'object' || entry === null || Array.isArray(entry)) {
@@ -612,11 +613,11 @@ function legacyCollateralList(body: Record<string, unknown>): LegacyDecisionList
     const value  = entry as Record<string, unknown>;
     const before = problems.length;
 
-    const unexpected = Object.keys(value).filter(key => !LEGACY_DECISION_KEYS.includes(key));
+    const unexpected = Object.keys(value).filter(key => !DEPRECATED_DECISION_KEYS.includes(key));
     if (unexpected.length > 0) {
       problems.push(`${row} has unexpected properties: ${unexpected.sort().join(', ')}`);
     }
-    const { chainId, cometAddress, deploymentKey, tokenAddress, symbol, isLegacy } = value;
+    const { chainId, cometAddress, deploymentKey, tokenAddress, symbol, isDeprecated } = value;
     if (typeof(chainId) !== 'number' || !Number.isSafeInteger(chainId) || chainId <= 0) {
       problems.push(`${row}: chainId must be a positive integer`);
     }
@@ -632,8 +633,8 @@ function legacyCollateralList(body: Record<string, unknown>): LegacyDecisionList
     if (symbol !== undefined && symbol !== null && typeof(symbol) !== 'string') {
       problems.push(`${row}: symbol must be null or a string`);
     }
-    if (typeof(isLegacy) !== 'boolean') {
-      problems.push(`${row}: isLegacy must be a boolean`);
+    if (typeof(isDeprecated) !== 'boolean') {
+      problems.push(`${row}: isDeprecated must be a boolean`);
     }
     const rowReason = optionalReason(value.reason, `${row}: reason`, problems);
     if (problems.length > before) {
@@ -655,13 +656,13 @@ function legacyCollateralList(body: Record<string, unknown>): LegacyDecisionList
       deploymentKey: (deploymentKey as string | null | undefined) ?? null,
       tokenAddress:  token,
       symbol:        (symbol as string | null | undefined) ?? null,
-      isLegacy:      isLegacy as boolean,
+      isDeprecated:  isDeprecated as boolean,
       reason:        rowReason,
     });
   });
 
   if (problems.length > 0) {
-    throw new ApiError('BAD_REQUEST', `the list of legacy collaterals is invalid`, { problems });
+    throw new ApiError('BAD_REQUEST', `the list of deprecated collaterals is invalid`, { problems });
   }
   return { reason, decisions };
 }
@@ -807,30 +808,30 @@ async function routeAdmin(
       return await postTokenPolicyReview(context, decisionList(body));
     case 'applyTokenPolicies':
       return await postTokenPolicyApply(context, decisionList(body));
-    case 'legacyCollateral':
+    case 'deprecatedCollateral':
       // a chain id, the Comet and the token, as on the token routes
-      return await getLegacyCollateral(context, versionId!, second!, third!);
-    case 'setLegacyCollateral': {
+      return await getDeprecatedCollateral(context, versionId!, second!, third!);
+    case 'setDeprecatedCollateral': {
       /*
-       * A legacy decision changes which collaterals the frontend offers, so it
-       * carries a reason like every other decision, and the audit event stores
-       * it beside the actor.
+       * A deprecated decision changes which collaterals the frontend offers,
+       * and which tokens discovery shows, so it carries a reason like every
+       * other decision, and the audit event stores it beside the actor.
        */
-      requireExactKeys(body, [ 'isLegacy', 'reason' ]);
-      if (typeof(body.isLegacy) !== 'boolean') {
-        throw new ApiError('BAD_REQUEST', `isLegacy must be a boolean`);
+      requireExactKeys(body, [ 'isDeprecated', 'reason' ]);
+      if (typeof(body.isDeprecated) !== 'boolean') {
+        throw new ApiError('BAD_REQUEST', `isDeprecated must be a boolean`);
       }
-      return await patchLegacyCollateral(context, versionId!, second!, third!, {
-        isLegacy: body.isLegacy,
-        reason:   requireReason(body),
+      return await patchDeprecatedCollateral(context, versionId!, second!, third!, {
+        isDeprecated: body.isDeprecated,
+        reason:       requireReason(body),
       });
     }
-    case 'exportLegacyCollaterals':
-      return await getLegacyCollateralExport(context);
-    case 'reviewLegacyCollaterals':
-      return await postLegacyCollateralReview(context, legacyCollateralList(body));
-    case 'applyLegacyCollaterals':
-      return await postLegacyCollateralApply(context, legacyCollateralList(body));
+    case 'exportDeprecatedCollaterals':
+      return await getDeprecatedCollateralExport(context);
+    case 'reviewDeprecatedCollaterals':
+      return await postDeprecatedCollateralReview(context, deprecatedCollateralList(body));
+    case 'applyDeprecatedCollaterals':
+      return await postDeprecatedCollateralApply(context, deprecatedCollateralList(body));
   }
 }
 

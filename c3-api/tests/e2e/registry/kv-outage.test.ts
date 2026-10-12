@@ -5,8 +5,10 @@ import { randomUUID } from 'node:crypto';
 import C3Api, { Env } from '../../../entrypoint.js';
 import { sha256 } from '../../../lib/hash.js';
 import { POINTER_KEY } from '../../../src/registry/cache.js';
+import { DEPRECATED_KEY } from '../../../src/registry/deprecated-collaterals.js';
 import { maintainRegistryCache } from '../../../src/registry/scheduled.js';
 
+import { executionContext, settledWithin } from '../../util/execution-context.js';
 import { MemoryKv, refusingKv } from '../../util/kv.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { seedCandidate } from '../../util/registry-fixture.js';
@@ -38,6 +40,7 @@ async function envWith(overrides: Partial<Env>): Promise<Env> {
   });
 }
 
+// without an execution context, so the cache writes the records an outage reads before it answers
 async function get(env: Env, path: string, headers: Record<string, string> = {}): Promise<Response> {
   return C3Api.fetch(new Request(`https://api.test.local${path}`, { headers }), env);
 }
@@ -198,6 +201,82 @@ t.test('a database that cannot be reached, with a namespace that does not answer
     t.same([ error.code, error.message ], [ 'UPSTREAM_UNAVAILABLE', 'the comet registry could not be read' ],
       'as the registry being unavailable');
   }
+});
+
+/*
+ * Bindings of `store` that hold back the writes of the records an outage
+ * reads — the pointer record and the deprecated collateral decisions — until
+ * `release`. Each binding is an isolate that has written neither yet.
+ */
+function heldRecords(store: KVNamespace): { binding: () => KVNamespace, release: () => void } {
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const binding = () => new Proxy(store, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'put' && typeof(value) === 'function') {
+        return async (...parameters: unknown[]) => {
+          if (parameters[0] === POINTER_KEY || parameters[0] === DEPRECATED_KEY) {
+            await released;
+          }
+          return (value as (...parameters: unknown[]) => unknown).apply(target, parameters);
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as KVNamespace;
+  return { binding, release };
+}
+
+/*
+ * A namespace slow to take a write holds no answer either. What the cache
+ * keeps for an outage is handed to the request's waitUntil and written past
+ * the answer, on the registry's routes and the market routes alike.
+ */
+t.test('a namespace slow to take a write holds no answer: the records an outage reads are left to waitUntil', async t => {
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+  captureLogs(t);
+  const store = MemoryKv({});
+  const held  = heldRecords(store);
+  const request = async (path: string) => {
+    const { context, handed } = executionContext();
+    const env = await envWith({ APP_DB: registry.db, kv_registry: held.binding() });
+    return { answer: C3Api.fetch(new Request(`https://api.test.local${path}`), env, context), handed };
+  };
+
+  const active = await request('/registry/v1/active');
+  const tokens = await request('/registry/v1/networks/10/tokens');
+  const market = await request(`/market/${MAINNET}/${UNKNOWN}/summary`);
+  t.ok(await settledWithin(Promise.all([ active.answer, tokens.answer, market.answer ]), 5000),
+    'the registry routes and a market route answer while those writes are held');
+  t.same([ active.handed.length, tokens.handed.length, market.handed.length ], [ 2, 1, 1 ],
+    'each having handed its writes to waitUntil: the pointer record, and on /active the check of the decisions');
+  t.same([ await store.get(POINTER_KEY), await store.get(DEPRECATED_KEY) ], [ null, null ], 'none of which has landed');
+
+  held.release();
+  t.same([ (await active.answer).status, (await tokens.answer).status, (await market.answer).status ], [ 200, 404, 400 ],
+    'the token list of a chain the version does not hold, and a market of no version, refused after the version was read');
+  await Promise.all([ ...active.handed, ...tokens.handed, ...market.handed ].map(entry => entry.work));
+  t.ok(await store.get(POINTER_KEY) !== null, 'the pointer record lands once the namespace takes it');
+  t.ok(await store.get(DEPRECATED_KEY) !== null, 'and so does the record of the decisions');
+});
+
+// a request without an execution context, as a test makes one, writes them before it answers instead
+t.test('without an execution context a request writes the records an outage reads before it answers', async t => {
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+  captureLogs(t);
+  const store = MemoryKv({});
+  const held  = heldRecords(store);
+  t.equal((await get(await envWith({ APP_DB: registry.db, kv_registry: MemoryKv({}) }), '/registry/v1/active')).status, 200,
+    'a first read holds the version in memory, so the request below waits for nothing else');
+
+  const answer = get(await envWith({ APP_DB: registry.db, kv_registry: held.binding() }), '/registry/v1/active');
+  t.notOk(await settledWithin(answer, 300), 'the request waits while the writes are held');
+  held.release();
+  t.equal((await answer).status, 200, 'and answers once they land');
+  t.same([ await store.get(POINTER_KEY) !== null, await store.get(DEPRECATED_KEY) !== null ], [ true, true ], 'both records written');
 });
 
 t.test("the Cron's upkeep of a namespace that does not answer fails nothing", async t => {

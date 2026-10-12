@@ -1,4 +1,4 @@
-import { sha256Hex } from '../../lib/hash.js';
+import { sha256 } from '../../lib/hash.js';
 
 import { ApiError } from './errors.js';
 
@@ -67,7 +67,7 @@ async function authenticateAdmin(request: Request, tokenHash: string | undefined
       `the administrative API is misconfigured in this environment: COMET_REGISTRY_ADMIN_TOKEN_HASH is not 64 hex digits`,
     );
   }
-  const presented = await sha256Hex(bearerToken(request));
+  const presented = await sha256(bearerToken(request));
   if (!equalsFixedTime(presented, configured)) {
     throw unauthorized(`the bearer token is not valid`, 'Bearer error="invalid_token"');
   }
@@ -75,4 +75,4 @@ async function authenticateAdmin(request: Request, tokenHash: string | undefined
 }
 
 export type { Credential };
-export { authenticateAdmin, sha256Hex };
+export { authenticateAdmin };

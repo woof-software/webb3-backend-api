@@ -22,10 +22,10 @@ import {
 import type { Address, MarketV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
-import { legacyDecisionsOf } from '../../../src/registry/legacy-collaterals.js';
-import { RULE_VERSION, collateralView, positionsOf } from '../../../src/registry/token-collateral.js';
+import { deprecatedDecisionsOf } from '../../../src/registry/deprecated-collaterals.js';
+import { collateralView, positionsOf } from '../../../src/registry/token-collateral.js';
 import type { BlockRef, TokenCollateralDeps } from '../../../src/registry/token-collateral.js';
-import { tokenList } from '../../../src/registry/token-visibility.js';
+import { RULE_VERSION, tokenList } from '../../../src/registry/token-visibility.js';
 
 import { fakeNode } from '../../util/fake-node.js';
 import type { Read } from '../../util/fake-node.js';
@@ -62,7 +62,7 @@ const LIST_KEYS      = [ 'registryVersion', 'chainId', 'thresholdUsd', 'ruleVers
 const VERSION_KEYS   = [ 'id', 'checksum' ];
 const BLOCK_KEYS     = [ 'number', 'timestamp' ];
 const TOKEN_KEYS     = [
-  'address', 'symbol', 'name', 'decimals', 'roles', 'isStrategic', 'isLegacy', 'legacyIn', 'collateralValueUsd',
+  'address', 'symbol', 'name', 'decimals', 'roles', 'isStrategic', 'isDeprecated', 'deprecatedIn', 'collateralValueUsd',
   'collateralValueStatus', 'valueAt', 'valueBlock', 'staleAgeSeconds', 'exceptions', 'isVisible', 'visibilityReason',
 ];
 const EXCEPTION_KEYS = [ 'kind', 'priceFeedAddress', 'provenance', 'expiresAt' ];
@@ -170,7 +170,7 @@ t.test('the list names its version, chain, threshold, rule, time and block', asy
     }
     checkInteger(problems, list.chainId, 1, Number.MAX_SAFE_INTEGER, 'chainId');
     if (list.thresholdUsd !== THRESHOLD_USD) problems.push(`thresholdUsd: expected the string "${THRESHOLD_USD}"`);
-    if (list.ruleVersion !== RULE_VERSION) problems.push(`ruleVersion: expected ${RULE_VERSION}, the rule the code values and decides by`);
+    if (list.ruleVersion !== RULE_VERSION) problems.push(`ruleVersion: expected ${RULE_VERSION}, the rule the code decides by`);
     checkInstant(problems, list.computedAt, 'computedAt');
     if (list.block !== null) checkBlock(problems, list.block, 'block');
     if (!Array.isArray(list.tokens)) problems.push('tokens: expected an array');
@@ -198,13 +198,14 @@ t.test('every token is typed, listed once, and ordered by symbol then address', 
     }
 
     checkBoolean(problems, token.isStrategic, `${where}.isStrategic`);
-    checkBoolean(problems, token.isLegacy, `${where}.isLegacy`);
-    if (!Array.isArray(token.legacyIn)) {
-      problems.push(`${where}.legacyIn: expected an array`);
+    checkBoolean(problems, token.isDeprecated, `${where}.isDeprecated`);
+    if (!Array.isArray(token.deprecatedIn)) {
+      problems.push(`${where}.deprecatedIn: expected an array`);
     } else {
-      token.legacyIn.forEach((comet: unknown, c: number) => checkPattern(problems, comet, ADDRESS, `${where}.legacyIn[${c}]`));
-      if ([ ...token.legacyIn ].sort().join(',') !== token.legacyIn.join(',') || new Set(token.legacyIn).size !== token.legacyIn.length) {
-        problems.push(`${where}.legacyIn: expected each Comet once, sorted`);
+      token.deprecatedIn.forEach((comet: unknown, c: number) => checkPattern(problems, comet, ADDRESS, `${where}.deprecatedIn[${c}]`));
+      if ([ ...token.deprecatedIn ].sort().join(',') !== token.deprecatedIn.join(',')
+        || new Set(token.deprecatedIn).size !== token.deprecatedIn.length) {
+        problems.push(`${where}.deprecatedIn: expected each Comet once, sorted`);
       }
     }
     if (token.collateralValueUsd !== null) checkPattern(problems, token.collateralValueUsd, DECIMAL, `${where}.collateralValueUsd`);
@@ -314,41 +315,44 @@ t.test('each status carries the value, time, age and exceptions its rule gives i
 });
 
 /*
- * Strategic first; then a value that could not be read, which is shown
- * (decision D4); then the threshold, which exactly 250000 reaches. Only
- * below_threshold hides a token.
+ * A token deprecated in every enabled market that takes it is hidden, whatever
+ * else holds. Then strategic; then a value that could not be read, which is
+ * shown (decision D4); then the threshold, which exactly 250000 reaches. Only
+ * deprecated and below_threshold hide a token.
  */
-t.test('a token is shown when strategic, when its value is unknown, or when its value reaches the threshold', async t => {
+t.test('a token is hidden when deprecated, and shown when strategic, when its value is unknown, or when its value reaches the threshold', async t => {
   const problems: Problems = [];
   typed.forEach((token, i) => {
     const where  = `tokens[${i}] ${token.symbol}`;
     const value  = token.collateralValueUsd;
-    const reason = token.isStrategic === true ? 'strategic'
+    const reason = token.isDeprecated === true ? 'deprecated'
+      : token.isStrategic === true ? 'strategic'
       : value === null ? 'data_unavailable'
       : typeof value === 'string' && reachesThreshold(value) ? 'collateral_threshold'
       : 'below_threshold';
     if (token.visibilityReason !== reason) problems.push(`${where}.visibilityReason: expected ${reason}`);
-    if (token.isVisible !== (token.visibilityReason !== 'below_threshold')) problems.push(`${where}.isVisible: only below_threshold hides a token`);
+    if (token.isVisible !== ![ 'deprecated', 'below_threshold' ].includes(token.visibilityReason)) {
+      problems.push(`${where}.isVisible: only deprecated and below_threshold hide a token`);
+    }
   });
   t.same(problems, []);
 });
 
 /*
- * Legacy collateral (migrations/0006): only a collateral is legacy in a
- * Comet, and a token legacy in every enabled market that takes it names at
- * least one. Whether a token is shown is decided without either, which the
- * rule above holds the fixture to: it derives every reason without them.
+ * Deprecated collateral (migrations 0006 and 0007): only a collateral is
+ * deprecated in a Comet, and a token deprecated in every enabled market that
+ * takes it names at least one.
  */
-t.test('a token is legacy only as a collateral, and in a Comet it names', async t => {
+t.test('a token is deprecated only as a collateral, and in a Comet it names', async t => {
   const problems: Problems = [];
   typed.forEach((token, i) => {
-    const where    = `tokens[${i}] ${token.symbol}`;
-    const legacyIn = Array.isArray(token.legacyIn) ? token.legacyIn : [];
-    if (!token.roles.includes('collateral') && (token.isLegacy !== false || legacyIn.length !== 0)) {
-      problems.push(`${where}: a token no market takes as collateral is legacy nowhere`);
+    const where        = `tokens[${i}] ${token.symbol}`;
+    const deprecatedIn = Array.isArray(token.deprecatedIn) ? token.deprecatedIn : [];
+    if (!token.roles.includes('collateral') && (token.isDeprecated !== false || deprecatedIn.length !== 0)) {
+      problems.push(`${where}: a token no market takes as collateral is deprecated nowhere`);
     }
-    if (token.isLegacy === true && legacyIn.length === 0) {
-      problems.push(`${where}: a legacy token names the Comets it is legacy in`);
+    if (token.isDeprecated === true && deprecatedIn.length === 0) {
+      problems.push(`${where}: a deprecated token names the Comets it is deprecated in`);
     }
   });
   t.same(problems, []);
@@ -368,14 +372,17 @@ t.test('the fixture shows every case a client must handle', async t => {
   t.ok(typed.some(token => token.roles.includes('collateral') && token.collateralValueUsd === '0'),
     'a collateral only a deprecated market holds, worth 0 as well');
   t.ok(values.includes(THRESHOLD_USD), 'a value exactly at the threshold');
+  t.ok(typed.some(token => token.visibilityReason === 'below_threshold' && token.collateralValueUsd !== '0'),
+    'and a collateral hidden by a value short of it');
   t.ok(values.some(value => value.replace('.', '').length > 17), 'a value with more digits than a float keeps');
   t.ok(typed.some(token => token.exceptions.some((exception: any) => exception?.expiresAt !== null)), 'an exception that expires');
   t.ok(typed.some(token => token.collateralValueStatus === 'fresh' && blockOf(token.valueBlock) !== null && !sameBlock(blockOf(token.valueBlock), blockOf(list.block))),
     'a value read at an earlier block of the list\'s minute');
-  t.ok(typed.some(token => token.isLegacy === true), 'a token legacy in every enabled market that takes it');
-  t.ok(typed.some(token => token.isLegacy === true && token.isVisible === true), 'and one discovery shows all the same');
-  t.ok(typed.some(token => token.isLegacy === false && Array.isArray(token.legacyIn) && token.legacyIn.length > 0),
-    'a token legacy in a Comet, but current in another enabled market, or taken by none');
+  t.ok(typed.some(token => token.isDeprecated === true), 'a token deprecated in every enabled market that takes it');
+  t.ok(typed.some(token => token.isDeprecated === true && token.isStrategic === true && token.isVisible === false),
+    'and a strategic one, hidden all the same');
+  t.ok(typed.some(token => token.isDeprecated === false && Array.isArray(token.deprecatedIn) && token.deprecatedIn.length > 0),
+    'a token deprecated in a Comet, but current in another enabled market, or taken by none');
 });
 
 /*
@@ -386,13 +393,15 @@ t.test('the fixture shows every case a client must handle', async t => {
  * The USDT market is deprecated, and keeps XAUt alone. pumpBTC is priced
  * through the feed the network's fixed price is stated for, so its price is
  * the registry's 1.02447384 BTC and is never read; that price is given an
- * expiry, stated with an offset, as an overlay may state it. COMP and WBTC
- * are strategic.
+ * expiry, stated with an offset, as an overlay may state it. COMP, WBTC and
+ * pumpBTC are strategic.
  *
- * LBTC and pumpBTC are legacy collateral of the WBTC market, tBTC and wstETH
- * of the USDC market, and XAUt of the deprecated USDT market. LBTC, pumpBTC
- * and tBTC are legacy, tBTC shown all the same; wstETH is not, being current
- * in the WETH market, and nor is XAUt, which no enabled market takes.
+ * pumpBTC is deprecated collateral of the WBTC market, wstETH of the USDC
+ * market, and XAUt of the USDT market, itself deprecated. pumpBTC is
+ * deprecated in every enabled market that takes it, and hidden though it is
+ * strategic; wstETH is not, being current in the WETH market, and nor is
+ * XAUt, which no enabled market takes. LBTC is current, and hidden by its
+ * value alone, a quarter of a cent short of the threshold.
  *
  * Three requests value the chain. The first is three minutes back, when only
  * tBTC's price reverts. The second is the first of the current minute, when
@@ -403,7 +412,7 @@ t.test('the fixture shows every case a client must handle', async t => {
  *   cbETH    100 in WETH × 1.25 ETH × 2000                   250000, exactly the threshold
  *   COMP     1500 in USDC × 45.5                             68250, strategic
  *   LBTC     2.5 in WBTC × 0.99999999 BTC × 100000           249999.9975, three minutes back
- *   pumpBTC  2 in WBTC × 1.02447384 BTC × 100000             204894.768, at the fixed price
+ *   pumpBTC  2 in WBTC × 1.02447384 BTC × 100000             204894.768, at the fixed price, strategic
  *   tBTC     5 in USDC, at a price that reverts              unavailable
  *   USDC     1000000.5 in WETH × 0.00049997 ETH × 2000       999940.49997
  *   USDT     the base of the deprecated market               0
@@ -418,6 +427,7 @@ const debug = Debug.MakeLogger([]).configure(process.env);
 const PUMPBTC_FEED = '0x351a133fd850ea81ed8a782016e308acbaddec91';
 const COMP         = '0xc00e94cb662c3520282e6f5717214004a7f26888';
 const WBTC         = '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599';
+const PUMPBTC      = '0xf469fbd2abcd6b9de8e169d128226c0fc90a012e';
 
 // the collaterals each market keeps, by symbol
 const KEPT: Record<string, string[]> = {
@@ -427,11 +437,11 @@ const KEPT: Record<string, string[]> = {
   wbtc: [ 'LBTC', 'pumpBTC' ],
 };
 
-// the collaterals each market has marked legacy, by symbol
-const LEGACY: Record<string, string[]> = {
-  usdc: [ 'tBTC', 'wstETH' ],
+// the collaterals each market has marked deprecated, by symbol
+const DEPRECATED: Record<string, string[]> = {
+  usdc: [ 'wstETH' ],
   usdt: [ 'XAUt' ],
-  wbtc: [ 'LBTC', 'pumpBTC' ],
+  wbtc: [ 'pumpBTC' ],
 };
 
 // what each market holds of each collateral, in whole tokens
@@ -553,9 +563,9 @@ t.test('the scenario the fixture was made from reproduces it exactly', async t =
     network:         'ethereum-mainnet',
     positions,
     view,
-    strategic:       new Set<Address>([ COMP, WBTC ]),
-    legacy:          legacyDecisionsOf(markets.flatMap(entry => entry.collateralAssets
-      .filter(asset => (LEGACY[entry.deploymentKey] ?? []).includes(asset.token.symbol))
+    strategic:       new Set<Address>([ COMP, WBTC, PUMPBTC ]),
+    deprecated:      deprecatedDecisionsOf(markets.flatMap(entry => entry.collateralAssets
+      .filter(asset => (DEPRECATED[entry.deploymentKey] ?? []).includes(asset.token.symbol))
       .map(asset => ({ chainId: 1, cometAddress: entry.contracts.comet!, tokenAddress: asset.token.address })))),
     now,
   });

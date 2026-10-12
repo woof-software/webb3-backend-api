@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
-import { sha256Hex } from '../../../src/http/bearer-auth.js';
+import { sha256 } from '../../../lib/hash.js';
 import { readSnapshot, readUnreviewed } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
@@ -25,7 +25,7 @@ const ADMIN_TOKEN = 'registry-admin-token-for-tests';
 const server = createTestHarness({
   workers: [ {
     configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256Hex(ADMIN_TOKEN) },
+    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
   } ],
 });
 
@@ -111,8 +111,11 @@ t.test('the proposal is read, and applied by the digest its review names', async
 
   const stale = await apply(versionId, { reason: 'bootstrap', digest: '0123456789abcdef' });
   t.equal(stale.status, 409, 'a digest that is not the proposal\'s is refused');
-  t.same((await stale.json() as { error: { details: { digest: string } } }).error.details, { digest: proposal.digest },
-    'with the digest of the proposal as it is now');
+  t.same(
+    (await stale.json() as { error: { details: unknown } }).error.details,
+    { code: 'PROPOSAL_CHANGED', digest: proposal.digest },
+    'with the digest of the proposal as it is now',
+  );
   t.same(await readUnreviewed(db, versionId), {
     networks: [ 1, 8453, 534352 ],
     markets:  [ '1/undescribed', '1/usdc', '1/usdt', '1/wbtc', '1/weth', '8453/aero', '534352/usdc' ],
@@ -145,7 +148,9 @@ t.test('the apply route takes a digest and a reason, and an open candidate only'
   t.equal((await server.fetch('/registry/v1/admin/versions/00000000-0000-4000-8000-000000000999/proposal', { headers: auth })).status, 404);
 
   await validateSeeded(db, versionId);
-  t.equal((await apply(versionId, { reason: 'too late', digest })).status, 409, 'a validated version can no longer be changed');
+  const closed = await apply(versionId, { reason: 'too late', digest });
+  t.equal(closed.status, 409, 'a validated version can no longer be changed');
+  t.equal((await closed.json() as { error: { details: { code: string } } }).error.details.code, 'VERSION_NOT_IMPORTING');
 });
 
 /*
@@ -172,9 +177,11 @@ t.test('the proposal is for an environment no version has been switched on in', 
   for (const route of [ 'proposal', 'proposal/review' ]) {
     const answer = await server.fetch(`/registry/v1/admin/versions/${versionId}/${route}`, { headers: auth });
     t.equal(answer.status, 409, `${route} is refused from then on`);
+    t.equal((await answer.json() as { error: { details: { code: string } } }).error.details.code, 'PROPOSAL_CLOSED');
   }
   const applied = await apply(versionId, { reason: 'too late', digest });
   t.equal(applied.status, 409, 'and so is applying it');
-  t.match((await applied.json() as { error: { message: string } }).error.message, /first version/, 'saying what it is for');
+  t.match((await applied.json() as { error: unknown }).error, { message: /first version/, details: { code: 'PROPOSAL_CLOSED' } },
+    'saying what it is for');
   t.same((await readUnreviewed(db, versionId)).networks, [ 1, 8453, 534352 ], 'with nothing written');
 });

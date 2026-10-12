@@ -42,11 +42,13 @@ type Dependencies = evm.Evm | market.AssetCollateralValue;
 
 const RECORD_VERSION = 1;
 /*
- * The rule a record was valued and a list decided by. A change of either must
- * not read records of the old one: assetCollateralValue is never cached, so
- * this is the only thing that retires them.
+ * The rule a record was valued by. A change of it must not read records of
+ * the old one: assetCollateralValue is never cached, so this is the only thing
+ * that retires them. Which tokens a list shows is decided from the values when
+ * the list is made, and no record holds it, so a change of that rule
+ * (token-visibility.ts, RULE_VERSION) keeps every record.
  */
-const RULE_VERSION = 1;
+const VALUE_RULE_VERSION = 1;
 
 /*
  * How far back a token whose value cannot be read now may take the last value
@@ -188,7 +190,7 @@ function positionSetOf(positions: Position[]): string {
 }
 
 function recordKey(chainId: number, positionSet: string, minute: number): string {
-  return `token-collateral:v${RECORD_VERSION}:r${RULE_VERSION}:${chainId}:${positionSet}:${minute}`;
+  return `token-collateral:v${RECORD_VERSION}:r${VALUE_RULE_VERSION}:${chainId}:${positionSet}:${minute}`;
 }
 
 function storedOf(value: BigFixnum): StoredValue {
@@ -686,7 +688,6 @@ export {
   INCOMPLETE_BACKOFF_MS,
   LOOKBACK_DEADLINE_MS,
   MAX_SPLIT_EVALUATIONS,
-  RULE_VERSION,
   collateralView,
   maxStaleMinutesOf,
   positionSetOf,

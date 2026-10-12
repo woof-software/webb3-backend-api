@@ -5,15 +5,16 @@ import { randomUUID } from 'node:crypto';
 import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
+import { sha256 } from '../../../lib/hash.js';
 import type { Address } from '../../../lib/model/comet-registry.js';
-import { sha256Hex } from '../../../src/http/bearer-auth.js';
-import { activeSnapshot, cacheDepsOf } from '../../../src/registry/cache.js';
+import { POINTER_KEY, activeSnapshot, cacheDepsOf } from '../../../src/registry/cache.js';
 import { CHECK_KEY, checkChain } from '../../../src/registry/drift.js';
-import { activateVersion, markInvalid, recordValidationResults } from '../../../src/registry/repository.js';
+import { activateVersion } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
 import { FakeChain, fakeChain } from '../../util/fake-chain.js';
 import { activateSeeded, loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { markInvalid, recordValidationResults } from '../../util/registry-repository.js';
 
 /*
  * The status route: one answer a monitor polls and an operator reads.
@@ -23,7 +24,7 @@ import { activateSeeded, loadRegistrySnapshotFixture, seedCandidate, validateSee
  * "alerts is empty" without the monitor knowing the registry's rules.
  */
 const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-const SECRETS     = { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256Hex(ADMIN_TOKEN) };
+const SECRETS     = { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) };
 
 const server = createTestHarness({
   workers: [ {
@@ -85,6 +86,15 @@ async function status(): Promise<Status> {
   return await response.json() as Status;
 }
 
+// waits for the pointer record a read writes past its answer, through waitUntil, for two seconds at most
+async function pointerRecorded(): Promise<void> {
+  const { kv_registry } = await server.getWorker<Env>().getEnv();
+  const deadline = Date.now() + 2000;
+  while (await kv_registry.get(POINTER_KEY) === null && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
 const COMMIT = 'a34d9b571c833b5d77f052ab8e2dbdbe10df726d';
 
 async function recordRun(
@@ -132,6 +142,7 @@ t.test('a healthy registry raises nothing', async t => {
 
   // the worker caches what it serves, which is what the status then reports
   t.equal((await server.fetch('/registry/v1/active')).status, 200);
+  await pointerRecorded();
 
   const healthy = await status();
   t.equal(healthy.active?.versionId, versionId);

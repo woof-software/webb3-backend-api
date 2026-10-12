@@ -3,7 +3,7 @@ import t, { Test } from 'tap';
 import { randomUUID } from 'node:crypto';
 
 import C3Api, { Env } from '../../../entrypoint.js';
-import { sha256Hex } from '../../../src/http/bearer-auth.js';
+import { sha256 } from '../../../lib/hash.js';
 
 import { MemoryKv } from '../../util/kv.js';
 import { makeTestEnv } from '../../util/test-env.js';
@@ -36,13 +36,18 @@ function failing(message: string): D1Database {
 async function envWith(overrides: Partial<Env>): Promise<Env> {
   return makeTestEnv({
     MEMORY_CACHE_SEED:                'registry-outage',
-    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256Hex(ADMIN_TOKEN),
+    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256(ADMIN_TOKEN),
     REGISTRY_ADMIN_RATE_LIMITER:      { limit: async () => ({ success: true }) },
     REGISTRY_ADMIN_AUTH_RATE_LIMITER: { limit: async () => ({ success: true }) },
     ...overrides,
   });
 }
 
+/*
+ * Without an execution context, so the cache writes the records an outage
+ * reads before it answers, not past the answer: what a request records is
+ * there for the request after it.
+ */
 async function get(env: Env, path: string, headers: Record<string, string> = {}): Promise<Response> {
   return C3Api.fetch(new Request(`https://api.test.local${path}`, { headers }), env);
 }
@@ -102,13 +107,13 @@ t.test('a database that answers with a fault is a 500 that says nothing but the 
 });
 
 /*
- * A missing table is such a fault too. Only the token policy and legacy
+ * A missing table is such a fault too. Only the token policy and deprecated
  * collateral tables are answered otherwise, by the routes that read them,
  * with a 503 that names the remedy (token-list-routes, token-policy-routes,
- * legacy-collateral-routes); a registry table missing is a 500 on the token
- * list and the active reads as everywhere else.
+ * deprecated-collateral-routes); a registry table missing is a 500 on the
+ * token list and the active reads as everywhere else.
  */
-t.test('a missing table is a 500, unless it is a token policy or legacy collateral table', async t => {
+t.test('a missing table is a 500, unless it is a token policy or deprecated collateral table', async t => {
   const logs = captureLogs(t);
   const env  = await envWith({ APP_DB: failing('D1_ERROR: no such table: registry_state: SQLITE_ERROR') });
 

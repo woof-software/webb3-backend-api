@@ -1,5 +1,7 @@
-import {
-  DeploymentPath,
+import type { DeploymentPath } from '../../lib/model/comet-registry.js';
+
+import { RegistryError } from './errors.js';
+import type {
   RegistryVersionRow,
   SyncItemStatus,
   SyncOutcome,
@@ -7,10 +9,8 @@ import {
   SyncRunRow,
   SyncRunStatus,
   SyncTriggerKind,
-} from '../../lib/model/comet-registry.js';
-
-import { RegistryError } from './errors.js';
-import { Condition, candidateStatement, changedRows, conditioned } from './repository.js';
+} from './rows.js';
+import { Condition, changedRows, conditioned, insertStatement } from './sql-condition.js';
 
 /*
  * The sync fence. One registry import may run at a time, and one invocation
@@ -405,7 +405,7 @@ async function bindCandidate(
     values: [ fence.runId, fence.owner, at(options.now) ],
   };
   const [ created, bound ] = await db.batch([
-    candidateStatement(db, version, unbound),
+    insertStatement(db, 'registry_versions', version, unbound),
     conditioned(db, `UPDATE sync_runs SET registry_version_id = ?1 WHERE id = ?2`, [ version.id, fence.runId ], unbound),
   ]);
   // D1 rolls a batch back on an error, not on a statement that changed nothing

@@ -16,8 +16,8 @@ import {
 } from '../../lib/model/comet-registry.js';
 
 import type { Catalog, CatalogMarket } from './catalog.js';
-import type { LegacyDecisions } from './legacy-collaterals.js';
-import { CollateralView, Position, RULE_VERSION, TokenValue, tokenValue } from './token-collateral.js';
+import type { DeprecatedDecisions } from './deprecated-collaterals.js';
+import { CollateralView, Position, TokenValue, tokenValue } from './token-collateral.js';
 
 /*
  * Which tokens discovery shows: a token an administrator marked strategic, or
@@ -28,9 +28,22 @@ import { CollateralView, Position, RULE_VERSION, TokenValue, tokenValue } from '
  * audit): hiding it would hide an asset someone may hold, and showing it is
  * the safe answer to not knowing. A strategic token is shown whatever its
  * value says.
+ *
+ * A token deprecated in every enabled market that takes it is hidden whatever
+ * else holds, strategic or worth the threshold: no market offers it as
+ * collateral any longer, so discovery does not either. Its holders lose
+ * nothing by it, since the app keeps showing a deprecated collateral to a user
+ * who still holds some, so that it can be withdrawn.
  */
 const THRESHOLD_USD  = BigFixnum.from({ value: 250000 });
 const THRESHOLD_TEXT = '250000';
+
+/*
+ * The rule a list decides by, which the list names: 2 since a token
+ * deprecated in every enabled market that takes it is hidden. It reads the
+ * values the records hold (token-collateral.ts), and no record depends on it.
+ */
+const RULE_VERSION = 2;
 
 /*
  * Every token the active version serves on a chain, with every role it plays
@@ -56,33 +69,37 @@ function tokensOf(catalog: Catalog, network: KnownNetwork.Name): Array<{ token: 
 }
 
 /*
- * Where a token is a legacy collateral: the Comets of the chain's served
- * markets that take it as collateral and whose decision marks it legacy,
- * sorted, and whether it is legacy in every enabled market that takes it, of
- * which there is at least one. A deprecated market's decision is named, but
- * takes no part in `isLegacy`, which says that no enabled market offers the
- * token as a current collateral any longer.
- *
- * Neither changes whether discovery shows the token. The frontend decides
- * what to hide, because it keeps a legacy collateral visible to a user who
- * still holds some of it.
+ * Where a token is a deprecated collateral: the Comets of the chain's served
+ * markets that take it as collateral and whose decision marks it deprecated,
+ * sorted, and whether it is deprecated in every enabled market that takes it,
+ * of which there is at least one. The decision of a market whose status is
+ * `deprecated` is named, but takes no part in `isDeprecated`, which says that
+ * no enabled market offers the token as a current collateral any longer: a
+ * token still current in one of them is offered there, and discovery decides
+ * it as any other.
  */
-function legacyOf(
+function deprecatedOf(
   chainId: number,
   token: Address,
   markets: CatalogMarket[],
-  legacy: LegacyDecisions,
-): { isLegacy: boolean, legacyIn: Address[] } {
+  deprecated: DeprecatedDecisions,
+): { isDeprecated: boolean, deprecatedIn: Address[] } {
   const taking  = markets.filter(({ market }) => market.collateralAssets.some(asset => asset.token.address === token));
-  const marked  = taking.filter(({ market }) => legacy.has(chainId, market.contracts.comet, token));
+  const marked  = taking.filter(({ market }) => deprecated.has(chainId, market.contracts.comet, token));
   const enabled = taking.filter(({ market }) => market.status === 'enabled');
   return {
-    isLegacy: enabled.length > 0 && enabled.every(entry => marked.includes(entry)),
-    legacyIn: marked.map(({ market }) => market.contracts.comet).sort(),
+    isDeprecated: enabled.length > 0 && enabled.every(entry => marked.includes(entry)),
+    deprecatedIn: marked.map(({ market }) => market.contracts.comet).sort(),
   };
 }
 
-function visibilityOf(isStrategic: boolean, value: TokenValue): { isVisible: boolean, visibilityReason: VisibilityReasonV1 } {
+function visibilityOf(
+  { isDeprecated, isStrategic }: { isDeprecated: boolean, isStrategic: boolean },
+  value: TokenValue,
+): { isVisible: boolean, visibilityReason: VisibilityReasonV1 } {
+  if (isDeprecated) {
+    return { isVisible: false, visibilityReason: 'deprecated' };
+  }
   if (isStrategic) {
     return { isVisible: true, visibilityReason: 'strategic' };
   }
@@ -135,13 +152,14 @@ function tokenList(input: {
   positions:       Position[],
   view:            CollateralView,
   strategic:       ReadonlySet<Address>,
-  legacy:          LegacyDecisions,
+  deprecated:      DeprecatedDecisions,
   now:             Date,
 }): TokenListV1 {
   const markets = input.catalog.marketsOn(input.network);
   const tokens  = tokensOf(input.catalog, input.network).map(({ token, roles }): TokenVisibilityV1 => {
     const value       = tokenValue(token.address, input.view, input.positions, THRESHOLD_USD, input.now);
     const isStrategic = input.strategic.has(token.address);
+    const deprecated  = deprecatedOf(input.chainId, token.address, markets, input.deprecated);
     return {
       address:               token.address,
       symbol:                token.symbol,
@@ -149,14 +167,14 @@ function tokenList(input: {
       decimals:              token.decimals,
       roles,
       isStrategic,
-      ...legacyOf(input.chainId, token.address, markets, input.legacy),
+      ...deprecated,
       collateralValueUsd:    value.valueUsd === null ? null : decimalString(value.valueUsd),
       collateralValueStatus: value.status,
       valueAt:               value.block === null ? null : new Date(value.block.timestamp * 1000).toISOString(),
       valueBlock:            value.block,
       staleAgeSeconds:       value.staleAgeSeconds,
       exceptions:            value.exceptions.map(appliedOf),
-      ...visibilityOf(isStrategic, value),
+      ...visibilityOf({ isDeprecated: deprecated.isDeprecated, isStrategic }, value),
     };
   });
   return {
@@ -170,4 +188,4 @@ function tokenList(input: {
   };
 }
 
-export { THRESHOLD_USD, decimalString, legacyOf, tokenList, tokensOf, visibilityOf };
+export { RULE_VERSION, THRESHOLD_USD, decimalString, deprecatedOf, tokenList, tokensOf, visibilityOf };

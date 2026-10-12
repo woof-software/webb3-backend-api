@@ -28,13 +28,13 @@ A client that must not act on an older version refuses such a response; one
 that only reads can use it. How long that is allowed is per environment, and
 a `503` with the code `UPSTREAM_UNAVAILABLE` is the answer once the window has
 passed. These endpoints and the registry's own fail the same way, with two
-exceptions. The token list reads the token policies and the legacy collateral
-decisions from the database on every request, so it answers `503` as soon as
-the database cannot be reached. `/registry/v1/active` and the market reads
-under `/registry/v1/networks/{chain_id}/markets` mark every collateral with
-the legacy collateral decisions, and when the database cannot be reached they
-use the ones the API last recorded: with none recorded, they answer `503`
-inside the window too (see `/registry/v1/active`).
+exceptions. The token list reads the token policies and the deprecated
+collateral decisions from the database on every request, so it answers `503`
+as soon as the database cannot be reached. `/registry/v1/active` and the
+market reads under `/registry/v1/networks/{chain_id}/markets` mark every
+collateral with the deprecated collateral decisions, and when the database
+cannot be reached they use the ones the API last recorded: with none
+recorded, they answer `503` inside the window too (see `/registry/v1/active`).
 
 Testnets are not served: the registry imports mainnets only. A request that
 names one is answered `400` in the [envelope](#errors), with the code
@@ -868,25 +868,49 @@ it is; a monitor matches `details.code` for those. Besides
 `REGISTRY_NOT_ACTIVE`, only a source or a node provider that did not answer,
 a database that could not be reached, and a database without the migration of
 the tables a route reads — the token policies' on the token list and the token
-policy routes, the legacy collaterals' on the token list, `/active`, the
-market reads and the legacy collateral routes — are a `503`, here as on every
-endpoint ([Errors](#errors)): those are the answers worth trying again.
+policy routes, the deprecated collaterals' on the token list, `/active`, the
+market reads and the deprecated collateral routes — are a `503`, here as on
+every endpoint ([Errors](#errors)): those are the answers worth trying again.
+
+Every `CONFLICT` names in `details.code` the conflict it met, which is what a
+script matches; the message says the same to a person, and may change. An
+overlay write below is any of `PUT …/overlay`, `PUT …/overlays` and
+`POST …/proposal/apply`:
+
+| `details.code` | Answered by | Means |
+|---|---|---|
+| `SYNC_ALREADY_RUNNING` | `POST …/admin/sync` | an import is running: another invocation holds its run right now, or the request carries what only a new run takes — `sourceCommitSha`, `forceNewAttempt` or `holdForReview` |
+| `SYNC_RUN_HELD` | `POST …/sync-runs/{sync_run_id}/cancel` | an invocation holds the run until the time the message names |
+| `SYNC_RUN_ENDED` | `POST …/sync-runs/{sync_run_id}/cancel` | the run has already ended |
+| `IMPORT_STILL_RUNNING` | `POST …/validate` | the candidate's import is still running |
+| `CANDIDATE_CHANGED` | `POST …/validate` | an overlay was written to the candidate while it was being checked |
+| `CANDIDATE_STATE_CONFLICT` | `POST …/activate`, `POST …/rollback` | the version is not validated, or `expectedActiveVersionId` no longer names the version that is on |
+| `VERSION_NOT_IMPORTING` | an overlay write | the version is no longer importing, so it cannot be changed |
+| `OVERLAY_CHANGED` | an overlay write | a scope holds another overlay than the digest it was decided against, and `details.current` names the one it holds; or another write to the candidate landed in the middle of this one |
+| `SLUG_TAKEN` | an overlay write | another market of the network keeps the slug a market's document names |
+| `DEFAULT_TAKEN` | an overlay write | a market's document says `isDefault: true` while another market of the version is the default |
+| `REWARD_FEED_WITHOUT_REWARD` | an overlay write | a market's document names a `rewardPriceFeed`, and its rewards contract names no reward token |
+| `PROPOSAL_CLOSED` | the proposal routes | a version of the registry has been activated |
+| `PROPOSAL_CHANGED` | `POST …/proposal/apply` | the proposal no longer has the digest sent; `details.digest` is the one it has |
+| `TOKEN_LEFT_REGISTRY` | `PATCH …/policy`, `POST …/token-policies/apply` | a version without the token, or without a token of the list, was activated while it was being written |
+| `COLLATERAL_LEFT_REGISTRY` | `PATCH …/deprecated`, `POST …/deprecated-collaterals/apply` | a version whose market does not take the collateral, or a collateral of the list, was activated while it was being written |
+| `DECISION_CHANGED` | `POST …/token-policies/apply`, `POST …/deprecated-collaterals/apply` | someone else changed a decision of the list while it was being applied |
 
 Public reads carry `X-Registry-Version` and `X-Registry-Checksum`, which a
 browser can read. Every one of them but the token list is cacheable by its
 version, carries an `ETag`, and answers `304` to an `If-None-Match` that names
-what it would send; `/active` and the market reads are cacheable by the legacy
-flags they carry as well, which their tag names. The token list's values
-change every minute, so it is kept for 30 seconds and carries none. The tags
-are compared weakly, as RFC 9110 has it: `W/"…"`, which is what a browser
-sends back for a response Cloudflare compressed, names the same as the tag
-itself; `*` names any; and a list of tags names what any tag in it names. A
-header that is none of those is answered with the body, and so is every
-request while an answer comes from the cache because the database cannot be
-reached. They answer `503 REGISTRY_NOT_ACTIVE` when no version is active, and
-`503 UPSTREAM_UNAVAILABLE` when the database cannot be reached and no older
-version may be served instead. A path is matched with or without a trailing
-slash.
+what it would send; `/active` and the market reads are cacheable by the
+deprecated flags they carry as well, which their tag names. The token list's
+values change every minute, so it is kept for 30 seconds and carries none.
+The tags are compared weakly, as RFC 9110 has it: `W/"…"`, which is what a
+browser sends back for a response Cloudflare compressed, names the same as
+the tag itself; `*` names any; and a list of tags names what any tag in it
+names. A header that is none of those is answered with the body, and so is
+every request while an answer comes from the cache because the database
+cannot be reached. They answer `503 REGISTRY_NOT_ACTIVE` when no version is
+active, and `503 UPSTREAM_UNAVAILABLE` when the database cannot be reached
+and no older version may be served instead. A path is matched with or
+without a trailing slash.
 
 A `{chain_id}` is written in decimal without a leading zero — `1`, never
 `01`, `0x1`, `1e0` or `1.0` — in every path that takes one and in the keys of
@@ -909,10 +933,10 @@ request is rate limited twice, reads as well as commands:
   and each family of routes. Every read shares one budget, so a monitor
   polling the status spends it with an operator who holds the same token, and
   each kind of command has one of its own. `POST …/token-policies/review`
-  and `POST …/legacy-collaterals/review`, which write nothing, count as reads;
-  the decisions an administrator makes about what the app offers —
-  `PATCH …/policy`, `POST …/token-policies/apply`, `PATCH …/legacy` and
-  `POST …/legacy-collaterals/apply` — share one `policy` budget.
+  and `POST …/deprecated-collaterals/review`, which write nothing, count as
+  reads; the decisions an administrator makes about what the app offers —
+  `PATCH …/policy`, `POST …/token-policies/apply`, `PATCH …/deprecated` and
+  `POST …/deprecated-collaterals/apply` — share one `policy` budget.
 
 Past either budget the answer is `429` `RATE_LIMITED`, saying in
 `Retry-After` how many seconds to wait, and in its message which budget ran
@@ -920,7 +944,7 @@ out: `too many administrative requests from this address`, or
 `too many <family> requests with this token`.
 
 A command's body is at most 64 KiB — 512 KiB for `PUT …/overlays`, and 1 MiB
-for `POST …/token-policies/review`, `POST …/legacy-collaterals/review` and
+for `POST …/token-policies/review`, `POST …/deprecated-collaterals/review` and
 their `…/apply` — and a larger one is refused with `413`. A `reason`, wherever
 a command takes one, is at most 1,000 characters, and a longer one is refused
 with `400`.
@@ -938,12 +962,14 @@ the source has just added arrives that way, under its canonical name and
 with nothing about it reviewed, until a version decides to offer it.
 
 Every collateral of every market says whether an administrator has marked it
-legacy in that market (`isLegacy`), beside what the version says of it. A
-legacy collateral is one the app no longer offers in that market: it leaves
-it out of the market's collateral and of what can be supplied, and keeps
-showing it to a user who still holds some of it, so that it can be
+deprecated in that market (`isDeprecated`), beside what the version says of
+it. A deprecated collateral is one the app no longer offers in that market:
+it leaves it out of the market's collateral and of what can be supplied, and
+keeps showing it to a user who still holds some of it, so that it can be
 withdrawn. The decision is about one collateral of one market, so a token can
-be legacy in one market and current in another:
+be deprecated in one market and current in another. It is not the market's
+`status`: a market whose status is `deprecated` is itself no longer offered,
+while `isDeprecated` says so of one collateral of a market:
 
 ```json
 {
@@ -960,13 +986,13 @@ be legacy in one market and current in another:
           "assetIndex": 1,
           "token": { "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "symbol": "WETH", "name": "Wrapped Ether", "decimals": 18 },
           "priceFeed": { "address": "0x…", "decimals": 8 },
-          "isLegacy": false
+          "isDeprecated": false
         },
         {
           "assetIndex": 10,
           "token": { "address": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa", "symbol": "mETH", "name": "mETH", "decimals": 18 },
           "priceFeed": { "address": "0x…", "decimals": 8 },
-          "isLegacy": true
+          "isDeprecated": true
         }
       ]
     } ]
@@ -975,7 +1001,7 @@ be legacy in one market and current in another:
 ```
 
 The flag is not part of the version — a decision outlives every activation
-(`PATCH …/collaterals/{token_address}/legacy` below) — so it is read with
+(`PATCH …/collaterals/{token_address}/deprecated` below) — so it is read with
 every answer, and the `ETag` names the flags an answer carries beside the
 version: a decision that changes them changes the tag, and a client holding a
 copy made before it is sent the new one rather than a `304`. A browser may
@@ -1007,7 +1033,7 @@ markets.
 ### description:
 
 The markets of one chain that are not `disabled`, in the same order the
-snapshot lists them, each collateral with its `isLegacy` as
+snapshot lists them, each collateral with its `isDeprecated` as
 `/registry/v1/active` has it. A chain the active version does not list
 answers `404`. The `ETag` names the flags of this chain's markets, so a
 decision about another chain leaves it as it is.
@@ -1015,8 +1041,8 @@ decision about another chain leaves it as it is.
 ## `/registry/v1/networks/{chain_id}/markets/{comet_address}`
 ### description:
 
-One market, addressed by its Comet, each collateral with its `isLegacy` as
-`/registry/v1/active` has it, and an `ETag` that names this market's flags
+One market, addressed by its Comet, each collateral with its `isDeprecated`
+as `/registry/v1/active` has it, and an `ETag` that names this market's flags
 alone. A `disabled` market answers `404`; a `deprecated` one is served,
 because positions and history in it must stay reachable.
 
@@ -1025,7 +1051,7 @@ because positions and history in it must stay reachable.
 
 Every token the active version serves on one chain — the base, reward and
 collateral tokens of its enabled and deprecated markets — with its strategic
-mark, the markets it is a legacy collateral of, the USD value of its
+mark, the markets it is a deprecated collateral of, the USD value of its
 collateral across the chain's enabled markets, and whether token discovery
 shows it. `?visibleOnly=true` lists only the tokens it shows; `visibleOnly` is
 exactly `true` or `false`, and anything else answers `400`.
@@ -1033,14 +1059,26 @@ exactly `true` or `false`, and anything else answers `400`.
 A token is shown when an administrator marked it strategic, or when its
 collateral is worth at least `thresholdUsd`, USD 250,000, compared exactly. A
 token whose value cannot be read is shown as well (`data_unavailable`): not
-knowing what a token is worth is no reason to hide one someone may hold.
+knowing what a token is worth is no reason to hide one someone may hold. A
+token deprecated in every enabled market that takes it as collateral
+(`isDeprecated`, below) is hidden before any of that is asked
+(`deprecated`), whatever it is worth and even when it is strategic: no
+enabled market offers it as a collateral any longer, so discovery does not
+either. Only its collateral is asked about, so a token that is also the base
+or reward token of an enabled market is hidden all the same. Its value is
+still read and told, as any other token's.
+
+Hiding a token from discovery takes nothing from a user who holds it. The app
+keeps showing a deprecated collateral to a user with a balance of it in that
+market, so that it can be withdrawn, whatever the list says: `isVisible`
+decides what discovery offers, not whether a holder sees a position.
 
 ```json
 {
   "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
   "chainId": 1,
   "thresholdUsd": "250000",
-  "ruleVersion": 1,
+  "ruleVersion": 2,
   "computedAt": "2026-10-05T12:00:31.204Z",
   "block": { "number": 23512345, "timestamp": 1791201623 },
   "tokens": [
@@ -1051,8 +1089,8 @@ knowing what a token is worth is no reason to hide one someone may hold.
       "decimals": 8,
       "roles": [ "collateral" ],
       "isStrategic": false,
-      "isLegacy": true,
-      "legacyIn": [ "0xe85dc543813b8c2cfeaac371517b925a166a9293" ],
+      "isDeprecated": true,
+      "deprecatedIn": [ "0xe85dc543813b8c2cfeaac371517b925a166a9293" ],
       "collateralValueUsd": "182345.0912",
       "collateralValueStatus": "exception",
       "valueAt": "2026-10-05T12:00:23.000Z",
@@ -1067,7 +1105,7 @@ knowing what a token is worth is no reason to hide one someone may hold.
         }
       ],
       "isVisible": false,
-      "visibilityReason": "below_threshold"
+      "visibilityReason": "deprecated"
     },
     {
       "address": "0x68749665ff8d2d112fa859aa293f07a622782f38",
@@ -1076,8 +1114,8 @@ knowing what a token is worth is no reason to hide one someone may hold.
       "decimals": 6,
       "roles": [ "collateral" ],
       "isStrategic": false,
-      "isLegacy": false,
-      "legacyIn": [],
+      "isDeprecated": false,
+      "deprecatedIn": [],
       "collateralValueUsd": "1843210.123456",
       "collateralValueStatus": "fresh",
       "valueAt": "2026-10-05T12:00:23.000Z",
@@ -1118,29 +1156,32 @@ block this minute was valued at, which can be an earlier block of the same
 minute than `block`, or an earlier minute's for a `stale` value. `block` is
 the chain's latest, and is `null` when the node did not answer; a token no
 enabled market takes as collateral is then `"0"` with no block.
-`visibilityReason` is `strategic`, `collateral_threshold`, `below_threshold`
-or `data_unavailable`.
+`visibilityReason` is `deprecated`, `strategic`, `data_unavailable`,
+`collateral_threshold` or `below_threshold`, in the order the rule asks them;
+only `deprecated` and `below_threshold` hide a token. `ruleVersion` names the
+rule: `2` since a deprecated token is hidden, `1` before.
 
-`legacyIn` lists, sorted, the Comets of the chain's served markets that take
-the token as a collateral an administrator has marked legacy in that market
-(`PATCH …/collaterals/{token_address}/legacy`), and is empty for a token no
-market marks so — a base or reward token among them. `isLegacy` is `true` when
-the token is a collateral of at least one enabled market and legacy in every
-enabled market that takes it: no enabled market offers it as a current
-collateral any longer. A deprecated market's decision is named in `legacyIn`,
-but takes no part in `isLegacy`. Neither changes whether discovery shows the
-token: `isVisible` and `visibilityReason` follow the rule above, and
-`ruleVersion` is still `1`. Where to hide a legacy collateral is the app's
-decision, since it keeps one visible to a user who still holds some of it.
+`deprecatedIn` lists, sorted, the Comets of the chain's served markets that
+take the token as a collateral an administrator has marked deprecated in that
+market (`PATCH …/collaterals/{token_address}/deprecated`), and is empty for a
+token no market marks so — a base or reward token among them. `isDeprecated`
+is `true` when the token is a collateral of at least one enabled market and
+deprecated in every enabled market that takes it: no enabled market offers it
+as a current collateral any longer, and discovery hides it. The decision of a
+market whose status is `deprecated` is named in `deprecatedIn`, but takes no
+part in `isDeprecated`. A token deprecated in some enabled markets only is
+still offered in the others, and is shown or hidden by the rest of the rule;
+where to hide it is the app's decision, per market, by `isDeprecated` on that
+market's collateral.
 
 The list answers `200` whatever the node does: a token that cannot be valued
 is a status of that token, never a failure of the list. It answers `404` for a
 chain the active version does not list, as `/networks/{chain_id}/markets`
 does: one it does not hold, or one whose every market is disabled. It answers
 `503` when no version is active, or when the database cannot be reached for
-the token policies or the legacy collateral decisions, or does not have their
-migrations yet — without them a strategic token would be listed as hidden,
-and a legacy collateral as current. It carries
+the token policies or the deprecated collateral decisions, or does not have
+their migrations yet — without them a strategic token would be listed as
+hidden, and a deprecated collateral as current, and shown. It carries
 `Cache-Control: public, max-age=30` and no `ETag`; an answer from a version
 the database could not confirm carries `X-Registry-Stale` and `no-store`
 instead.
@@ -1155,10 +1196,10 @@ $ curl 'localhost:8787/registry/v1/networks/1/tokens?visibleOnly=true'
 A validated version by id, so a session that pinned one can refetch exactly
 what it pinned even after another version was activated. It is the version as
 it was imported: the networks and markets `/registry/v1/active` serves for
-the same version, without the `isLegacy` the active reads add to every
-collateral, since a legacy decision is no part of a version. It has an `ETag`
-of its own, and a client that sends it back is answered `304` without the
-version being read again.
+the same version, without the `isDeprecated` the active reads add to every
+collateral, since a deprecated collateral decision is no part of a version.
+It has an `ETag` of its own, and a client that sends it back is answered
+`304` without the version being read again.
 
 ## `POST /registry/v1/admin/sync`
 ### description:
@@ -1452,10 +1493,10 @@ again, and a sync with `forceNewAttempt` is refused while it is running. Its
 
 Takes `{"reason": "…"}` and nothing else, and spends from the same budget
 as `POST /registry/v1/admin/sync`. Only a run nobody holds is cancelled: a
-run whose lease is live is `409` until the lease has run out — the message
-says when — since the invocation that holds it may be importing into it, and
-so is a run that has already ended. An unknown id is `404`, and a missing
-`reason` is `400`.
+run whose lease is live is `409` with `SYNC_RUN_HELD` until the lease has run
+out — the message says when — since the invocation that holds it may be
+importing into it, and a run that has already ended is `409` with
+`SYNC_RUN_ENDED`. An unknown id is `404`, and a missing `reason` is `400`.
 
 Answers with the run as `GET /registry/v1/admin/sync-runs/{sync_run_id}`
 does: `failed`, with `lastError` `cancelled by <actor>: <reason>` and
@@ -1545,10 +1586,11 @@ that ran answers `200` with what it decided: `version.status` is `validated`,
 or `invalid` with the checks that decided it in `summary`. A version that is
 already decided, either way, answers the same again with `changed: false`.
 
-It answers `409` only when it could not run: while the candidate's import is
-still running, or when an overlay was written to the candidate while it was
-being checked — the checks would describe rows it no longer holds, so none of
-them is recorded; validate it again.
+It answers `409` only when it could not run: with `IMPORT_STILL_RUNNING`
+while the candidate's import is still running, and with `CANDIDATE_CHANGED`
+when an overlay was written to the candidate while it was being checked — the
+checks would describe rows it no longer holds, so none of them is recorded;
+validate it again.
 
 ```json
 { "version": { "id": "c0d77dad-…", "status": "invalid", "checksum": null }, "changed": true, "summary": { "attempt": 1, "passed": 41, "failed": 1, "checks": [ … ] } }
@@ -1562,15 +1604,17 @@ the activation.
 ## `POST /registry/v1/admin/versions/{version_id}/activate`
 ### description:
 
-Makes a validated version the one the API serves. Requires a `reason`, which
+Makes a validated version the one the API serves; any other version is
+refused with `409` and `CANDIDATE_STATE_CONFLICT`. Requires a `reason`, which
 is stored with the audit event. Activating the version that is already active
 changes nothing.
 
 `expectedActiveVersionId` — [optional] — the version the move is decided
 against, or `null` when nothing is on yet. When it is no longer the version
-that is on, the move is refused with `409` naming the one that is, instead of
-silently undoing a move somebody else made in the meantime. A move whose
-target is already on changes nothing, whatever it expected.
+that is on, the move is refused with `409` and `CANDIDATE_STATE_CONFLICT`,
+naming the one that is, instead of silently undoing a move somebody else made
+in the meantime. A move whose target is already on changes nothing, whatever
+it expected.
 
 ```json
 { "reason": "switch on the new commit", "expectedActiveVersionId": "d9698ddd-ab86-46bc-a412-c71df7d20414" }
@@ -1604,7 +1648,8 @@ property is refused with `400`:
 The overlay is applied to the rows the import wrote, and a network reviewed
 this way stops being listed as unreviewed. A chain the candidate has not
 imported yet answers `404`: the import writes every network it reaches, so
-the answer is to let it continue.
+the answer is to let it continue. Only an importing candidate is writable:
+any other version answers `409` with `VERSION_NOT_IMPORTING`.
 
 A feed the overlay introduces — a remap's replacement feed — is read on the
 chain for its decimals, unless the version already knows it on that chain.
@@ -1626,9 +1671,9 @@ The answer names the overlay the scope now holds by its `digest`.
 `expectedDigest` — [optional] — is the digest of the overlay the document was
 decided against, as the `GET` below answers it, or `null` for a scope nobody
 has reviewed: when the scope holds another one, the document is refused with
-`409` rather than silently undoing a change made since. A write that another
-write to the same candidate lands in the middle of is refused with `409` too;
-read again and resend.
+`409` and `OVERLAY_CHANGED` rather than silently undoing a change made since.
+A write that another write to the same candidate lands in the middle of is
+refused with `OVERLAY_CHANGED` too; read again and resend.
 
 ```json
 { "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414", "changed": true, "overlayEventId": "0d0f3f7e-...", "digest": "5f0c...", "snapshotChecksum": null }
@@ -1641,7 +1686,7 @@ after the type is the `scope` the scope's `GET` answers: read the scope again
 there, redo the change on what it answers, and send that with its `digest`.
 
 ```json
-{ "error": { "code": "CONFLICT", "message": "the overlay of network 1 is no longer the one this was decided against; read it again", "requestId": "8419...", "details": { "current": { "network 1": "1cd5..." } } } }
+{ "error": { "code": "CONFLICT", "message": "the overlay of network 1 is no longer the one this was decided against; read it again", "requestId": "8419...", "details": { "code": "OVERLAY_CHANGED", "current": { "network 1": "1cd5..." } } } }
 ```
 
 ## `GET /registry/v1/admin/versions/{version_id}/networks/{chain_id}/overlay`
@@ -1687,7 +1732,8 @@ unreviewed. It takes the same body, with the market's document as
 `overlay`, answers the market's `digest` and takes `expectedDigest` exactly
 as the network route does, and reads the feeds it introduces — the USD feed
 and the reward feed — the same way. A `rewardPriceFeed` on a market whose
-rewards contract names no reward token is refused with `409`.
+rewards contract names no reward token is refused with `409` and
+`REWARD_FEED_WITHOUT_REWARD`.
 
 It also states how the frontend lists the market. `displayName` is its label,
 `slug` — lowercase letters, digits, dots and hyphens, or `null` — is what the
@@ -1696,10 +1742,10 @@ the same network, and `isInstitutional` lists it in the institutional section.
 Within a network, no two markets that are not disabled may answer to the same
 `slug`, or to the same label where they have none; validation refuses a
 version where they do, and a slug another market of the network keeps is
-refused with `409`. So is `isDefault: true` while another market of the
-version is the default: the default moves with both markets in one
-`PUT …/overlays`, each decided against the `digest` its `GET` answered
-(`expectedDigests`).
+refused with `409` and `SLUG_TAKEN`. So is `isDefault: true` while another
+market of the version is the default, with `DEFAULT_TAKEN`: the default moves
+with both markets in one `PUT …/overlays`, each decided against the `digest`
+its `GET` answered (`expectedDigests`).
 
 ## `GET /registry/v1/admin/versions/{version_id}/markets/{chain_id}/{deployment_key}/overlay`
 ### description:
@@ -1758,9 +1804,10 @@ and the writes are one D1 transaction: a document the parser refuses answers
 naming all of them, with nothing written in either case. A request may move
 the default market or a slug between the markets it names, or swap two slugs,
 in whatever order it names them. Only an importing candidate is
-writable (`409` otherwise), and a request that another write to the
-candidate lands in the middle of is refused with `409`, with nothing
-written: what it decided was decided against what it read.
+writable (`409` with `VERSION_NOT_IMPORTING` otherwise), and a request that
+another write to the candidate lands in the middle of is refused with `409`
+and `OVERLAY_CHANGED`, with nothing written: what it decided was decided
+against what it read.
 
 ```json
 {
@@ -1774,15 +1821,15 @@ written: what it decided was decided against what it read.
 the documents are, by chain id for a network and by `chainId/deploymentKey`
 for a market, the digest of the overlay each was decided against, as the
 `GET` of its scope answers it, or `null` for a scope nobody has reviewed. A
-request where any scope holds another overlay is refused with `409`, and
-nothing is written. Its `details.current` names each such scope as the
-one-document routes do, with the digest it holds now: the scope's type, then
-the key the request names it by (`"market 1/usdc"`). Read each of them again
-through its `GET`, redo the change, and send the digests read. A document it
-names nothing for is written whatever its scope holds; a key that names no
-document of the request, or a value that is not a digest, is refused with
-`400`. The default or a slug moving between two markets is read from both and
-sent back this way:
+request where any scope holds another overlay is refused with `409` and
+`OVERLAY_CHANGED`, and nothing is written. Its `details.current` names each
+such scope as the one-document routes do, with the digest it holds now: the
+scope's type, then the key the request names it by (`"market 1/usdc"`). Read
+each of them again through its `GET`, redo the change, and send the digests
+read. A document it names nothing for is written whatever its scope holds; a
+key that names no document of the request, or a value that is not a digest,
+is refused with `400`. The default or a slug moving between two markets is
+read from both and sent back this way:
 
 ```json
 {
@@ -1830,7 +1877,8 @@ The proposal is for an environment's first version only. Once any version
 has been activated, the decisions live in the registry and every draft
 inherits them, so applying the constants' values over a draft would undo
 what was reviewed since: the proposal routes, `apply` included, answer
-`409` from then on, and a draft is reviewed with the overlay routes.
+`409` with `PROPOSAL_CLOSED` from then on, and a draft is reviewed with the
+overlay routes.
 
 `/proposal` answers with the proposal as data: its `digest`, what it leaves
 undecided, and under `bundle` the body `PUT /versions/{version_id}/overlays`
@@ -1852,10 +1900,11 @@ takes. `/proposal/review` answers with the same proposal as a document to read
 Applies the proposal by its digest: `{"reason": "...", "digest": "<16 hex>"}`.
 The proposal is built again and written only if it still has that digest, so
 what is applied is exactly what was read; one that changed since — another
-release, another version — answers `409` with its current digest in
-`details`. The write is the one `PUT /versions/{version_id}/overlays` makes,
-all of it or none, and answers the same way, with the `digest` beside it.
-Only an importing version is writable.
+release, another version — answers `409` with `PROPOSAL_CHANGED`, and its
+current digest in `details.digest`. The write is the one
+`PUT /versions/{version_id}/overlays` makes, all of it or none, and answers
+the same way, with the `digest` beside it. Only an importing version is
+writable.
 
 ## `GET /registry/v1/admin/shadow`
 ### `GET /registry/v1/admin/versions/{version_id}/shadow`
@@ -1944,10 +1993,11 @@ source adds reads as a longer list and one more entry.
 
 Marks a token strategic, or takes the mark away. The token list
 (`/registry/v1/networks/{chain_id}/tokens`) shows a strategic token whatever
-its collateral value, and reads the mark on every request, so a change is in
-its next answer. The list names only the tokens of served markets: a mark on
-a token only disabled markets name — every token of a chain whose markets are
-all disabled, for one — shows once a market that names it is served.
+its collateral value — unless it is deprecated in every enabled market that
+takes it — and reads the mark on every request, so a change is in its next
+answer. The list names only the tokens of served markets: a mark on a token
+only disabled markets name — every token of a chain whose markets are all
+disabled, for one — shows once a market that names it is served.
 
 A policy belongs to the token — a chain id and an address — and not to a
 registry version, so it survives every activation, and a version that drops
@@ -1982,7 +2032,8 @@ is `null` for a token nobody has ever decided about. A change is committed
 with its audit event before it is answered, and the answer names the version
 it was checked against, in the body and in `X-Registry-Version`. If a version
 without the token is activated while the change is being written, the write
-is rolled back, event and all, and the request answers `409`.
+is rolled back, event and all, and the request answers `409` with
+`TOKEN_LEFT_REGISTRY`.
 
 ```sh
 $ curl -X PATCH 'localhost:8787/registry/v1/admin/networks/1/tokens/0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2/policy' \
@@ -2145,8 +2196,10 @@ done. A list is applied completely or not at all:
 
 - a list with any `problem` answers `422`, naming each such row in
   `details.problems`, and writes nothing;
-- a version activated, or a decision of the list changed by someone else,
-  while the list is being written answers `409` and writes nothing.
+- a version without one of its tokens activated while the list is being
+  written answers `409` with `TOKEN_LEFT_REGISTRY`, and a decision of the
+  list changed by someone else meanwhile `409` with `DECISION_CHANGED`; either
+  writes nothing.
 
 The list is compared with the decisions in force when it is applied, not when
 it was reviewed, so review it right before applying it: a decision someone
@@ -2184,16 +2237,18 @@ Every token policy route answers `503 UPSTREAM_UNAVAILABLE` naming the D1
 migrations when the environment's database does not have migration `0005`
 yet: a release deployed before its migration.
 
-## `PATCH /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/collaterals/{token_address}/legacy`
+## `PATCH /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/collaterals/{token_address}/deprecated`
 ### description:
 
-Marks a collateral of a market legacy, or makes it current again. A legacy
-collateral is one the app no longer offers in that market; it keeps showing
-it to a user who still holds some, so that it can be withdrawn. `/active` and
-the market reads mark it with `isLegacy` on that collateral of that market,
-and the token list names the market's Comet in the token's `legacyIn`; all of
-them read the decisions on every request, so a change is in their next
-answer, and changes the `ETag` of every read whose flags it changes.
+Marks a collateral of a market deprecated, or makes it current again. A
+deprecated collateral is one the app no longer offers in that market; it
+keeps showing it to a user who still holds some, so that it can be
+withdrawn. `/active` and the market reads mark it with `isDeprecated` on that
+collateral of that market, and the token list names the market's Comet in
+the token's `deprecatedIn`, and hides a token deprecated in every enabled
+market that takes it; all of them read the decisions on every request, so a
+change is in their next answer, and changes the `ETag` of every read whose
+flags it changes.
 
 A decision belongs to the collateral of the Comet — a chain id, the Comet's
 address and the token's — and not to a registry version, so it survives every
@@ -2209,7 +2264,7 @@ The body is exactly a boolean and the reason, which is required and stored
 with the audit event beside the actor:
 
 ```json
-{ "isLegacy": true, "reason": "Legacy collateral of the USDT market" }
+{ "isDeprecated": true, "reason": "Deprecated collateral of the USDT market" }
 ```
 
 ```json
@@ -2218,36 +2273,38 @@ with the audit event beside the actor:
   "chainId": 1,
   "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840",
   "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa",
-  "isLegacy": true,
+  "isDeprecated": true,
   "changed": true,
   "updatedAt": "2026-10-08T09:12:44.512Z"
 }
 ```
 
-A collateral nobody has decided about is not legacy. Asking for the decision
-already in force answers `changed: false`, writes nothing and keeps the time
-the decision was made, so a repeated or retried request is safe; `updatedAt`
-is `null` for a collateral nobody has ever decided about. A change is
-committed with its audit event before it is answered, and the answer names
-the version it was checked against, in the body and in `X-Registry-Version`.
-If a version without the collateral is activated while the change is being
-written, the write is rolled back, event and all, and the request answers
-`409`. Once it has committed, the command records the decisions in force for
-the active reads to answer with while the database cannot be reached.
+A collateral nobody has decided about is not deprecated. Asking for the
+decision already in force answers `changed: false`, writes nothing and keeps
+the time the decision was made, so a repeated or retried request is safe;
+`updatedAt` is `null` for a collateral nobody has ever decided about. A
+change is committed with its audit event before it is answered, and the
+answer names the version it was checked against, in the body and in
+`X-Registry-Version`. If a version without the collateral is activated while
+the change is being written, the write is rolled back, event and all, and the
+request answers `409` with `COLLATERAL_LEFT_REGISTRY`. Once it has committed,
+the command records the decisions in force for the active reads to answer
+with while the database cannot be reached.
 
 ```sh
-$ curl -X PATCH 'localhost:8787/registry/v1/admin/networks/1/markets/0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840/collaterals/0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa/legacy' \
+$ curl -X PATCH 'localhost:8787/registry/v1/admin/networks/1/markets/0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840/collaterals/0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa/deprecated' \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-    -d '{"isLegacy": true, "reason": "Legacy collateral of the USDT market"}'
+    -d '{"isDeprecated": true, "reason": "Deprecated collateral of the USDT market"}'
 ```
 
-## `GET /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/collaterals/{token_address}/legacy`
+## `GET /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/collaterals/{token_address}/deprecated`
 ### description:
 
 One collateral's decision and the changes that led to it, at most 100, newest
 first in the order they were committed, so the first is always the change
-that set the decision in force. `previousIsLegacy` is `null` for the first
-decision about a collateral.
+that set the decision in force. `previousIsDeprecated` is `null` for the
+first decision about a collateral. A change recorded before the routes were
+renamed keeps the reason it was given then.
 
 A decision stays readable while the active version does not hold the
 collateral in that Comet, with `inActiveVersion: false`; it applies again once
@@ -2261,23 +2318,23 @@ does not hold and nobody has decided about answers `404`.
   "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840",
   "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa",
   "inActiveVersion": true,
-  "isLegacy": true,
+  "isDeprecated": true,
   "updatedAt": "2026-10-08T09:12:44.512Z",
   "updatedBy": "registry-admin:stage",
   "events": [
     {
       "id": "0c55b0f3-8b1e-4a54-b3f4-6a0d3c2e7f19",
-      "previousIsLegacy": null,
-      "isLegacy": true,
+      "previousIsDeprecated": null,
+      "isDeprecated": true,
       "actor": "registry-admin:stage",
-      "reason": "Legacy collateral of the USDT market",
+      "reason": "Deprecated collateral of the USDT market",
       "createdAt": "2026-10-08T09:12:44.512Z"
     }
   ]
 }
 ```
 
-## `GET /registry/v1/admin/legacy-collaterals`
+## `GET /registry/v1/admin/deprecated-collaterals`
 ### description:
 
 Every collateral of every market of the active version with the decision in
@@ -2297,15 +2354,15 @@ so it is worth reviewing before one is.
   "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
   "reason": null,
   "collaterals": [
-    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa", "symbol": "mETH", "isLegacy": true },
-    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x68749665ff8d2d112fa859aa293f07a622782f38", "symbol": "XAUt", "isLegacy": false }
+    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa", "symbol": "mETH", "isDeprecated": true },
+    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x68749665ff8d2d112fa859aa293f07a622782f38", "symbol": "XAUt", "isDeprecated": false }
   ],
   "retained": [
     {
       "chainId": 1,
       "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840",
       "tokenAddress": "0x57f5e098cad7a3d1eed53991d4d66c45c9af7812",
-      "isLegacy": true,
+      "isDeprecated": true,
       "updatedAt": "2026-10-08T09:20:11.903Z",
       "updatedBy": "registry-admin:stage"
     }
@@ -2313,7 +2370,7 @@ so it is worth reviewing before one is.
 }
 ```
 
-## `POST /registry/v1/admin/legacy-collaterals/review`
+## `POST /registry/v1/admin/deprecated-collaterals/review`
 ### description:
 
 What applying a list would change, row by row, without writing anything. The
@@ -2321,7 +2378,7 @@ body is a list as the export answers it, edited, of 1 to 500 rows and at most
 1 MiB:
 
 - `collaterals[]`: `chainId`, `cometAddress` and `tokenAddress` (both in any
-  case) and `isLegacy` are required; `deploymentKey` and `symbol` are
+  case) and `isDeprecated` are required; `deploymentKey` and `symbol` are
   optional and only checked — a market or a symbol that is not the one the
   active version names is reported as the mistake it usually is; `reason` is
   optional.
@@ -2351,7 +2408,7 @@ A malformed body answers `400` with every problem of every row in
       "current": false,
       "requested": true,
       "action": "change",
-      "reason": "Legacy collateral the app hid by its own list until the registry served it (Linear COM-18)",
+      "reason": "Deprecated collateral the app hid by its own list until the registry served it (Linear COM-18)",
       "problem": null
     }
   ]
@@ -2363,7 +2420,7 @@ market of that chain has there, a token that is not one of that market's
 collateral, a market or a symbol that names another, or a change without a
 reason.
 
-## `POST /registry/v1/admin/legacy-collaterals/apply`
+## `POST /registry/v1/admin/deprecated-collaterals/apply`
 ### description:
 
 Applies a list — the same body as review — in one transaction, as
@@ -2374,8 +2431,10 @@ is applied completely or not at all:
 
 - a list with any `problem` answers `422`, naming each such row in
   `details.problems`, and writes nothing;
-- a version activated, or a decision of the list changed by someone else,
-  while the list is being written answers `409` and writes nothing.
+- a version without one of its collaterals activated while the list is being
+  written answers `409` with `COLLATERAL_LEFT_REGISTRY`, and a decision of the
+  list changed by someone else meanwhile `409` with `DECISION_CHANGED`; either
+  writes nothing.
 
 The list is compared with the decisions in force when it is applied, not when
 it was reviewed, so review it right before applying it. A row the comparison
@@ -2396,7 +2455,7 @@ records the decisions in force, as a single change does.
       "deploymentKey": "usdt",
       "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa",
       "symbol": "mETH",
-      "isLegacy": true,
+      "isDeprecated": true,
       "changed": true,
       "updatedAt": "2026-10-08T09:12:44.512Z"
     }
@@ -2405,15 +2464,19 @@ records the decisions in force, as a single change does.
 ```
 
 ```sh
-$ curl -X POST 'localhost:8787/registry/v1/admin/legacy-collaterals/apply' \
+$ curl -X POST 'localhost:8787/registry/v1/admin/deprecated-collaterals/apply' \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-    --data @legacy-collaterals.json
+    --data @deprecated-collaterals.json
 ```
 
-The list the app hid until this release is applied once in each environment
-from the document in [REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md).
+The list the app kept of its own, which calls these collaterals legacy, is
+applied once in each environment from the document in
+[REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md).
 
-Every legacy collateral route answers `503 UPSTREAM_UNAVAILABLE` naming the
-D1 migrations when the environment's database does not have migration `0006`
-yet — a release deployed before its migration — and so do `/active`, the
-market reads and the token list, which read the decisions.
+Every deprecated collateral route answers `503 UPSTREAM_UNAVAILABLE` naming
+the D1 migrations when the environment's database does not have migration
+`0007` yet — a release deployed before its migration — and so do `/active`,
+the market reads and the token list, which read the decisions. These routes
+were `…/legacy` and `/registry/v1/admin/legacy-collaterals…`, with
+`isLegacy`, before migration `0007` renamed the feature; the old paths answer
+`404`.

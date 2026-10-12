@@ -4,7 +4,8 @@ import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
 import { isRegistryError } from '../../../src/registry/errors.js';
-import { Condition, candidateRow, conditioned } from '../../../src/registry/repository.js';
+import { candidateRow } from '../../../src/registry/repository.js';
+import { Condition, conditioned } from '../../../src/registry/sql-condition.js';
 import {
   Fence,
   MAX_ITEM_ATTEMPTS,

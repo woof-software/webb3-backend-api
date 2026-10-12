@@ -1,6 +1,6 @@
 import type { Env } from '../../entrypoint.js';
 
-import type { RegistrySnapshotV1, RegistryVersionRefV1, RegistryVersionRow } from '../../lib/model/comet-registry.js';
+import type { RegistrySnapshotV1, RegistryVersionRefV1 } from '../../lib/model/comet-registry.js';
 
 import { registryConfig } from './config.js';
 import {
@@ -10,6 +10,7 @@ import {
   readVersion,
   snapshotChecksum,
 } from './repository.js';
+import type { RegistryVersionRow } from './rows.js';
 import type { VersionRef } from './version-headers.js';
 
 /*
@@ -58,6 +59,12 @@ type CacheDeps = {
     error: (...parameters: unknown[]) => unknown,
     warn:  (...parameters: unknown[]) => unknown,
   },
+  /*
+   * The request's waitUntil, which keeps a write going past the answer, so
+   * the request does not wait for it. Without it, as in the Cron, the write
+   * is waited for.
+   */
+  defer?:  (work: Promise<unknown>) => void,
 };
 
 /*
@@ -121,7 +128,7 @@ const POINTER_RETRY_SECONDS = 60;
  * version sets. A value neither takes is answered with its default, and the
  * status names it.
  */
-function cacheDepsOf(env: Env, debug?: CacheDeps['debug']): CacheDeps {
+function cacheDepsOf(env: Env, debug?: CacheDeps['debug'], defer?: CacheDeps['defer']): CacheDeps {
   const { snapshotTtlSeconds, staleFallbackSeconds } = registryConfig(env);
   return {
     db:           env.APP_DB,
@@ -129,6 +136,7 @@ function cacheDepsOf(env: Env, debug?: CacheDeps['debug']): CacheDeps {
     ttlSeconds:   snapshotTtlSeconds,
     staleSeconds: staleFallbackSeconds,
     ...(debug === undefined ? {} : { debug }),
+    ...(defer === undefined ? {} : { defer }),
   };
 }
 
@@ -391,10 +399,15 @@ async function writeSnapshot(deps: CacheDeps, pointer: RegistryVersionRefV1, sna
  * all of them together after an activation. So a write is claimed before it
  * is made, and the requests that arrive while it is under way leave it to the
  * one making it. The claim holds for the period only once the write has
- * landed: a write KV refused, or one cut off with its request, is made again
- * about a minute later, not by the next request and not a period later. The
- * minute is spread at random between half a minute and a minute and a half,
- * so isolates refused together do not try again together.
+ * landed: a write KV refused, or one the runtime cut off, is made again about
+ * a minute later, not by the next request and not a period later. The minute
+ * is spread at random between half a minute and a minute and a half, so
+ * isolates refused together do not try again together.
+ *
+ * No request waits for the write. It is handed to the request's waitUntil
+ * (`defer`), which keeps it going past the answer until the runtime cuts it
+ * off; that is why the claim is extended by the write itself, once it has
+ * landed, and never when it is handed over.
  */
 const written = new WeakMap<KVNamespace, { ref: string, due: number }>();
 
@@ -420,13 +433,20 @@ async function rememberPointer(deps: CacheDeps, pointer: RegistryVersionRefV1): 
   const claim = { ref, due: at + Math.min(period, POINTER_RETRY_SECONDS * 1000 * (0.5 + Math.random())) };
   written.set(deps.kv, claim);
   const record: PointerRecord = { ...pointer, at: new Date(at).toISOString() };
-  try {
-    await deps.kv.put(POINTER_KEY, JSON.stringify(record), {
-      expirationTtl: Math.max(deps.staleSeconds, MIN_TTL_SECONDS),
-    });
-    claim.due = at + period;
-  } catch (error) {
-    deps.debug?.warn(`registry pointer cache unwritable`, { versionId: pointer.id, error });
+  const write = (async () => {
+    try {
+      await deps.kv.put(POINTER_KEY, JSON.stringify(record), {
+        expirationTtl: Math.max(deps.staleSeconds, MIN_TTL_SECONDS),
+      });
+      claim.due = at + period;
+    } catch (error) {
+      deps.debug?.warn(`registry pointer cache unwritable`, { versionId: pointer.id, error });
+    }
+  })();
+  if (deps.defer === undefined) {
+    await write;
+  } else {
+    deps.defer(write);
   }
 }
 

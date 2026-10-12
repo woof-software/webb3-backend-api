@@ -1,11 +1,12 @@
 import t from 'tap';
 
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 import { createTestHarness } from 'wrangler';
 
 import { registryConfig } from '../../../src/registry/config.js';
-import { readLegacyCollateral } from '../../../src/registry/legacy-collateral-repository.js';
+import { readDeprecatedCollateral, setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
 import { activationStatements } from '../../../src/registry/repository.js';
 import type { Env } from '../../../entrypoint.js';
 import { readTokenPolicy, setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
@@ -13,6 +14,7 @@ import {
   Row,
   applyMigration,
   applyMigrations,
+  applySql,
   changedRows,
   foreignKeyViolations,
   insertRow,
@@ -62,8 +64,8 @@ const APPLICATION_TABLES = [
   'sync_run_items',
   'token_policies',
   'token_policy_events',
-  'legacy_collaterals',
-  'legacy_collateral_events',
+  'deprecated_collaterals',
+  'deprecated_collateral_events',
 ];
 
 const NOT_IMPORTING = { message: /registry version is not importing/ };
@@ -323,7 +325,7 @@ t.test('migration 0001 creates strict tables and an empty active pointer', async
     `SELECT name FROM sqlite_schema WHERE type = 'index' AND sql LIKE '%WHERE%' ORDER BY name`
   ).all<{ name: string }>();
   t.same((partialIndexes.results ?? []).map(index => index.name), [
-    'legacy_collaterals_marked',
+    'deprecated_collaterals_marked',
     'market_assets_collateral_index',
     'market_assets_single_base',
     'market_assets_single_reward',
@@ -1221,9 +1223,10 @@ t.test('a token policy is decided for an active token, and every change is audit
 });
 
 /*
- * Migration 0006: a legacy collateral decision is about a collateral of a
- * Comet of the active registry, and the schema keeps its audit complete
- * whatever code writes it, as 0005 does for token policies.
+ * Migration 0006, under the names 0007 gave it: a deprecated collateral
+ * decision is about a collateral of a Comet of the active registry, and the
+ * schema keeps its audit complete whatever code writes it, as 0005 does for
+ * token policies.
  */
 const COMET = address('comet');
 
@@ -1242,39 +1245,39 @@ async function insertCollateralCandidate(db: D1Database): Promise<Candidate & { 
   return { ...candidate, token: (await addressOf(candidate.collateralTokenId))!, base: (await addressOf(candidate.baseTokenId))! };
 }
 
-t.test('a legacy collateral is decided for a collateral of an active Comet, and every change is audited', async t => {
+t.test('a deprecated collateral is decided for a collateral of an active Comet, and every change is audited', async t => {
   const { APP_DB: db } = await freshEnv();
   const candidate = await insertCollateralCandidate(db);
   const token     = candidate.token;
 
   type Decision = { chainId?: number, comet?: string, token?: string, value: number, at: string, actor?: string };
   const event = ({ chainId = 1, comet = COMET, token: tokenAddress = token, value, at, actor = 'test-admin' }: Decision, previous: number | null): Row => ({
-    id:                 randomUUID(),
-    chain_id:           chainId,
-    comet_address:      comet,
-    token_address:      tokenAddress,
-    previous_is_legacy: previous,
-    is_legacy:          value,
+    id:                     randomUUID(),
+    chain_id:               chainId,
+    comet_address:          comet,
+    token_address:          tokenAddress,
+    previous_is_deprecated: previous,
+    is_deprecated:          value,
     actor,
-    reason:             'reviewed',
-    created_at:         at,
+    reason:                 'reviewed',
+    created_at:             at,
   });
   const decision = ({ chainId = 1, comet = COMET, token: tokenAddress = token, value, at, actor = 'test-admin' }: Decision): Row => ({
     chain_id:      chainId,
     comet_address: comet,
     token_address: tokenAddress,
-    is_legacy:     value,
+    is_deprecated: value,
     updated_at:    at,
     updated_by:    actor,
   });
   // the repository's write: the event and the row in one batch, which is one transaction
   const decide = (change: Decision, previous: number | null) => db.batch([
-    insertStatement(db, 'legacy_collateral_events', event(change, previous)),
+    insertStatement(db, 'deprecated_collateral_events', event(change, previous)),
     db.prepare(
-      `INSERT INTO legacy_collaterals (chain_id, comet_address, token_address, is_legacy, updated_at, updated_by)
+      `INSERT INTO deprecated_collaterals (chain_id, comet_address, token_address, is_deprecated, updated_at, updated_by)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
        ON CONFLICT (chain_id, comet_address, token_address) DO UPDATE
-       SET is_legacy = excluded.is_legacy, updated_at = excluded.updated_at, updated_by = excluded.updated_by`
+       SET is_deprecated = excluded.is_deprecated, updated_at = excluded.updated_at, updated_by = excluded.updated_by`
     ).bind(change.chainId ?? 1, change.comet ?? COMET, change.token ?? token, change.value, change.at, change.actor ?? 'test-admin'),
   ]);
   const NOT_ACTIVE = { message: /collateral is not in the active registry/ };
@@ -1282,7 +1285,7 @@ t.test('a legacy collateral is decided for a collateral of an active Comet, and 
   const APPENDED   = { message: /append-only/ };
 
   await t.rejects(() => decide({ value: 1, at: NOW }, null), NOT_ACTIVE, 'nothing is decided while no version is active');
-  t.equal(await count(db, 'legacy_collateral_events'), 0, 'and the refused write leaves no event behind');
+  t.equal(await count(db, 'deprecated_collateral_events'), 0, 'and the refused write leaves no event behind');
 
   await validate(db, candidate.registry_version_id);
   await activate(db, candidate.registry_version_id);
@@ -1293,47 +1296,47 @@ t.test('a legacy collateral is decided for a collateral of an active Comet, and 
   await t.rejects(() => decide({ token: address('unknown'), value: 1, at: NOW }, null), NOT_ACTIVE, 'a token it does not hold');
   await t.rejects(() => decide({ token: candidate.base, value: 1, at: NOW }, null), NOT_ACTIVE,
     'or a token of the market that is not one of its collateral: its base');
-  await t.rejects(() => insertRow(db, 'legacy_collaterals', decision({ value: 1, at: NOW })), UNAUDITED, 'a decision row without its event');
+  await t.rejects(() => insertRow(db, 'deprecated_collaterals', decision({ value: 1, at: NOW })), UNAUDITED, 'a decision row without its event');
   await t.rejects(() => decide({ value: 1, at: NOW }, 0), UNAUDITED, 'or with an event that misstates the value it replaces');
-  await t.rejects(() => insertRow(db, 'legacy_collateral_events', event({ value: 0, at: NOW }, null)), CHECK_FAILED,
-    'an event that changes nothing: a collateral without a row is not legacy');
+  await t.rejects(() => insertRow(db, 'deprecated_collateral_events', event({ value: 0, at: NOW }, null)), CHECK_FAILED,
+    'an event that changes nothing: a collateral without a row is not deprecated');
 
   await t.resolves(() => decide({ value: 1, at: NOW }, null), 'a decision with its event');
   await t.resolves(() => decide({ value: 0, at: '2026-09-17T00:00:01.000Z' }, 1), 'and its reversal, which names what it replaced');
   await t.rejects(() => decide({ value: 1, at: '2026-09-17T00:00:02.000Z' }, null), UNAUDITED,
     'a change must name the decision in force, not the default');
-  await t.rejects(() => run(db, `UPDATE legacy_collaterals SET is_legacy = 1, updated_at = ?1`, '2026-09-17T00:00:03.000Z'), UNAUDITED,
+  await t.rejects(() => run(db, `UPDATE deprecated_collaterals SET is_deprecated = 1, updated_at = ?1`, '2026-09-17T00:00:03.000Z'), UNAUDITED,
     'a direct update has no event to stand beside');
-  await t.rejects(() => run(db, `UPDATE legacy_collaterals SET updated_by = 'someone-else'`), UNAUDITED,
+  await t.rejects(() => run(db, `UPDATE deprecated_collaterals SET updated_by = 'someone-else'`), UNAUDITED,
     'and a row is not touched without a change');
-  await t.rejects(() => run(db, `UPDATE legacy_collaterals SET comet_address = ?1`, address('moved')), { message: /belongs to one collateral/ },
+  await t.rejects(() => run(db, `UPDATE deprecated_collaterals SET comet_address = ?1`, address('moved')), { message: /belongs to one collateral/ },
     'a decision cannot move to another Comet');
-  await t.rejects(() => run(db, `UPDATE legacy_collaterals SET token_address = ?1`, address('moved')), { message: /belongs to one collateral/ },
+  await t.rejects(() => run(db, `UPDATE deprecated_collaterals SET token_address = ?1`, address('moved')), { message: /belongs to one collateral/ },
     'nor to another token');
-  await t.rejects(() => run(db, `DELETE FROM legacy_collaterals`), { message: /changed, not deleted/ }, 'a decision is never deleted');
-  await t.rejects(() => run(db, `UPDATE legacy_collateral_events SET reason = 'edited'`), APPENDED);
-  await t.rejects(() => run(db, `DELETE FROM legacy_collateral_events`), APPENDED);
+  await t.rejects(() => run(db, `DELETE FROM deprecated_collaterals`), { message: /changed, not deleted/ }, 'a decision is never deleted');
+  await t.rejects(() => run(db, `UPDATE deprecated_collateral_events SET reason = 'edited'`), APPENDED);
+  await t.rejects(() => run(db, `DELETE FROM deprecated_collateral_events`), APPENDED);
 
   t.same(
-    await db.prepare(`SELECT chain_id, comet_address, token_address, is_legacy, updated_by FROM legacy_collaterals`).all().then(result => result.results),
-    [ { chain_id: 1, comet_address: COMET, token_address: token, is_legacy: 0, updated_by: 'test-admin' } ],
+    await db.prepare(`SELECT chain_id, comet_address, token_address, is_deprecated, updated_by FROM deprecated_collaterals`).all().then(result => result.results),
+    [ { chain_id: 1, comet_address: COMET, token_address: token, is_deprecated: 0, updated_by: 'test-admin' } ],
     'one row holds the decision in force',
   );
   t.same(
-    await db.prepare(`SELECT previous_is_legacy, is_legacy FROM legacy_collateral_events ORDER BY rowid`).all().then(result => result.results),
-    [ { previous_is_legacy: null, is_legacy: 1 }, { previous_is_legacy: 1, is_legacy: 0 } ],
+    await db.prepare(`SELECT previous_is_deprecated, is_deprecated FROM deprecated_collateral_events ORDER BY rowid`).all().then(result => result.results),
+    [ { previous_is_deprecated: null, is_deprecated: 1 }, { previous_is_deprecated: 1, is_deprecated: 0 } ],
     'and the events hold every change that led to it',
   );
 
   // an older event that happens to describe the change is not its event, however it is reached
   await t.resolves(() => decide({ value: 1, at: '2026-09-17T00:00:02.000Z' }, 0), 'a third change');
-  await t.rejects(() => run(db, `UPDATE legacy_collaterals SET is_legacy = 0, updated_at = '2026-09-17T00:00:01.000Z'`), UNAUDITED,
+  await t.rejects(() => run(db, `UPDATE deprecated_collaterals SET is_deprecated = 0, updated_at = '2026-09-17T00:00:01.000Z'`), UNAUDITED,
     'a change cannot reuse an older event that happens to describe it');
-  const [ first ] = (await db.prepare(`SELECT id FROM legacy_collateral_events ORDER BY rowid LIMIT 1`).all<{ id: string }>()).results ?? [];
+  const [ first ] = (await db.prepare(`SELECT id FROM deprecated_collateral_events ORDER BY rowid LIMIT 1`).all<{ id: string }>()).results ?? [];
   await t.rejects(
     () => run(db,
-      `INSERT OR REPLACE INTO legacy_collateral_events
-         (id, chain_id, comet_address, token_address, previous_is_legacy, is_legacy, actor, reason, created_at)
+      `INSERT OR REPLACE INTO deprecated_collateral_events
+         (id, chain_id, comet_address, token_address, previous_is_deprecated, is_deprecated, actor, reason, created_at)
        VALUES (?1, 1, ?2, ?3, NULL, 1, 'test-admin', 'edited', ?4)`,
       first!.id, COMET, token, NOW),
     APPENDED,
@@ -1341,7 +1344,7 @@ t.test('a legacy collateral is decided for a collateral of an active Comet, and 
   );
   await t.rejects(
     () => run(db,
-      `INSERT OR REPLACE INTO legacy_collaterals (chain_id, comet_address, token_address, is_legacy, updated_at, updated_by)
+      `INSERT OR REPLACE INTO deprecated_collaterals (chain_id, comet_address, token_address, is_deprecated, updated_at, updated_by)
        VALUES (1, ?1, ?2, 0, '2026-09-17T00:00:01.000Z', 'test-admin')`,
       COMET, token),
     UNAUDITED,
@@ -1350,8 +1353,8 @@ t.test('a legacy collateral is decided for a collateral of an active Comet, and 
   for (const [ verb, rowid ] of [ [ 'INSERT OR REPLACE', 1 ], [ 'INSERT', 1000 ], [ 'INSERT', -1 ], [ 'INSERT OR REPLACE', -1 ] ] as const) {
     await t.rejects(
       () => run(db,
-        `${verb} INTO legacy_collateral_events
-           (rowid, id, chain_id, comet_address, token_address, previous_is_legacy, is_legacy, actor, reason, created_at)
+        `${verb} INTO deprecated_collateral_events
+           (rowid, id, chain_id, comet_address, token_address, previous_is_deprecated, is_deprecated, actor, reason, created_at)
          VALUES (?1, ?2, 1, ?3, ?4, 1, 0, 'test-admin', 'reviewed', ?5)`,
         rowid, randomUUID(), COMET, token, NOW),
       APPENDED,
@@ -1360,7 +1363,7 @@ t.test('a legacy collateral is decided for a collateral of an active Comet, and 
   }
   await t.rejects(
     () => run(db,
-      `INSERT OR REPLACE INTO legacy_collaterals (rowid, chain_id, comet_address, token_address, is_legacy, updated_at, updated_by)
+      `INSERT OR REPLACE INTO deprecated_collaterals (rowid, chain_id, comet_address, token_address, is_deprecated, updated_at, updated_by)
        VALUES (1, 1, ?1, ?2, 1, ?3, 'test-admin')`,
       COMET, address('another'), NOW),
     { message: /rowid/ },
@@ -1369,19 +1372,19 @@ t.test('a legacy collateral is decided for a collateral of an active Comet, and 
 
   // history is read in the order it was committed, whatever the stamps say
   await t.resolves(() => decide({ value: 0, at: '2026-09-17T00:00:00.500Z' }, 1), 'a change stamped earlier than the one before it');
-  const history = await readLegacyCollateral(db, { chainId: 1, cometAddress: COMET as `0x${string}`, tokenAddress: token as `0x${string}` });
+  const history = await readDeprecatedCollateral(db, { chainId: 1, cometAddress: COMET as `0x${string}`, tokenAddress: token as `0x${string}` });
   t.same(
-    [ history.isLegacy, history.events[0]?.previousIsLegacy, history.events[0]?.isLegacy, history.events[0]?.createdAt ],
+    [ history.isDeprecated, history.events[0]?.previousIsDeprecated, history.events[0]?.isDeprecated, history.events[0]?.createdAt ],
     [ false, true, false, '2026-09-17T00:00:00.500Z' ],
     'is listed first, as the change that set the decision in force',
   );
 
   // an expectation states what a collateral must hold when a write is done; one that does not hold aborts
   const expect = (value: number, tokenAddress: string = token) => run(db,
-    `INSERT INTO legacy_collateral_expectations (chain_id, comet_address, token_address, is_legacy) VALUES (1, ?1, ?2, ?3)`,
+    `INSERT INTO deprecated_collateral_expectations (chain_id, comet_address, token_address, is_deprecated) VALUES (1, ?1, ?2, ?3)`,
     COMET, tokenAddress, value);
   await t.resolves(() => expect(0), 'an expectation that holds passes');
-  t.equal(await count(db, 'legacy_collateral_expectations'), 0, 'and writes nothing');
+  t.equal(await count(db, 'deprecated_collateral_expectations'), 0, 'and writes nothing');
   await t.rejects(() => expect(1), { message: /changed while they were being written/ }, 'one for another decision aborts');
   await t.rejects(() => expect(0, candidate.base), NOT_ACTIVE, 'and so does one for a token that is no collateral of the Comet');
 
@@ -1389,22 +1392,22 @@ t.test('a legacy collateral is decided for a collateral of an active Comet, and 
   const next = await insertCollateralCandidate(db);
   await validate(db, next.registry_version_id);
   await activate(db, next.registry_version_id);
-  const events = await count(db, 'legacy_collateral_events');
+  const events = await count(db, 'deprecated_collateral_events');
   await t.rejects(
     () => db.batch([
-      insertStatement(db, 'legacy_collateral_events', event({ value: 1, at: '2026-09-17T00:00:03.000Z' }, 0)),
-      db.prepare(`UPDATE legacy_collaterals SET is_legacy = 1, updated_at = ?1, updated_by = 'test-admin'`).bind('2026-09-17T00:00:03.000Z'),
+      insertStatement(db, 'deprecated_collateral_events', event({ value: 1, at: '2026-09-17T00:00:03.000Z' }, 0)),
+      db.prepare(`UPDATE deprecated_collaterals SET is_deprecated = 1, updated_at = ?1, updated_by = 'test-admin'`).bind('2026-09-17T00:00:03.000Z'),
     ]),
     NOT_ACTIVE,
     'a collateral the active version no longer holds keeps its decision until a version brings it back',
   );
-  t.equal(await count(db, 'legacy_collateral_events'), events, 'and the refused change leaves no event');
+  t.equal(await count(db, 'deprecated_collateral_events'), events, 'and the refused change leaves no event');
 
   // a literal, so the value reaches the column as the integer it is rather than as a bound double
   await t.rejects(
     () => run(db,
-      `INSERT INTO legacy_collateral_events
-         (id, chain_id, comet_address, token_address, previous_is_legacy, is_legacy, actor, reason, created_at)
+      `INSERT INTO deprecated_collateral_events
+         (id, chain_id, comet_address, token_address, previous_is_deprecated, is_deprecated, actor, reason, created_at)
        VALUES (?1, 9007199254740992, ?2, ?3, 0, 1, 'test-admin', 'reviewed', ?4)`,
       randomUUID(), COMET, token, NOW),
     CHECK_FAILED,
@@ -1414,13 +1417,13 @@ t.test('a legacy collateral is decided for a collateral of an active Comet, and 
     [ 'a chain id of zero', { chain_id: 0 } ],
     [ 'a Comet address that is not lowercase', { comet_address: COMET.toUpperCase().replace('0X', '0x') } ],
     [ 'a token address that is not hex', { token_address: `0x${'g'.repeat(40)}` } ],
-    [ 'a value that is not a flag', { is_legacy: 2, previous_is_legacy: 0 } ],
+    [ 'a value that is not a flag', { is_deprecated: 2, previous_is_deprecated: 0 } ],
     [ 'a blank reason', { reason: ' ' } ],
     [ 'an unbounded reason', { reason: 'x'.repeat(1001) } ],
     [ 'a blank actor', { actor: ' ' } ],
   ];
   for (const [ name, overrides ] of cases) {
-    await t.rejects(() => insertRow(db, 'legacy_collateral_events', { ...event({ value: 1, at: NOW }, 0), ...overrides }), CHECK_FAILED, name);
+    await t.rejects(() => insertRow(db, 'deprecated_collateral_events', { ...event({ value: 1, at: NOW }, 0), ...overrides }), CHECK_FAILED, name);
   }
   t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
 });
@@ -1449,5 +1452,164 @@ t.test('migration 0006 adds its tables beside a registry in use', async t => {
   t.equal((await readTokenPolicy(db, 1, weth)).isStrategic, true, 'and the token policies decided before it stand');
   t.same([ await count(db, 'legacy_collaterals'), await count(db, 'legacy_collateral_events') ], [ 0, 0 ],
     'while nothing is decided about any collateral yet');
+  t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
+});
+
+/*
+ * Migration 0007 renames what 0006 created: the tables and their columns in
+ * place, the indexes, triggers and view by creating them again. What it leaves
+ * is the schema 0006 would have created under the new names. SQLite quotes
+ * the new name of a renamed table where it stores the table's statement, so
+ * statements are compared without quotes, comments or spacing.
+ */
+type SchemaObject = { type: string, name: string, tbl_name: string, sql: string | null };
+
+async function schemaOf(db: D1Database): Promise<SchemaObject[]> {
+  const { results } = await db.prepare(
+    `SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE substr(name, 1, 4) <> '_cf_' ORDER BY type, name`
+  ).all<SchemaObject>();
+  return (results ?? []).map(object => ({
+    ...object,
+    sql: object.sql === null ? null : object.sql.replace(/--[^\n]*/g, '').replaceAll('"', '').replace(/\s+/g, ' ').trim(),
+  }));
+}
+
+t.test('migration 0007 leaves the schema 0006 would have created under the deprecated names', async t => {
+  const { APP_DB: migrated } = await freshEnv();
+  const renamed = await schemaOf(migrated);
+  t.same(renamed.filter(object => /legacy/.test(`${object.name} ${object.sql}`)), [], 'no object of 0001 to 0007 says legacy');
+
+  await server.reset();
+  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
+  await applyMigrations(db, undefined, { through: '0005' });
+  await applySql(db, readFileSync('./migrations/0006_legacy_collaterals.sql', 'utf8').replaceAll('legacy', 'deprecated'));
+  t.same(renamed, await schemaOf(db), 'and each is the object 0006 creates when it says deprecated, statement for statement');
+});
+
+/*
+ * An environment that ran the release before 0007 may hold decisions made
+ * under 0006. 0007 keeps every row as it was, every event at the rowid its
+ * collateral's history is read by, and every invariant 0006 enforces, which
+ * now refuses in the new words. Applying it again is refused before it
+ * changes anything.
+ */
+t.test('migration 0007 keeps the decisions and events made under 0006, and every invariant', async t => {
+  await server.reset();
+  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
+  await applyMigrations(db, undefined, { through: '0006' });
+
+  // a change as the release before 0007 wrote it: the event and the row beside it, under 0006's names
+  const decide = (token: string, previous: number | null, value: number, at: string) => db.batch([
+    insertStatement(db, 'legacy_collateral_events', {
+      id:                 randomUUID(),
+      chain_id:           1,
+      comet_address:      COMET,
+      token_address:      token,
+      previous_is_legacy: previous,
+      is_legacy:          value,
+      actor:              'test-admin',
+      reason:             'decided under 0006',
+      created_at:         at,
+    }),
+    db.prepare(
+      `INSERT INTO legacy_collaterals (chain_id, comet_address, token_address, is_legacy, updated_at, updated_by)
+       VALUES (1, ?1, ?2, ?3, ?4, 'test-admin')
+       ON CONFLICT (chain_id, comet_address, token_address) DO UPDATE
+       SET is_legacy = excluded.is_legacy, updated_at = excluded.updated_at, updated_by = excluded.updated_by`
+    ).bind(COMET, token, value, at),
+  ]);
+  const first = await insertCollateralCandidate(db);
+  await validate(db, first.registry_version_id);
+  await activate(db, first.registry_version_id);
+  await decide(first.token, null, 1, '2026-10-08T00:00:00.000Z');
+  await decide(first.token, 1, 0, '2026-10-08T00:00:02.000Z');
+  // committed after the change before it, though stamped earlier
+  await decide(first.token, 0, 1, '2026-10-08T00:00:01.000Z');
+  // a version whose market takes another token keeps the first token's decision until a version brings it back
+  const second = await insertCollateralCandidate(db);
+  await validate(db, second.registry_version_id);
+  await activate(db, second.registry_version_id);
+  await decide(second.token, null, 1, '2026-10-08T00:00:03.000Z');
+
+  const events    = (await db.prepare(`SELECT rowid, * FROM legacy_collateral_events ORDER BY rowid`).all<Row>()).results ?? [];
+  const decisions = (await db.prepare(`SELECT * FROM legacy_collaterals ORDER BY token_address`).all<Row>()).results ?? [];
+
+  await applyMigration(db, '0007_deprecated_collaterals.sql');
+
+  const renamed = (row: Row) => Object.fromEntries(Object.entries(row).map(([ column, value ]) => [ column.replace('legacy', 'deprecated'), value ]));
+  t.equal(events.length, 4, 'four changes were recorded under 0006');
+  t.same((await db.prepare(`SELECT rowid, * FROM deprecated_collateral_events ORDER BY rowid`).all<Row>()).results, events.map(renamed),
+    'every event is kept as it was written, at its rowid');
+  t.same((await db.prepare(`SELECT * FROM deprecated_collaterals ORDER BY token_address`).all<Row>()).results, decisions.map(renamed),
+    'and so is every decision');
+
+  const collateral = (token: string) => ({ chainId: 1, cometAddress: COMET as `0x${string}`, tokenAddress: token as `0x${string}` });
+  const kept = await readDeprecatedCollateral(db, collateral(first.token));
+  t.same(
+    [ kept.inActiveVersion, kept.isDeprecated, kept.events.map(event => [ event.previousIsDeprecated, event.isDeprecated, event.createdAt ]) ],
+    [ false, true, [
+      [ false, true,  '2026-10-08T00:00:01.000Z' ],
+      [ true,  false, '2026-10-08T00:00:02.000Z' ],
+      [ null,  true,  '2026-10-08T00:00:00.000Z' ],
+    ] ],
+    'the release that reads the new names finds a kept decision, with its history newest committed first',
+  );
+
+  const UNAUDITED = { message: /a deprecated collateral decision changes only with its audit event/ };
+  const APPENDED  = { message: /deprecated collateral events are append-only/ };
+  await t.rejects(() => run(db, `UPDATE deprecated_collaterals SET is_deprecated = 0, updated_at = ?1 WHERE token_address = ?2`, NOW, second.token),
+    UNAUDITED, 'a decision still changes only beside its event');
+  await t.rejects(() => run(db, `UPDATE deprecated_collaterals SET token_address = ?1 WHERE token_address = ?2`, address('moved'), second.token),
+    { message: /a deprecated collateral decision belongs to one collateral/ }, 'stays its own collateral\'s');
+  await t.rejects(() => run(db, `DELETE FROM deprecated_collaterals`), { message: /deprecated collateral decisions are changed, not deleted/ },
+    'and is never deleted');
+  await t.rejects(
+    () => db.batch([
+      insertStatement(db, 'deprecated_collateral_events', {
+        id:                     randomUUID(),
+        chain_id:               1,
+        comet_address:          COMET,
+        token_address:          first.token,
+        previous_is_deprecated: 1,
+        is_deprecated:          0,
+        actor:                  'test-admin',
+        reason:                 'reviewed',
+        created_at:             NOW,
+      }),
+      db.prepare(`UPDATE deprecated_collaterals SET is_deprecated = 0, updated_at = ?1, updated_by = 'test-admin' WHERE token_address = ?2`)
+        .bind(NOW, first.token),
+    ]),
+    { message: /collateral is not in the active registry/ },
+    'a kept decision is not changed while the active version does not hold its collateral',
+  );
+  await t.rejects(() => run(db, `UPDATE deprecated_collateral_events SET reason = 'edited'`), APPENDED, 'an event is never edited');
+  await t.rejects(() => run(db, `DELETE FROM deprecated_collateral_events`), APPENDED, 'nor deleted');
+  await t.rejects(
+    () => run(db,
+      `INSERT INTO deprecated_collateral_events
+         (rowid, id, chain_id, comet_address, token_address, previous_is_deprecated, is_deprecated, actor, reason, created_at)
+       VALUES (1000, ?1, 1, ?2, ?3, 1, 0, 'test-admin', 'reviewed', ?4)`,
+      randomUUID(), COMET, second.token, NOW),
+    APPENDED,
+    'nor written at a rowid its writer chose',
+  );
+  await t.rejects(
+    () => run(db,
+      `INSERT INTO deprecated_collateral_expectations (chain_id, comet_address, token_address, is_deprecated) VALUES (1, ?1, ?2, 0)`,
+      COMET, second.token),
+    { message: /deprecated collateral decisions changed while they were being written/ },
+    'and an expectation that does not hold aborts the write that states it',
+  );
+
+  const written = await setDeprecatedCollateral(db, { ...collateral(second.token), isDeprecated: false, actor: 'test-admin', reason: 'decided under 0007' });
+  t.same([ written.changed, written.isDeprecated ], [ true, false ], 'the release that reads the new names writes beside them');
+  t.equal(await db.prepare(`SELECT max(rowid) AS last FROM deprecated_collateral_events`).first<number>('last'), events.length + 1,
+    'its event taking the rowid after the last one written under 0006');
+
+  const before = [ await schemaOf(db), (await db.prepare(`SELECT rowid, * FROM deprecated_collateral_events ORDER BY rowid`).all()).results ];
+  await t.rejects(() => applyMigration(db, '0007_deprecated_collaterals.sql'), { message: /no such trigger/ },
+    'applying 0007 again is refused at its first statement');
+  t.same([ await schemaOf(db), (await db.prepare(`SELECT rowid, * FROM deprecated_collateral_events ORDER BY rowid`).all()).results ], before,
+    'and changes nothing, since a migration is applied as one batch');
   t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
 });

@@ -1,8 +1,10 @@
 /*
- * Types shared by the Comet registry: the rows of the APP_DB tables created
- * in migrations/0001_comet_registry.sql, the records parsed from the pinned
- * Comet source, and the RegistrySnapshotV1 wire contract frozen in
- * tests/fixtures/registry/registry-snapshot-v1.json.
+ * Types shared by the Comet registry: the records parsed from the pinned
+ * Comet source, the RegistrySnapshotV1 wire contract frozen in
+ * tests/fixtures/registry/registry-snapshot-v1.json and the other answers of
+ * the registry routes, and the Comet a computation takes. The rows of the
+ * APP_DB tables are in src/registry/rows.ts, beside the only modules that
+ * read them.
  *
  * Addresses are stored and compared lowercase. The registry validates them
  * with the anchored validator below rather than Eth.parseAddress, whose
@@ -21,26 +23,22 @@ type Address = `0x${string}`;
  * array, so the type and the runtime list validation uses cannot drift apart,
  * and the values are exactly what D1 stores and the wire contract carries.
  */
-const CONTRACT_ROLES   = [ 'comet', 'configurator', 'rewards', 'bulker', 'fauceteer', 'bridge_receiver' ] as const;
-const ASSET_ROLES      = [ 'base', 'reward', 'collateral' ] as const;
-const PRICE_QUOTES     = [ 'usd', 'base' ] as const;
-const MARKET_STATUSES  = [ 'enabled', 'deprecated', 'disabled' ] as const;
-const VERSION_STATUSES = [ 'importing', 'invalid', 'validated' ] as const;
-const EXCEPTION_KINDS  = [ 'zero_price', 'fixed_price', 'deprecated_price_remap' ] as const;
+const CONTRACT_ROLES  = [ 'comet', 'configurator', 'rewards', 'bulker', 'fauceteer', 'bridge_receiver' ] as const;
+const ASSET_ROLES     = [ 'base', 'reward', 'collateral' ] as const;
+const PRICE_QUOTES    = [ 'usd', 'base' ] as const;
+const MARKET_STATUSES = [ 'enabled', 'deprecated', 'disabled' ] as const;
+const EXCEPTION_KINDS = [ 'zero_price', 'fixed_price', 'deprecated_price_remap' ] as const;
 
 const ACTIVATION_ACTIONS = [ 'activate', 'rollback' ] as const;
-const SYNC_TRIGGER_KINDS = [ 'scheduled', 'manual' ] as const;
-const SYNC_RUN_STATUSES  = [ 'running', 'failed', 'completed' ] as const;
-const SYNC_OUTCOMES      = [ 'imported', 'no_change' ] as const;
-const SYNC_ITEM_STATUSES = [ 'pending', 'processing', 'completed', 'failed' ] as const;
 
 /*
  * How the token list valued a token, and why it shows or hides it. `partial`
  * is a value read from only some of a token's positions that already reaches
- * the threshold (decision D7 of the TOK-0 audit).
+ * the threshold (decision D7 of the TOK-0 audit). `deprecated` hides a token
+ * deprecated in every enabled market that takes it, whatever else holds.
  */
 const COLLATERAL_VALUE_STATUSES = [ 'fresh', 'exception', 'partial', 'stale', 'unavailable' ] as const;
-const VISIBILITY_REASONS        = [ 'strategic', 'collateral_threshold', 'below_threshold', 'data_unavailable' ] as const;
+const VISIBILITY_REASONS        = [ 'deprecated', 'strategic', 'collateral_threshold', 'below_threshold', 'data_unavailable' ] as const;
 
 type ContractRole  = (typeof CONTRACT_ROLES)[number];
 
@@ -63,14 +61,9 @@ type ContractRoleKey = (typeof CONTRACT_ROLE_KEYS)[ContractRole];
 type AssetRole     = (typeof ASSET_ROLES)[number];
 type PriceQuote    = (typeof PRICE_QUOTES)[number];
 type MarketStatus  = (typeof MARKET_STATUSES)[number];
-type VersionStatus = (typeof VERSION_STATUSES)[number];
 type ExceptionKind = (typeof EXCEPTION_KINDS)[number];
 
 type ActivationAction = (typeof ACTIVATION_ACTIONS)[number];
-type SyncTriggerKind  = (typeof SYNC_TRIGGER_KINDS)[number];
-type SyncRunStatus   = (typeof SYNC_RUN_STATUSES)[number];
-type SyncOutcome     = (typeof SYNC_OUTCOMES)[number];
-type SyncItemStatus  = (typeof SYNC_ITEM_STATUSES)[number];
 
 /*
  * Anchored address validation. Accepts any casing, because upstream roots
@@ -156,183 +149,6 @@ type ParsedRoot = DeploymentPath & {
   contracts:    Partial<Record<ContractRole, Address>>,
   otherRoots:   Record<string, Address>,
   checksum:     string,
-};
-
-/*
- * D1 rows. Booleans are INTEGER 0 or 1 and every nullable column is
- * explicitly nullable, matching the migrations.
- *
- * `reviewed` says whether someone made the decisions a network or market row
- * carries (0002). The column defaults to 1, which SQLite needs to add it to a
- * table that has rows, so a row inserted without it would claim a review
- * nobody made; the row types require it, and so every write states it.
- */
-type RegistryVersionRow = {
-  id:                string,
-  source_repository: string,
-  source_commit_sha: string,
-  source_checksum:   string,
-  snapshot_checksum: string | null,
-  attempt:           number,
-  status:            VersionStatus,
-  created_at:        string,
-  validated_at:      string | null,
-  created_by:        string,
-};
-
-type RegistryNetworkRow = {
-  id:                   string,
-  registry_version_id:  string,
-  chain_id:             number,
-  upstream_network_key: string,
-  canonical_name:       string,
-  display_name:         string,
-  is_testnet:           number,
-  metadata:             string,
-  reviewed:             number,
-};
-
-type MarketRow = {
-  id:                          string,
-  registry_version_id:         string,
-  network_id:                  string,
-  deployment_key:              string,
-  display_name:                string,
-  slug:                        string | null,
-  contract_name:               string | null,
-  creation_block:              number,
-  status:                      MarketStatus,
-  is_default:                  number,
-  is_institutional:            number,
-  rewards_enabled:             number,
-  account_rewards_enabled:     number,
-  transaction_history_enabled: number,
-  collateral_value_quote:      PriceQuote,
-  reviewed:                    number,
-};
-
-type TokenRow = {
-  id:                  string,
-  registry_version_id: string,
-  network_id:          string,
-  address:             Address,
-  symbol:              string,
-  name:                string,
-  decimals:            number,
-};
-
-type MarketContractRow = {
-  id?:       number,
-  market_id: string,
-  role:      ContractRole,
-  address:   Address,
-};
-
-type MarketAssetRow = {
-  id?:                     number,
-  registry_version_id:     string,
-  network_id:              string,
-  market_id:               string,
-  token_id:                string,
-  role:                    AssetRole,
-  asset_index:             number | null,
-  price_feed_address:      Address | null,
-  price_feed_decimals:     number | null,
-  price_feed_quote:        PriceQuote | null,
-  usd_price_feed_address:  Address | null,
-  usd_price_feed_decimals: number | null,
-  display_name:            string | null,
-  is_wrapped_native:       number | null,
-};
-
-type NetworkPriceExceptionRow = {
-  id?:                             number,
-  registry_version_id:             string,
-  network_id:                      string,
-  price_feed_address:              Address,
-  kind:                            ExceptionKind,
-  fixed_price_value:               string | null,
-  fixed_price_decimals:            number | null,
-  replacement_price_feed_address:  Address | null,
-  replacement_price_feed_decimals: number | null,
-  provenance:                      string,
-  expires_at:                      string | null,
-};
-
-type ValidationResultRow = {
-  id?:                 number,
-  registry_version_id: string,
-  validation_attempt:  number,
-  check_name:          string,
-  scope:               string,
-  passed:              number,
-  details:             string,
-  created_at:          string,
-};
-
-type RegistryOverlayEventRow = {
-  id:                  string,
-  registry_version_id: string,
-  scope_type:          'network' | 'market',
-  scope_key:           string,
-  previous_digest:     string | null,
-  new_digest:          string,
-  actor:               string,
-  reason:              string,
-  created_at:          string,
-};
-
-type SyncRunRow = {
-  id:                  string,
-  source_commit_sha:   string,
-  tracked_ref:         string | null,
-  registry_version_id: string | null,
-  trigger_kind:        SyncTriggerKind,
-  requested_by:        string | null,
-  reason:              string | null,
-  status:              SyncRunStatus,
-  outcome:             SyncOutcome | null,
-  lease_owner:         string | null,
-  lease_expires_at:    string | null,
-  expected_count:      number,
-  completed_count:     number,
-  failed_count:        number,
-  last_error:          string | null,
-  started_at:          string,
-  completed_at:        string | null,
-  hold_for_review:     number,
-};
-
-type SyncRunItemRow = {
-  id:                   string,
-  sync_run_id:          string,
-  root_path:            string,
-  source_blob_sha:      string,
-  upstream_network_key: string,
-  deployment_key:       string,
-  status:               SyncItemStatus,
-  attempts:             number,
-  claim_owner:          string | null,
-  claimed_at:           string | null,
-  completed_at:         string | null,
-  last_error:           string | null,
-  created_at:           string,
-  updated_at:           string,
-};
-
-/*
- * The tables the registry writes row by row, with the row each one takes, so
- * a write names its table and is checked against that table's columns.
- */
-type RegistryTables = {
-  registry_versions:        RegistryVersionRow,
-  registry_networks:        RegistryNetworkRow,
-  network_price_exceptions: NetworkPriceExceptionRow,
-  markets:                  MarketRow,
-  tokens:                   TokenRow,
-  market_contracts:         MarketContractRow,
-  market_assets:            MarketAssetRow,
-  registry_overlay_events:  RegistryOverlayEventRow,
 };
 
 /*
@@ -468,12 +284,12 @@ type RegistrySnapshotV1 = {
 /*
  * The active version as the active reads serve it — /active and the market
  * reads — beside RegistrySnapshotV1, which stays the version as imported:
- * every collateral also says whether an administrator marked it legacy in its
- * Comet (migrations/0006_legacy_collaterals.sql). The flag is a decision
- * about the market, not part of the version, so it takes no part in the
- * version's checksum and is read anew for every answer.
+ * every collateral also says whether an administrator marked it deprecated in
+ * its Comet (migrations/0007_deprecated_collaterals.sql). The flag is a
+ * decision about the market, not part of the version, so it takes no part in
+ * the version's checksum and is read anew for every answer.
  */
-type ActiveCollateralAssetV1 = CollateralAssetV1 & { isLegacy: boolean };
+type ActiveCollateralAssetV1 = CollateralAssetV1 & { isDeprecated: boolean };
 type ActiveMarketV1          = Omit<MarketV1, 'collateralAssets'> & { collateralAssets: ActiveCollateralAssetV1[] };
 type ActiveNetworkV1         = Omit<NetworkV1, 'markets'> & { markets: ActiveMarketV1[] };
 type ActiveSnapshotV1        = Omit<RegistrySnapshotV1, 'networks'> & { networks: ActiveNetworkV1[] };
@@ -509,30 +325,6 @@ type ValidationSummaryV1 = {
   passed:  number,
   failed:  number,
   checks:  ValidationCheckV1[],
-};
-
-/*
- * Token policies, from migrations/0005_token_policies.sql: the decisions an
- * administrator makes about a token, kept by chain id and address rather than
- * on a versioned row, so that they outlive every activation.
- */
-type TokenPolicyRow = {
-  chain_id:      number,
-  token_address: Address,
-  is_strategic:  number,
-  updated_at:    string,
-  updated_by:    string,
-};
-
-type TokenPolicyEventRow = {
-  id:                    string,
-  chain_id:              number,
-  token_address:         Address,
-  previous_is_strategic: number | null,
-  is_strategic:          number,
-  actor:                 string,
-  reason:                string,
-  created_at:            string,
 };
 
 /*
@@ -654,50 +446,23 @@ type TokenPolicyApplyV1 = {
 };
 
 /*
- * Legacy collaterals, from migrations/0006_legacy_collaterals.sql: which
- * collaterals of which Comets an administrator has marked legacy, kept by
- * chain id, Comet address and token address rather than on a versioned row,
- * so that they outlive every activation as token policies do.
- */
-type LegacyCollateralRow = {
-  chain_id:      number,
-  comet_address: Address,
-  token_address: Address,
-  is_legacy:     number,
-  updated_at:    string,
-  updated_by:    string,
-};
-
-type LegacyCollateralEventRow = {
-  id:                 string,
-  chain_id:           number,
-  comet_address:      Address,
-  token_address:      Address,
-  previous_is_legacy: number | null,
-  is_legacy:          number,
-  actor:              string,
-  reason:             string,
-  created_at:         string,
-};
-
-/*
  * The decision in force for a collateral of a Comet. A collateral nobody has
- * decided about is not legacy, and has no time or author to name.
+ * decided about is not deprecated, and has no time or author to name.
  */
-type LegacyCollateralV1 = {
-  isLegacy:  boolean,
-  updatedAt: string | null,
-  updatedBy: string | null,
+type DeprecatedCollateralV1 = {
+  isDeprecated: boolean,
+  updatedAt:    string | null,
+  updatedBy:    string | null,
 };
 
-type LegacyCollateralEventV1 = {
-  id:               string,
-  // null where the collateral had no decision yet, which is not legacy
-  previousIsLegacy: boolean | null,
-  isLegacy:         boolean,
-  actor:            string,
-  reason:           string,
-  createdAt:        string,
+type DeprecatedCollateralEventV1 = {
+  id:                   string,
+  // null where the collateral had no decision yet, which is not deprecated
+  previousIsDeprecated: boolean | null,
+  isDeprecated:         boolean,
+  actor:                string,
+  reason:               string,
+  createdAt:            string,
 };
 
 /*
@@ -706,13 +471,13 @@ type LegacyCollateralEventV1 = {
  * version does not hold the collateral in that Comet, which applies again once
  * one does.
  */
-type LegacyCollateralDetailV1 = LegacyCollateralV1 & {
+type DeprecatedCollateralDetailV1 = DeprecatedCollateralV1 & {
   registryVersion: VersionRefV1,
   chainId:         number,
   cometAddress:    Address,
   tokenAddress:    Address,
   inActiveVersion: boolean,
-  events:          LegacyCollateralEventV1[],
+  events:          DeprecatedCollateralEventV1[],
 };
 
 /*
@@ -720,12 +485,12 @@ type LegacyCollateralDetailV1 = LegacyCollateralV1 & {
  * decision asked for was already in force, which writes nothing; `updatedAt`
  * is when the decision in force was made, and null where nobody has decided.
  */
-type LegacyCollateralResultV1 = {
+type DeprecatedCollateralResultV1 = {
   registryVersion: VersionRefV1,
   chainId:         number,
   cometAddress:    Address,
   tokenAddress:    Address,
-  isLegacy:        boolean,
+  isDeprecated:    boolean,
   changed:         boolean,
   updatedAt:       string | null,
 };
@@ -742,32 +507,32 @@ type LegacyCollateralResultV1 = {
  * and `retained` say where the list was exported from and which decisions
  * the active version does not hold, and are not read.
  */
-type LegacyCollateralDecisionV1 = {
+type DeprecatedCollateralDecisionV1 = {
   chainId:        number,
   cometAddress:   Address,
   deploymentKey?: string | null,
   tokenAddress:   Address,
   symbol?:        string | null,
-  isLegacy:       boolean,
+  isDeprecated:   boolean,
   reason?:        string | null,
 };
 
 // a decision kept for a collateral the active version does not hold in that Comet
-type RetainedLegacyCollateralV1 = LegacyCollateralV1 & {
+type RetainedDeprecatedCollateralV1 = DeprecatedCollateralV1 & {
   chainId:      number,
   cometAddress: Address,
   tokenAddress: Address,
 };
 
-type LegacyCollateralListV1 = {
+type DeprecatedCollateralListV1 = {
   registryVersion?: VersionRefV1,
   reason:           string | null,
-  collaterals:      LegacyCollateralDecisionV1[],
-  retained?:        RetainedLegacyCollateralV1[],
+  collaterals:      DeprecatedCollateralDecisionV1[],
+  retained?:        RetainedDeprecatedCollateralV1[],
 };
 
 // what applying a list would change, row by row, without writing anything
-type LegacyCollateralReviewV1 = {
+type DeprecatedCollateralReviewV1 = {
   registryVersion: VersionRefV1,
   summary:         { change: number, unchanged: number, problems: number },
   collaterals:     Array<{
@@ -786,7 +551,7 @@ type LegacyCollateralReviewV1 = {
 };
 
 // what applying a list wrote: every row, as the transaction that wrote it left it
-type LegacyCollateralApplyV1 = {
+type DeprecatedCollateralApplyV1 = {
   registryVersion: VersionRefV1,
   summary:         { changed: number, unchanged: number },
   collaterals:     Array<{
@@ -796,7 +561,7 @@ type LegacyCollateralApplyV1 = {
     deploymentKey: string,
     tokenAddress:  Address,
     symbol:        string,
-    isLegacy:      boolean,
+    isDeprecated:  boolean,
     changed:       boolean,
     updatedAt:     string | null,
   }>,
@@ -826,16 +591,18 @@ type AppliedPriceExceptionV1 = {
 };
 
 /*
- * `legacyIn` names the Comets of the chain's served markets that take the
- * token as a collateral an administrator marked legacy, sorted; `isLegacy`
- * says it is legacy in every enabled market that takes it, of which there is
- * at least one. Neither changes whether discovery shows the token.
+ * `deprecatedIn` names the Comets of the chain's served markets that take the
+ * token as a collateral an administrator marked deprecated, sorted.
+ * `isDeprecated` says it is deprecated in every enabled market that takes it,
+ * of which there is at least one, and then discovery does not show it,
+ * whatever else holds. A token deprecated in some of them only is shown or
+ * hidden by the rest of the rule.
  */
 type TokenVisibilityV1 = TokenV1 & {
   roles:                 AssetRole[],
   isStrategic:           boolean,
-  isLegacy:              boolean,
-  legacyIn:              Address[],
+  isDeprecated:          boolean,
+  deprecatedIn:          Address[],
   collateralValueUsd:    string | null,
   collateralValueStatus: CollateralValueStatusV1,
   valueAt:               string | null,
@@ -908,72 +675,50 @@ export type {
   ContractRole,
   ContractRoleKey,
   DeploymentPath,
+  DeprecatedCollateralApplyV1,
+  DeprecatedCollateralDecisionV1,
+  DeprecatedCollateralDetailV1,
+  DeprecatedCollateralEventV1,
+  DeprecatedCollateralListV1,
+  DeprecatedCollateralResultV1,
+  DeprecatedCollateralReviewV1,
+  DeprecatedCollateralV1,
   ExceptionKind,
-  LegacyCollateralApplyV1,
-  LegacyCollateralDecisionV1,
-  LegacyCollateralDetailV1,
-  LegacyCollateralEventRow,
-  LegacyCollateralEventV1,
-  LegacyCollateralListV1,
-  LegacyCollateralResultV1,
-  LegacyCollateralReviewV1,
-  LegacyCollateralRow,
-  LegacyCollateralV1,
-  MarketAssetRow,
-  MarketContractRow,
-  MarketRow,
   MarketStatus,
   MarketV1,
   NetworkPresentationV1,
-  NetworkPriceExceptionRow,
   NetworkV1,
   ParsedRoot,
   PriceExceptionV1,
   PriceFeedV1,
   PriceQuote,
-  RegistryNetworkRow,
-  RegistryOverlayEventRow,
   RegistrySnapshotV1,
-  RegistryTables,
   RegistryVersionRefV1,
   RegistryAnnotation,
   RegistryComet,
-  RegistryVersionRow,
-  RetainedLegacyCollateralV1,
+  RetainedDeprecatedCollateralV1,
   RewardAssetV1,
-  SyncItemStatus,
-  SyncOutcome,
-  SyncRunItemRow,
-  SyncRunRow,
-  SyncRunStatus,
-  SyncTriggerKind,
   TokenPoliciesV1,
   TokenListV1,
   TokenPolicyApplyV1,
   TokenPolicyDecisionV1,
   TokenPolicyDetailV1,
-  TokenPolicyEventRow,
   TokenPolicyEventV1,
   TokenPolicyListV1,
   TokenPolicyResultV1,
   TokenPolicyReviewV1,
-  TokenPolicyRow,
   TokenPolicyV1,
-  TokenRow,
   TokenV1,
   UnwrappedCollateralAssetV1,
   ValidationCheckV1,
-  ValidationResultRow,
   ValidationSummaryV1,
   VersionRefV1,
-  VersionStatus,
   VisibilityReasonV1,
   TokenVisibilityV1,
 };
 
 export {
   checksumAddress,
-  ACTIVATION_ACTIONS,
   ASSET_ROLES,
   COLLATERAL_VALUE_STATUSES,
   VISIBILITY_REASONS,
@@ -982,11 +727,6 @@ export {
   EXCEPTION_KINDS,
   MARKET_STATUSES,
   PRICE_QUOTES,
-  SYNC_ITEM_STATUSES,
-  SYNC_OUTCOMES,
-  SYNC_RUN_STATUSES,
-  SYNC_TRIGGER_KINDS,
-  VERSION_STATUSES,
   isAddress,
   isCommitSha,
   MARKET_KEY_SEPARATOR,

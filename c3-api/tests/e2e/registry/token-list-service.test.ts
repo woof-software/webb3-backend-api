@@ -4,9 +4,11 @@ import C3Api, { Env } from '../../../entrypoint.js';
 
 import type { RegistrySnapshotV1, TokenListV1, TokenVisibilityV1 } from '../../../lib/model/comet-registry.js';
 
-import { setLegacyCollateral } from '../../../src/registry/legacy-collateral-repository.js';
+import { setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
+import { DEADLINE_MS } from '../../../src/registry/token-collateral.js';
 import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
+import { executionContext } from '../../util/execution-context.js';
 import { FakeNode, NodeScript, batches, fakeNode } from '../../util/fake-node.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
@@ -126,7 +128,7 @@ t.test('a chain is valued in one batch through the whole worker, and answered as
 
   t.same(
     { registryVersion: list.registryVersion, chainId: list.chainId, thresholdUsd: list.thresholdUsd, ruleVersion: list.ruleVersion, block: list.block },
-    { registryVersion: { id: registry.versionId, checksum: fixture.registryVersion.checksum }, chainId: BASE, thresholdUsd: '250000', ruleVersion: 1, block: LATEST },
+    { registryVersion: { id: registry.versionId, checksum: fixture.registryVersion.checksum }, chainId: BASE, thresholdUsd: '250000', ruleVersion: 2, block: LATEST },
   );
   t.equal(new Date(list.computedAt).toISOString(), list.computedAt, 'computedAt is an ISO instant');
   t.equal(node.requests.length, 2, 'the latest block, then every position of the chain in one batch');
@@ -154,6 +156,36 @@ t.test('a chain is valued in one batch through the whole worker, and answered as
 
   await get(`/registry/v1/networks/${BASE}/tokens`);
   t.equal(batches(node).length, 1, 'the next request of the minute answers from it');
+});
+
+/*
+ * A valuation the request stops waiting for goes on past the answer, because
+ * the entrypoint hands the request's execution context to the registry
+ * router, and the token list hands the valuation to its waitUntil: the next
+ * request of the minute answers from it. The node holds the minute's batch
+ * past the deadline, until the test lets it through.
+ */
+t.test('a valuation the request stopped waiting for is left to waitUntil, and the next request answers from it', async t => {
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const { node, env } = await workerOf(t, {
+    ...BASE_NODE,
+    hold: ({ calls }) => calls[0]!.method === 'eth_getBlockByNumber' ? undefined : released,
+  });
+  const { context, handed } = executionContext();
+  const tokens = () => C3Api.fetch(new Request(`https://api.test.local/registry/v1/networks/${BASE}/tokens`), env, context);
+  const weth   = async () => bySymbol(await listOf(await tokens())).get('WETH')!;
+
+  const first = await weth();
+  t.same([ first.collateralValueStatus, first.collateralValueUsd ], [ 'unavailable', null ],
+    `the first request answers without the minute, after waiting ${DEADLINE_MS} ms for it`);
+  t.ok(handed.some(entry => !entry.settled), 'having handed the valuation, still under way, to waitUntil');
+
+  release();
+  await Promise.all(handed.map(entry => entry.work));
+  const next = await weth();
+  t.same([ next.collateralValueStatus, next.collateralValueUsd ], [ 'fresh', '500000' ], 'the next request answers from the minute it finished');
+  t.equal(batches(node).length, 1, 'without another batch');
 });
 
 t.test('a strategic token is shown below the threshold, and a decision is read on every request', async t => {
@@ -197,63 +229,84 @@ t.test('policies the database cannot give are a 503, and are logged', async t =>
 
 const MAINNET_MARKETS = fixture.networks.find(network => network.chainId === 1)!.markets;
 
-// marks one collateral of one mainnet market legacy, by the market's deployment key and the token's symbol
-const markLegacy = (db: D1Database, key: string, symbol: string, isLegacy: boolean = true) => {
+// marks one collateral of one mainnet market deprecated, by the market's deployment key and the token's symbol
+const markDeprecated = (db: D1Database, key: string, symbol: string, isDeprecated: boolean = true) => {
   const market = MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!;
-  return setLegacyCollateral(db, {
+  return setDeprecatedCollateral(db, {
     chainId:      1,
     cometAddress: market.contracts.comet!,
     tokenAddress: assetOf(market, symbol).token.address,
-    isLegacy,
+    isDeprecated,
     actor:        'test',
     reason:       'decided for a token list test',
   });
 };
 
 /*
- * Legacy collateral (migrations/0006): weETH is a collateral of the USDC,
- * WETH and USDT markets of the fixture's mainnet, and mETH of the USDT market
- * alone. A decision is read on every request, and changes nothing but the two
- * fields that say where a token is legacy.
+ * Deprecated collateral (migrations 0006 and 0007): weETH is a collateral of
+ * the USDC, WETH and USDT markets of the fixture's mainnet, and mETH of the
+ * USDT market alone. Both are strategic here, so discovery shows them whatever
+ * they are worth, until a token is deprecated in every enabled market that
+ * takes it. A decision is read on every request, and changes nothing but the
+ * fields that say where a token is deprecated and, for such a token, whether
+ * it is shown.
  */
-t.test('a token says where it is a legacy collateral, read on every request, and nothing else changes', async t => {
+t.test('a token says where it is a deprecated collateral, and is hidden once it is one in every enabled market that takes it', async t => {
   const { registry, get } = await workerOf(t);
-  const comet = (key: string) => MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!.contracts.comet!;
-  const list  = async () => bySymbol(await listOf(await get('/registry/v1/networks/1/tokens')));
-  const legacyOf = (tokens: Map<string, TokenVisibilityV1>, symbol: string) => {
-    const { isLegacy, legacyIn } = tokens.get(symbol)!;
-    return { isLegacy, legacyIn };
+  const comet   = (key: string) => MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!.contracts.comet!;
+  const token   = (key: string, symbol: string) => assetOf(MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!, symbol).token.address;
+  const list    = async () => bySymbol(await listOf(await get('/registry/v1/networks/1/tokens')));
+  const visible = async () => (await listOf(await get('/registry/v1/networks/1/tokens?visibleOnly=true'))).tokens.map(entry => entry.symbol);
+  const stateOf = (tokens: Map<string, TokenVisibilityV1>, symbol: string) => {
+    const { isDeprecated, deprecatedIn, isVisible, visibilityReason } = tokens.get(symbol)!;
+    return { isDeprecated, deprecatedIn, isVisible, visibilityReason };
   };
 
+  await decide(registry.db, 1, token('usdt', 'mETH'), true);
+  await decide(registry.db, 1, token('usdt', 'weETH'), true);
   const before = await list();
-  t.ok([ ...before.values() ].every(token => token.isLegacy === false && token.legacyIn.length === 0), 'nothing is legacy at first');
+  t.ok([ ...before.values() ].every(entry => entry.isDeprecated === false && entry.deprecatedIn.length === 0), 'nothing is deprecated at first');
+  t.same(await visible(), [ 'mETH', 'weETH' ], 'and discovery shows the two strategic tokens');
 
-  await markLegacy(registry.db, 'usdc', 'weETH');
-  await markLegacy(registry.db, 'usdt', 'weETH');
-  await markLegacy(registry.db, 'usdt', 'mETH');
+  await markDeprecated(registry.db, 'usdc', 'weETH');
+  await markDeprecated(registry.db, 'usdt', 'weETH');
+  await markDeprecated(registry.db, 'usdt', 'mETH');
   const partly = await list();
-  t.same(legacyOf(partly, 'weETH'), { isLegacy: false, legacyIn: [ comet('usdc'), comet('usdt') ].sort() },
-    'a token legacy in two of the three enabled markets that take it names the two, and is not legacy');
-  t.same(legacyOf(partly, 'mETH'), { isLegacy: true, legacyIn: [ comet('usdt') ] }, 'one legacy in the one market that takes it is');
+  t.same(stateOf(partly, 'weETH'), { isDeprecated: false, deprecatedIn: [ comet('usdc'), comet('usdt') ].sort(), isVisible: true, visibilityReason: 'strategic' },
+    'a token deprecated in two of the three enabled markets that take it names the two, and is shown as before');
+  t.same(stateOf(partly, 'mETH'), { isDeprecated: true, deprecatedIn: [ comet('usdt') ], isVisible: false, visibilityReason: 'deprecated' },
+    'one deprecated in the one market that takes it is hidden, strategic as it is');
+  t.same(await visible(), [ 'weETH' ], 'and visibleOnly leaves it out');
 
-  await markLegacy(registry.db, 'weth', 'weETH');
+  await markDeprecated(registry.db, 'weth', 'weETH');
   const after = await list();
-  t.same(legacyOf(after, 'weETH'), { isLegacy: true, legacyIn: [ comet('usdc'), comet('usdt'), comet('weth') ].sort() },
-    'and a token legacy in every enabled market that takes it is legacy, the next request says');
+  t.same(stateOf(after, 'weETH'), { isDeprecated: true, deprecatedIn: [ comet('usdc'), comet('usdt'), comet('weth') ].sort(), isVisible: false, visibilityReason: 'deprecated' },
+    'a token deprecated in every enabled market that takes it is hidden, the next request says');
+  t.same(await visible(), [], 'which leaves discovery nothing to show');
 
-  const rest = (tokens: Map<string, TokenVisibilityV1>) => [ ...tokens.values() ].map(({ isLegacy: _isLegacy, legacyIn: _legacyIn, ...token }) => token);
-  t.same(rest(after), rest(before), 'every other field of every token is what it was, whether it is shown included');
+  const decided = [ 'mETH', 'weETH' ];
+  const shown = (tokens: Map<string, TokenVisibilityV1>) => [ ...tokens.values() ]
+    .filter(entry => !decided.includes(entry.symbol))
+    .map(entry => [ entry.symbol, entry.isVisible, entry.visibilityReason ]);
+  t.same(shown(after), shown(before), 'every other token is shown or hidden as it was');
+  const rest = (tokens: Map<string, TokenVisibilityV1>) => [ ...tokens.values() ].map(({
+    isDeprecated: _isDeprecated, deprecatedIn: _deprecatedIn, isVisible: _isVisible, visibilityReason: _visibilityReason, ...entry
+  }) => entry);
+  t.same(rest(after), rest(before), 'and every other field of every token is what it was, its value included');
+
+  await markDeprecated(registry.db, 'weth', 'weETH', false);
+  t.same(await visible(), [ 'weETH' ], 'a decision taken back shows the token again');
 });
 
-t.test('legacy decisions the database cannot give are a 503, and are logged', async t => {
+t.test('deprecated collateral decisions the database cannot give are a 503, and are logged', async t => {
   const { registry, get } = await workerOf(t, BASE_NODE);
   const errors = captureErrors(t);
 
-  const response = await get(`/registry/v1/networks/${BASE}/tokens`, unreachableFor(registry.db, /FROM legacy_collaterals\s+WHERE chain_id/));
-  t.equal(response.status, 503, 'without them the list would call a legacy collateral current');
+  const response = await get(`/registry/v1/networks/${BASE}/tokens`, unreachableFor(registry.db, /FROM deprecated_collaterals\s+WHERE chain_id/));
+  t.equal(response.status, 503, 'without them the list would call a deprecated collateral current, and show a token it hides');
   const body = await response.json() as ErrorBody;
-  t.same([ body.error.code, body.error.message ], [ 'UPSTREAM_UNAVAILABLE', 'the legacy collateral decisions could not be read' ]);
-  t.ok(errors.some(line => line.includes('the token list could not read the legacy collateral decisions')), 'the outage is logged');
+  t.same([ body.error.code, body.error.message ], [ 'UPSTREAM_UNAVAILABLE', 'the deprecated collateral decisions could not be read' ]);
+  t.ok(errors.some(line => line.includes('the token list could not read the deprecated collateral decisions')), 'the outage is logged');
   t.ok(errors.some(line => line.includes('Network connection lost') && line.includes(body.error.requestId)),
     'with its cause, under the id the answer names');
 });
@@ -318,9 +371,9 @@ t.test('every answer of the token list names the version it read, and only that'
   t.same(await answer('GET', tokens, unreachableFor(registry.db, /FROM token_policies WHERE chain_id/)),
     { status: 503, headers: { ...readable, ...json, ...version } },
     'and so is a list whose policies could not be read after the version was');
-  t.same(await answer('GET', tokens, unreachableFor(registry.db, /FROM legacy_collaterals\s+WHERE chain_id/)),
+  t.same(await answer('GET', tokens, unreachableFor(registry.db, /FROM deprecated_collaterals\s+WHERE chain_id/)),
     { status: 503, headers: { ...readable, ...json, ...version } },
-    'or whose legacy collateral decisions could not be');
+    'or whose deprecated collateral decisions could not be');
   t.same(await answer('GET', `${tokens}?visibleOnly=yes`), { status: 400, headers: { ...readable, ...json } },
     'while a request refused before any version was read names none');
   t.same(await answer('OPTIONS', tokens), {

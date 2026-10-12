@@ -5,13 +5,13 @@ import { randomUUID } from 'node:crypto';
 import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
+import { sha256 } from '../../../lib/hash.js';
 import type { ActiveSnapshotV1 } from '../../../lib/model/comet-registry.js';
-import { sha256Hex } from '../../../src/http/bearer-auth.js';
 import { overlayOfMarket } from '../../../src/registry/overlay.js';
-import { recordValidationResults } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, overlayOfNetwork, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { recordValidationResults } from '../../util/registry-repository.js';
 
 /*
  * The registry HTTP API, served by the real worker in workerd over local D1.
@@ -31,7 +31,7 @@ const ADMIN_TOKEN = 'registry-admin-token-for-tests';
 const server = createTestHarness({
   workers: [ {
     configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256Hex(ADMIN_TOKEN) },
+    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
   } ],
 });
 
@@ -92,15 +92,15 @@ t.test('the bootstrap read serves the active snapshot, or says there is none', a
   const body = await response.json() as ActiveSnapshotV1;
   t.equal(body.schemaVersion, 1);
   t.equal(body.registryVersion.id, versionId);
-  // every collateral also says whether it is legacy in its Comet (legacy-collateral-reads.test.ts)
+  // every collateral also says whether it is deprecated in its Comet (deprecated-collateral-reads.test.ts)
   const collaterals = body.networks.flatMap(network => network.markets.flatMap(market => market.collateralAssets));
-  t.ok(collaterals.every(asset => asset.isLegacy === false), 'none of them legacy, since nobody has decided about one');
+  t.ok(collaterals.every(asset => asset.isDeprecated === false), 'none of them deprecated, since nobody has decided about one');
   t.same(
     body.networks.map(network => ({
       ...network,
       markets: network.markets.map(market => ({
         ...market,
-        collateralAssets: market.collateralAssets.map(({ isLegacy: _isLegacy, ...asset }) => asset),
+        collateralAssets: market.collateralAssets.map(({ isDeprecated: _isDeprecated, ...asset }) => asset),
       })),
     })),
     snapshot.networks,
@@ -119,8 +119,8 @@ t.test('a snapshot is cacheable by version and checksum', async t => {
 
   const first = await server.fetch('/registry/v1/active');
   const etag  = first.headers.get('etag');
-  t.match(etag, new RegExp(`^"v1-r3-snapshot\\+legacy-[0-9a-f]{16}-${versionId}-${snapshot.registryVersion.checksum}"$`),
-    'the ETag identifies schema, revision, representation with the legacy flags it carries, version, and checksum');
+  t.match(etag, new RegExp(`^"v1-r4-snapshot\\+deprecated-[0-9a-f]{16}-${versionId}-${snapshot.registryVersion.checksum}"$`),
+    'the ETag identifies schema, revision, representation with the deprecated flags it carries, version, and checksum');
   t.match(first.headers.get('cache-control'), /max-age=300/, 'with the configured cache lifetime');
 
   /*
@@ -148,10 +148,11 @@ t.test('a snapshot is cacheable by version and checksum', async t => {
 
   /*
    * The version read by id is the version as it was imported, without the
-   * legacy flags of the active reads: another representation of the same
-   * version, under a tag of its own, decided from the version's row alone.
+   * deprecated flags of the active reads: another representation of the
+   * same version, under a tag of its own, decided from the version's row
+   * alone.
    */
-  const pinnedTag = `"v1-r3-snapshot-${versionId}-${snapshot.registryVersion.checksum}"`;
+  const pinnedTag = `"v1-r4-snapshot-${versionId}-${snapshot.registryVersion.checksum}"`;
   const crossed   = await server.fetch(`/registry/v1/versions/${versionId}`, { headers: { 'If-None-Match': etag! } });
   t.equal(crossed.status, 200, 'the version read by id does not accept the bootstrap tag, which names other bytes');
   t.equal(crossed.headers.get('etag'), pinnedTag, 'and names its own');
@@ -507,8 +508,11 @@ t.test('a move decided against a version someone has since replaced is refused',
   t.equal((await move('activate', third, second)).status, 200);
   const rollback = await move('rollback', first, second);
   t.equal(rollback.status, 409, 'the rollback decided against the second version is refused');
-  t.match((await rollback.json() as { error: { message: string } }).error.message, new RegExp(`active version is ${third}`),
-    'and says what is on now');
+  t.match(
+    (await rollback.json() as { error: unknown }).error,
+    { message: new RegExp(`active version is ${third}`), details: { code: 'CANDIDATE_STATE_CONFLICT' } },
+    'and says what is on now',
+  );
 
   const active = await (await server.fetch('/registry/v1/active')).json() as typeof snapshot;
   t.equal(active.registryVersion.id, third, 'so the activation it raced is what the registry serves');
@@ -557,6 +561,18 @@ t.test('administrative commands validate their bodies', async t => {
   const { versionId: importing } = await seedCandidate(await freshDatabase(), snapshot);
   const conflict = await server.fetch(...admin(`/registry/v1/admin/versions/${importing}/activate`, { reason: 'x' }));
   t.equal(conflict.status, 409, 'while one that exists but is not validated is a conflict');
+  t.match(
+    (await conflict.json() as { error: unknown }).error,
+    { message: /only a validated version can be activated/, details: { code: 'CANDIDATE_STATE_CONFLICT' } },
+    'named as the state of the version',
+  );
+  const unrestorable = await server.fetch(...admin(`/registry/v1/admin/versions/${importing}/rollback`, { reason: 'x' }));
+  t.equal(unrestorable.status, 409, 'and restoring it is the same conflict');
+  t.match(
+    (await unrestorable.json() as { error: unknown }).error,
+    { message: /only a validated version can be restored/, details: { code: 'CANDIDATE_STATE_CONFLICT' } },
+    'under the same code',
+  );
 
   /*
    * A held import leaves the commit unimported until somebody acts on the
@@ -727,9 +743,9 @@ t.test('a market overlay read and sent back says what it was decided against', a
     reason: 'rename it differently', overlay: { ...read.overlay, displayName: 'USDC market' }, expectedDigest: read.digest,
   }));
   t.equal(stale.status, 409, 'a change decided against the overlay it replaced is refused');
-  t.equal(
-    (await stale.json() as { error: { details: { current: Record<string, string> } } }).error.details.current['market 1/usdc'],
-    written.digest,
+  t.same(
+    (await stale.json() as { error: { details: unknown } }).error.details,
+    { code: 'OVERLAY_CHANGED', current: { 'market 1/usdc': written.digest } },
     'naming the overlay the market holds now',
   );
 
@@ -804,9 +820,9 @@ t.test('a network overlay reads back as the draft holds it, and says what a chan
     reason: 'rename it differently', overlay: { ...held.overlay, displayName: 'Mainnet' }, expectedDigest: held.digest,
   }));
   t.equal(stale.status, 409, 'a change decided against the overlay it replaced is refused');
-  t.equal(
-    (await stale.json() as { error: { details: { current: Record<string, string> } } }).error.details.current['network 1'],
-    written.digest,
+  t.same(
+    (await stale.json() as { error: { details: unknown } }).error.details,
+    { code: 'OVERLAY_CHANGED', current: { 'network 1': written.digest } },
     'naming the overlay the network holds now',
   );
 
@@ -988,6 +1004,7 @@ t.test('a market overlay carries the reviewed decisions', async t => {
     { reason: 'too late', overlay },
   ));
   t.equal(terminal.status, 409, 'a validated version can no longer be changed');
+  t.equal((await terminal.json() as { error: { details: { code: string } } }).error.details.code, 'VERSION_NOT_IMPORTING');
 });
 
 /*
@@ -1156,7 +1173,8 @@ t.test('a sync run nobody holds can be cancelled, with a reason', async t => {
     .bind(new Date(Date.now() + 900_000).toISOString(), runId).run();
   const held = await cancel(runId, { reason: 'x' });
   t.equal(held.status, 409, 'a run an invocation holds is left to it');
-  t.match(await messageOf(held), /holds the sync run until/, 'until its lease runs out');
+  t.match(await held.json(), { error: { message: /holds the sync run until/, details: { code: 'SYNC_RUN_HELD' } } },
+    'until its lease runs out');
   t.equal(
     await db.prepare(`SELECT status FROM sync_run_items WHERE sync_run_id = ?1 AND deployment_key = 'usdc'`)
       .bind(runId).first<string>('status'),
@@ -1186,7 +1204,7 @@ t.test('a sync run nobody holds can be cancelled, with a reason', async t => {
 
   const ended = await cancel(runId, { reason: 'x' });
   t.equal(ended.status, 409, 'a run that has ended is not cancelled again');
-  t.match(await messageOf(ended), /already ended/);
+  t.match(await ended.json(), { error: { message: /already ended/, details: { code: 'SYNC_RUN_ENDED' } } });
 });
 
 /*
@@ -1214,6 +1232,33 @@ t.test('validating a candidate again decides it over its rows alone', async t =>
   t.notOk(
     result.summary.checks.some(check => check.name === 'market-contracts-deployed'),
     'which carries nothing over from the attempt before it',
+  );
+});
+
+/*
+ * A candidate whose import is still running is missing markets it will have
+ * in a minute: validated now, it would be frozen as invalid. The answer is to
+ * wait, and nothing is recorded.
+ */
+t.test('a candidate whose import is still running is not validated yet', async t => {
+  const db = await freshDatabase();
+  const { versionId } = await seedCandidate(db, snapshot);
+  await db.prepare(
+    `INSERT INTO sync_runs (
+       id, source_commit_sha, tracked_ref, registry_version_id, trigger_kind, requested_by, status,
+       lease_owner, lease_expires_at, expected_count, started_at
+     ) VALUES (?1, ?2, 'main', ?3, 'scheduled', 'registry-cron', 'running', ?4, ?5, 1, ?6)`
+  ).bind(randomUUID(), 'a'.repeat(40), versionId, randomUUID(), new Date(Date.now() + 900_000).toISOString(), new Date().toISOString()).run();
+
+  const response = await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/validate`, {}));
+  t.equal(response.status, 409, 'it is refused while the import runs');
+  t.equal((await response.json() as { error: { details: { code: string } } }).error.details.code, 'IMPORT_STILL_RUNNING');
+  t.equal(await db.prepare(`SELECT status FROM registry_versions WHERE id = ?1`).bind(versionId).first<string>('status'), 'importing',
+    'and the candidate is left as it is');
+  t.equal(
+    await db.prepare(`SELECT COUNT(*) AS n FROM validation_results WHERE registry_version_id = ?1`).bind(versionId).first<number>('n'),
+    0,
+    'with no checks recorded',
   );
 });
 

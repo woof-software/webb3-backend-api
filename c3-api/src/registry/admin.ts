@@ -2,13 +2,12 @@ import {
   Address,
   PriceFeedV1,
   ValidationSummaryV1,
-  VersionStatus,
   marketKey,
 } from '../../lib/model/comet-registry.js';
 
 import { ApiError } from '../http/errors.js';
 
-import { RegistryError, isRegistryError } from './errors.js';
+import { RegistryError, conflict, isRegistryError } from './errors.js';
 import type { RegistryErrorCode } from './errors.js';
 import {
   networkOverlayFeedAddresses,
@@ -18,20 +17,13 @@ import {
   parseNetworkOverlay,
 } from './overlay.js';
 import type { MarketOverlay, NetworkOverlay } from './overlay.js';
-import {
-  Condition,
-  changedRows,
-  conditioned,
-  insertStatement,
-  readOverlays,
-  readRevision,
-  readUnreviewed,
-  readValidationSummary,
-  readVersion,
-  unchanged,
-} from './repository.js';
+import { readOverlays } from './overlay-store.js';
+import { readUnreviewed, readVersion } from './repository.js';
+import type { VersionStatus } from './rows.js';
+import { Condition, changedRows, conditioned, insertStatement } from './sql-condition.js';
 import { importOf, noRunImporting } from './sync.js';
 import { judgeVersion, verdictStatements } from './validation.js';
+import { readRevision, readValidationSummary, unchanged } from './validation-store.js';
 
 /*
  * The administrative command behind `POST /versions/{id}/validate`.
@@ -84,7 +76,7 @@ async function validateStoredVersion(db: D1Database, versionId: string): Promise
    * as invalid, so the answer is to wait rather than to fail.
    */
   if (run?.status === 'running') {
-    throw new ApiError('CONFLICT', `the import of this registry version is still running`);
+    throw conflict('IMPORT_STILL_RUNNING', `the import of this registry version is still running`);
   }
 
   /*
@@ -110,7 +102,7 @@ async function validateStoredVersion(db: D1Database, versionId: string): Promise
        */
       return decided(db, current);
     }
-    throw new ApiError('CONFLICT', `the candidate changed while it was being validated; validate it again`);
+    throw conflict('CANDIDATE_CHANGED', `the candidate changed while it was being validated; validate it again`);
   }
 
   return {
@@ -239,7 +231,7 @@ async function importingVersion(db: D1Database, versionId: string) {
     throw new ApiError('NOT_FOUND', `no registry version with that id`);
   }
   if (version.status !== 'importing') {
-    throw new ApiError('CONFLICT', `a ${version.status} registry version cannot be changed`);
+    throw conflict('VERSION_NOT_IMPORTING', `a ${version.status} registry version cannot be changed`);
   }
   return version;
 }
@@ -407,8 +399,8 @@ function marketStatements(
 
 function refuseRewardFeedWithoutReward(key: string, row: MarketRow, overlay: MarketOverlay): void {
   if (overlay.rewardPriceFeed !== null && row.reward_id === null) {
-    throw new ApiError(
-      'CONFLICT',
+    throw conflict(
+      'REWARD_FEED_WITHOUT_REWARD',
       `${key} has no reward asset on chain, so it cannot carry a reward price feed`,
     );
   }
@@ -452,13 +444,13 @@ async function writeReview(db: D1Database, statements: D1PreparedStatement[]): P
   } catch (error) {
     const message = String(error);
     if (message.includes('UNIQUE constraint failed') && message.includes('markets.slug')) {
-      throw new ApiError('CONFLICT', `another market of this network already has that slug`);
+      throw conflict('SLUG_TAKEN', `another market of this network already has that slug`);
     }
     if (message.includes('UNIQUE constraint failed: markets.registry_version_id')) {
-      throw new ApiError('CONFLICT', `another market of this version is already the default`);
+      throw conflict('DEFAULT_TAKEN', `another market of this version is already the default`);
     }
     if (message.includes('registry version is not importing')) {
-      throw new ApiError('CONFLICT', `the registry version is no longer importing, so it cannot be changed`);
+      throw conflict('VERSION_NOT_IMPORTING', `the registry version is no longer importing, so it cannot be changed`);
     }
     throw error;
   }
@@ -623,8 +615,8 @@ async function writeOverlays(
   const stale = [ ...plannedNetworks, ...plannedMarkets ]
     .filter(entry => entry.expectedDigest !== undefined && entry.expectedDigest !== entry.previous);
   if (stale.length > 0) {
-    throw new ApiError(
-      'CONFLICT',
+    throw conflict(
+      'OVERLAY_CHANGED',
       `the overlay of ${stale.map(entry => entry.scope).join(', ')} is no longer the one this was decided against; read it again`,
       { current: Object.fromEntries(stale.map(entry => [ entry.scope, entry.previous ])) },
     );
@@ -707,9 +699,9 @@ async function writeOverlays(
 
     if (changedRows(results[0]!) !== 1) {
       const current = await readVersion(db, input.versionId);
-      throw new ApiError('CONFLICT', current === null || current.status !== 'importing'
-        ? `a ${current?.status ?? 'removed'} registry version cannot be changed`
-        : `the registry version changed while this overlay was being written; read it again`);
+      throw current === null || current.status !== 'importing'
+        ? conflict('VERSION_NOT_IMPORTING', `a ${current?.status ?? 'removed'} registry version cannot be changed`)
+        : conflict('OVERLAY_CHANGED', `the registry version changed while this overlay was being written; read it again`);
     }
   }
 

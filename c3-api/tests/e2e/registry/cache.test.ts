@@ -22,6 +22,7 @@ import { CHECK_KEY } from '../../../src/registry/drift.js';
 import { activateVersion, snapshotChecksum } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
+import { settledWithin } from '../../util/execution-context.js';
 import { refusingKv } from '../../util/kv.js';
 import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 
@@ -161,6 +162,18 @@ function unfinishedWrite(kv: KVNamespace, key: string): KVNamespace {
       return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
     },
   }) as KVNamespace;
+}
+
+// waits for `key` to be written, for two seconds at most: a request leaves the pointer record to waitUntil
+async function landed(kv: KVNamespace, key: string): Promise<boolean> {
+  const deadline = Date.now() + 2000;
+  while (await kv.get(key) === null) {
+    if (Date.now() > deadline) {
+      return false;
+    }
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  return true;
 }
 
 /*
@@ -399,8 +412,8 @@ t.test('a pointer record KV refused is written again a minute or so later, not b
 });
 
 /*
- * A write that never finishes — its request cancelled when the client went
- * away — is as good as refused. A claim lasts the period only once its write
+ * A write that never finishes — cut off with the invocation that waited for
+ * it — is as good as refused. A claim lasts the period only once its write
  * has landed, so the write is made again a minute or so later rather than a
  * period later: after an activation, the record would name the version before
  * for that long.
@@ -445,6 +458,55 @@ t.test('the reads an isolate answers together write the pointer record once', as
   const answers = await Promise.all(reads);
   t.ok(answers.every(answer => answer !== null), 'every read is answered');
   t.equal(pointers(), 1, 'and one of them writes the record');
+});
+
+// a request does not wait for the pointer record: it hands the write to its waitUntil, `defer` here
+t.test('a read hands the pointer record to waitUntil, and is answered before it lands', async t => {
+  const { db, kv, versionId } = await activeFixture();
+  const held     = heldWrites(kv, POINTER_KEY);
+  const deferred: Array<Promise<unknown>> = [];
+  const read     = activeSnapshot({ ...depsOf(counting(db).db, held.kv), defer: work => { deferred.push(work); } });
+
+  t.ok(await settledWithin(read, 5000), 'the read is answered while the write is held');
+  t.equal(deferred.length, 1, 'having handed the write over');
+  t.equal(await kv.get(POINTER_KEY), null, 'which has not landed');
+  held.release();
+  t.equal((await read)?.snapshot.registryVersion.id, versionId);
+  await Promise.all(deferred);
+  t.equal((await kv.get(POINTER_KEY, 'json') as { id: string } | null)?.id, versionId,
+    'and lands once the namespace takes it, naming the version');
+});
+
+/*
+ * The runtime keeps work handed to waitUntil going past the answer, until it
+ * cuts it off. The claim lasts the period only once the write has landed,
+ * never from when it is handed over, so a write cut off there is made again a
+ * minute or so later too.
+ */
+t.test('a pointer record whose write a read handed to waitUntil never finished is written again a minute or so later', async t => {
+  const { db, kv } = await activeFixture();
+  const isolate  = { db: counting(db).db, ...recordingWrites(unfinishedWrite(kv, POINTER_KEY)) };
+  const pointers = () => isolate.written.filter(key => key === POINTER_KEY).length;
+  const deferred: Array<Promise<unknown>> = [];
+  const start    = Date.parse('2026-09-23T12:00:00.000Z');
+  const readAt   = (seconds: number) => activeSnapshot({
+    ...depsOf(isolate.db, isolate.kv, () => new Date(start + seconds * 1000)),
+    defer: work => { deferred.push(work); },
+  });
+
+  const reads = (async () => {
+    for (const seconds of [ 0, 1, 10, 29 ]) {
+      await readAt(seconds);
+    }
+  })();
+  t.ok(await settledWithin(reads, 5000), 'the reads are answered, though the first one\'s write never finishes');
+  t.same([ pointers(), deferred.length ], [ 1, 1 ], 'the first read hands its write over, and the reads after it leave the write to it');
+
+  await readAt(91);
+  t.equal(pointers(), 2, 'a read a minute and a half later writes it again');
+  await Promise.all(deferred.slice(1));
+  t.equal((await kv.get(POINTER_KEY, 'json') as { at: string } | null)?.at, new Date(start + 91_000).toISOString(),
+    'so the record is written');
 });
 
 t.test('a version that is not active yet can be warmed', async t => {
@@ -589,7 +651,7 @@ t.test('the public read is served through the cache', async t => {
 
   const keys: string[] = (await kv.list()).keys.map((key: { name: string }) => key.name);
   t.ok(keys.some(name => name.startsWith('snapshot:v1:')), 'the worker cached the snapshot it served');
-  t.ok(keys.includes(POINTER_KEY), 'and the pointer it verified');
+  t.ok(await landed(kv, POINTER_KEY), 'and the pointer it verified, once the write it left to waitUntil has landed');
 });
 
 /*

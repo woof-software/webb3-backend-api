@@ -6,9 +6,9 @@ import { ApiError } from '../http/errors.js';
 import { jsonResponse } from '../http/json.js';
 
 import { isUnreachable } from './cache.js';
+import { readDeprecatedCollaterals } from './deprecated-collateral-repository.js';
+import { DeprecatedDecisions, deprecatedDecisionsOf } from './deprecated-collaterals.js';
 import { RegistryContext, chainIdOf } from './handlers.js';
-import { readLegacyCollaterals } from './legacy-collateral-repository.js';
-import { LegacyDecisions, legacyDecisionsOf } from './legacy-collaterals.js';
 import { catalogHeaders } from './request-catalog.js';
 import { collateralView, positionsOf } from './token-collateral.js';
 import { tokenList } from './token-visibility.js';
@@ -132,19 +132,19 @@ async function strategicTokens(context: RegistryContext, chainId: number): Promi
 }
 
 /*
- * The legacy collateral decisions of a chain, read as the strategic ones are:
- * from the database on every request, and a 503 when it does not answer,
- * since without them the list would call a legacy collateral current. Unlike
- * the active reads, the list does not answer from the decisions last recorded:
- * it fails with the token policies anyway.
+ * The deprecated collateral decisions of a chain, read as the strategic ones
+ * are: from the database on every request, and a 503 when it does not answer,
+ * since without them the list would call a deprecated collateral current, and
+ * show a token it hides. Unlike the active reads, the list does not answer
+ * from the decisions last recorded: it fails with the token policies anyway.
  */
-async function legacyCollaterals(context: RegistryContext, chainId: number): Promise<LegacyDecisions> {
+async function deprecatedCollaterals(context: RegistryContext, chainId: number): Promise<DeprecatedDecisions> {
   try {
-    return legacyDecisionsOf(await readLegacyCollaterals(context.db, chainId));
+    return deprecatedDecisionsOf(await readDeprecatedCollaterals(context.db, chainId));
   } catch (error) {
     if (isUnreachable(error)) {
-      context.debug.error(`the token list could not read the legacy collateral decisions`, { requestId: context.requestId, chainId, error });
-      throw new ApiError('UPSTREAM_UNAVAILABLE', `the legacy collateral decisions could not be read`);
+      context.debug.error(`the token list could not read the deprecated collateral decisions`, { requestId: context.requestId, chainId, error });
+      throw new ApiError('UPSTREAM_UNAVAILABLE', `the deprecated collateral decisions could not be read`);
     }
     throw error;
   }
@@ -153,7 +153,7 @@ async function legacyCollaterals(context: RegistryContext, chainId: number): Pro
 /*
  * `GET /registry/v1/networks/{chainId}/tokens[?visibleOnly=true]`: every token
  * the active version serves on a chain, with its strategic decision, the
- * Comets it is a legacy collateral of, its collateral value, and whether
+ * Comets it is a deprecated collateral of, its collateral value, and whether
  * discovery shows it.
  *
  * Values change every minute and with every decision, so the answer is kept
@@ -182,13 +182,13 @@ async function getTokenList(request: Request, context: RegistryContext, chainIdT
    * which a refusal to read the decisions does.
    */
   context.tokens.waitUntil(valuing);
-  const [ strategic, legacy, view ] = await Promise.all([
+  const [ strategic, deprecated, view ] = await Promise.all([
     strategicTokens(context, chainId),
-    legacyCollaterals(context, chainId),
+    deprecatedCollaterals(context, chainId),
     valuing,
   ]);
 
-  const list = tokenList({ registryVersion, chainId, catalog, network: name, positions, view, strategic, legacy, now: context.tokens.now() });
+  const list = tokenList({ registryVersion, chainId, catalog, network: name, positions, view, strategic, deprecated, now: context.tokens.now() });
   return jsonResponse(visibleOnly ? { ...list, tokens: list.tokens.filter(token => token.isVisible) } : list, {
     headers: {
       'Cache-Control': 'public, max-age=30',

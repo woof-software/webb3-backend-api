@@ -74,8 +74,8 @@ function unavailableError(error: RegistryUnavailable): ApiError {
     : new ApiError('UPSTREAM_UNAVAILABLE', `the comet registry could not be read`);
 }
 
-function requestCatalog(env: Env, debug?: CacheDeps['debug']): RequestCatalog {
-  const deps = cacheDepsOf(env, debug);
+function requestCatalog(env: Env, debug?: CacheDeps['debug'], defer?: CacheDeps['defer']): RequestCatalog {
+  const deps = cacheDepsOf(env, debug, defer);
   let pending: Promise<Catalog> | null = null;
   let catalog: Catalog | null          = null;
   let staleFor: number | null          = null;

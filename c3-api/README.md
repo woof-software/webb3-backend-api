@@ -75,11 +75,12 @@ Migrations are numbered in the order they are applied, not by feature:
 `0001` is the Comet registry schema, `0002` marks the markets nobody has
 reviewed yet, and `0003` adds how the frontend lists a market — its slug and
 whether it is institutional. `0004` drops the columns and indexes nothing
-uses, `0005` stores token policies — which tokens an administrator has marked
-strategic, and the audit of every change — `0006` stores legacy collaterals —
-which collaterals of which Comets an administrator has marked legacy, and the
-audit of every change — and the Agreements migration takes the next free
-number.
+uses, and `0005` stores token policies — which tokens an administrator has
+marked strategic, and the audit of every change. `0006` stores which
+collaterals of which Comets an administrator has marked legacy, with the audit
+of every change, and `0007` renames them deprecated collaterals: tables,
+columns, view, indexes and triggers alike. The Agreements migration takes
+the next free number.
 
 Apply migrations to the local Miniflare database under `.wrangler/state`:
 ```sh
@@ -94,10 +95,23 @@ npm run d1:migrate:stage
 npm run d1:migrate:production
 ```
 
+CI applies the migrations before it deploys, so a migration has to work with
+the release deployed before it, which serves until the deploy that follows.
+Two do not, accepted while production serves nothing from what they change:
+after `0004` a sync that release runs fails, and after `0007`, which renames
+the tables that release reads and writes, its token list, `/active`, market
+reads and legacy collateral routes answer `503 UPSTREAM_UNAVAILABLE` ("the
+database is missing tables this release needs"). Either lasts as long as the
+build and the deploy take, and a worker rolled back to the release before
+fails the same way. In the shared develop database only the token visibility
+test deploy, the `woof-c3-api-token-visibility` worker of
+`woof-token-visibility.wrangler.toml`, reads the tables `0007` renames; the
+develop worker does not.
+
 The Comet registry also binds `kv_registry` for its snapshot cache, its
-last check of the chain and the legacy collateral decisions it last recorded,
-two rate limiters for its administrative routes, and an hourly Cron trigger
-for its resumable sync.
+last check of the chain and the deprecated collateral decisions it last
+recorded, two rate limiters for its administrative routes, and an hourly Cron
+trigger for its resumable sync.
 `REGISTRY_ADMIN_AUTH_RATE_LIMITER` counts every request under
 `/registry/v1/admin/` before its token is checked, 60 a minute for each
 client address (`CF-Connecting-IP`; an IPv6 client by its /64), so wrong
@@ -300,12 +314,13 @@ market routes read it the same way:
 - `REGISTRY_SNAPSHOT_CACHE_TTL_S` is the `max-age` public reads advertise to
   browsers and proxies.
 
-The legacy collateral decisions ([Legacy Collaterals](#legacy-collaterals))
-are no part of a version, so they are not cached with it. `/active` and the
-market reads read them beside the pointer, in one more statement, and mark
-the version's collaterals with them in the answer; the answer's `ETag` names
-the flags it carries, so a decision that changes them is never confirmed with
-a `304` to a client holding a copy made before it.
+The deprecated collateral decisions
+([Deprecated Collaterals](#deprecated-collaterals)) are no part of a version,
+so they are not cached with it. `/active` and the market reads read them
+beside the pointer, in one more statement, and mark the version's collaterals
+with them in the answer; the answer's `ETag` names the flags it carries, so a
+decision that changes them is never confirmed with a `304` to a client
+holding a copy made before it.
 
 When D1 cannot be reached at all, a request is answered from the version D1
 last named, for up to `REGISTRY_STALE_FALLBACK_MAX_S` after that. Such a
@@ -318,14 +333,14 @@ nothing cached, every route answers `503 UPSTREAM_UNAVAILABLE`. A D1 that
 answers "no version is active" is an answer, not an outage: it is served as
 `503 REGISTRY_NOT_ACTIVE`, never from the cache; and a D1 that answers with a
 fault, such as a table a migration has not created yet, is a `500`, never
-masked by the cache. The routes that read the token policy or legacy
+masked by the cache. The routes that read the token policy or deprecated
 collateral tables are the one exception, for those tables: without migration
-`0005` the token list and the token policy routes, and without `0006` the
-token list, `/active`, the market reads and the legacy collateral routes,
+`0005` the token list and the token policy routes, and without `0007` the
+token list, `/active`, the market reads and the deprecated collateral routes,
 answer `503 UPSTREAM_UNAVAILABLE`, naming the migrations to apply.
 
-During an outage `/active` and the market reads mark legacy collaterals by
-the decisions the worker last recorded in `kv_registry`. Every command that
+During an outage `/active` and the market reads mark deprecated collaterals
+by the decisions the worker last recorded in `kv_registry`. Every command that
 decides records them once it has committed. An isolate checks the record
 against the decisions it reads whenever they are not the ones it last found
 there or wrote, and every five minutes besides, and writes them only where
@@ -467,9 +482,10 @@ them is worth reading before activating.
 # Token Policies
 
 An administrator can mark a token strategic. A strategic token is shown
-wherever tokens are discovered whatever its collateral value: the token list
-reads the mark on every request ([Token Visibility](#token-visibility)). A
-policy is decided, audited, and read back through the administrative routes
+wherever tokens are discovered whatever its collateral value, unless it is
+deprecated in every enabled market that takes it: the token list reads the
+mark on every request ([Token Visibility](#token-visibility)). A policy is
+decided, audited, and read back through the administrative routes
 ([API.md](./API.md)).
 
 A policy belongs to the token — a chain id and an address — and not to a
@@ -510,47 +526,52 @@ kept for other environments is best reduced to the rows the list decides —
 the routes leave every token a list does not name as it is — and reviewed in
 each environment before it is applied there.
 
-# Legacy Collaterals
+# Deprecated Collaterals
 
-An administrator can mark a collateral of a market legacy: one the app no
-longer offers in that market, and keeps showing to a user who still holds
+An administrator can mark a collateral of a market deprecated: one the app
+no longer offers in that market, and keeps showing to a user who still holds
 some of it, so that it can be withdrawn. This replaces the list the frontend
-kept itself (Linear COM-18), which is also how it hides wUSDM in the USDT
-market now: that rule is the list's row for it, and so, once the list is
-applied, the decision `isLegacy` on wUSDM in cUSDTv3. `/registry/v1/active`
-and the market reads mark every collateral with `isLegacy`, by the decisions
-in force when they answer, and the token list says per token which Comets it
-is a legacy collateral of (`legacyIn`) and whether it is legacy in every
-enabled market that takes it (`isLegacy`). The flag changes nothing else:
-what the token list shows, and why, is decided as before
-([Token Visibility](#token-visibility)), and the app decides what to hide.
+kept itself, which calls them legacy collateral (Linear COM-18), and which is
+also how it hides wUSDM in the USDT market now: that rule is the list's row
+for it, and so, once the list is applied, the decision `isDeprecated` on
+wUSDM in cUSDTv3. `/registry/v1/active` and the market reads mark every
+collateral with `isDeprecated`, by the decisions in force when they answer,
+and the token list says per token which Comets it is a deprecated collateral
+of (`deprecatedIn`) and whether it is deprecated in every enabled market that
+takes it as collateral (`isDeprecated`). No enabled market offers such a
+token as a collateral any longer, so token discovery hides it, whatever else
+holds, even when it is also the base or reward token of a market
+([Token Visibility](#token-visibility)); one deprecated in some of them only
+is shown or hidden as any other, and the app decides per market what to
+hide.
 
 A decision belongs to the collateral of the Comet — a chain id, the Comet's
 address and the token's — and not to a registry version, so it survives
 every activation, as a token policy does; a version that drops the
 collateral from its market and a later one that brings it back bring its
 decision back with it. It is decided only for a collateral of a market of the
-active version, and a collateral nobody has decided about is not legacy,
+active version, and a collateral nobody has decided about is not deprecated,
 without a row. Every change is written in one D1 transaction with an event
 that records the value it replaced, the value it set, the actor and the
-reason, and migration `0006` enforces that in the database as `0005` does for
-token policies.
+reason, and the schema enforces that in the database as `0005` does for
+token policies: migration `0006` created it while the feature was called
+legacy collaterals, and `0007` renamed it.
 
 The routes are those of the token policies, for a collateral of a Comet in
 place of a token, under the same limiter budgets: marking a collateral and
 applying a list share the `policy` one, and the reads and the review count as
 reads. One collateral is marked with
-`PATCH …/networks/{chain_id}/markets/{comet}/collaterals/{token}/legacy`, and
-a list is exported, reviewed without writing anything, and applied in one
+`PATCH …/networks/{chain_id}/markets/{comet}/collaterals/{token}/deprecated`,
+and a list is exported, reviewed without writing anything, and applied in one
 transaction:
 
 ```sh
-curl -s "$API/registry/v1/admin/legacy-collaterals" -H "Authorization: Bearer $TOKEN" > legacy-collaterals.json
-# edit legacy-collaterals.json: "isLegacy": true on the legacy collaterals, and "reason"
-curl -s -X POST "$API/registry/v1/admin/legacy-collaterals/review" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @legacy-collaterals.json | jq 'if .error then .error else .summary end'
-curl -s -X POST "$API/registry/v1/admin/legacy-collaterals/apply" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @legacy-collaterals.json | jq 'if .error then .error else .summary end'
+curl -s "$API/registry/v1/admin/deprecated-collaterals" -H "Authorization: Bearer $TOKEN" > deprecated-collaterals.json
+# edit deprecated-collaterals.json: "isDeprecated": true on the deprecated collaterals, and "reason"
+curl -s -X POST "$API/registry/v1/admin/deprecated-collaterals/review" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @deprecated-collaterals.json | jq 'if .error then .error else .summary end'
+curl -s -X POST "$API/registry/v1/admin/deprecated-collaterals/apply" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @deprecated-collaterals.json | jq 'if .error then .error else .summary end'
 ```
 
 The frontend's list is not seeded by a migration: a migration cannot know
@@ -558,15 +579,17 @@ which version an environment has on, and a decision is only made about a
 collateral of one. The runbook holds it as a document applied once per
 environment, with every Comet and token address the repository's registry
 data resolves, and the steps for the rest
-([The initial list of legacy collaterals](./REGISTRY_RUNBOOK.md#the-initial-list-of-legacy-collaterals)).
+([The initial list of deprecated collaterals](./REGISTRY_RUNBOOK.md#the-initial-list-of-deprecated-collaterals)).
 
 # Token Visibility
 
 `GET /registry/v1/networks/{chainId}/tokens` lists every token the active
 version serves on a chain and says whether token discovery shows it: a token
 is shown when it is strategic, or when its collateral across the chain's
-enabled markets is worth at least USD 250,000. The value is computed, never
-stored in D1, and compared exactly, in fixed point.
+enabled markets is worth at least USD 250,000 — unless it is deprecated in
+every enabled market that takes it, which hides it whatever else holds
+([Deprecated Collaterals](#deprecated-collaterals)). The value is computed,
+never stored in D1, and compared exactly, in fixed point.
 
 Every collateral position of a chain's enabled markets is valued at the
 chain's latest block in one evaluation — `totalsCollateral` and the feed of
@@ -587,9 +610,10 @@ The list fails open. A position the node cannot read leaves its token
 `partial`, if what could be read already reaches the threshold; otherwise the
 token takes the newest complete value of the last
 `TOKEN_COLLATERAL_MAX_STALE_MINUTES` (15 by default, 0 to 30, 0 switches it
-off) as `stale`, and without one it is `unavailable` — and shown. A minute
-with transport failures is kept in the isolate only, and computed again after
-10 seconds, or after 60 when no read of the chain succeeded at all.
+off) as `stale`, and without one it is `unavailable` — and shown, unless it
+is deprecated in every enabled market that takes it. A minute with transport
+failures is kept in the isolate only, and computed again after 10 seconds, or
+after 60 when no read of the chain succeeded at all.
 
 A request waits for the node 4 seconds at most — for the latest block and the
 minute together — and for KV 1 second, and the route never answers an error

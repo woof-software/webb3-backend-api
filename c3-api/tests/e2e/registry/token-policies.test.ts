@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
+import { sha256 } from '../../../lib/hash.js';
 import type {
   NetworkV1,
   TokenPoliciesV1,
@@ -15,12 +16,6 @@ import type {
   TokenPolicyReviewV1,
 } from '../../../lib/model/comet-registry.js';
 import { checksumAddress } from '../../../lib/model/comet-registry.js';
-import { sha256Hex } from '../../../src/http/bearer-auth.js';
-import {
-  markValidated,
-  recordValidationResults,
-  snapshotChecksum,
-} from '../../../src/registry/repository.js';
 import {
   DecisionList,
   applyTokenPolicies,
@@ -29,7 +24,7 @@ import {
 } from '../../../src/registry/token-policy-repository.js';
 
 import { applyMigrations, foreignKeyViolations } from '../../util/d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 
 /*
  * Token policies, through the real worker in workerd over local D1: a
@@ -46,7 +41,7 @@ const ADMIN_TOKEN = 'registry-admin-token-for-tests';
 const server = createTestHarness({
   workers: [ {
     configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256Hex(ADMIN_TOKEN) },
+    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
   } ],
 });
 
@@ -90,8 +85,7 @@ async function seedValidated(db: D1Database, networks: NetworkV1[] = snapshot.ne
     { ...snapshot, networks },
     versionId === undefined ? {} : { versionId, attempt: 2 },
   );
-  await recordValidationResults(db, id, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, id, await snapshotChecksum(networks));
+  await validateSeeded(db, id);
   return id;
 }
 
@@ -305,13 +299,19 @@ t.test('an activation that drops the token between the read and the write aborts
   await switchTo(await seedValidated(db, withoutCollateral(WUSDM), randomUUID()));
 
   const change = { chainId: 1, tokenAddress: WUSDM, actor: 'test-admin', reason: 'raced an activation' } as const;
-  await t.rejects(() => writeTokenPolicy(db, { ...change, isStrategic: true }), { code: 'CONFLICT', message: /left the active registry/ },
-    'a change for a token the active version no longer holds is refused');
+  await t.rejects(
+    () => writeTokenPolicy(db, { ...change, isStrategic: true }),
+    { code: 'CONFLICT', details: { code: 'TOKEN_LEFT_REGISTRY' }, message: /left the active registry/ },
+    'a change for a token the active version no longer holds is refused',
+  );
   t.equal(await count(db, 'token_policy_events'), 0, 'and its event is rolled back with it');
   t.equal(await count(db, 'token_policies'), 0, 'as is the row');
 
-  await t.rejects(() => writeTokenPolicy(db, { ...change, isStrategic: false }), { code: 'CONFLICT' },
-    'a request that would change nothing is refused too, rather than answered for a version that does not hold the token');
+  await t.rejects(
+    () => writeTokenPolicy(db, { ...change, isStrategic: false }),
+    { code: 'CONFLICT', details: { code: 'TOKEN_LEFT_REGISTRY' } },
+    'a request that would change nothing is refused too, rather than answered for a version that does not hold the token',
+  );
 });
 
 const REVIEW = '/registry/v1/admin/token-policies/review';
@@ -463,17 +463,17 @@ t.test('a list that meets an activation or another decision while it is written 
 
   await t.rejects(
     () => writeTokenPolicyList(db, decisions([ [ WETH, true, 'approved' ], [ WUSDM, false, 'withdrawn' ] ]), 'test-admin'),
-    { code: 'CONFLICT', message: /activated while it was being applied; nothing was written/ },
+    { code: 'CONFLICT', details: { code: 'TOKEN_LEFT_REGISTRY' }, message: /activated while it was being applied; nothing was written/ },
     'a change for a token the active version no longer holds aborts the list',
   );
   await t.rejects(
     () => writeTokenPolicyList(db, decisions([ [ WETH, true, 'approved' ], [ WUSDM, true, null ] ]), 'test-admin'),
-    { code: 'CONFLICT', message: /activated while it was being applied/ },
+    { code: 'CONFLICT', details: { code: 'TOKEN_LEFT_REGISTRY' }, message: /activated while it was being applied/ },
     'and so does a row that changes nothing, once its token is gone',
   );
   await t.rejects(
     () => writeTokenPolicyList(db, decisions([ [ WETH, true, 'approved' ], [ WBTC, true, null ] ]), 'test-admin'),
-    { code: 'CONFLICT', message: /changed by someone else while it was being applied/ },
+    { code: 'CONFLICT', details: { code: 'DECISION_CHANGED' }, message: /changed by someone else while it was being applied/ },
     'as does a row without a reason whose decision is not the one the list states',
   );
   t.equal(await count(db, 'token_policy_events'), events, 'none of them wrote anything');
@@ -523,7 +523,7 @@ t.test('a decision made while a list is being applied aborts the list, rather th
   const racing = beforeFirstBatch(db, () => decide(1, WBTC, { isStrategic: true, reason: 'governance vote 42' }));
 
   await t.rejects(() => applyTokenPolicies(racing, list, 'test-admin'),
-    { code: 'CONFLICT', message: /changed by someone else while it was being applied; nothing was written/ });
+    { code: 'CONFLICT', details: { code: 'DECISION_CHANGED' }, message: /changed by someone else while it was being applied; nothing was written/ });
   t.equal(await count(db, 'token_policies', 'token_address = ?1', WETH), 0, 'nothing of the list is written');
   t.equal(await db.prepare(`SELECT is_strategic FROM token_policies WHERE token_address = ?1`).bind(WBTC).first<number>('is_strategic'), 1,
     'and the decision made meanwhile stands');

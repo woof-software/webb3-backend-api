@@ -3,7 +3,7 @@ import t from 'tap';
 import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
-import { sha256Hex } from '../../../src/http/bearer-auth.js';
+import { sha256 } from '../../../lib/hash.js';
 
 import { applyMigrations } from '../../util/d1.js';
 
@@ -21,7 +21,7 @@ const ADMIN_TOKEN = 'registry-admin-token-for-tests';
 const server = createTestHarness({
   workers: [ {
     configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256Hex(ADMIN_TOKEN) },
+    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
   } ],
 });
 
@@ -46,7 +46,7 @@ t.test('the token is what the routes are behind, and nothing else', async t => {
     [ 'no header',        undefined ],
     [ 'another scheme',   { 'Authorization': `Basic ${ADMIN_TOKEN}` } ],
     [ 'an empty token',   { 'Authorization': 'Bearer ' } ],
-    [ 'the token hash',   { 'Authorization': `Bearer ${await sha256Hex(ADMIN_TOKEN)}` } ],
+    [ 'the token hash',   { 'Authorization': `Bearer ${await sha256(ADMIN_TOKEN)}` } ],
     [ 'a prefix of it',   { 'Authorization': `Bearer ${ADMIN_TOKEN.slice(0, -1)}` } ],
   ];
   for (const [ name, headers ] of cases) {

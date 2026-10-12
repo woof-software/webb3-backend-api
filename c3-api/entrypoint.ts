@@ -160,7 +160,12 @@ function prepare(env: Env, executionContext?: ExecutionContext) {
     env,
     debug,
     flags,
-    waitUntil: work => executionContext?.waitUntil(work),
+    /*
+     * A closure: the method called on its own throws. A caller that gave no
+     * execution context, such as a test calling the worker directly, gets no
+     * waitUntil, and the cache waits for the writes it would hand to one.
+     */
+    ...(executionContext === undefined ? {} : { waitUntil: (work: Promise<unknown>) => executionContext.waitUntil(work) }),
   };
   return {
     context,

@@ -15,18 +15,14 @@ import type {
 import { CONTRACT_ROLES, CONTRACT_ROLE_KEYS } from '../../../lib/model/comet-registry.js';
 
 import { applyMarketOverlay, applyNetworkOverlay, orderNetworks, overlayOfMarket } from '../../../src/registry/overlay.js';
-import {
-  activateVersion,
-  readActiveOverlays,
-  readImportOverlays,
-  readOverlays,
-  snapshotChecksum,
-} from '../../../src/registry/repository.js';
-import type { ClonedOverlays } from '../../../src/registry/repository.js';
+import { readImportOverlays, readOverlays } from '../../../src/registry/overlay-store.js';
+import type { ClonedOverlays } from '../../../src/registry/overlay-store.js';
+import { activateVersion, snapshotChecksum } from '../../../src/registry/repository.js';
 import type { MarketEnrichment } from '../../../src/registry/enrichment.js';
 
 import { applyMigrations } from '../../util/d1.js';
 import { activateSeeded, loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { readActiveOverlays } from '../../util/registry-repository.js';
 
 /*
  * Overlay cloning, against real local D1: the reviewed decisions of a stored

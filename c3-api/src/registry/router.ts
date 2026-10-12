@@ -8,10 +8,10 @@ import type * as Evaluator from '../evaluator.js';
 import { routeAdmin } from './admin-router.js';
 import type { CacheDeps, CachedSnapshot } from './cache.js';
 import { activeSnapshot, cacheDepsOf, isUnreachable, versionSnapshot, warmSnapshot } from './cache.js';
+import type { DeprecatedRead } from './deprecated-collaterals.js';
+import { deprecatedDecisions, recordDeprecatedCollaterals } from './deprecated-collaterals.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
-import type { LegacyRead } from './legacy-collaterals.js';
-import { legacyDecisions, recordLegacyCollaterals } from './legacy-collaterals.js';
 import { routePublic } from './public-router.js';
 import { catalogHeadersOf, isRegistryUnavailable, requestCatalog, unavailableError } from './request-catalog.js';
 import type * as TokenCollateral from './token-collateral.js';
@@ -66,10 +66,10 @@ function activeReader(deps: CacheDeps): () => Promise<CachedSnapshot | null> {
   return () => pending ??= activeSnapshot(deps);
 }
 
-// the legacy decisions of one request, read at most once, for the same reason
-function legacyReader(deps: CacheDeps): () => Promise<LegacyRead> {
-  let pending: Promise<LegacyRead> | null = null;
-  return () => pending ??= legacyDecisions(deps);
+// the deprecated decisions of one request, read at most once, for the same reason
+function deprecatedReader(deps: CacheDeps): () => Promise<DeprecatedRead> {
+  let pending: Promise<DeprecatedRead> | null = null;
+  return () => pending ??= deprecatedDecisions(deps);
 }
 
 /*
@@ -103,14 +103,14 @@ const ERROR_STATUS: Record<RegistryErrorCode, ApiErrorCode> = {
 };
 
 /*
- * A release that reached an environment before its token policy or legacy
+ * A release that reached an environment before its token policy or deprecated
  * collateral migration finds those tables missing. The remedy is known and is
  * an operator's, so it is said, rather than answered as an internal error only
  * the logs explain. Any other table missing is a fault like the rest, and
  * stays a 500.
  */
 function missingSchema(error: unknown): boolean {
-  return /no such table: (token_polic|legacy_collateral)/i.test(String(error));
+  return /no such table: (token_polic|deprecated_collateral)/i.test(String(error));
 }
 
 /*
@@ -179,8 +179,8 @@ async function routeRegistry(
    * token of its chain from it — and every answer given after it was loaded
    * says which version that was.
    */
-  const registry = requestCatalog(env, debug);
-  const deps     = cacheDepsOf(env, debug);
+  const registry = requestCatalog(env, debug, waitUntil);
+  const deps     = cacheDepsOf(env, debug, waitUntil);
   const context: RegistryContext = {
     db:      env.APP_DB,
     actor:   env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`,
@@ -200,8 +200,8 @@ async function routeRegistry(
         debug.warn(`registry snapshot not warmed`, { versionId, error });
       }
     },
-    legacy:       legacyReader(deps),
-    recordLegacy: () => recordLegacyCollaterals(deps),
+    deprecated:       deprecatedReader(deps),
+    recordDeprecated: () => recordDeprecatedCollaterals(deps),
     catalog: registry,
     tokens: {
       frame:           { apiHost: env.V3_API_HOST, nodeHost: env.NODE_PROXY_HOST, nodeKey: env.NODE_PROXY_KEY },

@@ -1,9 +1,9 @@
 import t, { Test } from 'tap';
 
 import C3Api, { Env } from '../../../entrypoint.js';
+import { sha256 } from '../../../lib/hash.js';
 import type { Address, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
-import { sha256Hex } from '../../../src/http/bearer-auth.js';
 import { cacheDepsOf } from '../../../src/registry/cache.js';
 import { ChainCheckDeps, checkChain, readChainCheck } from '../../../src/registry/drift.js';
 import { registryStatus } from '../../../src/registry/status.js';
@@ -401,7 +401,7 @@ t.test('an administrative sync that checks the source leaves the chain to the ho
     DEBUG:                            '',
     APP_DB:                           registry.db,
     kv_registry:                      MemoryKv({}),
-    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256Hex('registry-admin-token-for-tests'),
+    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256('registry-admin-token-for-tests'),
     REGISTRY_ADMIN_RATE_LIMITER:      { limit: async () => ({ success: true }) },
     REGISTRY_ADMIN_AUTH_RATE_LIMITER: { limit: async () => ({ success: true }) },
   });

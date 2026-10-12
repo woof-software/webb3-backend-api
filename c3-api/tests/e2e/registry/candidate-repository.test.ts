@@ -12,18 +12,20 @@ import {
   seedCandidate,
   writeCandidateSnapshot,
 } from '../../util/registry-fixture.js';
-import { isRegistryError } from '../../../src/registry/errors.js';
 import {
   createCandidate,
-  findAttemptsByCommit,
-  latestValidationAttempt,
-  marketWrites,
   markInvalid,
-  readSnapshot,
   markValidated,
   recordValidationResults,
+} from '../../util/registry-repository.js';
+import { isRegistryError } from '../../../src/registry/errors.js';
+import {
+  findAttemptsByCommit,
+  marketWrites,
+  readSnapshot,
   snapshotChecksum,
 } from '../../../src/registry/repository.js';
+import { readValidationSummary } from '../../../src/registry/validation-store.js';
 
 /*
  * The candidate write repository against real local D1: the RegistrySnapshotV1
@@ -307,7 +309,7 @@ t.test('an importing candidate can be rewritten, a terminal one cannot', async t
     { check_name: 'source-reproducible', scope: 'global', passed: 1 },
     { check_name: 'markets-enriched',    scope: 'global', passed: 1 },
   ]);
-  t.equal(await latestValidationAttempt(db, version.id), 1, 'the latest attempt is reported');
+  t.equal((await readValidationSummary(db, version.id)).attempt, 1, 'the latest attempt is reported');
 
   await markValidated(db, version.id, await snapshotChecksum(networks));
   const [ validated ] = await findAttemptsByCommit(db, SOURCE.repository, SOURCE.commitSha);

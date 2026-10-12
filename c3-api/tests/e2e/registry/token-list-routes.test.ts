@@ -4,16 +4,11 @@ import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
 import type { TokenListV1 } from '../../../lib/model/comet-registry.js';
-import {
-  activateVersion,
-  markValidated,
-  recordValidationResults,
-  snapshotChecksum,
-} from '../../../src/registry/repository.js';
+import { activateVersion } from '../../../src/registry/repository.js';
 import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 
 /*
  * The token list through the real worker, with a node that refuses every
@@ -53,8 +48,7 @@ async function freshDatabase(
   const { APP_DB: db } = await server.getWorker<Env>().getEnv();
   await applyMigrations(db, undefined, through === undefined ? {} : { through });
   const { versionId } = await seedCandidate(db, snapshot);
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
+  await validateSeeded(db, versionId);
   if (activate) {
     await activateVersion(db, { versionId, action: 'activate', actor: 'test-seed', reason: 'seeded for a token list test' });
   }
@@ -92,7 +86,7 @@ t.test('a chain whose collateral cannot be read is still listed, failing open', 
   const body = await response.json() as TokenListV1;
   t.same(
     { registryVersion: body.registryVersion, chainId: body.chainId, thresholdUsd: body.thresholdUsd, ruleVersion: body.ruleVersion, block: body.block },
-    { registryVersion: { id: versionId, checksum: snapshot.registryVersion.checksum }, chainId: SCROLL, thresholdUsd: '250000', ruleVersion: 1, block: null },
+    { registryVersion: { id: versionId, checksum: snapshot.registryVersion.checksum }, chainId: SCROLL, thresholdUsd: '250000', ruleVersion: 2, block: null },
     'the latest block could not be read',
   );
   t.same(

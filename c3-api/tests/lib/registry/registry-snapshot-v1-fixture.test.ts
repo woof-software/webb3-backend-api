@@ -4,8 +4,8 @@ import { readFileSync } from 'node:fs';
 /*
  * Contract freeze for RegistrySnapshotV1, the body of GET
  * /registry/v1/versions/{id}, and of GET /registry/v1/active but for the
- * `isLegacy` the active reads add to every collateral (ActiveSnapshotV1,
- * legacy-collateral-reads.test.ts).
+ * `isDeprecated` the active reads add to every collateral (ActiveSnapshotV1,
+ * deprecated-collateral-reads.test.ts).
  *
  * The type in lib/model/comet-registry.ts gives its shape to the compiler, and
  * nothing checks the shape at run time, so this test is the executable

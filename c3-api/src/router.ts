@@ -180,7 +180,7 @@ async function route(
    * first handler that needs it, and every response whose content depended on
    * it says which version answered.
    */
-  const registry  = requestCatalog(context.env, context.debug);
+  const registry  = requestCatalog(context.env, context.debug, context.waitUntil);
   // a caller that made no id, such as a test calling the router directly, gets one here
   const requestId = context.requestId ?? crypto.randomUUID();
   const answer = async (): Promise<Response> => {

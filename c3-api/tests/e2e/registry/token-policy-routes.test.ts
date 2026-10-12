@@ -3,16 +3,11 @@ import t from 'tap';
 import { createTestHarness } from 'wrangler';
 
 import type { Env } from '../../../entrypoint.js';
-import { sha256Hex } from '../../../src/http/bearer-auth.js';
-import {
-  activateVersion,
-  markValidated,
-  recordValidationResults,
-  snapshotChecksum,
-} from '../../../src/registry/repository.js';
+import { sha256 } from '../../../lib/hash.js';
+import { activateVersion } from '../../../src/registry/repository.js';
 
 import { applyMigrations } from '../../util/d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 
 /*
  * What the token policy routes refuse, through the real worker: a caller
@@ -25,7 +20,7 @@ const ADMIN_TOKEN = 'registry-admin-token-for-tests';
 const server = createTestHarness({
   workers: [ {
     configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256Hex(ADMIN_TOKEN) },
+    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
   } ],
 });
 
@@ -50,8 +45,7 @@ async function freshDatabase(
   const { APP_DB: db } = await server.getWorker<Env>().getEnv();
   await applyMigrations(db, undefined, through === undefined ? {} : { through });
   const { versionId } = await seedCandidate(db, snapshot);
-  await recordValidationResults(db, versionId, 1, [ { check_name: 'seeded', scope: 'global', passed: 1 } ]);
-  await markValidated(db, versionId, await snapshotChecksum(snapshot.networks));
+  await validateSeeded(db, versionId);
   if (activate) {
     await activateVersion(db, { versionId, action: 'activate', actor: 'test-seed', reason: 'seeded for a policy test' });
   }

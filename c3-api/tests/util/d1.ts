@@ -47,7 +47,12 @@ async function applyMigrations(
  * database an earlier migration left behind.
  */
 async function applyMigration(db: D1Database, file: string, directory: string = MIGRATIONS_DIR): Promise<void> {
-  const statements = unstable_splitSqlQuery(readFileSync(join(directory, file), 'utf8'));
+  await applySql(db, readFileSync(join(directory, file), 'utf8'));
+}
+
+// statements written as a migration is, applied as one is: split by Wrangler's splitter and sent as one batch
+async function applySql(db: D1Database, sql: string): Promise<void> {
+  const statements = unstable_splitSqlQuery(sql);
   await db.batch(statements.map(statement => db.prepare(statement)));
 }
 
@@ -85,6 +90,7 @@ export {
   SqlValue,
   applyMigration,
   applyMigrations,
+  applySql,
   changedRows,
   foreignKeyViolations,
   insertRow,

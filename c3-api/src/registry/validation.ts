@@ -5,17 +5,9 @@ import {
 } from '../../lib/model/comet-registry.js';
 
 import { orderNetworks } from './overlay.js';
-import {
-  Condition,
-  both,
-  endCandidateStatement,
-  readRevision,
-  readSnapshot,
-  readUnreviewed,
-  snapshotChecksum,
-  unchanged,
-  validationResultsStatement,
-} from './repository.js';
+import { readSnapshot, readUnreviewed, snapshotChecksum } from './repository.js';
+import { Condition, both } from './sql-condition.js';
+import { endCandidateStatement, readRevision, unchanged, validationResultsStatement } from './validation-store.js';
 
 /*
  * Candidate validation. Every invariant that cannot be expressed as a column

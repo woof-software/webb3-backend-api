@@ -3,7 +3,6 @@ import type {
   TokenPoliciesV1,
   TokenPolicyApplyV1,
   TokenPolicyDetailV1,
-  TokenPolicyEventRow,
   TokenPolicyListV1,
   TokenPolicyResultV1,
   TokenPolicyReviewV1,
@@ -12,7 +11,9 @@ import type {
 
 import { ApiError } from '../http/errors.js';
 
-import { changedRows } from './repository.js';
+import { conflict } from './errors.js';
+import type { TokenPolicyEventRow } from './rows.js';
+import { changedRows } from './sql-condition.js';
 import { registryHeaders } from './version-headers.js';
 
 /*
@@ -125,7 +126,7 @@ function activeVersionOf(row: { version_id: string | null, checksum: string | nu
  * token is missing from that version, and may be in the next one.
  */
 function refusal(
-  code: 'NOT_FOUND' | 'CONFLICT' | 'UNPROCESSABLE',
+  code: 'NOT_FOUND' | 'UNPROCESSABLE',
   message: string,
   registryVersion: VersionRefV1,
   details: Record<string, unknown> = {},
@@ -257,8 +258,8 @@ async function writeDecisions(
  * make the active version change in between.
  */
 async function writeTokenPolicy(db: D1Database, change: PolicyChange): Promise<TokenPolicyResultV1> {
-  const left = new ApiError(
-    'CONFLICT',
+  const left = conflict(
+    'TOKEN_LEFT_REGISTRY',
     `${change.tokenAddress} left the active registry on chain ${change.chainId} while its policy was being written`,
   );
   const [ after ] = await writeDecisions(db, keyed([ change ]), change.actor, { left: () => left, changed: () => left });
@@ -548,12 +549,12 @@ async function reviewTokenPolicies(db: D1Database, list: DecisionList): Promise<
  */
 async function writeTokenPolicyList(db: D1Database, list: DecisionList, actor: string): Promise<TokenPolicyApplyV1> {
   const states = await writeDecisions(db, keyed(decisionsOf(list)), actor, {
-    left: () => new ApiError(
-      'CONFLICT',
+    left: () => conflict(
+      'TOKEN_LEFT_REGISTRY',
       `a version that does not hold every token of the list was activated while it was being applied; nothing was written`,
     ),
-    changed: () => new ApiError(
-      'CONFLICT',
+    changed: () => conflict(
+      'DECISION_CHANGED',
       `a decision of the list was changed by someone else while it was being applied; nothing was written`,
     ),
   });

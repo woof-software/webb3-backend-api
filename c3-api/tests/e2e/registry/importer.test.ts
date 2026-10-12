@@ -25,16 +25,14 @@ import { overlayOfMarket } from '../../../src/registry/overlay.js';
 import { gitBlobSha } from '../../../src/registry/source/github.js';
 import {
   SUPERSEDED_CHECK,
-  createCandidate,
   readSnapshot,
   readUnreviewed,
-  readValidationSummary,
-  recordValidationResults,
   snapshotChecksum,
   supersedeEarlierAttempts,
 } from '../../../src/registry/repository.js';
 import { registryStatus } from '../../../src/registry/status.js';
 import { cancelRun } from '../../../src/registry/sync.js';
+import { readValidationSummary } from '../../../src/registry/validation-store.js';
 
 import { applyMigrations } from '../../util/d1.js';
 import { interleaved } from '../../util/interleave.js';
@@ -45,6 +43,7 @@ import {
   seedCandidate,
   validateSeeded,
 } from '../../util/registry-fixture.js';
+import { createCandidate, recordValidationResults } from '../../util/registry-repository.js';
 
 /*
  * The whole import, end to end against real local D1: discovery, the fenced

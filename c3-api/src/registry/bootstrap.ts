@@ -9,7 +9,7 @@ import type {
 } from '../../lib/model/comet-registry.js';
 import { marketKey } from '../../lib/model/comet-registry.js';
 import { canonicalJson } from '../../lib/canonical-json.js';
-import { sha256Hex } from '../../lib/hash.js';
+import { sha256 } from '../../lib/hash.js';
 
 import type { OverlayPriceException } from './overlay.js';
 import { staticComets } from './shadow.js';
@@ -663,7 +663,7 @@ function proposalFor(networks: NetworkV1[], source: { repository: string, commit
  */
 async function digestOf(generated: Generated): Promise<string> {
   const { reason: _reason, ...decisions } = bundleOf(generated);
-  return (await sha256Hex(canonicalJson(decisions))).slice(0, 16);
+  return (await sha256(canonicalJson(decisions))).slice(0, 16);
 }
 
 function yes(value: boolean): string {

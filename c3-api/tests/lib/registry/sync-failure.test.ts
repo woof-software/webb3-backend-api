@@ -3,7 +3,7 @@ import t from 'tap';
 import { randomUUID } from 'node:crypto';
 
 import C3Api, { type Env } from '../../../entrypoint.js';
-import { sha256Hex } from '../../../src/http/bearer-auth.js';
+import { sha256 } from '../../../lib/hash.js';
 import { ApiError } from '../../../src/http/errors.js';
 import { syncAnswer, syncFailure } from '../../../src/registry/admin-router.js';
 import { CHECK_KEY } from '../../../src/registry/drift.js';
@@ -201,7 +201,7 @@ t.test('an administrative sync refused while another imports is logged under its
     DEBUG:                            '',
     MEMORY_CACHE_SEED:                'registry-sync-failure',
     APP_DB:                           registry.db,
-    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256Hex('registry-admin-token-for-tests'),
+    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256('registry-admin-token-for-tests'),
     REGISTRY_ADMIN_RATE_LIMITER:      { limit: async () => ({ success: true }) },
     REGISTRY_ADMIN_AUTH_RATE_LIMITER: { limit: async () => ({ success: true }) },
   });
@@ -253,7 +253,7 @@ t.test('an administrative sync with work left answers 202, and attempts up to fi
     DEBUG:                             '',
     MEMORY_CACHE_SEED:                 'registry-sync-default',
     APP_DB:                            registry.db,
-    COMET_REGISTRY_ADMIN_TOKEN_HASH:   await sha256Hex('registry-admin-token-for-tests'),
+    COMET_REGISTRY_ADMIN_TOKEN_HASH:   await sha256('registry-admin-token-for-tests'),
     REGISTRY_ADMIN_RATE_LIMITER:       { limit: async () => ({ success: true }) },
     REGISTRY_ADMIN_AUTH_RATE_LIMITER:  { limit: async () => ({ success: true }) },
     // the Cron's batch, which an administrative sync does not keep to
@@ -344,7 +344,7 @@ t.test('a cancel is answered with what it found or did, whatever happens to the 
     DEBUG:                            '',
     MEMORY_CACHE_SEED:                'registry-sync-cancel',
     APP_DB:                           db,
-    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256Hex('registry-admin-token-for-tests'),
+    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256('registry-admin-token-for-tests'),
     REGISTRY_ADMIN_RATE_LIMITER:      { limit: async () => ({ success: true }) },
     REGISTRY_ADMIN_AUTH_RATE_LIMITER: { limit: async () => ({ success: true }) },
   });

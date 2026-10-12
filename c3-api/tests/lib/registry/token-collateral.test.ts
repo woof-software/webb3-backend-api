@@ -30,7 +30,7 @@ import {
   tokenValue,
 } from '../../../src/registry/token-collateral.js';
 
-import { legacyDecisionsOf } from '../../../src/registry/legacy-collaterals.js';
+import { deprecatedDecisionsOf } from '../../../src/registry/deprecated-collaterals.js';
 import { tokenList } from '../../../src/registry/token-visibility.js';
 
 import { FakeNode, NodeScript, batches, blockReads, fakeNode } from '../../util/fake-node.js';
@@ -282,14 +282,14 @@ t.test('a delisted collateral is valued through the constant feed its Comet now 
   const view = await collateralView(depsOf(countedKv().kv), chain1);
   const list = tokenList({
     registryVersion: { id: versionId, checksum: snapshot.registryVersion.checksum },
-    chainId:   1,
+    chainId:    1,
     catalog,
-    network:   'ethereum-mainnet',
-    positions: mainnet,
+    network:    'ethereum-mainnet',
+    positions:  mainnet,
     view,
-    strategic: new Set(),
-    legacy:    legacyDecisionsOf([]),
-    now:       NOW,
+    strategic:  new Set(),
+    deprecated: deprecatedDecisionsOf([]),
+    now:        NOW,
   });
   const entry = (address: string) => list.tokens.find(token => token.address === address)!;
 
