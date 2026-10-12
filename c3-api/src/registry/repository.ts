@@ -237,7 +237,12 @@ function networkStatement(
   }, condition);
 }
 
-function exceptionStatements(db: D1Database, scope: Scope, network: NetworkV1, condition?: Condition): D1PreparedStatement[] {
+function exceptionStatements(
+  db: D1Database,
+  scope: Scope,
+  network: Pick<NetworkV1, 'priceExceptions'>,
+  condition?: Condition,
+): D1PreparedStatement[] {
   return network.priceExceptions.map(exception => insertStatement(db, 'network_price_exceptions', {
     ...scope,
     price_feed_address:              exception.priceFeedAddress,
@@ -249,6 +254,45 @@ function exceptionStatements(db: D1Database, scope: Scope, network: NetworkV1, c
     provenance:                      exception.provenance,
     expires_at:                      exception.expiresAt,
   }, condition));
+}
+
+/*
+ * A stored price exception as the wire shape states it: what
+ * exceptionStatements wrote, read back. The snapshot and the overlay both read
+ * an exception through it. Each kind is written out, so the key order follows
+ * the wire contract and the kind stays a literal the union can discriminate;
+ * and there is no default, so a kind added to EXCEPTION_KINDS does not compile
+ * until it is read here, rather than being read as another.
+ */
+function priceExceptionOfRow(row: NetworkPriceExceptionRow): PriceExceptionV1 {
+  switch (row.kind) {
+    case 'zero_price':
+      return {
+        kind:             'zero_price',
+        priceFeedAddress: row.price_feed_address,
+        provenance:       row.provenance,
+        expiresAt:        row.expires_at,
+      };
+    case 'fixed_price':
+      return {
+        kind:             'fixed_price',
+        priceFeedAddress: row.price_feed_address,
+        price:            { value: row.fixed_price_value!, decimals: row.fixed_price_decimals! },
+        provenance:       row.provenance,
+        expiresAt:        row.expires_at,
+      };
+    case 'deprecated_price_remap':
+      return {
+        kind:                 'deprecated_price_remap',
+        priceFeedAddress:     row.price_feed_address,
+        replacementPriceFeed: {
+          address:  row.replacement_price_feed_address!,
+          decimals: row.replacement_price_feed_decimals!,
+        },
+        provenance:           row.provenance,
+        expiresAt:            row.expires_at,
+      };
+  }
 }
 
 /*
@@ -587,37 +631,7 @@ async function readSnapshot(db: D1Database, versionId: string): Promise<NetworkV
       presentation,
       priceExceptions: (exceptionRows.results ?? [])
         .filter(exception => exception.network_id === network.id)
-        .map((exception): PriceExceptionV1 => {
-          // each branch is written out, so the key order follows the wire
-          // contract and the kind stays a literal the union can discriminate
-          if (exception.kind === 'fixed_price') {
-            return {
-              kind:             'fixed_price',
-              priceFeedAddress: exception.price_feed_address,
-              price:            { value: exception.fixed_price_value!, decimals: exception.fixed_price_decimals! },
-              provenance:       exception.provenance,
-              expiresAt:        exception.expires_at,
-            };
-          }
-          if (exception.kind === 'deprecated_price_remap') {
-            return {
-              kind:                 'deprecated_price_remap',
-              priceFeedAddress:     exception.price_feed_address,
-              replacementPriceFeed: {
-                address:  exception.replacement_price_feed_address!,
-                decimals: exception.replacement_price_feed_decimals!,
-              },
-              provenance:           exception.provenance,
-              expiresAt:            exception.expires_at,
-            };
-          }
-          return {
-            kind:             'zero_price',
-            priceFeedAddress: exception.price_feed_address,
-            provenance:       exception.provenance,
-            expiresAt:        exception.expires_at,
-          };
-        }),
+        .map(priceExceptionOfRow),
       markets,
     };
   });
@@ -989,6 +1003,8 @@ export {
   candidateRow,
   findAttemptsByCommit,
   marketWrites,
+  exceptionStatements,
+  priceExceptionOfRow,
   readSnapshot,
   readUnreviewed,
   readActivationHistory,

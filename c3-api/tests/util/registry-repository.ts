@@ -56,7 +56,7 @@ function assertChanged(result: D1Result, versionId: string, message: string): vo
  */
 async function readActiveOverlays(db: D1Database): Promise<ClonedOverlays> {
   const versionId = await readActiveVersionId(db);
-  return versionId === null ? { networks: new Map(), markets: new Map() } : readOverlays(db, versionId);
+  return versionId === null ? { networks: new Map(), markets: new Map(), comets: new Map() } : readOverlays(db, versionId);
 }
 
 export {
