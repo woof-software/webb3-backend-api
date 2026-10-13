@@ -282,6 +282,17 @@ type RegistrySnapshotV1 = {
 };
 
 /*
+ * A market the API serves: one that is not disabled, with its Comet, which
+ * is what it is addressed and keyed by (isServed, src/registry/catalog.ts).
+ * Validation refuses a market that does not declare its Comet
+ * (comet-contract-declared), so of a validated version only the disabled
+ * markets are left out. A network the API serves lists only the markets it
+ * serves.
+ */
+type ServedMarket  = MarketV1 & { contracts: MarketV1['contracts'] & { comet: Address } };
+type ServedNetwork = Omit<NetworkV1, 'markets'> & { markets: ServedMarket[] };
+
+/*
  * The active version as the active reads serve it — /active and the market
  * reads — beside RegistrySnapshotV1, which stays the version as imported:
  * every collateral also says whether an administrator marked it deprecated in
@@ -290,7 +301,7 @@ type RegistrySnapshotV1 = {
  * the version's checksum and is read anew for every answer.
  */
 type ActiveCollateralAssetV1 = CollateralAssetV1 & { isDeprecated: boolean };
-type ActiveMarketV1          = Omit<MarketV1, 'collateralAssets'> & { collateralAssets: ActiveCollateralAssetV1[] };
+type ActiveMarketV1          = Omit<ServedMarket, 'collateralAssets'> & { collateralAssets: ActiveCollateralAssetV1[] };
 type ActiveNetworkV1         = Omit<NetworkV1, 'markets'> & { markets: ActiveMarketV1[] };
 type ActiveSnapshotV1        = Omit<RegistrySnapshotV1, 'networks'> & { networks: ActiveNetworkV1[] };
 
@@ -698,6 +709,8 @@ export type {
   RegistryComet,
   RetainedDeprecatedCollateralV1,
   RewardAssetV1,
+  ServedMarket,
+  ServedNetwork,
   TokenPoliciesV1,
   TokenListV1,
   TokenPolicyApplyV1,

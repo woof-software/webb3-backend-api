@@ -2,16 +2,14 @@ import t from 'tap';
 
 import { randomUUID } from 'node:crypto';
 
-import { createTestHarness } from 'wrangler';
-
 import type { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 import type { ActiveSnapshotV1 } from '../../../lib/model/comet-registry.js';
 import { overlayOfMarket } from '../../../src/registry/overlay.js';
 
-import { applyMigrations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, overlayOfNetwork, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
 import { recordValidationResults } from '../../util/registry-repository.js';
+import { ADMIN_TOKEN } from '../../util/test-env.js';
 
 /*
  * The registry HTTP API, served by the real worker in workerd over local D1.
@@ -22,32 +20,9 @@ import { recordValidationResults } from '../../util/registry-repository.js';
  * CORS headers the router sets and the security headers the entrypoint adds,
  * authentication, and the error envelope.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-
-/*
- * The worker stores only the hash of the admin token, so the harness is given
- * the hash as a secret and the tests present the token itself.
- */
-const server = createTestHarness({
-  workers: [ {
-    configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
-  } ],
-});
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { server, freshDatabase } = await registryHarness({ admin: true });
 
 const snapshot = loadRegistrySnapshotFixture();
-
-async function freshDatabase(): Promise<D1Database> {
-  await server.reset();
-  const { APP_DB } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(APP_DB);
-  return APP_DB;
-}
 
 /*
  * Seeds the fixture as a validated version. Activation goes through the API

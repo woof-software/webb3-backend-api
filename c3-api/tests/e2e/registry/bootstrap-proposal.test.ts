@@ -2,14 +2,11 @@ import t from 'tap';
 
 import { randomUUID } from 'node:crypto';
 
-import { createTestHarness } from 'wrangler';
-
-import type { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 import { readSnapshot, readUnreviewed } from '../../../src/registry/repository.js';
 
-import { applyMigrations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
+import { ADMIN_TOKEN } from '../../util/test-env.js';
 
 /*
  * The first review of an environment, as an operator does it: read the
@@ -20,19 +17,7 @@ import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../.
  * tests/lib/registry/bootstrap-overlays.test.ts; these tests are about the
  * routes — that what is read is what is applied, all of it or none.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-
-const server = createTestHarness({
-  workers: [ {
-    configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
-  } ],
-});
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { server, freshDatabase } = await registryHarness({ admin: true });
 
 // a deployment the source has and the constants do not describe
 const UNDESCRIBED = '0x5555555555555555555555555555555555555555';
@@ -43,9 +28,7 @@ const UNDESCRIBED = '0x5555555555555555555555555555555555555555';
  * nothing about.
  */
 async function unreviewedCandidate(): Promise<{ db: D1Database, versionId: string }> {
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db);
+  const db = await freshDatabase();
 
   const snapshot = loadRegistrySnapshotFixture();
   const mainnet  = snapshot.networks.find(network => network.chainId === 1)!;

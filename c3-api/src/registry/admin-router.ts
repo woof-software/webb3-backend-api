@@ -7,8 +7,9 @@ import { clientOf } from '../http/client-address.js';
 import { ApiError, methodNotAllowed } from '../http/errors.js';
 import { MAX_BODY_BYTES, jsonResponse, readJsonObject } from '../http/json.js';
 
-import { cacheDepsOf } from './cache.js';
+import { cacheDepsOf, isUnreachable } from './cache.js';
 import { readCreationBlocks, readFeeds } from './enrichment.js';
+import { isRegistryError, isTransportFailure } from './errors.js';
 import { registryStatus } from './status.js';
 import {
   CreationReader,
@@ -305,28 +306,16 @@ async function limit(env: Env, fingerprint: string, family: string): Promise<voi
   }
 }
 
-type SyncFailure = Extract<InvocationResult, { kind: 'invalid' | 'failed' }>;
-
 /*
- * The error an administrative sync answers with when the invocation failed.
- *
- * A registry error is answered as the routes answer it everywhere: a request
- * the registry has to refuse, such as a commit the tracked ref cannot reach,
- * is the client's to fix. A candidate that failed its checks would fail the
- * same way again, so it is refused with the ids to inspect it by rather than
- * offered as something to retry. A database or a source that did not answer
- * is a 503; a fault never reaches here — it is raised, and answered 500.
+ * The error an administrative sync answers with when its candidate failed its
+ * checks. It would fail the same way again, so it is refused with the ids to
+ * inspect it by rather than offered as something to retry.
  */
-function syncFailure(result: SyncFailure): Error {
-  switch (result.kind) {
-    case 'invalid':
-      return new ApiError('UNPROCESSABLE', result.reason, {
-        syncRunId:         result.runId,
-        registryVersionId: result.versionId,
-      });
-    case 'failed':
-      return result.error ?? new ApiError('UPSTREAM_UNAVAILABLE', result.reason);
-  }
+function syncFailure(result: Extract<InvocationResult, { kind: 'invalid' }>): ApiError {
+  return new ApiError('UNPROCESSABLE', result.reason, {
+    syncRunId:         result.runId,
+    registryVersionId: result.versionId,
+  });
 }
 
 /*
@@ -335,7 +324,7 @@ function syncFailure(result: SyncFailure): Error {
  * candidate completed its import as one that validated did, and says that it
  * is held, and how many of its checks failed.
  */
-function syncAnswer(result: Exclude<InvocationResult, SyncFailure>): {
+function syncAnswer(result: Exclude<InvocationResult, { kind: 'invalid' }>): {
   status:        'idle' | 'running' | 'completed',
   outcome:       SyncOutcome | null,
   heldForReview: boolean,
@@ -413,9 +402,22 @@ async function postSync(
     env,
     isExplicit(request) ? { ...request, reason: requireReason(body) } : request,
     { requestId },
-  );
+  ).catch((error: unknown) => {
+    /*
+     * A registry error is answered as the routes answer it everywhere: a
+     * request the registry has to refuse, such as a commit the tracked ref
+     * cannot reach, is the client's to fix. A database or a source that did
+     * not answer, with no registry error to say so, is worth trying again
+     * whatever it said: a 503, whose cause the line runRegistrySync logged
+     * names. A fault is raised as it is, and answered 500.
+     */
+    if (!isRegistryError(error) && (isTransportFailure(error) || isUnreachable(error))) {
+      throw new ApiError('UPSTREAM_UNAVAILABLE', `the import was interrupted by a service that did not answer`);
+    }
+    throw error;
+  });
 
-  if (result.kind === 'invalid' || result.kind === 'failed') {
+  if (result.kind === 'invalid') {
     throw syncFailure(result);
   }
   const { status, outcome, heldForReview, checksFailed } = syncAnswer(result);
@@ -842,4 +844,4 @@ async function routeAdmin(
   }
 }
 
-export { routeAdmin, syncAnswer, syncFailure };
+export { routeAdmin, syncAnswer };

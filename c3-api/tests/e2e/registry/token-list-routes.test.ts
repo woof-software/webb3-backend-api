@@ -1,14 +1,11 @@
 import t from 'tap';
 
-import { createTestHarness } from 'wrangler';
-
-import type { Env } from '../../../entrypoint.js';
 import type { TokenListV1 } from '../../../lib/model/comet-registry.js';
 import { activateVersion } from '../../../src/registry/repository.js';
 import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
-import { applyMigrations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
 
 /*
  * The token list through the real worker, with a node that refuses every
@@ -20,17 +17,8 @@ import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../.
  * The node is set here rather than taken from wrangler.toml: a developer's
  * .dev.vars may name a real one, and the harness's own vars win over it.
  */
-const server = createTestHarness({
-  workers: [ {
-    configPath: './wrangler.toml',
-    vars:       { NODE_PROXY_HOST: '127.0.0.1:1', NODE_PROXY_KEY: '' },
-  } ],
-});
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const harness = await registryHarness({ vars: { NODE_PROXY_HOST: '127.0.0.1:1', NODE_PROXY_KEY: '' } });
+const { server } = harness;
 
 const snapshot = loadRegistrySnapshotFixture();
 const SCROLL   = 534352;
@@ -44,9 +32,7 @@ const tokensPath = (chainId: string | number, query = '') => `/registry/v1/netwo
 async function freshDatabase(
   { activate, through }: { activate: boolean, through?: string },
 ): Promise<{ db: D1Database, versionId: string }> {
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db, undefined, through === undefined ? {} : { through });
+  const db = await harness.freshDatabase({ through });
   const { versionId } = await seedCandidate(db, snapshot);
   await validateSeeded(db, versionId);
   if (activate) {

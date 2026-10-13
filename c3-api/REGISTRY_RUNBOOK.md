@@ -827,10 +827,11 @@ price feed reverted: 0xe3a409ed15cd53afdefdd191ad945cec528a2496 read by 0x3Afdc9
 The market's `collateralAssets` in
 `GET /registry/v1/networks/<chainId>/markets/<comet>` say which asset reads
 it. A feed none of them names can be the replacement of a remap among the
-network's `priceExceptions` in `GET /registry/v1/active`: then neither it nor
-the feed it replaces answered at that block. A replacement that reverts
-while the feed it replaces answers — at a block before it was deployed — is
-not logged.
+network's `priceExceptions` in `GET /registry/v1/active`. The summaries log
+it only when neither it nor the feed it replaces answered at that block: a
+replacement that reverts while the feed it replaces answers — at a block
+before it was deployed — is not logged. The token list reads only the
+replacement, and logs it whenever it reverts.
 
 A price exception covers collateral feeds only. When the feed is the market's
 base feed, the Comet itself cannot price its base asset and only its
@@ -844,7 +845,9 @@ back changed as in its step 5, with the `digest` the read answered as
 refused instead of undoing theirs.
 
 An exception names a feed, not a token, and applies wherever a Comet reads
-that feed: at the latest block, and at a past block a history reads. A feed
+that feed: at the latest block, and at a past block a history reads. Where a
+remap's replacement does not answer yet — at a block before it was deployed —
+a history reads the feed the Comet named at that block instead. A feed
 governance has since replaced is still priced by its exception on the days
 the market read it. That is all the seeded exceptions of wUSDM and pumpBTC do
 now: governance delisted both by moving them onto a "Constant price feed"

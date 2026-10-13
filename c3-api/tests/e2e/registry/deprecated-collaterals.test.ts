@@ -3,10 +3,7 @@ import t from 'tap';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
-import { createTestHarness } from 'wrangler';
-
 import type { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 import type {
   ActiveMarketV1,
   DeprecatedCollateralApplyV1,
@@ -25,8 +22,10 @@ import {
   writeDeprecatedCollateralList,
 } from '../../../src/registry/deprecated-collateral-repository.js';
 
-import { applyMigrations, foreignKeyViolations } from '../../util/d1.js';
+import { foreignKeyViolations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
+import { ADMIN_TOKEN } from '../../util/test-env.js';
 
 /*
  * Deprecated collaterals, through the real worker in workerd over local D1: a
@@ -40,19 +39,7 @@ import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../.
  * which keeps each file's administrative requests well inside the limiter's
  * budget.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-
-const server = createTestHarness({
-  workers: [ {
-    configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
-  } ],
-});
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { server, freshEnv } = await registryHarness({ admin: true });
 
 const snapshot = loadRegistrySnapshotFixture();
 const auth     = { 'Authorization': `Bearer ${ADMIN_TOKEN}` };
@@ -72,13 +59,6 @@ const METH  = collateral('usdt', 'mETH');
 const WEETH = collateral('usdt', 'weETH');
 
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-
-async function freshEnv(): Promise<Env> {
-  await server.reset();
-  const env = await server.getWorker<Env>().getEnv();
-  await applyMigrations(env.APP_DB);
-  return env;
-}
 
 function actorOf(env: Env): string {
   return env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`;

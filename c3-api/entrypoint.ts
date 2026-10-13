@@ -136,8 +136,11 @@ function secured(response: Response, cors: Record<string, string> = {}): Respons
  * the id it is answered under, what it may spend, and every computation the
  * evaluators of either router evaluate. Each router is handed evaluators of
  * these typed by the scope its own handlers read.
+ *
+ * It takes the execution context even where there is none, so no call can
+ * drop the request's waitUntil by leaving it out.
  */
-function prepare(env: Env, executionContext?: ExecutionContext) {
+function prepare(env: Env, executionContext: ExecutionContext | undefined) {
   /*
    * What one request may spend before the counting fetch and the
    * computation cache refuse it themselves. No environment sets either
@@ -258,9 +261,6 @@ export default {
      * metrics and past events show it, rather than a success that only the
      * log contradicts. A market that failed fails only its root.
      */
-    const result = await runRegistrySync(env);
-    if (result.kind === 'failed') {
-      throw new Error(`registry sync failed: ${result.reason}`);
-    }
+    await runRegistrySync(env);
   },
 };

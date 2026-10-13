@@ -14,6 +14,7 @@ import type { PositionFailure, PositionValue } from '../../lib/computations/mark
 import type { Address, BlockRefV1, CollateralValueStatusV1, PriceExceptionV1 } from '../../lib/model/comet-registry.js';
 
 import type * as Evaluator from '../evaluator.js';
+import type { Log } from '../log.js';
 
 import type { Catalog, RegistryComet } from './catalog.js';
 
@@ -135,7 +136,7 @@ type TokenCollateralDeps = {
   kv:              (networkEnv: 'mainnet' | 'testnet') => KVNamespace,
   maxStaleMinutes: number,
   now:             () => Date,
-  debug:           { error: (...parameters: unknown[]) => unknown },
+  debug:           Pick<Log, 'error'>,
   /*
    * Keeps work alive past the answer. The runtime cancels whatever a request
    * still has in flight once it has answered, and a minute is shared by every

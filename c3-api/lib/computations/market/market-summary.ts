@@ -15,6 +15,7 @@ import {
   type TotalBorrow,
   type TotalSupply,
   type BaseUsdPrice,
+  type PriceError,
 } from '../comet.js';
 
 import type { BorrowApr } from './borrow-apr.js';
@@ -41,7 +42,7 @@ type MarketIdentity = {
 
 type CollateralStatus = (
   & { address: Eth.Address, symbol: string }
-  & ({ status: 'success' } | { status: 'error', message: string })
+  & ({ status: 'success' } | PriceError)
 );
 
 type MarketSummary = Compute.Spec<{
@@ -65,10 +66,7 @@ type MarketSummary = Compute.Spec<{
     contract: RegistryComet,     // comet contract for the market
   },
   returns: (
-    | MarketIdentity & {
-        status:  'error',
-        message: string,
-      }
+    | MarketIdentity & PriceError
     | MarketIdentity & {
         status: 'success' | 'partially',
         supplyApr: string,

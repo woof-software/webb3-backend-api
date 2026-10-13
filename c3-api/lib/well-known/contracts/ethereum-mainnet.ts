@@ -1197,8 +1197,9 @@ const market01wbtc = <const>[BTC_USD_priceFeed, Comet_01wbtc];
  *     If rewards are ever configured on a *different* CometRewards, both of
  *     those assumptions need revisiting.
  *
- * Transaction history additionally requires an entry in GetAllStreamEvents()
- * in src/transaction-history-handler/transaction-history-items-handler.ts --
+ * Transaction history is served for a market only when the active registry
+ * version marks its transactionHistory capability and gives it a rewards
+ * contract (streamEventsOf in src/transaction-history-handler/cursor.ts) --
  * declaring a Comet here is not sufficient for that endpoint.
  */
 const Comet_01iusdc = Comet(<const>{

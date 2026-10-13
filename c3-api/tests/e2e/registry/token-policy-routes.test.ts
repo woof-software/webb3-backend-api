@@ -1,13 +1,10 @@
 import t from 'tap';
 
-import { createTestHarness } from 'wrangler';
-
-import type { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 import { activateVersion } from '../../../src/registry/repository.js';
 
-import { applyMigrations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
+import { ADMIN_TOKEN } from '../../util/test-env.js';
 
 /*
  * What the token policy routes refuse, through the real worker: a caller
@@ -15,19 +12,8 @@ import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../.
  * registry does not hold, and a registry with nothing active. Every refusal
  * writes nothing.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-
-const server = createTestHarness({
-  workers: [ {
-    configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
-  } ],
-});
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const harness = await registryHarness({ admin: true });
+const { server } = harness;
 
 const snapshot = loadRegistrySnapshotFixture();
 const auth     = { 'Authorization': `Bearer ${ADMIN_TOKEN}` };
@@ -41,9 +27,7 @@ type ErrorBody = { error: { code: string, message: string, details?: { registryV
 async function freshDatabase(
   { activate, through }: { activate: boolean, through?: string },
 ): Promise<{ db: D1Database, versionId: string }> {
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db, undefined, through === undefined ? {} : { through });
+  const db = await harness.freshDatabase({ through });
   const { versionId } = await seedCandidate(db, snapshot);
   await validateSeeded(db, versionId);
   if (activate) {

@@ -1,39 +1,26 @@
 import t from 'tap';
 
-import { createTestHarness } from 'wrangler';
-
-import type { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 import { activateVersion } from '../../../src/registry/repository.js';
 
-import { applyMigrations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
+import { ADMIN_TOKEN } from '../../util/test-env.js';
 
 /*
  * What the deprecated collateral routes refuse, through the real worker: a
  * caller without the token, a malformed request, a chain, a Comet or a
  * collateral the active registry does not hold, a registry with nothing
  * active, and a database without the migration. Every refusal writes nothing.
- */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-
-/*
+ *
  * The token list is among the reads refused for a missing migration, and it
  * values collateral beside reading its decisions, so the node is one that
  * refuses every connection: a developer's .dev.vars may name a real one.
  */
-const server = createTestHarness({
-  workers: [ {
-    configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
-    vars:       { NODE_PROXY_HOST: '127.0.0.1:1', NODE_PROXY_KEY: '' },
-  } ],
+const harness = await registryHarness({
+  admin: true,
+  vars:  { NODE_PROXY_HOST: '127.0.0.1:1', NODE_PROXY_KEY: '' },
 });
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { server } = harness;
 
 const snapshot = loadRegistrySnapshotFixture();
 const auth     = { 'Authorization': `Bearer ${ADMIN_TOKEN}` };
@@ -51,9 +38,7 @@ type ErrorBody = { error: { code: string, message: string, details?: { registryV
 async function freshDatabase(
   { activate, through }: { activate: boolean, through?: string },
 ): Promise<{ db: D1Database, versionId: string }> {
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db, undefined, through === undefined ? {} : { through });
+  const db = await harness.freshDatabase({ through });
   const { versionId } = await seedCandidate(db, snapshot);
   await validateSeeded(db, versionId);
   if (activate) {

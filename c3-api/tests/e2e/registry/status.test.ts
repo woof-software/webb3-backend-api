@@ -2,19 +2,18 @@ import t from 'tap';
 
 import { randomUUID } from 'node:crypto';
 
-import { createTestHarness } from 'wrangler';
-
 import type { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 import type { Address } from '../../../lib/model/comet-registry.js';
 import { POINTER_KEY, activeSnapshot, cacheDepsOf } from '../../../src/registry/cache.js';
 import { CHECK_KEY, checkChain } from '../../../src/registry/drift.js';
 import { activateVersion } from '../../../src/registry/repository.js';
 
-import { applyMigrations } from '../../util/d1.js';
 import { FakeChain, fakeChain } from '../../util/fake-chain.js';
+import { quietLog } from '../../util/quiet-log.js';
 import { activateSeeded, loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
 import { markInvalid, recordValidationResults } from '../../util/registry-repository.js';
+import { ADMIN_TOKEN } from '../../util/test-env.js';
 
 /*
  * The status route: one answer a monitor polls and an operator reads.
@@ -23,25 +22,7 @@ import { markInvalid, recordValidationResults } from '../../util/registry-reposi
  * and each condition worth waking someone for names itself, so a check can be
  * "alerts is empty" without the monitor knowing the registry's rules.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-const SECRETS     = { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) };
-
-const server = createTestHarness({
-  workers: [ {
-    configPath: './wrangler.toml',
-    secrets:    SECRETS,
-  } ],
-});
-
-// the worker again, with `vars` set over the ones wrangler.toml gives it, until the next freshDatabase
-async function withVars(vars: Record<string, string>): Promise<void> {
-  await server.update({ workers: [ { configPath: './wrangler.toml', secrets: SECRETS, vars } ] });
-}
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { server, freshDatabase, withVars } = await registryHarness({ admin: true });
 
 const snapshot = loadRegistrySnapshotFixture();
 const auth     = { 'Authorization': `Bearer ${ADMIN_TOKEN}` };
@@ -72,13 +53,6 @@ type Status = {
   } | null,
   alerts: string[],
 };
-
-async function freshDatabase(): Promise<D1Database> {
-  await server.reset();
-  const { APP_DB } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(APP_DB);
-  return APP_DB;
-}
 
 async function status(): Promise<Status> {
   const response = await server.fetch('/registry/v1/admin/status', { headers: auth });
@@ -563,10 +537,11 @@ t.test('a version the chain has drifted from is raised, until the version on agr
     const at = new Date(month + ++days * 86_400_000);
     return checkChain({
       kv:              env.kv_registry,
-      active:          () => activeSnapshot(cacheDepsOf(env)),
+      active:          () => activeSnapshot(cacheDepsOf(env, quietLog)),
       transportFor:    chain.transportFor,
       intervalSeconds: 86_400,
       now:             () => at,
+      debug:           quietLog,
     });
   };
   // switches a version on, and serves it once, as the first request after the switch would

@@ -1,14 +1,11 @@
 import t from 'tap';
 
-import { createTestHarness } from 'wrangler';
-
-import type { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 import type { RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 import { overlayOfMarket } from '../../../src/registry/overlay.js';
 
-import { applyMigrations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, overlayOfNetwork, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
+import { ADMIN_TOKEN } from '../../util/test-env.js';
 
 /*
  * `PUT /registry/v1/admin/versions/{id}/overlays`: a whole reviewed directory
@@ -20,27 +17,13 @@ import { loadRegistrySnapshotFixture, overlayOfNetwork, seedCandidate, validateS
  * one of them cannot. Each document is decided exactly as the one-document
  * routes decide it, which api.test.ts covers.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-
-const server = createTestHarness({
-  workers: [ {
-    configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
-  } ],
-});
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { server, freshDatabase } = await registryHarness({ admin: true });
 
 const snapshot = loadRegistrySnapshotFixture();
 const mainnet  = snapshot.networks.find(network => network.chainId === 1)!;
 
 async function freshCandidate(seeded: RegistrySnapshotV1 = snapshot): Promise<{ db: D1Database, versionId: string }> {
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db);
+  const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, seeded);
   return { db, versionId };
 }

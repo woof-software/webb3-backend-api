@@ -1,15 +1,16 @@
 import t, { Test } from 'tap';
 
 import C3Api, { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 import type { ActiveMarketV1, ActiveSnapshotV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 import { setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
 import { DEPRECATED_KEY, deprecatedDecisions, recordDeprecatedCollaterals } from '../../../src/registry/deprecated-collaterals.js';
 
+import { consoleLines } from '../../util/console.js';
 import { executionContext, settledWithin } from '../../util/execution-context.js';
 import { MemoryKv } from '../../util/kv.js';
+import { quietLog } from '../../util/quiet-log.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
-import { makeTestEnv } from '../../util/test-env.js';
+import { ADMIN_TOKEN, adminTestEnv } from '../../util/test-env.js';
 
 import '../../../shim/node-self.js';
 
@@ -25,8 +26,6 @@ import '../../../shim/node-self.js';
  * Decisions are made through the repository, or through the command where
  * what it records is the point, so nothing here spends the limiter's budget.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-
 let seed = 0;
 
 type Envelope = { error: { code: string, message: string } };
@@ -53,14 +52,11 @@ function reachable(db: D1Database, { down = () => false, failing = /^$/ }: { dow
   });
 }
 
-async function envOf(db: D1Database, kv: KVNamespace, overrides: Partial<Env> = {}): Promise<Env> {
-  return makeTestEnv({
-    APP_DB:                           db,
-    kv_registry:                      kv,
-    MEMORY_CACHE_SEED:                `deprecated-collateral-reads-${seed++}`,
-    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256(ADMIN_TOKEN),
-    REGISTRY_ADMIN_RATE_LIMITER:      { limit: async () => ({ success: true }) },
-    REGISTRY_ADMIN_AUTH_RATE_LIMITER: { limit: async () => ({ success: true }) },
+function envOf(db: D1Database, kv: KVNamespace, overrides: Partial<Env> = {}): Promise<Env> {
+  return adminTestEnv({
+    APP_DB:            db,
+    kv_registry:       kv,
+    MEMORY_CACHE_SEED: `deprecated-collateral-reads-${seed++}`,
     ...overrides,
   });
 }
@@ -84,15 +80,7 @@ async function json<T>(env: Env, path: string): Promise<T> {
 
 // what the worker logged, for the length of a test, each line after its level
 function captureLogs(t: Test): string[] {
-  const lines: string[] = [];
-  const { error, warn } = console;
-  console.error = (...parameters: unknown[]) => { lines.push(`error: ${parameters.map(String).join(' ')}`); };
-  console.warn  = (...parameters: unknown[]) => { lines.push(`warn: ${parameters.map(String).join(' ')}`); };
-  t.teardown(() => {
-    console.error = error;
-    console.warn  = warn;
-  });
-  return lines;
+  return consoleLines(t, [ 'error', 'warn' ], { prefixed: true });
 }
 
 async function fixture(t: Test) {
@@ -473,7 +461,7 @@ t.test('a record a read put back after a decision is put right by the next check
     ttlSeconds:   300,
     staleSeconds: 3600,
     now:          () => new Date(now),
-    debug:        { error: () => {}, warn: () => {} },
+    debug:        quietLog,
   });
   const recorded = async () => (await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] }).collaterals.length;
 
@@ -573,6 +561,7 @@ t.test('a read hands its check of the record to waitUntil, and is answered befor
     kv:           bindingOf(store, { put: async (_parameters, write) => { await released; await write(); } }),
     ttlSeconds:   300,
     staleSeconds: 3600,
+    debug:        quietLog,
     defer:        (work: Promise<unknown>) => { deferred.push(work); },
   };
 
@@ -652,7 +641,7 @@ function cutOff(db: D1Database, store: KVNamespace) {
     ttlSeconds:   300,
     staleSeconds: 3600,
     now:          () => new Date(clock.now),
-    debug:        { error: () => {}, warn: () => {} },
+    debug:        quietLog,
     defer:        (work: Promise<unknown>) => { deferred.push(work); },
   };
   return { deps, clock, deferred, puts: () => puts };
@@ -699,7 +688,7 @@ t.test('a command waits for a check of the same decisions under way, and leaves 
     kv:           bindingOf(store, { put: async (_parameters, write) => { puts += 1; await (puts === 1 ? released.then(write) : write()); } }),
     ttlSeconds:   300,
     staleSeconds: 3600,
-    debug:        { error: () => {}, warn: () => {} },
+    debug:        quietLog,
     defer:        () => {},
   };
 

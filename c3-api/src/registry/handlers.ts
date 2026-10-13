@@ -1,16 +1,18 @@
 import {
   ActivationAction,
-  MarketV1,
   NetworkV1,
   RegistrySnapshotV1,
+  ServedMarket,
+  ServedNetwork,
   isAddress,
   marketKey,
   normalizeAddress,
 } from '../../lib/model/comet-registry.js';
 
 import { matchesIfNoneMatch } from '../http/conditional.js';
-import { ApiError } from '../http/errors.js';
+import { ApiError, noActiveVersion } from '../http/errors.js';
 import { jsonResponse } from '../http/json.js';
+import type { Log } from '../log.js';
 
 import type { CachedSnapshot, PinnedVersion } from './cache.js';
 import type { DeprecatedDecisions, DeprecatedRead } from './deprecated-collaterals.js';
@@ -33,6 +35,7 @@ import {
 } from './repository.js';
 import { readNetworkOverlay } from './overlay-store.js';
 import { VERSION_STATUSES } from './rows.js';
+import type { SyncRunItemRow, SyncRunRow } from './rows.js';
 import { readValidationSummary } from './validation-store.js';
 import { compareVersions } from './changes.js';
 import { isServed, servedNetworks } from './catalog.js';
@@ -40,9 +43,10 @@ import { bundleOf, digestOf, proposalFor, reviewDocument } from './bootstrap.js'
 import type { Generated } from './bootstrap.js';
 import { orderNetworks, overlayDigest, overlayOfMarket, parseMarketOverlay } from './overlay.js';
 import { compareWithStatic } from './shadow.js';
-import { replaceOverlays, validateStoredVersion } from './admin.js';
+import { replaceOverlays, requireVersion, validateStoredVersion } from './admin.js';
 import type { CreationReader, FeedReader } from './admin.js';
-import { cancelRun } from './sync.js';
+import { syncRunSummary } from './status.js';
+import { cancelRun, readRun, readRunItems } from './sync.js';
 
 /*
  * The registry HTTP handlers. They resolve a version, shape the response, and
@@ -62,10 +66,7 @@ type RegistryContext = {
    * Where a failure that is not the caller's goes, and a degradation the
    * registry recovered from; the routes never return either.
    */
-  debug: {
-    error: (...parameters: unknown[]) => unknown,
-    warn:  (...parameters: unknown[]) => unknown,
-  },
+  debug: Pick<Log, 'error' | 'warn'>,
   /*
    * The active snapshot as the cache resolves it: from this isolate's memory
    * or from KV where the pointer D1 reports names a version they already
@@ -74,6 +75,9 @@ type RegistryContext = {
    * them are cached the same and every stale answer says so; an
    * administrative read that only needs the active version's id still asks
    * D1 directly, because it is asking what is true now.
+   *
+   * Each call reads the pointer again, so a handler asks once and answers
+   * from the one version that call returned.
    */
   active: () => Promise<CachedSnapshot | null>,
   /*
@@ -92,9 +96,9 @@ type RegistryContext = {
   /*
    * The deprecated decisions of every chain, which the active reads mark the
    * collaterals of the active version with (deprecated-collaterals.ts): read
-   * from D1 at most once per request, or during an outage from the record the
-   * Worker keeps of them. `recordDeprecated` keeps that record, after a
-   * command that may have changed them; it never fails the command.
+   * from D1, or during an outage from the record the Worker keeps of them.
+   * `recordDeprecated` keeps that record, after a command that may have
+   * changed them; it never fails the command.
    */
   deprecated:       () => Promise<DeprecatedRead>,
   recordDeprecated: () => Promise<void>,
@@ -199,7 +203,7 @@ async function snapshotResponse(
  * decided to offer. A network whose markets are deprecated is still served,
  * because positions and history in them must stay reachable.
  */
-function selectable(snapshot: RegistrySnapshotV1): RegistrySnapshotV1 {
+function selectable(snapshot: RegistrySnapshotV1): Omit<RegistrySnapshotV1, 'networks'> & { networks: ServedNetwork[] } {
   return {
     ...snapshot,
     networks: servedNetworks(snapshot).map(({ network, markets }) => ({ ...network, markets })),
@@ -209,7 +213,7 @@ function selectable(snapshot: RegistrySnapshotV1): RegistrySnapshotV1 {
 async function activeSnapshot(context: RegistryContext): Promise<CachedSnapshot> {
   const active = await context.active();
   if (active === null) {
-    throw new ApiError('REGISTRY_NOT_ACTIVE', `No active registry snapshot is available`);
+    throw noActiveVersion();
   }
   return active;
 }
@@ -266,7 +270,8 @@ async function freshActiveSnapshot(context: RegistryContext): Promise<RegistrySn
   return active.snapshot;
 }
 
-function networkOf(snapshot: RegistrySnapshotV1, chainId: number): NetworkV1 {
+// a chain's network as `snapshot` holds it: a served one in what the API serves (selectable)
+function networkOf<Network extends NetworkV1>(snapshot: { networks: Network[] }, chainId: number): Network {
   const network = snapshot.networks.find(candidate => candidate.chainId === chainId);
   if (network === undefined) {
     throw new ApiError('NOT_FOUND', `chain ${chainId} is not part of the active registry`);
@@ -297,7 +302,7 @@ function chainIdOf(value: string): number {
  * diagnostics; a deprecated one is still readable, because positions and
  * history in it must remain reachable.
  */
-function marketOf(network: NetworkV1, address: string): MarketV1 {
+function marketOf(network: NetworkV1, address: string): ServedMarket {
   if (!isAddress(address)) {
     throw new ApiError('BAD_REQUEST', `${address} is not an address`);
   }
@@ -460,10 +465,7 @@ async function getVersions(context: RegistryContext, query: URLSearchParams): Pr
 }
 
 async function getVersionDetail(context: RegistryContext, versionId: string): Promise<Response> {
-  const version = await readVersion(context.db, versionId);
-  if (version === null) {
-    throw new ApiError('NOT_FOUND', `no registry version with that id`);
-  }
+  const version = await requireVersion(context.db, versionId);
   // three reads that do not depend on each other, so one round trip of waiting rather than three
   const [ validation, activations, unreviewed ] = await Promise.all([
     readValidationSummary(context.db, versionId),
@@ -502,57 +504,37 @@ async function getVersionDetail(context: RegistryContext, versionId: string): Pr
  * resumable.
  */
 async function getSyncRun(context: RegistryContext, syncRunId: string): Promise<Response> {
-  const run = await context.db.prepare(`SELECT * FROM sync_runs WHERE id = ?1`).bind(syncRunId).first<SyncRunRecord>();
-  if (run === null || run === undefined) {
+  const [ run, items ] = await Promise.all([
+    readRun(context.db, syncRunId),
+    readRunItems(context.db, syncRunId),
+  ]);
+  if (run === null) {
     throw new ApiError('NOT_FOUND', `no sync run with that id`);
   }
-
-  const items = await context.db.prepare(
-    `SELECT root_path, upstream_network_key, deployment_key, status, attempts,
-            completed_at, last_error, updated_at
-     FROM sync_run_items WHERE sync_run_id = ?1 ORDER BY root_path`
-  ).bind(syncRunId).all<SyncRunItemRecord>();
-
-  return syncRunResponse(run, items.results ?? []);
+  return syncRunResponse(run, items);
 }
-
-type SyncRunRecord = {
-  id: string, source_commit_sha: string, tracked_ref: string | null, registry_version_id: string | null,
-  trigger_kind: string, requested_by: string | null, reason: string | null, status: string,
-  outcome: string | null, lease_expires_at: string | null, expected_count: number,
-  completed_count: number, failed_count: number, last_error: string | null,
-  started_at: string, completed_at: string | null,
-};
-
-type SyncRunItemRecord = {
-  root_path: string, upstream_network_key: string, deployment_key: string,
-  status: string, attempts: number, completed_at: string | null,
-  last_error: string | null, updated_at: string,
-};
 
 /*
  * What both sync run routes answer: the run read by id, or as a cancel left
- * it. Every field is named, so neither owner a row carries leaves the worker.
+ * it, listing what started it before how far it got, as it always has. Every
+ * field is named, here and in syncRunSummary, so neither owner a row carries
+ * leaves the worker.
  */
-function syncRunResponse(run: SyncRunRecord, items: SyncRunItemRecord[]): Response {
+function syncRunResponse(run: SyncRunRow, items: SyncRunItemRow[]): Response {
+  const {
+    id, registryVersionId, status, outcome, startedAt, completedAt,
+    failedCount, expectedCount, completedCount, lastError, leaseExpiresAt,
+  } = syncRunSummary(run);
   return jsonResponse({
     syncRun: {
-      id:                run.id,
-      registryVersionId: run.registry_version_id,
-      sourceCommitSha:   run.source_commit_sha,
-      trackedRef:        run.tracked_ref,
-      triggerKind:       run.trigger_kind,
-      requestedBy:       run.requested_by,
-      reason:            run.reason,
-      status:            run.status,
-      outcome:           run.outcome,
-      leaseExpiresAt:    run.lease_expires_at,
-      expectedCount:     run.expected_count,
-      completedCount:    run.completed_count,
-      failedCount:       run.failed_count,
-      lastError:         run.last_error,
-      startedAt:         run.started_at,
-      completedAt:       run.completed_at,
+      id, registryVersionId,
+      sourceCommitSha: run.source_commit_sha,
+      trackedRef:      run.tracked_ref,
+      triggerKind:     run.trigger_kind,
+      requestedBy:     run.requested_by,
+      reason:          run.reason,
+      status, outcome, leaseExpiresAt, expectedCount, completedCount, failedCount, lastError,
+      startedAt, completedAt,
     },
     items: items.map(item => ({
       rootPath:           item.root_path,
@@ -628,12 +610,9 @@ async function getShadow(context: RegistryContext, versionId: string | undefined
  */
 async function getChanges(context: RegistryContext, versionId: string): Promise<Response> {
   const [ version, activeId ] = await Promise.all([
-    readVersion(context.db, versionId),
+    requireVersion(context.db, versionId),
     readActiveVersionId(context.db),
   ]);
-  if (version === null) {
-    throw new ApiError('NOT_FOUND', `no registry version with that id`);
-  }
 
   // the two versions and the review state are read side by side, not one after another
   const [ after, before, unreviewed ] = await Promise.all([
@@ -667,14 +646,11 @@ async function getMarketOverlay(
 ): Promise<Response> {
   const scope = marketKey(chainId, deploymentKey);
   // the one market, not every row of the version, and the version beside it
-  const [ version, market, unreviewed ] = await Promise.all([
-    readVersion(context.db, versionId),
+  const [ , market, unreviewed ] = await Promise.all([
+    requireVersion(context.db, versionId),
     readMarket(context.db, versionId, { chainId, deploymentKey }),
     readUnreviewed(context.db, versionId),
   ]);
-  if (version === null) {
-    throw new ApiError('NOT_FOUND', `no registry version with that id`);
-  }
   if (market === null) {
     throw new ApiError('NOT_FOUND', `${scope} is not in this registry version`);
   }
@@ -696,13 +672,10 @@ async function getMarketOverlay(
  * version serves would drop every exception this one has and that one lacks.
  */
 async function getNetworkOverlay(context: RegistryContext, versionId: string, chainId: number): Promise<Response> {
-  const [ version, network ] = await Promise.all([
-    readVersion(context.db, versionId),
+  const [ , network ] = await Promise.all([
+    requireVersion(context.db, versionId),
     readNetworkOverlay(context.db, versionId, chainId),
   ]);
-  if (version === null) {
-    throw new ApiError('NOT_FOUND', `no registry version with that id`);
-  }
   if (network === null) {
     throw new ApiError('NOT_FOUND', `chain ${chainId} is not in this registry version`);
   }
@@ -726,12 +699,9 @@ async function proposalOf(
   versionId: string,
 ): Promise<{ repository: string, generated: Generated, digest: string }> {
   const [ version, activeId ] = await Promise.all([
-    readVersion(context.db, versionId),
+    requireVersion(context.db, versionId),
     readActiveVersionId(context.db),
   ]);
-  if (version === null) {
-    throw new ApiError('NOT_FOUND', `no registry version with that id`);
-  }
   /*
    * The proposal is the first review of an environment, derived from the
    * static constants. Once a version has been activated, the decisions live
@@ -829,9 +799,7 @@ async function postActivation(
   expectation: { expectedActiveVersionId?: string | null } = {},
 ): Promise<Response> {
   // a version that does not exist is not a state conflict, and answers as every other route does
-  if (await readVersion(context.db, versionId) === null) {
-    throw new ApiError('NOT_FOUND', `no registry version with that id`);
-  }
+  await requireVersion(context.db, versionId);
   const result = await activateVersion(context.db, { versionId, action, actor: context.actor, reason, ...expectation });
   /*
    * A rollback names a version that was validated long ago, and whose bytes

@@ -9,7 +9,7 @@ import { BigFixnum } from '../../../lib/bigfixnum.js';
 import { enrichTransactionHistoryItem, isBulker } from '../../../lib/computations/account/enrich-transaction-history-items.js';
 import { rawTransactionHistoryItems, tokenSymbol } from '../../../lib/computations/account/raw-transaction-history-items.js';
 import { baseAssetLabel, marketRewards } from '../../../lib/computations/market/market-rewards.js';
-import { usdBasePriceFeedFor } from '../../../lib/computations/rewards/base-price-feed.js';
+import { convertsRewardPriceToUsd, usdBasePriceFeedFor } from '../../../lib/computations/rewards/base-price-feed.js';
 import type * as account from '../../../lib/computations/account.js';
 import type * as comet from '../../../lib/computations/comet.js';
 import type * as market from '../../../lib/computations/market.js';
@@ -23,10 +23,7 @@ import { describeContractCallForHumans, contractForLocation } from '../../../lib
 import { defaultAbiCoder } from '@ethersproject/abi';
 import { rewardGroups, rewardsInclusion, rewardsSummary } from '../../../src/account-handlers/rewards.js';
 import type { MarketRouteData } from '../../../src/router.js';
-import {
-  streamEventsOf,
-  streamKeyOf,
-} from '../../../src/transaction-history-handler/transaction-history-items-handler.js';
+import { streamEventsOf, streamKeyOf } from '../../../src/transaction-history-handler/cursor.js';
 
 import * as Compute    from '../../../lib/symbolic/computation.js';
 import * as Debug      from '../../../lib/debug-log.js';
@@ -35,6 +32,7 @@ import * as Flags      from '../../../lib/flags.js';
 import { BigNumber }   from '../../../lib/bignumber.js';
 import { MemoryCache } from '../../../lib/symbolic/cache.js';
 
+import { consoleLines } from '../../util/console.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 
 /*
@@ -109,16 +107,9 @@ t.test('an account\'s rewards are read only in the token the version describes',
   t.equal(rewardsInclusion(usdc, Eth.NullAddress), 'none', 'a market the contract pays nothing for is left out');
   t.equal(rewardsInclusion(usdc, COMP as never), 'read', 'one that pays the token the version describes is read');
 
-  const warnings: string[] = [];
-  const warn = console.warn;
-  console.warn = (line: string) => { warnings.push(line); };
-  let mismatch;
-  try {
-    mismatch = rewardsInclusion(usdc, OTHER as never);
-    rewardsInclusion(usdc, OTHER as never);
-  } finally {
-    console.warn = warn;
-  }
+  const warnings = consoleLines(t, [ 'warn' ]);
+  const mismatch = rewardsInclusion(usdc, OTHER as never);
+  rewardsInclusion(usdc, OTHER as never);
   t.same(mismatch, {
     chainId: 1,
     comet:   { address: usdc.address },
@@ -155,17 +146,11 @@ t.test('the account rewards route reconciles each market\'s reward token with th
     }),
   } as any, { cache: new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]), debug: Debug.MakeLogger([]).configure(process.env), flags });
 
-  const warn = console.warn;
-  console.warn = () => {};
-  let answer;
-  try {
-    answer = await (await rewardsSummary(
-      { apiHost: '', nodeHost: '', nodeKey: '', account: '0x1111111111111111111111111111111111111111', catalog },
-      { evaluator } as never,
-    )).json() as Array<{ comet: { address: string }, status: string, message?: string }>;
-  } finally {
-    console.warn = warn;
-  }
+  t.capture(console, 'warn');
+  const answer = await (await rewardsSummary(
+    { apiHost: '', nodeHost: '', nodeKey: '', account: '0x1111111111111111111111111111111111111111', catalog },
+    { evaluator } as never,
+  )).json() as Array<{ comet: { address: string }, status: string, message?: string }>;
 
   t.same(read.sort(), [ USDC, WBTC ].sort(), 'the amounts of the markets paying the token the version describes are read');
   t.same(answer.map(entry => [ entry.comet.address.toLowerCase(), entry.status ]).sort(), [
@@ -269,6 +254,7 @@ t.test('a computation takes only a Comet the registry materialized', async t => 
     marketOf<rewards.RewardsSummary>(usdc),
     marketOf<account.AccountRewards>(usdc),
     argumentOf<typeof usdBasePriceFeedFor>(usdc),
+    argumentOf<typeof convertsRewardPriceToUsd>(usdc),
     argumentOf<typeof baseAssetLabel>(usdc),
     routedTo(usdc),
   ];
@@ -307,6 +293,8 @@ t.test('a computation takes only a Comet the registry materialized', async t => 
   marketOf<market.AssetCollateralValue>(constant);
   // @ts-expect-error
   argumentOf<typeof usdBasePriceFeedFor>(constant);
+  // @ts-expect-error
+  argumentOf<typeof convertsRewardPriceToUsd>(constant);
   // @ts-expect-error
   argumentOf<typeof baseAssetLabel>(constant);
   // @ts-expect-error and a market route is handed nothing else

@@ -2,10 +2,7 @@ import t from 'tap';
 
 import { randomUUID } from 'node:crypto';
 
-import { createTestHarness } from 'wrangler';
-
 import type { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 import type {
   NetworkV1,
   TokenPoliciesV1,
@@ -23,8 +20,10 @@ import {
   writeTokenPolicyList,
 } from '../../../src/registry/token-policy-repository.js';
 
-import { applyMigrations, foreignKeyViolations } from '../../util/d1.js';
+import { foreignKeyViolations } from '../../util/d1.js';
 import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
+import { ADMIN_TOKEN } from '../../util/test-env.js';
 
 /*
  * Token policies, through the real worker in workerd over local D1: a
@@ -36,19 +35,7 @@ import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../.
  * Refusals of malformed requests are in token-policy-routes.test.ts, which
  * keeps each file's administrative requests well inside the limiter's budget.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-
-const server = createTestHarness({
-  workers: [ {
-    configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256(ADMIN_TOKEN) },
-  } ],
-});
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { server, freshEnv } = await registryHarness({ admin: true });
 
 const snapshot = loadRegistrySnapshotFixture();
 const auth     = { 'Authorization': `Bearer ${ADMIN_TOKEN}` };
@@ -63,13 +50,6 @@ const WUSDM = '0x57f5e098cad7a3d1eed53991d4d66c45c9af7812';
 const AERO  = '0x940181a94a35a4569e4529a3cdfb74e38fd98631';
 
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-
-async function freshEnv(): Promise<Env> {
-  await server.reset();
-  const env = await server.getWorker<Env>().getEnv();
-  await applyMigrations(env.APP_DB);
-  return env;
-}
 
 function actorOf(env: Env): string {
   return env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`;

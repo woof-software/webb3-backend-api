@@ -16,6 +16,7 @@ import * as comet from '../../../../lib/computations/comet.js';
 import { checksumAddress, type Address } from '../../../../lib/model/comet-registry.js';
 import { catalogOf } from '../../../../src/registry/catalog.js';
 
+import { consoleLines } from '../../../util/console.js';
 import * as mock from '../../../util/mock/mock.js';
 import { loadRegistrySnapshotFixture } from '../../../util/registry-fixture.js';
 
@@ -83,14 +84,6 @@ function stub(answer: (context: any) => unknown) {
   return Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
 }
 
-function captureWarnings(t: { teardown: (fn: () => void) => void }): string[] {
-  const logged: string[] = [];
-  const consoleWarn = console.warn;
-  console.warn = (...args: unknown[]) => { logged.push(args.join(' ')); };
-  t.teardown(() => { console.warn = consoleWarn; });
-  return logged;
-}
-
 /*
  * The price of a collateral of the USDT market whose Comet names `feed` at
  * the block, with every price read answered from `prices` by feed, and
@@ -116,7 +109,7 @@ async function priceOf(feed: string, prices: Record<string, unknown>) {
 }
 
 t.test('a remapped feed is read from its replacement', async t => {
-  const logged = captureWarnings(t);
+  const logged = consoleLines(t, [ 'warn' ]);
   const { answer, reads } = await priceOf(RETIRED, { [REPLACEMENT]: price(8), [RETIRED]: price(18) });
 
   t.strictSame(answer, price(8), 'at the scale the version states for the replacement');
@@ -125,7 +118,7 @@ t.test('a remapped feed is read from its replacement', async t => {
 });
 
 t.test('a block before the replacement was deployed is read from the feed the Comet named', async t => {
-  const logged = captureWarnings(t);
+  const logged = consoleLines(t, [ 'warn' ]);
   const { answer, reads } = await priceOf(RETIRED, { [RETIRED]: price(18) });
 
   t.strictSame(answer, price(18), 'at the scale the version states for that feed');
@@ -134,7 +127,7 @@ t.test('a block before the replacement was deployed is read from the feed the Co
 });
 
 t.test('a remapped feed is reported only when neither feed answers', async t => {
-  const logged = captureWarnings(t);
+  const logged = consoleLines(t, [ 'warn' ]);
   const { answer, reads } = await priceOf(RETIRED, {
     [REPLACEMENT]: reverted('the replacement reverted'),
     [RETIRED]:     reverted('the retired feed reverted'),
@@ -164,7 +157,7 @@ t.test('a feed the version prices is not read', async t => {
  * feed the Comet named answers.
  */
 t.test('a replacement with no code yet falls back through a real read, which reports nothing', async t => {
-  const logged      = captureWarnings(t);
+  const logged      = consoleLines(t, [ 'warn' ]);
   const replacement = '0x6666666666666666666666666666666666666666';
   const contract    = remapping(RETIRED_TOO, replacement);
 

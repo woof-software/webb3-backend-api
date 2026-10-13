@@ -210,6 +210,34 @@ t.test('the summary of every market makes four node requests per network', async
 });
 
 /*
+ * The rewards of a market are read in one round once the block is known:
+ * each APR reads the base price it divides by beside the reward price and the
+ * rates (rewards-apr.ts), not in a round of its own once they are in.
+ */
+t.test('the rewards of every market make two node requests per network', async t => {
+  const node = fakeNode();
+  serving(t, node);
+
+  const response = await marketHandlers.rewardsDappData(everyMarket(), context());
+  t.equal(response.status, 200);
+
+  const rewarded = catalog.markets().filter(entry => entry.comet.registry.market.capabilities.rewards);
+  const networks = [ ...new Set(rewarded.map(entry => entry.network)) ];
+  for (const network of networks) {
+    const requests = node.requests.filter(request => request.network === network);
+    t.equal(requests.length, 2, `${network}: the latest block, then one round of reads, whatever its market count`);
+  }
+  t.equal(node.requests.length, 2 * networks.length);
+
+  // a market whose APRs divide by the USD price of its base asset, as the rewards summary reads them
+  const wbtc = rewarded.find(entry => entry.comet.address.toLowerCase() === WBTC)!;
+  node.requests.length = 0;
+  const summary = await marketHandlers.latestRewardsSummary({ ...everyMarket(), network: wbtc.network, contract: wbtc.comet }, context());
+  t.equal(summary.status, 200);
+  t.equal(node.requests.length, 2, 'and so does the rewards summary of one market');
+});
+
+/*
  * The rewards of every market cost the same per network. A reward feed that
  * quotes a market's base asset — mainnet's WETH market values COMP in ETH —
  * is converted to USD with one more price, read beside the reward price, not

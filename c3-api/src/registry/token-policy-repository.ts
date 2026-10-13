@@ -9,7 +9,7 @@ import type {
   VersionRefV1,
 } from '../../lib/model/comet-registry.js';
 
-import { ApiError } from '../http/errors.js';
+import { ApiError, noActiveVersion } from '../http/errors.js';
 
 import { conflict } from './errors.js';
 import type { TokenPolicyEventRow } from './rows.js';
@@ -116,7 +116,7 @@ function rowsOf<T>(result: D1Result | undefined): T[] {
 
 function activeVersionOf(row: { version_id: string | null, checksum: string | null } | null | undefined): VersionRefV1 {
   if (row === null || row === undefined || row.version_id === null || row.checksum === null) {
-    throw new ApiError('REGISTRY_NOT_ACTIVE', `No active registry snapshot is available`);
+    throw noActiveVersion();
   }
   return { id: row.version_id, checksum: row.checksum };
 }

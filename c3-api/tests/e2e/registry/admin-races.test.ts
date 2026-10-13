@@ -1,16 +1,13 @@
 import t from 'tap';
 
-import { createTestHarness } from 'wrangler';
-
-import type { Env } from '../../../entrypoint.js';
 import type { Address, PriceFeedV1 } from '../../../lib/model/comet-registry.js';
 import { replaceMarketOverlay, validateStoredVersion } from '../../../src/registry/admin.js';
 import { overlayOfMarket } from '../../../src/registry/overlay.js';
 import { readSnapshot, snapshotChecksum } from '../../../src/registry/repository.js';
 
-import { applyMigrations } from '../../util/d1.js';
 import { interleaved } from '../../util/interleave.js';
 import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
 
 /*
  * Administrative commands racing each other over one candidate.
@@ -22,21 +19,14 @@ import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-
  * command that does not check that what it read still holds loses an update,
  * or records a decision about rows that are no longer there.
  */
-const server = createTestHarness({ workers: [ { configPath: './wrangler.toml' } ] });
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { freshDatabase } = await registryHarness();
 
 const snapshot = loadRegistrySnapshotFixture();
 const usdc     = snapshot.networks.find(network => network.chainId === 1)!.markets
   .find(market => market.deploymentKey === 'usdc')!;
 
 async function freshCandidate(): Promise<{ db: D1Database, versionId: string }> {
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db);
+  const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
   return { db, versionId };
 }

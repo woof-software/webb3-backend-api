@@ -21,6 +21,7 @@ import {
   RegistryAnnotation,
   RegistryComet,
   RegistrySnapshotV1,
+  ServedMarket,
   TokenV1,
   checksumAddress,
 } from '../../lib/model/comet-registry.js';
@@ -38,14 +39,6 @@ import { feedContract, tokenContract } from '../../lib/model/registry-contracts.
  * pinned version, and the version id is available for cache keys, because two
  * versions can describe the same address with different metadata.
  */
-
-/*
- * A market the API serves: one that is not disabled, with its Comet, which
- * is what it is addressed and keyed by. Validation refuses a market that does
- * not declare its Comet (comet-contract-declared), so of a validated version
- * only the disabled markets are left out.
- */
-type ServedMarket = MarketV1 & { contracts: MarketV1['contracts'] & { comet: Address } };
 
 type CatalogMarket = {
   chainId:       number,

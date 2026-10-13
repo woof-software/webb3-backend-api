@@ -2,16 +2,14 @@ import t from 'tap';
 
 import { randomUUID } from 'node:crypto';
 
-import { createTestHarness } from 'wrangler';
-
-import type { Env } from '../../../entrypoint.js';
-import { applyMigrations, foreignKeyViolations } from '../../util/d1.js';
+import { foreignKeyViolations } from '../../util/d1.js';
 import {
   clearCandidateSnapshot,
   loadRegistrySnapshotFixture,
   seedCandidate,
   writeCandidateSnapshot,
 } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
 import {
   createCandidate,
   markInvalid,
@@ -34,19 +32,7 @@ import { readValidationSummary } from '../../../src/registry/validation-store.js
  * tests assert that the repository writes rows the triggers accept and that
  * its checksum matches the frozen contract.
  */
-const server = createTestHarness({ workers: [ { configPath: './wrangler.toml' } ] });
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
-
-async function freshDatabase(): Promise<D1Database> {
-  await server.reset();
-  const { APP_DB } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(APP_DB);
-  return APP_DB;
-}
+const { freshDatabase } = await registryHarness();
 
 const snapshot = loadRegistrySnapshotFixture();
 const networks = snapshot.networks;

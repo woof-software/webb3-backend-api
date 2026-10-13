@@ -1,4 +1,4 @@
-import t from 'tap';
+import t, { Test } from 'tap';
 
 import C3Api, { Env } from '../../../entrypoint.js';
 
@@ -8,6 +8,7 @@ import { setDeprecatedCollateral } from '../../../src/registry/deprecated-collat
 import { DEADLINE_MS } from '../../../src/registry/token-collateral.js';
 import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
+import { consoleLines } from '../../util/console.js';
 import { executionContext } from '../../util/execution-context.js';
 import { FakeNode, NodeScript, batches, fakeNode } from '../../util/fake-node.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
@@ -89,12 +90,8 @@ function unreachableFor(db: D1Database, failing: RegExp): D1Database {
 }
 
 // what the worker logged as errors, for the length of a test
-function captureErrors(t: Teardown): string[] {
-  const lines: string[] = [];
-  const error = console.error;
-  console.error = (...parameters: unknown[]) => { lines.push(parameters.map(String).join(' ')); };
-  t.teardown(() => { console.error = error; });
-  return lines;
+function captureErrors(t: Test): string[] {
+  return consoleLines(t, [ 'error' ]);
 }
 
 const decide = (db: D1Database, chainId: number, tokenAddress: string, isStrategic: boolean) => setTokenPolicy(db, {

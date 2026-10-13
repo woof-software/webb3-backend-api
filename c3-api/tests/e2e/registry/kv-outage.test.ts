@@ -3,16 +3,16 @@ import t, { Test } from 'tap';
 import { randomUUID } from 'node:crypto';
 
 import C3Api, { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 import { POINTER_KEY } from '../../../src/registry/cache.js';
 import { DEPRECATED_KEY } from '../../../src/registry/deprecated-collaterals.js';
 import { maintainRegistryCache } from '../../../src/registry/scheduled.js';
 
+import { consoleLines } from '../../util/console.js';
 import { executionContext, settledWithin } from '../../util/execution-context.js';
 import { MemoryKv, refusingKv } from '../../util/kv.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { seedCandidate } from '../../util/registry-fixture.js';
-import { makeTestEnv } from '../../util/test-env.js';
+import { ADMIN_TOKEN, adminTestEnv } from '../../util/test-env.js';
 
 import '../../../shim/node-self.js';
 
@@ -23,21 +23,13 @@ import '../../../shim/node-self.js';
  * the Cron's upkeep fails nothing. The status is what says the cache is gone,
  * and with it the older version a database outage would be answered from.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-const MAINNET     = 'ethereum-mainnet';
-const UNKNOWN     = '0x1111111111111111111111111111111111111111';
+const MAINNET = 'ethereum-mainnet';
+const UNKNOWN = '0x1111111111111111111111111111111111111111';
 
 type Envelope = { error: { code: string, message: string, requestId: string } };
 
-async function envWith(overrides: Partial<Env>): Promise<Env> {
-  return makeTestEnv({
-    MEMORY_CACHE_SEED:                'registry-kv-outage',
-    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256(ADMIN_TOKEN),
-    REGISTRY_ADMIN_RATE_LIMITER:      { limit: async () => ({ success: true }) },
-    REGISTRY_ADMIN_AUTH_RATE_LIMITER: { limit: async () => ({ success: true }) },
-    kv_registry:                      refusingKv(),
-    ...overrides,
-  });
+function envWith(overrides: Partial<Env>): Promise<Env> {
+  return adminTestEnv({ MEMORY_CACHE_SEED: 'registry-kv-outage', kv_registry: refusingKv(), ...overrides });
 }
 
 // without an execution context, so the cache writes the records an outage reads before it answers
@@ -54,17 +46,7 @@ async function post(env: Env, path: string, body: unknown): Promise<Response> {
 }
 
 function captureLogs(t: Test): string[] {
-  const lines: string[] = [];
-  const { error, warn, log } = console;
-  console.error = (...parameters: unknown[]) => { lines.push(`error: ${parameters.map(String).join(' ')}`); };
-  console.warn  = (...parameters: unknown[]) => { lines.push(`warn: ${parameters.map(String).join(' ')}`); };
-  console.log   = (...parameters: unknown[]) => { lines.push(`log: ${parameters.map(String).join(' ')}`); };
-  t.teardown(() => {
-    console.error = error;
-    console.warn  = warn;
-    console.log   = log;
-  });
-  return lines;
+  return consoleLines(t, [ 'error', 'warn', 'log' ], { prefixed: true });
 }
 
 t.test('a namespace that does not answer leaves every read to the database', async t => {

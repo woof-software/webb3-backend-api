@@ -3,8 +3,6 @@ import t from 'tap';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
-import { createTestHarness } from 'wrangler';
-
 import { registryConfig } from '../../../src/registry/config.js';
 import { readDeprecatedCollateral, setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
 import { activationStatements } from '../../../src/registry/repository.js';
@@ -13,7 +11,6 @@ import { readTokenPolicy, setTokenPolicy } from '../../../src/registry/token-pol
 import {
   Row,
   applyMigration,
-  applyMigrations,
   applySql,
   changedRows,
   foreignKeyViolations,
@@ -25,6 +22,7 @@ import {
   seedCandidate,
   sha256Hex,
 } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
 
 /*
  * Runs the worker from wrangler.toml in real workerd with local D1, KV, and
@@ -32,19 +30,7 @@ import {
  * migrations, then checks that migration 0001 enforces the registry
  * invariants in the database itself rather than in application code.
  */
-const server = createTestHarness({ workers: [ { configPath: './wrangler.toml' } ] });
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
-
-async function freshEnv(): Promise<Env> {
-  await server.reset();
-  const env = await server.getWorker<Env>().getEnv();
-  await applyMigrations(env.APP_DB);
-  return env;
-}
+const { server, freshEnv } = await registryHarness();
 
 const NOW = '2026-09-17T00:00:00.000Z';
 
@@ -928,9 +914,7 @@ t.test('sync runs keep one running job and consistent checkpoints', async t => {
  * written to, so it has to apply over their rows and keep the rest of them.
  */
 t.test('migration 0004 keeps the sync history it drops columns from', async t => {
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db, undefined, { through: '0003' });
+  const { APP_DB: db } = await freshEnv({ through: '0003' });
 
   const { registry_version_id: versionId } = await insertCandidate(db);
   const runId = randomUUID();
@@ -1434,9 +1418,7 @@ t.test('a deprecated collateral is decided for a collateral of an active Comet, 
  * activated and the token policies it decided are left as they were.
  */
 t.test('migration 0006 adds its tables beside a registry in use', async t => {
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db, undefined, { through: '0005' });
+  const { APP_DB: db } = await freshEnv({ through: '0005' });
 
   const snapshot = loadRegistrySnapshotFixture();
   const { versionId, counts } = await seedCandidate(db, snapshot);
@@ -1479,9 +1461,7 @@ t.test('migration 0007 leaves the schema 0006 would have created under the depre
   const renamed = await schemaOf(migrated);
   t.same(renamed.filter(object => /legacy/.test(`${object.name} ${object.sql}`)), [], 'no object of 0001 to 0007 says legacy');
 
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db, undefined, { through: '0005' });
+  const { APP_DB: db } = await freshEnv({ through: '0005' });
   await applySql(db, readFileSync('./migrations/0006_legacy_collaterals.sql', 'utf8').replaceAll('legacy', 'deprecated'));
   t.same(renamed, await schemaOf(db), 'and each is the object 0006 creates when it says deprecated, statement for statement');
 });
@@ -1494,9 +1474,7 @@ t.test('migration 0007 leaves the schema 0006 would have created under the depre
  * changes anything.
  */
 t.test('migration 0007 keeps the decisions and events made under 0006, and every invariant', async t => {
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db, undefined, { through: '0006' });
+  const { APP_DB: db } = await freshEnv({ through: '0006' });
 
   // a change as the release before 0007 wrote it: the event and the row beside it, under 0006's names
   const decide = (token: string, previous: number | null, value: number, at: string) => db.batch([

@@ -7,6 +7,8 @@ import * as Index      from '../../../lib/symbolic/index.js';
 import * as Compute    from '../../../lib/symbolic/computation.js';
 import * as Workingset from '../../../lib/symbolic/evaluator/workingset.js';
 
+import { consoleLines } from '../../util/console.js';
+
 function expectState<Scope extends Compute.Spec = Compute.Spec>(
   t:        Test,
   message:  string,
@@ -327,10 +329,7 @@ t.test('WorkingsetEvaluator: a computation that fails says why', async t => {
  * not write it a third time.
  */
 t.test('WorkingsetEvaluator: a computation that fails is not logged by the step that ran it', async t => {
-  const lines: string[] = [];
-  const consoleError = console.error;
-  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
-  t.teardown(() => { console.error = consoleError; });
+  const lines = consoleLines(t, [ 'error' ]);
 
   type Refuse = Compute.Spec<{ name: 'refuse', expects: number, returns: number }>;
   const refuse = Compute.Functor<Refuse>({}).implement({

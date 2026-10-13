@@ -4,14 +4,15 @@ import {
   ActiveMarketV1,
   ActiveNetworkV1,
   Address,
-  MarketV1,
-  NetworkV1,
+  ServedMarket,
+  ServedNetwork,
   isAddress,
   normalizeAddress,
 } from '../../lib/model/comet-registry.js';
 
 import type { CacheDeps } from './cache.js';
 import { RegistryUnavailable, isUnreachable } from './cache.js';
+import { nowOf } from './clock.js';
 import type { DeprecatedCollateral } from './deprecated-collateral-repository.js';
 import { readDeprecatedCollaterals } from './deprecated-collateral-repository.js';
 
@@ -136,7 +137,7 @@ const CHECK_RECORD_EVERY_MS = 300_000;
 const RETRY_RECORD_AFTER_MS = 60_000;
 
 function timeOf(deps: CacheDeps): number {
-  return (deps.now?.() ?? new Date()).getTime();
+  return nowOf(deps.now).getTime();
 }
 
 // whether the record holds these decisions; one that cannot be read, or is not a record, does not
@@ -164,7 +165,7 @@ async function writeRecord(deps: CacheDeps, decisions: DeprecatedDecisions, chec
     await deps.kv.put(DEPRECATED_KEY, JSON.stringify(record));
     return false;
   } catch (error) {
-    deps.debug?.warn(`deprecated collateral record unwritable`, { error });
+    deps.debug.warn(`deprecated collateral record unwritable`, { error });
     return true;
   }
 }
@@ -247,7 +248,7 @@ async function recordDeprecatedCollaterals(deps: CacheDeps): Promise<void> {
   try {
     decisions = deprecatedDecisionsOf(await readDeprecatedCollaterals(deps.db));
   } catch (error) {
-    deps.debug?.warn(`deprecated collateral record not written: the decisions could not be read`, { error });
+    deps.debug.warn(`deprecated collateral record not written: the decisions could not be read`, { error });
     return;
   }
   const last = known.get(deps.kv);
@@ -265,12 +266,12 @@ async function recordDeprecatedCollaterals(deps: CacheDeps): Promise<void> {
  * is past the fallback window.
  */
 async function recordedDeprecated(deps: CacheDeps, cause: unknown): Promise<DeprecatedDecisions> {
-  const unavailable = () => new RegistryUnavailable(`the deprecated collateral decisions could not be read`, 'unreadable', cause);
+  const unavailable = () => new RegistryUnavailable(`the deprecated collateral decisions could not be read`, cause);
   let value: unknown;
   try {
     value = await deps.kv.get(DEPRECATED_KEY, 'json');
   } catch (error) {
-    deps.debug?.warn(`deprecated collateral record unreadable`, { error });
+    deps.debug.warn(`deprecated collateral record unreadable`, { error });
     throw unavailable();
   }
   const collaterals = recordOf(value);
@@ -296,7 +297,7 @@ function reportFallback(deps: CacheDeps, error: unknown): void {
     return;
   }
   reportedFallback.set(deps.db, at);
-  deps.debug?.warn(`deprecated collateral decisions unreadable; answering with the ones last recorded`, { error });
+  deps.debug.warn(`deprecated collateral decisions unreadable; answering with the ones last recorded`, { error });
 }
 
 /*
@@ -314,7 +315,7 @@ async function deprecatedDecisions(deps: CacheDeps): Promise<DeprecatedRead> {
       throw error;
     }
     if (deps.staleSeconds <= 0) {
-      throw new RegistryUnavailable(`the comet registry could not be read`, 'unreadable', error);
+      throw new RegistryUnavailable(`the comet registry could not be read`, error);
     }
     const last = await recordedDeprecated(deps, error);
     reportFallback(deps, error);
@@ -329,18 +330,18 @@ async function deprecatedDecisions(deps: CacheDeps): Promise<DeprecatedRead> {
  * deprecated in this Comet. The version's own objects are left as they are,
  * since the cache hands one snapshot to every request of an isolate.
  */
-function markedMarket(chainId: number, market: MarketV1, deprecated: DeprecatedDecisions): ActiveMarketV1 {
+function markedMarket(chainId: number, market: ServedMarket, deprecated: DeprecatedDecisions): ActiveMarketV1 {
   const comet = market.contracts.comet;
   return {
     ...market,
     collateralAssets: market.collateralAssets.map(asset => ({
       ...asset,
-      isDeprecated: comet !== null && deprecated.has(chainId, comet, asset.token.address),
+      isDeprecated: deprecated.has(chainId, comet, asset.token.address),
     })),
   };
 }
 
-function markedNetwork(network: NetworkV1, deprecated: DeprecatedDecisions): ActiveNetworkV1 {
+function markedNetwork(network: ServedNetwork, deprecated: DeprecatedDecisions): ActiveNetworkV1 {
   return { ...network, markets: network.markets.map(market => markedMarket(network.chainId, market, deprecated)) };
 }
 
@@ -355,7 +356,7 @@ function markedNetwork(network: NetworkV1, deprecated: DeprecatedDecisions): Act
 function deprecatedRepresentation(name: string, networks: Array<{ chainId: number, markets: ActiveMarketV1[] }>): string {
   const flagged = networks.flatMap(network => network.markets.flatMap(market => market.collateralAssets
     .filter(asset => asset.isDeprecated)
-    .map(asset => keyOf(network.chainId, market.contracts.comet!, asset.token.address))));
+    .map(asset => keyOf(network.chainId, market.contracts.comet, asset.token.address))));
   return `${name}+deprecated-${digestOf(flagged)}`;
 }
 

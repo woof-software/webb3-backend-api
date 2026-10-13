@@ -1,4 +1,4 @@
-import t from 'tap';
+import t, { Test } from 'tap';
 
 import * as Debug    from '../../../lib/debug-log.js';
 import * as Flags    from '../../../lib/flags.js';
@@ -69,18 +69,17 @@ function useNode(t: { teardown: (fn: () => void) => void }, node: FakeNode): voi
 }
 
 // the lines a dashboard reads, taken off the console for the length of a test
-function captureEvents(t: { teardown: (fn: () => void) => void }): Array<Record<string, any>> {
+function captureEvents(t: Test): Array<Record<string, any>> {
   const events: Array<Record<string, any>> = [];
   const log = console.log;
-  console.log = (...parameters: unknown[]) => {
+  t.capture(console, 'log', (...parameters: unknown[]) => {
     const [ line ] = parameters;
     if (typeof(line) === 'string' && line.startsWith('{"event":')) {
       events.push(JSON.parse(line));
     } else {
       log(...parameters);
     }
-  };
-  t.teardown(() => { console.log = log; });
+  });
   return events;
 }
 

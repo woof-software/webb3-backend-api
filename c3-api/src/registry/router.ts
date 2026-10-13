@@ -1,19 +1,16 @@
-import * as jsonRpc from '../../lib/json-rpc.js';
-
 import { corsHeaders } from '../http/cors.js';
-import { ApiError, ApiErrorCode, failureResponse, isApiError, nodeUnavailable } from '../http/errors.js';
+import { ApiError, ApiErrorCode, failureResponse } from '../http/errors.js';
+import { knownFailure } from '../http/failures.js';
 
 import type * as Evaluator from '../evaluator.js';
 
 import { routeAdmin } from './admin-router.js';
-import type { CacheDeps, CachedSnapshot } from './cache.js';
 import { activeSnapshot, cacheDepsOf, isUnreachable, versionSnapshot, warmSnapshot } from './cache.js';
-import type { DeprecatedRead } from './deprecated-collaterals.js';
 import { deprecatedDecisions, recordDeprecatedCollaterals } from './deprecated-collaterals.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
-import { catalogHeadersOf, isRegistryUnavailable, requestCatalog, unavailableError } from './request-catalog.js';
+import { catalogHeadersOf, requestCatalog } from './request-catalog.js';
 import type * as TokenCollateral from './token-collateral.js';
 import { maxStaleMinutesOf } from './token-collateral.js';
 
@@ -54,22 +51,6 @@ function isAdminPath(pathname: string): boolean {
  */
 function withoutTrailingSlash(pathname: string): string {
   return pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
-}
-
-/*
- * The cache one request reads the active version through. It is built per
- * request and asked at most once, so two handlers of one response cannot be
- * served different versions.
- */
-function activeReader(deps: CacheDeps): () => Promise<CachedSnapshot | null> {
-  let pending: Promise<CachedSnapshot | null> | null = null;
-  return () => pending ??= activeSnapshot(deps);
-}
-
-// the deprecated decisions of one request, read at most once, for the same reason
-function deprecatedReader(deps: CacheDeps): () => Promise<DeprecatedRead> {
-  let pending: Promise<DeprecatedRead> | null = null;
-  return () => pending ??= deprecatedDecisions(deps);
 }
 
 /*
@@ -116,27 +97,28 @@ function missingSchema(error: unknown): boolean {
 
 /*
  * What a failure means to a client, or null for a fault the client is told
- * nothing about. A registry error keeps its own code in `details.code`, under
- * the class of answer in `error.code`.
+ * nothing about: what it means on every route (knownFailure), and what only
+ * the registry's routes read into it. A registry error keeps its own code in
+ * `details.code`, under the class of answer in `error.code`.
  */
 function asApiError(error: unknown): ApiError | null {
-  if (isApiError(error)) {
-    return error;
-  }
   if (isRegistryError(error)) {
     return new ApiError(ERROR_STATUS[error.code], error.message, { code: error.code });
   }
-  if (isRegistryUnavailable(error)) {
-    return unavailableError(error);
-  }
-  // a node provider that did not serve a call no registry code names: a 503, as on every route
-  if (jsonRpc.isNotServed(error)) {
-    return nodeUnavailable(error);
+  const known = knownFailure(error);
+  if (known !== null) {
+    return known;
   }
   /*
    * A database that could not be reached, wherever a route read it, is the
    * registry being unavailable: a 503 whichever route found out. One that
    * answered with a fault is not this, and stays a 500.
+   *
+   * The legacy routes do not read this into a message. They read D1 only
+   * through the request catalog, which raises an outage as
+   * RegistryUnavailable; what else fails them — KV, Tally, a computation —
+   * may say `unavailable` or `timed out` of itself, as `KV GET failed: 503
+   * Service Unavailable` does, and stays a 500 there.
    */
   if (isUnreachable(error)) {
     return new ApiError('UPSTREAM_UNAVAILABLE', `a service the registry depends on did not answer`);
@@ -187,7 +169,7 @@ async function routeRegistry(
     actor:   env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`,
     requestId,
     debug,
-    active:  activeReader(deps),
+    active:  () => activeSnapshot(deps),
     version: versionId => versionSnapshot(deps, versionId),
     /*
      * Warming is an optimization, and an optimization may not fail a command
@@ -201,7 +183,7 @@ async function routeRegistry(
         debug.warn(`registry snapshot not warmed`, { versionId, error });
       }
     },
-    deprecated:       deprecatedReader(deps),
+    deprecated:       () => deprecatedDecisions(deps),
     recordDeprecated: () => recordDeprecatedCollaterals(deps),
     catalog: registry,
     tokens: {

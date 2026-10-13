@@ -1,10 +1,12 @@
 import t from 'tap';
 
-import { readdirSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 
 import { failureResponse } from '../../../src/http/errors.js';
 import { conflict } from '../../../src/registry/errors.js';
 import { asApiError } from '../../../src/registry/router.js';
+
+import { sourceFiles } from '../../util/sources.js';
 
 /*
  * A 409 of the registry names the conflict it met in `details.code`, which is
@@ -37,9 +39,7 @@ t.test('a conflict is answered as CONFLICT, naming itself beside the details the
  * leave a script nothing to match but the message.
  */
 t.test('no route answers CONFLICT without naming the conflict', async t => {
-  const sources = [ 'lib', 'src' ].flatMap(root => (readdirSync(root, { recursive: true }) as string[])
-    .filter(path => path.endsWith('.ts') && !path.split('/').includes('dist'))
-    .map(path => `${root}/${path}`));
+  const sources = sourceFiles();
   t.ok(sources.length > 200, 'every source file is read');
   const building = sources.filter(path => /ApiError\(\s*'CONFLICT'/.test(readFileSync(path, 'utf8')));
   t.same(building, [ 'src/registry/errors.ts' ], 'only conflict() builds one');

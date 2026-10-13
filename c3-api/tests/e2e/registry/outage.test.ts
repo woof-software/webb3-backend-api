@@ -3,10 +3,10 @@ import t, { Test } from 'tap';
 import { randomUUID } from 'node:crypto';
 
 import C3Api, { Env } from '../../../entrypoint.js';
-import { sha256 } from '../../../lib/hash.js';
 
+import { consoleLines } from '../../util/console.js';
 import { MemoryKv } from '../../util/kv.js';
-import { makeTestEnv } from '../../util/test-env.js';
+import { ADMIN_TOKEN, adminTestEnv, failingDatabase } from '../../util/test-env.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 
 import '../../../shim/node-self.js';
@@ -21,26 +21,14 @@ import '../../../shim/node-self.js';
  * or a release ahead of its migrations: a 500 that tells the client nothing
  * but the request id, while the log has all of it under that id.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-const MAINNET     = 'ethereum-mainnet';
-const USDC        = '0xc3d688b66703497daa19211eedff47f25384cdc3';
-const UNKNOWN     = '0x1111111111111111111111111111111111111111';
+const MAINNET = 'ethereum-mainnet';
+const USDC    = '0xc3d688b66703497daa19211eedff47f25384cdc3';
+const UNKNOWN = '0x1111111111111111111111111111111111111111';
 
 type Envelope = { error: { code: string, message: string, requestId: string } };
 
-function failing(message: string): D1Database {
-  const fail = () => { throw new Error(message); };
-  return { prepare: fail, batch: fail, exec: fail, dump: fail } as unknown as D1Database;
-}
-
-async function envWith(overrides: Partial<Env>): Promise<Env> {
-  return makeTestEnv({
-    MEMORY_CACHE_SEED:                'registry-outage',
-    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256(ADMIN_TOKEN),
-    REGISTRY_ADMIN_RATE_LIMITER:      { limit: async () => ({ success: true }) },
-    REGISTRY_ADMIN_AUTH_RATE_LIMITER: { limit: async () => ({ success: true }) },
-    ...overrides,
-  });
+function envWith(overrides: Partial<Env>): Promise<Env> {
+  return adminTestEnv({ MEMORY_CACHE_SEED: 'registry-outage', ...overrides });
 }
 
 /*
@@ -53,20 +41,12 @@ async function get(env: Env, path: string, headers: Record<string, string> = {})
 }
 
 function captureLogs(t: Test): string[] {
-  const lines: string[] = [];
-  const { error, warn } = console;
-  console.error = (...parameters: unknown[]) => { lines.push(`error: ${parameters.map(String).join(' ')}`); };
-  console.warn  = (...parameters: unknown[]) => { lines.push(`warn: ${parameters.map(String).join(' ')}`); };
-  t.teardown(() => {
-    console.error = error;
-    console.warn  = warn;
-  });
-  return lines;
+  return consoleLines(t, [ 'error', 'warn' ], { prefixed: true });
 }
 
 t.test('a database that cannot be reached, with nothing cached, is a 503 on every route', async t => {
   const logs = captureLogs(t);
-  const env  = await envWith({ APP_DB: failing('D1_ERROR: Network connection lost.') });
+  const env  = await envWith({ APP_DB: failingDatabase('D1_ERROR: Network connection lost.') });
 
   for (const path of [
     '/registry/v1/active',
@@ -93,7 +73,7 @@ t.test('a database that cannot be reached, with nothing cached, is a 503 on ever
 
 t.test('a database that answers with a fault is a 500 that says nothing but the request id', async t => {
   const logs = captureLogs(t);
-  const env  = await envWith({ APP_DB: failing('D1_ERROR: no such column: version.snapshot_digest: SQLITE_ERROR') });
+  const env  = await envWith({ APP_DB: failingDatabase('D1_ERROR: no such column: version.snapshot_digest: SQLITE_ERROR') });
 
   for (const path of [ '/registry/v1/active', `/market/${MAINNET}/${USDC}/summary` ]) {
     const response = await get(env, path);
@@ -115,7 +95,7 @@ t.test('a database that answers with a fault is a 500 that says nothing but the 
  */
 t.test('a missing table is a 500, unless it is a token policy or deprecated collateral table', async t => {
   const logs = captureLogs(t);
-  const env  = await envWith({ APP_DB: failing('D1_ERROR: no such table: registry_state: SQLITE_ERROR') });
+  const env  = await envWith({ APP_DB: failingDatabase('D1_ERROR: no such table: registry_state: SQLITE_ERROR') });
 
   for (const path of [ '/registry/v1/active', '/registry/v1/networks/1/markets', '/registry/v1/networks/1/tokens' ]) {
     const response = await get(env, path);

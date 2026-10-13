@@ -1,5 +1,7 @@
 import type { NotServed } from '../../lib/json-rpc.js';
 
+import type { Log } from '../log.js';
+
 /*
  * Typed HTTP errors with one JSON envelope.
  *
@@ -81,6 +83,14 @@ function methodNotAllowed(method: string, pathname: string, allowed: string[]): 
 }
 
 /*
+ * The answer to a request that needs the active version while none is, on
+ * every route: not an outage but what D1 said, so it has a code of its own.
+ */
+function noActiveVersion(): ApiError {
+  return new ApiError('REGISTRY_NOT_ACTIVE', `No active registry snapshot is available`);
+}
+
+/*
  * The answer to a request a node provider did not serve, on every route: worth
  * trying again, after as long as the node provider proxy asked, when it said.
  */
@@ -121,11 +131,6 @@ function errorResponse(error: ApiError, requestId: string, headers: Record<strin
   });
 }
 
-type FailureLog = {
-  error: (...parameters: unknown[]) => unknown,
-  warn:  (...parameters: unknown[]) => unknown,
-};
-
 /*
  * The answer to a request that failed, and the log line an operator finds it
  * by, under the same request id.
@@ -144,7 +149,7 @@ function failureResponse(
   { requestId, pathname, debug, label, headers = {} }: {
     requestId: string,
     pathname:  string,
-    debug:     FailureLog,
+    debug:     Pick<Log, 'error' | 'warn'>,
     // what the log line says failed, such as the router that answered
     label:     string,
     headers?:  Record<string, string>,
@@ -159,5 +164,5 @@ function failureResponse(
   return errorResponse(error, requestId, headers);
 }
 
-export type { ApiErrorCode, FailureLog };
-export { ApiError, failureResponse, isApiError, methodNotAllowed, nodeUnavailable };
+export type { ApiErrorCode };
+export { ApiError, failureResponse, isApiError, methodNotAllowed, noActiveVersion, nodeUnavailable };

@@ -1,5 +1,14 @@
 import type { Env } from '../../entrypoint.js';
+import { sha256 } from '../../lib/hash.js';
+
 import { MemoryKv } from './kv.js';
+
+/*
+ * The token the administrative routes take in tests. A worker is given only
+ * its hash (COMET_REGISTRY_ADMIN_TOKEN_HASH), as production is, and a test
+ * presents the token itself.
+ */
+const ADMIN_TOKEN = 'registry-admin-token-for-tests';
 
 /*
  * Stands in for a binding that only exists inside workerd. Any use throws, so
@@ -59,4 +68,30 @@ function makeTestEnv(overrides: Partial<Env> = {}, processEnv: NodeJS.ProcessEnv
   return Object.assign(defaultTestEnv(), overrides, processEnv);
 }
 
-export { makeTestEnv };
+/*
+ * The Env of a Node-side test that sends administrative requests: its routes
+ * take ADMIN_TOKEN, and both limiters let every request through, where the
+ * default ones throw. What the limiters refuse is tested through workerd, in
+ * tests/e2e/registry/security.test.ts.
+ */
+async function adminTestEnv(overrides: Partial<Env> = {}): Promise<Env> {
+  return makeTestEnv({
+    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256(ADMIN_TOKEN),
+    REGISTRY_ADMIN_RATE_LIMITER:      { limit: async () => ({ success: true }) },
+    REGISTRY_ADMIN_AUTH_RATE_LIMITER: { limit: async () => ({ success: true }) },
+    ...overrides,
+  });
+}
+
+// a database every call to which throws `failure`, or an error with that message
+function failingDatabase(failure: string | Error): D1Database {
+  const fail = () => { throw typeof(failure) === 'string' ? new Error(failure) : failure; };
+  return { prepare: fail, batch: fail, exec: fail, dump: fail } as unknown as D1Database;
+}
+
+export {
+  ADMIN_TOKEN,
+  adminTestEnv,
+  failingDatabase,
+  makeTestEnv,
+};

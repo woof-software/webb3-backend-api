@@ -27,9 +27,7 @@ t.test('a market route evaluates in the mainnet storage, and a request for testn
   t.teardown(() => registry.dispose());
 
   // the failure each route answers with here is logged; nothing here is about it
-  const error = console.error;
-  console.error = () => {};
-  t.teardown(() => { console.error = error; });
+  t.capture(console, 'error');
 
   // the storage each evaluator was made for; an evaluator that is asked anything fails, as there is no node
   const environments: string[] = [];
@@ -39,9 +37,10 @@ t.test('a market route evaluates in the mainnet storage, and a request for testn
     return { evaluate: unanswered, pull1: () => null, pipe1: () => null, split: () => null, value: () => null };
   }) as unknown as Parameters<typeof route>[2];
   const context = {
-    env:   makeTestEnv({ DEBUG: '', MEMORY_CACHE_SEED: 'network-environment', APP_DB: registry.db }),
-    debug: Debug.MakeLogger([]).configure({ DEBUG: '' }),
-    flags: Flags.parseWithDefaults({}),
+    env:       makeTestEnv({ DEBUG: '', MEMORY_CACHE_SEED: 'network-environment', APP_DB: registry.db }),
+    debug:     Debug.MakeLogger([]).configure({ DEBUG: '' }),
+    flags:     Flags.parseWithDefaults({}),
+    requestId: crypto.randomUUID(),
   };
   const storageOf = async (path: string): Promise<string[]> => {
     environments.length = 0;
