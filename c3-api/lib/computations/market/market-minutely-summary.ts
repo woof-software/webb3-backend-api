@@ -14,8 +14,8 @@ type MarketMinutelySummary = Compute.Spec<{
 
 const { implement, pull1 } = Compute.Functor<MarketMinutelySummary>({});
 const marketMinutelySummary = implement({
-  // 5: the latest summary, with its totals in USD, reserves, the rate model and each collateral's price and parameters, and its collateral and base feed as the registry version describes them
-  version: 5,
+  // 6: the latest summary, without reserves, the rate model or each collateral's price and parameters
+  version: 6,
   index: Index.MinutelyBlockIndex,
   key(name, {block, ...context}) {
     const { block: projected } = Fallible.must(this.index.project({ block, ...context }));

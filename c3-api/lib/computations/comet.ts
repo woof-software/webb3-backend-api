@@ -11,18 +11,6 @@ import { BorrowBalanceOf      } from './comet/borrow-balance-of.js';
 import { SupplyRatePerSecond  } from './comet/supply-rate-per-second.js';
 import { BorrowRatePerSecond  } from './comet/borrow-rate-per-second.js';
 import { AssetTotalCollateral } from './comet/asset-total-collateral.js';
-import { Reserves, CollateralReserves } from './comet/reserves.js';
-import {
-  RateModel,
-  SupplyKink,
-  SupplyPerSecondInterestRateBase,
-  SupplyPerSecondInterestRateSlopeLow,
-  SupplyPerSecondInterestRateSlopeHigh,
-  BorrowKink,
-  BorrowPerSecondInterestRateBase,
-  BorrowPerSecondInterestRateSlopeLow,
-  BorrowPerSecondInterestRateSlopeHigh,
-} from './comet/rate-model.js';
 import { BaseBorrowMin        } from './comet/base-borrow-min.js';
 import { BaseUsdPrice         } from './comet/base-usd-price.js';
 import { CollateralTotal      } from './comet/collateral-total.js';
@@ -41,17 +29,6 @@ export type Comet = (
   | SupplyRatePerSecond
   | BorrowRatePerSecond
   | AssetTotalCollateral
-  | Reserves
-  | CollateralReserves
-  | RateModel
-  | SupplyKink
-  | SupplyPerSecondInterestRateBase
-  | SupplyPerSecondInterestRateSlopeLow
-  | SupplyPerSecondInterestRateSlopeHigh
-  | BorrowKink
-  | BorrowPerSecondInterestRateBase
-  | BorrowPerSecondInterestRateSlopeLow
-  | BorrowPerSecondInterestRateSlopeHigh
   | BorrowBalanceOf
   | BaseBorrowMin
   | BaseUsdPrice
@@ -107,32 +84,3 @@ export {
   BaseBorrowMin, 
   baseBorrowMin
 } from './comet/base-borrow-min.js';
-
-export {
-  Reserves,
-  reserves,
-  CollateralReserves,
-  collateralReserves,
-} from './comet/reserves.js';
-
-export {
-  RateModel,
-  rateModel,
-  SupplyKink,
-  supplyKink,
-  SupplyPerSecondInterestRateBase,
-  supplyPerSecondInterestRateBase,
-  SupplyPerSecondInterestRateSlopeLow,
-  supplyPerSecondInterestRateSlopeLow,
-  SupplyPerSecondInterestRateSlopeHigh,
-  supplyPerSecondInterestRateSlopeHigh,
-  BorrowKink,
-  borrowKink,
-  BorrowPerSecondInterestRateBase,
-  borrowPerSecondInterestRateBase,
-  BorrowPerSecondInterestRateSlopeLow,
-  borrowPerSecondInterestRateSlopeLow,
-  BorrowPerSecondInterestRateSlopeHigh,
-  borrowPerSecondInterestRateSlopeHigh,
-} from './comet/rate-model.js';
-export type { RateCurve } from './comet/rate-model.js';
