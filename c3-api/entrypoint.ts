@@ -137,10 +137,9 @@ function secured(response: Response, cors: Record<string, string> = {}): Respons
  * evaluators of either router evaluate. Each router is handed evaluators of
  * these typed by the scope its own handlers read.
  *
- * It takes the execution context even where there is none, so no call can
- * drop the request's waitUntil by leaving it out.
+ * It takes the request's waitUntil, so no call can drop it by leaving it out.
  */
-function prepare(env: Env, executionContext: ExecutionContext | undefined) {
+function prepare(env: Env, waitUntil: (work: Promise<unknown>) => void) {
   /*
    * What one request may spend before the counting fetch and the
    * computation cache refuse it themselves. No environment sets either
@@ -163,12 +162,7 @@ function prepare(env: Env, executionContext: ExecutionContext | undefined) {
     env,
     debug,
     flags,
-    /*
-     * A closure: the method called on its own throws. A caller that gave no
-     * execution context, such as a test calling the worker directly, gets no
-     * waitUntil, and the cache waits for the writes it would hand to one.
-     */
-    ...(executionContext === undefined ? {} : { waitUntil: (work: Promise<unknown>) => executionContext.waitUntil(work) }),
+    waitUntil,
   };
   return {
     context,
@@ -197,37 +191,58 @@ function prepare(env: Env, executionContext: ExecutionContext | undefined) {
   };
 }
 
-export default {
-  async fetch(request: Request, env: Env, executionContext?: ExecutionContext): Promise<Response> {
-    const { pathname } = new URL(request.url);
-    /*
-     * The path decides which router answers, here and nowhere else. The
-     * registry answers everything under its prefix, its preflight, its errors
-     * and its CORS headers included — none on an administrative route, whose
-     * authenticated writes no script on any origin may read.
-     */
-    if (isRegistryPath(pathname)) {
-      const { context, requestId, quota, computations } = prepare(env, executionContext);
-      return secured(await routeRegistry(
-        request,
-        { ...context, requestId },
-        Evaluator.preInstantiate(quota, context, computations),
-      ));
-    }
-    /*
-     * Every other path is a legacy route's. Its preflight reads nothing, so
-     * it is answered before anything is set up for it.
-     */
-    if (request.method === 'OPTIONS') {
-      return secured(new Response(null, { status: 204 }), corsHeaders('legacy', { preflight: true }));
-    }
-    const { context, requestId, quota, computations } = prepare(env, executionContext);
-    const response = await route(
+async function answer(request: Request, env: Env, waitUntil: (work: Promise<unknown>) => void): Promise<Response> {
+  const { pathname } = new URL(request.url);
+  /*
+   * The path decides which router answers, here and nowhere else. The
+   * registry answers everything under its prefix, its preflight, its errors
+   * and its CORS headers included — none on an administrative route, whose
+   * authenticated writes no script on any origin may read.
+   */
+  if (isRegistryPath(pathname)) {
+    const { context, requestId, quota, computations } = prepare(env, waitUntil);
+    return secured(await routeRegistry(
       request,
       { ...context, requestId },
       Evaluator.preInstantiate(quota, context, computations),
-    );
-    return secured(response, corsHeaders('legacy'));
+    ));
+  }
+  /*
+   * Every other path is a legacy route's. Its preflight reads nothing, so
+   * it is answered before anything is set up for it.
+   */
+  if (request.method === 'OPTIONS') {
+    return secured(new Response(null, { status: 204 }), corsHeaders('legacy', { preflight: true }));
+  }
+  const { context, requestId, quota, computations } = prepare(env, waitUntil);
+  const response = await route(
+    request,
+    { ...context, requestId },
+    Evaluator.preInstantiate(quota, context, computations),
+  );
+  return secured(response, corsHeaders('legacy'));
+}
+
+export default {
+  /*
+   * The runtime always gives an execution context. A call without one, as a
+   * test makes, is answered once everything the request handed to waitUntil
+   * has finished, so what a request writes past its answer is there for the
+   * request after it. A test that holds such work back passes its own context
+   * (tests/util/execution-context.ts).
+   */
+  async fetch(request: Request, env: Env, executionContext?: ExecutionContext): Promise<Response> {
+    const handed: Array<Promise<unknown>> = [];
+    // the context's method in a closure: called on its own, it throws
+    const waitUntil = executionContext === undefined
+      ? (work: Promise<unknown>) => { handed.push(work); }
+      : (work: Promise<unknown>) => executionContext.waitUntil(work);
+    const response = await answer(request, env, waitUntil);
+    // until nothing is left: a valuation handed over hands over its minute's record once it is done
+    while (handed.length > 0) {
+      await Promise.allSettled(handed.splice(0));
+    }
+    return response;
   },
 
   /*

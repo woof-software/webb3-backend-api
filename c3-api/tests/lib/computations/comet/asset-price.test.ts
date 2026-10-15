@@ -6,7 +6,6 @@ import * as Flags    from '../../../../lib/flags.js';
 import { BigNumber } from '../../../../lib/bignumber.js';
 import { BigFixnum } from '../../../../lib/bigfixnum.js';
 
-import * as Compute    from '../../../../lib/symbolic/computation.js';
 import * as Evaluator  from '../../../../lib/symbolic/evaluator.js';
 import { MemoryCache } from '../../../../lib/symbolic/cache.js';
 
@@ -17,6 +16,7 @@ import { checksumAddress, type Address } from '../../../../lib/model/comet-regis
 import { catalogOf } from '../../../../src/registry/catalog.js';
 
 import { consoleLines } from '../../../util/console.js';
+import { stub } from '../../../util/evaluator.js';
 import * as mock from '../../../util/mock/mock.js';
 import { loadRegistrySnapshotFixture } from '../../../util/registry-fixture.js';
 
@@ -79,10 +79,6 @@ declare var fetch: mock.Fetch;
 
 const price    = (decimals: number) => ({ status: 'success' as const, price: BigFixnum.from({ decimals, value: BigNumber.from(10).pow(decimals) }) });
 const reverted = (message: string) => ({ status: 'error' as const, message });
-
-function stub(answer: (context: any) => unknown) {
-  return Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
-}
 
 /*
  * The price of a collateral of the USDT market whose Comet names `feed` at

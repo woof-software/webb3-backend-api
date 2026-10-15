@@ -1,14 +1,13 @@
 import t, { Test } from 'tap';
 
-import { Interface, type FunctionFragment } from '@ethersproject/abi';
-import { BigNumber as EthersBigNumber } from '@ethersproject/bignumber';
-
 import C3Api, { Env } from '../../../entrypoint.js';
 
 import type { NetworkV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
 import { failures, validateCandidate } from '../../../src/registry/validation.js';
 
+import { consoleLines } from '../../util/console.js';
+import { asked, fakeNode, serve } from '../../util/fake-node.js';
 import { makeTestEnv } from '../../util/test-env.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
@@ -53,88 +52,6 @@ function unreachedSnapshot(): RegistrySnapshotV1 {
   };
 }
 
-const COMET = new Interface([
-  'function numAssets() view returns (uint8)',
-  'function getAssetInfo(uint8) view returns (tuple(uint8 offset, address asset, address priceFeed, uint64 scale, uint64 borrowCollateralFactor, uint64 liquidateCollateralFactor, uint64 liquidationFactor, uint128 supplyCap))',
-  'function baseTokenPriceFeed() view returns (address)',
-  'function getPrice(address) view returns (uint256)',
-  'function totalSupply() view returns (uint256)',
-  'function totalBorrow() view returns (uint256)',
-  'function getUtilization() returns (uint256)',
-  'function getSupplyRate(uint) returns (uint)',
-  'function getBorrowRate(uint) returns (uint)',
-  'function totalsCollateral(address) view returns (uint128)',
-  'function symbol() view returns (string)',
-  // the rewards of a market
-  'function baseBorrowMin() view returns (uint)',
-  'function baseMinForRewards() view returns (uint256)',
-  'function baseTrackingSupplySpeed() view returns (uint256)',
-  'function baseTrackingBorrowSpeed() view returns (uint256)',
-  'function trackingIndexScale() view returns (uint256)',
-  'function totalsBasic() view returns (tuple(uint64 baseSupplyIndex, uint64 baseBorrowIndex, uint64 trackingSupplyIndex, uint64 trackingBorrowIndex, uint104 totalSupplyBase, uint104 totalBorrowBase, uint40 lastAccrualTime, uint8 pauseFlags))',
-]);
-
-type Call = { id: number, method: string, params: any[] };
-
-// the error the node answers a call to a Comet with instead of its result, if any
-type Fault = (comet: string, fragment: string) => { code: number, message: string, data?: string } | undefined;
-
-/*
- * A node at LATEST that answers every read of the market routes from the
- * snapshot, at whatever block it is asked, in place of the global fetch for
- * the length of a test. It reports the Comets it was asked about.
- */
-function serving(t: Test, snapshot: RegistrySnapshotV1, fault: Fault = () => undefined): Set<string> {
-  const markets = new Map(snapshot.networks.flatMap(network => network.markets.map(market => (
-    [ market.contracts.comet!.toLowerCase(), market ] as const
-  ))));
-  const symbols = new Map(snapshot.networks.flatMap(network => network.markets.flatMap(market => (
-    market.collateralAssets.map(asset => [ asset.token.address.toLowerCase(), asset.token.symbol ] as const)
-  ))));
-  const asked = new Set<string>();
-
-  const answer = ({ id, method, params }: Call) => {
-    if (method === 'eth_getBlockByNumber') {
-      return { jsonrpc: '2.0', id, result: { number: `0x${LATEST.number.toString(16)}`, timestamp: `0x${LATEST.timestamp.toString(16)}`, transactions: [] } };
-    }
-    const [ { to, data } ] = params;
-    const fragment = COMET.getFunction(data.slice(0, 10)) as FunctionFragment;
-    asked.add(to.toLowerCase());
-    const error = fault(to.toLowerCase(), fragment.name);
-    if (error !== undefined) {
-      return { jsonrpc: '2.0', id, error };
-    }
-    const market = markets.get(to.toLowerCase());
-    const values = ((): unknown[] => {
-      switch (fragment.name) {
-        case 'numAssets':          return [ market!.collateralAssets.length ];
-        case 'getAssetInfo': {
-          const asset = market!.collateralAssets[Number(COMET.decodeFunctionData(fragment, data)[0])]!;
-          return [ [ asset.assetIndex, asset.token.address, asset.priceFeed.address, EthersBigNumber.from(10).pow(asset.token.decimals), 0, 0, 0, 0 ] ];
-        }
-        case 'baseTokenPriceFeed': return [ market!.baseAsset.priceFeed.address ];
-        case 'symbol':             return [ symbols.get(to.toLowerCase()) ?? 'TKN' ];
-        case 'totalsBasic': {
-          const [ index, base ] = [ EthersBigNumber.from(10).pow(15), EthersBigNumber.from(10).pow(12) ];
-          return [ [ index, index, 0, 0, base, base, LATEST.timestamp, 0 ] ];
-        }
-        default:                   return [ EthersBigNumber.from(10).pow(8) ];
-      }
-    })();
-    return { jsonrpc: '2.0', id, result: COMET.encodeFunctionResult(fragment, values) };
-  };
-
-  const fetchBefore = globalThis.fetch;
-  globalThis.fetch = (async (input: string | Request, init?: RequestInit) => {
-    const body  = await new Request(input, init).json() as Call | Call[];
-    const calls = body instanceof Array ? body : [ body ];
-    const answers = calls.map(answer);
-    return new Response(JSON.stringify(body instanceof Array ? answers : answers[0]));
-  }) as typeof globalThis.fetch;
-  t.teardown(() => { globalThis.fetch = fetchBefore; });
-  return asked;
-}
-
 /*
  * The worker over a database whose active version is `snapshot`. Each test
  * keeps its computations in a memory cache of its own: one filled by another
@@ -151,15 +68,6 @@ type Entry = { chain_id: number, comet: { address: string }, status: string, mes
 type Day   = Entry & { date: string, timestamp: number };
 
 type Envelope = { error: { code: string, message: string, requestId: string } };
-
-// the lines a test logs as `level`, kept out of the test's output
-function captured(t: Test, level: 'error' | 'warn'): string[] {
-  const lines: string[] = [];
-  const write = console[level];
-  console[level] = (...parameters: unknown[]) => { lines.push(parameters.map(String).join(' ')); };
-  t.teardown(() => { console[level] = write; });
-  return lines;
-}
 
 const isUsdt = (entry: Entry) => entry.comet.address.toLowerCase() === USDT;
 
@@ -181,9 +89,10 @@ t.test('a version that holds a creation block past the latest block validates', 
 t.test('the summaries answer a market created past the latest block as an error, and the rest as read', async t => {
   const snapshot = unreachedSnapshot();
   const get      = await workerOf(t, snapshot);
-  const asked    = serving(t, snapshot);
-  const warnings = captured(t, 'warn');
+  const node     = fakeNode(snapshot, LATEST);
+  const warnings = consoleLines(t, [ 'warn' ]);
   const markets  = fixtureCatalog(snapshot).markets().length;
+  serve(t, node);
 
   const everyNetwork = await get('/market/all-networks/all-contracts/summary');
   t.equal(everyNetwork.status, 200, 'the summary of every network is answered');
@@ -202,7 +111,7 @@ t.test('the summaries answer a market created past the latest block as an error,
   t.equal(alone.status, 200, 'the summary of that market alone is its status, as a price that reverts is');
   t.strictSame(await alone.json(), unreached(snapshot), 'answered as an object, as one market always was');
 
-  t.notOk(asked.has(USDT), 'and nothing of it was read');
+  t.notOk(asked(node).has(USDT), 'and nothing of it was read');
   t.same(warnings.filter(line => line.includes(MESSAGE)), [
     `creation block not reached: ${unreached(snapshot).comet.address} on ${MAINNET}: ${MESSAGE}`,
   ], 'while the log names it once, however many routes answered it');
@@ -216,8 +125,8 @@ t.test('the summaries answer a market created past the latest block as an error,
 t.test('the history answers every day of a market created past the latest block as an error', async t => {
   const snapshot = unreachedSnapshot();
   const get      = await workerOf(t, snapshot);
-  serving(t, snapshot);
-  captured(t, 'warn');
+  serve(t, fakeNode(snapshot, LATEST));
+  consoleLines(t, [ 'warn' ]);
 
   const response = await get('/market/all-networks/all-contracts/historical/summary');
   t.equal(response.status, 200, 'the history of every network is answered');
@@ -241,8 +150,8 @@ t.test('the history answers every day of a market created past the latest block 
 t.test('the rewards answer a market created past the latest block as an error', async t => {
   const snapshot = unreachedSnapshot();
   const get      = await workerOf(t, snapshot);
-  serving(t, snapshot);
-  captured(t, 'warn');
+  serve(t, fakeNode(snapshot, LATEST));
+  consoleLines(t, [ 'warn' ]);
 
   const response = await get('/market/all-networks/all-contracts/rewards/dapp-data');
   t.equal(response.status, 200, 'the rewards of every network are answered');
@@ -260,13 +169,12 @@ t.test('the rewards answer a market created past the latest block as an error', 
  * the one the chain has not reached, fails the answer as it always has.
  */
 t.test('a node that did not serve another market still fails the summary with 503', async t => {
-  captured(t, 'error');
-  captured(t, 'warn');
+  consoleLines(t, [ 'error', 'warn' ]);
   const snapshot = unreachedSnapshot();
   const get      = await workerOf(t, snapshot);
-  serving(t, snapshot, (comet, fragment) => (
-    comet === WBTC && fragment === 'totalSupply' ? { code: -32000, message: 'header not found' } : undefined
-  ));
+  serve(t, fakeNode(snapshot, LATEST, { answer: ({ comet, name }) => (
+    comet === WBTC && name === 'totalSupply' ? { code: -32000, message: 'header not found' } : undefined
+  ) }));
 
   const response = await get('/market/all-networks/all-contracts/summary');
   t.equal(response.status, 503);
@@ -274,13 +182,12 @@ t.test('a node that did not serve another market still fails the summary with 50
 });
 
 t.test('a read of another market that reverts still fails the summary with 500', async t => {
-  captured(t, 'error');
-  captured(t, 'warn');
+  consoleLines(t, [ 'error', 'warn' ]);
   const snapshot = unreachedSnapshot();
   const get      = await workerOf(t, snapshot);
-  serving(t, snapshot, (comet, fragment) => (
-    comet === WBTC && fragment === 'totalSupply' ? { code: 3, message: 'execution reverted', data: '0x' } : undefined
-  ));
+  serve(t, fakeNode(snapshot, LATEST, { answer: ({ comet, name }) => (
+    comet === WBTC && name === 'totalSupply' ? 'revert' : undefined
+  ) }));
 
   const response = await get('/market/all-networks/all-contracts/summary');
   t.equal(response.status, 500);

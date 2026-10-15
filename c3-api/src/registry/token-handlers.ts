@@ -1,6 +1,4 @@
-import { Address, isAddress, normalizeAddress } from '../../lib/model/comet-registry.js';
-
-import type * as KnownNetwork from '../../lib/well-known/networks/network.js';
+import type { Address } from '../../lib/model/comet-registry.js';
 
 import { ApiError } from '../http/errors.js';
 import { jsonResponse } from '../http/json.js';
@@ -8,7 +6,7 @@ import { jsonResponse } from '../http/json.js';
 import { isUnreachable } from './cache.js';
 import { readDeprecatedCollaterals } from './deprecated-collateral-repository.js';
 import { DeprecatedDecisions, deprecatedDecisionsOf } from './deprecated-collaterals.js';
-import { RegistryContext, chainIdOf } from './handlers.js';
+import { RegistryContext, addressOf, chainIdOf } from './handlers.js';
 import { catalogHeaders } from './request-catalog.js';
 import { collateralView, positionsOf } from './token-collateral.js';
 import { tokenList } from './token-visibility.js';
@@ -33,24 +31,13 @@ import { registryHeaders } from './version-headers.js';
  * headers and in the body, as the other registry routes do.
  */
 
-/*
- * A token is addressed by its address in any case; it is stored and answered
- * lowercase, as every address the registry holds.
- */
-function tokenAddressOf(value: string): Address {
-  if (!isAddress(value)) {
-    throw new ApiError('BAD_REQUEST', `${value} is not an address`);
-  }
-  return normalizeAddress(value);
-}
-
 async function getTokenPolicies(context: RegistryContext, chainId: string): Promise<Response> {
   const policies = await readTokenPolicies(context.db, chainIdOf(chainId));
   return jsonResponse(policies, { headers: registryHeaders(policies.registryVersion) });
 }
 
 async function getTokenPolicy(context: RegistryContext, chainId: string, tokenAddress: string): Promise<Response> {
-  const policy = await readTokenPolicy(context.db, chainIdOf(chainId), tokenAddressOf(tokenAddress));
+  const policy = await readTokenPolicy(context.db, chainIdOf(chainId), addressOf(tokenAddress));
   return jsonResponse(policy, { headers: registryHeaders(policy.registryVersion) });
 }
 
@@ -68,7 +55,7 @@ async function patchTokenPolicy(
 ): Promise<Response> {
   const result = await setTokenPolicy(context.db, {
     chainId:      chainIdOf(chainId),
-    tokenAddress: tokenAddressOf(tokenAddress),
+    tokenAddress: addressOf(tokenAddress),
     isStrategic:  decision.isStrategic,
     actor:        context.actor,
     reason:       decision.reason,
@@ -132,15 +119,17 @@ async function strategicTokens(context: RegistryContext, chainId: number): Promi
 }
 
 /*
- * The deprecated collateral decisions of a chain, read as the strategic ones
- * are: from the database on every request, and a 503 when it does not answer,
- * since without them the list would call a deprecated collateral current, and
- * show a token it hides. Unlike the active reads, the list does not answer
- * from the decisions last recorded: it fails with the token policies anyway.
+ * The deprecated collateral decisions, read as the strategic ones are: from
+ * the database on every request, and a 503 when it does not answer, since
+ * without them the list would call a deprecated collateral current, and show
+ * a token it hides. They are every chain's, read as the active reads read
+ * them, and the list looks up its own chain's. Unlike the active reads, the
+ * list does not answer from the decisions last recorded: it fails with the
+ * token policies anyway.
  */
 async function deprecatedCollaterals(context: RegistryContext, chainId: number): Promise<DeprecatedDecisions> {
   try {
-    return deprecatedDecisionsOf(await readDeprecatedCollaterals(context.db, chainId));
+    return deprecatedDecisionsOf(await readDeprecatedCollaterals(context.db));
   } catch (error) {
     if (isUnreachable(error)) {
       context.debug.error(`the token list could not read the deprecated collateral decisions`, { requestId: context.requestId, chainId, error });
@@ -168,12 +157,11 @@ async function getTokenList(request: Request, context: RegistryContext, chainIdT
   const catalog     = await context.catalog.load();
   const registryVersion = { id: catalog.versionId, checksum: catalog.checksum };
 
-  const network = catalog.networks().find(entry => entry.chainId === chainId);
-  if (network === undefined) {
+  const served = catalog.networkOn(chainId);
+  if (served === null) {
     throw new ApiError('NOT_FOUND', `chain ${chainId} is not part of the active registry`, { registryVersion }, registryHeaders(registryVersion));
   }
-  // the catalog only holds networks this API can name
-  const name      = network.key as KnownNetwork.Name;
+  const name      = served.name;
   const positions = positionsOf(catalog, name);
   const valuing   = collateralView(context.tokens, { chainId, network: name, positions, versionId: catalog.versionId });
   /*
@@ -206,6 +194,4 @@ export {
   patchTokenPolicy,
   postTokenPolicyApply,
   postTokenPolicyReview,
-  tokenAddressOf,
-  visibleOnlyOf,
 };

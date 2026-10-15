@@ -1,8 +1,5 @@
 import t, { Test } from 'tap';
 
-import { Interface, type FunctionFragment } from '@ethersproject/abi';
-import { BigNumber as EthersBigNumber } from '@ethersproject/bignumber';
-
 import * as Debug    from '../../lib/debug-log.js';
 import * as Flags    from '../../lib/flags.js';
 import * as jsonRpc  from '../../lib/json-rpc.js';
@@ -25,6 +22,8 @@ import {
   type UninstantiatedContext,
 } from '../../src/router.js';
 
+import { consoleLines } from '../util/console.js';
+import { type Call, type FakeNode, fakeNode, serve } from '../util/fake-node.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../util/registry-fixture.js';
 
 import '../../shim/node-self.js';
@@ -55,29 +54,6 @@ const LATEST = { number: 30_000_000, timestamp: 1_790_000_000 };
 const USDC   = '0xc3d688b66703497daa19211eedff47f25384cdc3';
 const WBTC   = '0xe85dc543813b8c2cfeaac371517b925a166a9293';
 
-const COMET = new Interface([
-  'function numAssets() view returns (uint8)',
-  'function getAssetInfo(uint8) view returns (tuple(uint8 offset, address asset, address priceFeed, uint64 scale, uint64 borrowCollateralFactor, uint64 liquidateCollateralFactor, uint64 liquidationFactor, uint128 supplyCap))',
-  'function baseTokenPriceFeed() view returns (address)',
-  'function getPrice(address) view returns (uint256)',
-  'function totalSupply() view returns (uint256)',
-  'function totalBorrow() view returns (uint256)',
-  'function getUtilization() returns (uint256)',
-  'function getSupplyRate(uint) returns (uint)',
-  'function getBorrowRate(uint) returns (uint)',
-  'function totalsCollateral(address) view returns (uint128)',
-  'function symbol() view returns (string)',
-  // the rewards of a market
-  'function baseBorrowMin() view returns (uint)',
-  'function baseMinForRewards() view returns (uint256)',
-  'function baseTrackingSupplySpeed() view returns (uint256)',
-  'function baseTrackingBorrowSpeed() view returns (uint256)',
-  'function trackingIndexScale() view returns (uint256)',
-  'function totalsBasic() view returns (tuple(uint64 baseSupplyIndex, uint64 baseBorrowIndex, uint64 trackingSupplyIndex, uint64 trackingBorrowIndex, uint104 totalSupplyBase, uint104 totalBorrowBase, uint40 lastAccrualTime, uint8 pauseFlags))',
-]);
-
-type Call = { id: number, method: string, params: any[] };
-
 /*
  * The error the node answers a call to a Comet with instead of its result,
  * if any, by the Comet called, the function, and its argument where it
@@ -98,67 +74,14 @@ const PRICES = new Map<string, number>([
 ]);
 
 /*
- * A node that answers the summary's reads from the fixture snapshot, and
- * records every request it receives: its network and its calls.
+ * The node of the fixture at LATEST, which answers the prices above and, in
+ * place of a call's result, the error `fault` answers it with.
  */
-function fakeNode(fault: Fault = () => undefined) {
-  const markets = new Map(snapshot.networks.flatMap(network => network.markets.map(entry => (
-    [ entry.contracts.comet!.toLowerCase(), entry ] as const
-  ))));
-  const symbols = new Map(snapshot.networks.flatMap(network => network.markets.flatMap(entry => (
-    entry.collateralAssets.map(asset => [ asset.token.address.toLowerCase(), asset.token.symbol ] as const)
-  ))));
-  const requests: Array<{ network: string, calls: Call[] }> = [];
-
-  const answer = ({ id, method, params }: Call) => {
-    if (method === 'eth_getBlockByNumber') {
-      return { jsonrpc: '2.0', id, result: { number: `0x${LATEST.number.toString(16)}`, timestamp: `0x${LATEST.timestamp.toString(16)}`, transactions: [] } };
-    }
-    const [ { to, data } ] = params;
-    const fragment = COMET.getFunction(data.slice(0, 10)) as FunctionFragment;
-    const argument: string | undefined = COMET.decodeFunctionData(fragment, data)[0]?.toString().toLowerCase();
-    const error = fault(to.toLowerCase(), fragment.name, argument);
-    if (error !== undefined) {
-      return { jsonrpc: '2.0', id, error };
-    }
-    const entry = markets.get(to.toLowerCase());
-    const values = ((): unknown[] => {
-      switch (fragment.name) {
-        case 'numAssets':          return [ entry!.collateralAssets.length ];
-        case 'getAssetInfo': {
-          const asset = entry!.collateralAssets[Number(argument)]!;
-          return [ [ asset.assetIndex, asset.token.address, asset.priceFeed.address, EthersBigNumber.from(10).pow(asset.token.decimals), 0, 0, 0, 0 ] ];
-        }
-        case 'baseTokenPriceFeed': return [ entry!.baseAsset.priceFeed.address ];
-        case 'getPrice':           return [ PRICES.get(argument!) ?? EthersBigNumber.from(10).pow(8) ];
-        case 'symbol':             return [ symbols.get(to.toLowerCase()) ?? 'TKN' ];
-        case 'totalsBasic': {
-          const [ index, base ] = [ EthersBigNumber.from(10).pow(15), EthersBigNumber.from(10).pow(12) ];
-          return [ [ index, index, 0, 0, base, base, LATEST.timestamp, 0 ] ];
-        }
-        default:                   return [ EthersBigNumber.from(10).pow(8) ];
-      }
-    })();
-    return { jsonrpc: '2.0', id, result: COMET.encodeFunctionResult(fragment, values) };
-  };
-
-  const fetch = async (input: string | Request, init?: RequestInit) => {
-    const request = new Request(input, init);
-    const network = new URL(request.url).pathname.split('/')[1]!;
-    const body = await request.json() as Call | Call[];
-    const calls = body instanceof Array ? body : [ body ];
-    requests.push({ network, calls });
-    const responses = calls.map(answer);
-    return new Response(JSON.stringify(body instanceof Array ? responses : responses[0]));
-  };
-  return { fetch, requests };
-}
-
-// puts `node` in place of the global fetch for the length of a test
-function serving(t: Test, node: ReturnType<typeof fakeNode>) {
-  const fetchBefore = globalThis.fetch;
-  globalThis.fetch = node.fetch as typeof globalThis.fetch;
-  t.teardown(() => { globalThis.fetch = fetchBefore; });
+function nodeOf(fault: Fault = () => undefined): FakeNode {
+  return fakeNode(snapshot, LATEST, {
+    answer: ({ comet, name, argument }) => fault(comet, name, argument)
+      ?? (name === 'getPrice' && PRICES.has(argument!) ? [ PRICES.get(argument!) ] : undefined),
+  });
 }
 
 function everyMarket(): MarketRouteData {
@@ -193,8 +116,8 @@ function context(evaluations: Promise<unknown>[] = []): UninstantiatedContext {
 }
 
 // how the summary of every market failed, once every evaluation it started has ended
-async function failureOf(node: ReturnType<typeof fakeNode>, t: Test): Promise<unknown> {
-  serving(t, node);
+async function failureOf(node: FakeNode, t: Test): Promise<unknown> {
+  serve(t, node);
   const evaluations: Promise<unknown>[] = [];
   const failure = await marketHandlers.latestSummary(everyMarket(), context(evaluations)).then(
     () => null,
@@ -205,8 +128,8 @@ async function failureOf(node: ReturnType<typeof fakeNode>, t: Test): Promise<un
 }
 
 t.test('the summary of every market makes four node requests per network', async t => {
-  const node = fakeNode();
-  serving(t, node);
+  const node = nodeOf();
+  serve(t, node);
 
   const response = await marketHandlers.latestSummary(everyMarket(), context());
   const body = await response.json() as Array<{ status: string }>;
@@ -234,8 +157,8 @@ t.test('the summary of every market makes four node requests per network', async
  * rates (rewards-apr.ts), not in a round of its own once they are in.
  */
 t.test('the rewards of every market make two node requests per network', async t => {
-  const node = fakeNode();
-  serving(t, node);
+  const node = nodeOf();
+  serve(t, node);
 
   const response = await marketHandlers.rewardsDappData(everyMarket(), context());
   t.equal(response.status, 200);
@@ -264,8 +187,8 @@ t.test('the rewards of every market make two node requests per network', async t
  * requests as Base, which has no such market.
  */
 t.test('the rewards of every market convert a reward price to USD in no round of its own', async t => {
-  const node = fakeNode();
-  serving(t, node);
+  const node = nodeOf();
+  serve(t, node);
 
   const response = await marketHandlers.rewardsDappData(everyMarket(), context());
   const body = await response.json() as Array<{ status: string }>;
@@ -294,7 +217,7 @@ t.test('the rewards of every market convert a reward price to USD in no round of
 });
 
 t.test('a price feed that reverts is one market\'s error, and the rest are answered', async t => {
-  serving(t, fakeNode((comet, fragment) => (
+  serve(t, nodeOf((comet, fragment) => (
     comet === WBTC && fragment === 'getPrice' ? { code: 3, message: 'execution reverted', data: '0x' } : undefined
   )));
   const response = await marketHandlers.latestSummary(everyMarket(), context());
@@ -309,7 +232,7 @@ t.test('a price feed that reverts is one market\'s error, and the rest are answe
 });
 
 t.test('a call the node did not serve for one market fails the summary', async t => {
-  const failure = await failureOf(fakeNode((comet, fragment) => (
+  const failure = await failureOf(nodeOf((comet, fragment) => (
     comet === WBTC && fragment === 'totalSupply' ? { code: -32000, message: 'header not found' } : undefined
   )), t);
   t.match((failure as Error | null)?.message, /header not found/);
@@ -322,7 +245,7 @@ t.test('a call the node did not serve for one market fails the summary', async t
  * failing so fails the summary of every network.
  */
 t.test('a request the node provider failed for one network fails the summary', async t => {
-  const node = fakeNode();
+  const node = nodeOf();
   const down = 'base-mainnet';
   const failure = await failureOf({
     ...node,
@@ -346,8 +269,8 @@ type Summary = {
 };
 
 // the summary of every market, as the route answers it from `node`
-async function summaryFrom(t: Test, node: ReturnType<typeof fakeNode>): Promise<Summary[]> {
-  serving(t, node);
+async function summaryFrom(t: Test, node: FakeNode): Promise<Summary[]> {
+  serve(t, node);
   const response = await marketHandlers.latestSummary(everyMarket(), context());
   t.equal(response.status, 200, 'the summary is answered');
   return await response.json() as Summary[];
@@ -358,13 +281,6 @@ const without = (entry: object, ...fields: string[]) => Object.fromEntries(Objec
 
 const REVERT = { code: 3, message: 'execution reverted', data: '0x' };
 
-// the warnings the summary logs while a test runs, kept out of its output
-function captureWarnings(t: Test): void {
-  const warn = console.warn;
-  console.warn = () => {};
-  t.teardown(() => { console.warn = warn; });
-}
-
 /*
  * A market whose base asset could not be priced is an error, and answers
  * every field that does not need the price it lacks. The version prices the
@@ -374,10 +290,11 @@ function captureWarnings(t: Test): void {
  * answers all but those totals and its base asset's USD price.
  */
 t.test('a market whose base feed reverts answers every field it can', async t => {
-  const reading = await summaryFrom(t, fakeNode());
-  captureWarnings(t);
+  const reading = await summaryFrom(t, nodeOf());
+  // the warnings the summary logs, kept out of the test's output
+  consoleLines(t, [ 'warn' ]);
   const feeds = new Map([ WBTC, USDC ].map(comet => [ comet, marketOf(comet).baseAsset.priceFeed.address ]));
-  const reverting = await summaryFrom(t, fakeNode((comet, fragment, argument) => (
+  const reverting = await summaryFrom(t, nodeOf((comet, fragment, argument) => (
     fragment === 'getPrice' && argument === feeds.get(comet) ? REVERT : undefined
   )));
   const totals = [ 'total_borrow_value', 'total_supply_value', 'total_borrow_value_usd', 'total_supply_value_usd' ];
@@ -401,4 +318,62 @@ t.test('a market whose base feed reverts answers every field it can', async t =>
 
   const others = (summary: Summary[]) => summary.filter(entry => ![ WBTC, USDC ].includes(entry.comet.address.toLowerCase()));
   t.strictSame(others(reverting), others(reading), 'and every other market as read');
+});
+
+/*
+ * Where the base feed the version names reverts, a market's base asset is
+ * priced through the feed its Comet names at the block: USDC's here, a
+ * market quoted in USD, so its USD price too. Asking the Comet for that feed,
+ * and reading it, takes two rounds after the one that reverted, which the
+ * summary takes anyway for the collateral, so no network sends another
+ * request. The rewards are read in one round, so the network of such a
+ * market takes two more.
+ */
+t.test('a base feed that reverts is read through the Comet\'s in the requests the summary makes anyway', async t => {
+  const own   = marketOf(USDC).baseAsset.priceFeed.address;
+  const OTHER = '0x2222222222222222222222222222222222222222';
+  // USDC's Comet names OTHER for its base asset, which answers 2.0, where the feed the version names reverts
+  const fallingBack = () => fakeNode(snapshot, LATEST, {
+    answer: ({ comet, name, argument }) => {
+      if (comet === USDC && name === 'baseTokenPriceFeed') {
+        return [ OTHER ];
+      }
+      if (comet === USDC && name === 'getPrice' && (argument === own || argument === OTHER)) {
+        return argument === own ? 'revert' : [ 200_000_000 ];
+      }
+      return name === 'getPrice' && PRICES.has(argument!) ? [ PRICES.get(argument!) ] : undefined;
+    },
+  });
+
+  const reading = await summaryFrom(t, nodeOf());
+  const node    = fallingBack();
+  const summary = await summaryFrom(t, node);
+  t.strictSame(entryOf(summary, USDC), {
+    ...entryOf(reading, USDC),
+    total_borrow_value:     '200.0',
+    total_supply_value:     '200.0',
+    total_borrow_value_usd: '200.0',
+    total_supply_value_usd: '200.0',
+    base_usd_price:         '2.0',
+  }, 'USDC: a success, its totals and its USD price at the 2.0 of the feed its Comet names');
+  const others = (entries: Summary[]) => entries.filter(entry => entry.comet.address.toLowerCase() !== USDC);
+  t.strictSame(others(summary), others(reading), 'and every other market as read');
+
+  const networks = [ ...new Set(catalog.markets().map(entry => entry.network)) ];
+  for (const network of networks) {
+    t.equal(node.requests.filter(request => request.network === network).length, 4, `${network}: four requests, as without the revert`);
+  }
+  for (const { network, calls } of node.requests) {
+    const distinct = new Set(calls.map(({ method, params }) => JSON.stringify([ method, params ])));
+    t.equal(distinct.size, calls.length, `${network}: no call is sent twice in one batch`);
+  }
+
+  const rewarding = fallingBack();
+  serve(t, rewarding);
+  const rewards = await marketHandlers.rewardsDappData(everyMarket(), context());
+  t.equal(rewards.status, 200);
+  t.ok((await rewards.json() as Array<{ status: string }>).every(entry => entry.status === 'success'), 'the rewards of every market are answered');
+  const requestsOn = (network: string) => rewarding.requests.filter(request => request.network === network).length;
+  t.equal(requestsOn('ethereum-mainnet'), 4, 'the rewards of USDC\'s network take two requests more');
+  t.equal(requestsOn('base-mainnet'), 2, 'and those of another network none');
 });

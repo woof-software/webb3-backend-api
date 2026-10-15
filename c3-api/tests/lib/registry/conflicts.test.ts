@@ -1,12 +1,9 @@
 import t from 'tap';
 
-import { readFileSync } from 'node:fs';
-
-import { failureResponse } from '../../../src/http/errors.js';
+import { ApiError, failureResponse } from '../../../src/http/errors.js';
+import type { ApiErrorCode } from '../../../src/http/errors.js';
 import { conflict } from '../../../src/registry/errors.js';
 import { asApiError } from '../../../src/registry/router.js';
-
-import { sourceFiles } from '../../util/sources.js';
 
 /*
  * A 409 of the registry names the conflict it met in `details.code`, which is
@@ -35,12 +32,16 @@ t.test('a conflict is answered as CONFLICT, naming itself beside the details the
 });
 
 /*
- * That holds only while no route builds a 409 of its own: one that did would
- * leave a script nothing to match but the message.
+ * That holds only while every CONFLICT names its conflict: one that did not
+ * would leave a script nothing to match but the message. ApiError takes no
+ * CONFLICT without a `details.code`, so each refusal below is a type error
+ * the build expects.
  */
-t.test('no route answers CONFLICT without naming the conflict', async t => {
-  const sources = sourceFiles();
-  t.ok(sources.length > 200, 'every source file is read');
-  const building = sources.filter(path => /ApiError\(\s*'CONFLICT'/.test(readFileSync(path, 'utf8')));
-  t.same(building, [ 'src/registry/errors.ts' ], 'only conflict() builds one');
+t.test('a CONFLICT that names no conflict does not compile', async () => {
+  // @ts-expect-error a CONFLICT names the conflict it met
+  new ApiError('CONFLICT', 'x');
+  // @ts-expect-error in details.code, whatever else its details say
+  new ApiError('CONFLICT', 'x', { current: null });
+  // @ts-expect-error and a code that may be CONFLICT is held to it as well
+  (code: ApiErrorCode) => new ApiError(code, 'x');
 });

@@ -504,23 +504,33 @@ A reviewed list of decisions — the seed — is a file, and nobody writes its
 addresses by hand: the export answers every token of every network of the
 active version with its decision, in exactly the form review and apply take
 back. Mark the tokens the list decides, give the reason once for the list or
-on a row, review the diff, and apply it. Apply writes the whole list in one D1
-transaction, with one event per change, and refuses the whole list, writing
-nothing, if any row names a chain or a token the active version does not
-hold, names a token by a symbol that is not its own, or changes a decision
-without a reason:
+on a row, review the diff, and apply the changes it shows. Apply writes the
+whole list in one D1 transaction, with one event per change, and refuses the
+whole list, writing nothing, if any row names a chain or a token the active
+version does not hold, names a token by a symbol that is not its own, or
+changes a decision without a reason:
 
 ```sh
 curl -s "$API/registry/v1/admin/token-policies" -H "Authorization: Bearer $TOKEN" > token-policies.json
 # edit token-policies.json: "isStrategic": true on the approved tokens, and "reason"
 curl -s -X POST "$API/registry/v1/admin/token-policies/review" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @token-policies.json | jq 'if .error then .error else .summary end'
-curl -s -X POST "$API/registry/v1/admin/token-policies/apply" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @token-policies.json | jq 'if .error then .error else .summary end'
+  -H 'Content-Type: application/json' --data @token-policies.json > review.json
+jq 'if .error then .error else .summary end' review.json
+# apply the rows the review shows as changes
+jq 'if .error then error("the review failed: \(.error.message)")
+    elif .summary.problems > 0 then error("the review found problems: fix the file and review it again")
+    elif .summary.change == 0 then error("the review shows no change: there is nothing to apply")
+    else {reason: null, policies: [.policies[] | select(.action == "change") | {chainId, tokenAddress, symbol, isStrategic: .requested, reason}]}
+    end' review.json > reviewed.json \
+  && curl -s -X POST "$API/registry/v1/admin/token-policies/apply" -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' --data @reviewed.json \
+  | jq 'if .error then .error else .summary end'
 ```
 
 Apply compares the list with the decisions in force when it runs, so review it
-right before applying it. Applying a list again changes nothing. A list
+right before applying it, and apply the rows the review shows as changes
+rather than the edited file: a decision someone makes on another token after
+the review then stays as it is. Applying a list again changes nothing. A list
 applies only where the active version holds every token it names, so the file
 kept for other environments is best reduced to the rows the list decides —
 the routes leave every token a list does not name as it is — and reviewed in
@@ -569,10 +579,25 @@ transaction:
 curl -s "$API/registry/v1/admin/deprecated-collaterals" -H "Authorization: Bearer $TOKEN" > deprecated-collaterals.json
 # edit deprecated-collaterals.json: "isDeprecated": true on the deprecated collaterals, and "reason"
 curl -s -X POST "$API/registry/v1/admin/deprecated-collaterals/review" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @deprecated-collaterals.json | jq 'if .error then .error else .summary end'
-curl -s -X POST "$API/registry/v1/admin/deprecated-collaterals/apply" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @deprecated-collaterals.json | jq 'if .error then .error else .summary end'
+  -H 'Content-Type: application/json' --data @deprecated-collaterals.json > review.json
+jq 'if .error then .error else .summary end' review.json
+# apply the rows the review shows as changes
+jq 'if .error then error("the review failed: \(.error.message)")
+    elif .summary.problems > 0 then error("the review found problems: fix the file and review it again")
+    elif .summary.change == 0 then error("the review shows no change: there is nothing to apply")
+    else {reason: null, collaterals: [.collaterals[] | select(.action == "change") | {chainId, cometAddress, deploymentKey, tokenAddress, symbol, isDeprecated: .requested, reason}]}
+    end' review.json > reviewed.json \
+  && curl -s -X POST "$API/registry/v1/admin/deprecated-collaterals/apply" -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' --data @reviewed.json \
+  | jq 'if .error then .error else .summary end'
 ```
+
+Apply compares the list with the decisions in force when it runs, as it does
+for token policies: a decision someone makes after the review is changed like
+any other row the list contradicts, and shows in the answer as a change. That
+is why the snippet applies only the rows the review shows as changes, as the
+runbook does
+([A reviewed list of deprecated collaterals](./REGISTRY_RUNBOOK.md#a-reviewed-list-of-deprecated-collaterals)).
 
 The frontend's list is not seeded by a migration: a migration cannot know
 which version an environment has on, and a decision is only made about a
@@ -597,8 +622,13 @@ each, in one batch of reads to the node — and the result is kept as one record
 per chain and minute: in the isolate, and in the network's KV namespace
 (`kv_mainnet`, `kv_testnet`) with an expiry. An isolate computes a minute once
 and writes it to KV, where an isolate that asks afterwards reads it; isolates
-that ask while it is being computed value it as well. Every request still
-reads the latest block. A record is keyed by
+that ask while it is being computed value it as well. So may an isolate in
+another location that read the minute's key before it was written: KV caches
+there that a key is missing too, for up to a minute by Cloudflare's
+documentation. A minute may thus be valued once by each such isolate; the
+`token_collateral_minute` lines say how many times it was
+([What the token list shows](./REGISTRY_RUNBOOK.md#what-the-token-list-shows)).
+Every request still reads the latest block. A record is keyed by
 the positions it valued, each named by its Comet's content digest, so an
 activation that changes a market, a feed or what a price exception does to a
 price starts afresh, and one that changes none of them keeps the records.

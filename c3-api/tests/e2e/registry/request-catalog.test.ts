@@ -6,7 +6,7 @@ import type { Env } from '../../../entrypoint.js';
 
 import type { RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
-import { snapshotKey } from '../../../src/registry/cache.js';
+import { cacheDepsOf, snapshotKey } from '../../../src/registry/cache.js';
 import { snapshotChecksum } from '../../../src/registry/repository.js';
 import { requestCatalog } from '../../../src/registry/request-catalog.js';
 
@@ -34,21 +34,21 @@ t.test('the active version is built once and reused, until another one is activa
   const db  = await freshDatabase();
   const env = await environmentOf(db);
 
-  await t.rejects(requestCatalog(env, quietLog).load(), { name: 'ApiError', code: 'REGISTRY_NOT_ACTIVE' },
+  await t.rejects(requestCatalog(cacheDepsOf(env, quietLog)).load(), { name: 'ApiError', code: 'REGISTRY_NOT_ACTIVE' },
     'with nothing active there is nothing to serve');
 
   const { versionId } = await seedCandidate(db, snapshot);
   await activateSeeded(db, versionId);
 
-  const first  = await requestCatalog(env, quietLog).load();
-  const second = await requestCatalog(env, quietLog).load();
+  const first  = await requestCatalog(cacheDepsOf(env, quietLog)).load();
+  const second = await requestCatalog(cacheDepsOf(env, quietLog)).load();
   t.equal(second, first, 'a later request of the same isolate is served the catalog the first one built');
   t.equal(second.versionId, versionId);
 
   const next = await seedCandidate(db, snapshot, { versionId: randomUUID(), attempt: 2 });
   await activateSeeded(db, next.versionId);
 
-  const activated = await requestCatalog(env, quietLog).load();
+  const activated = await requestCatalog(cacheDepsOf(env, quietLog)).load();
   t.not(activated, first, 'activating another version builds the catalog again');
   t.equal(activated.versionId, next.versionId, 'and the request is served the version that is on');
 });
@@ -74,12 +74,12 @@ t.test('a catalog is built again once an exception it applies has expired', asyn
   const { versionId } = await seedCandidate(db, expiring);
   await activateSeeded(db, versionId);
 
-  const applied = await requestCatalog(env, quietLog).load();
+  const applied = await requestCatalog(cacheDepsOf(env, quietLog)).load();
   t.equal(applied.validUntil, Date.parse(expiresAt), 'a catalog that applies the exception is kept until it expires');
-  t.equal(await requestCatalog(env, quietLog).load(), applied, 'and until then every request is served it');
+  t.equal(await requestCatalog(cacheDepsOf(env, quietLog)).load(), applied, 'and until then every request is served it');
 
   await new Promise(resolve => setTimeout(resolve, Date.parse(expiresAt) - Date.now() + 50));
-  const rebuilt = await requestCatalog(env, quietLog).load();
+  const rebuilt = await requestCatalog(cacheDepsOf(env, quietLog)).load();
   t.not(rebuilt, applied, 'a request after the expiry is served a catalog built again');
   t.equal(rebuilt.versionId, versionId, 'of the same version');
   t.equal(rebuilt.validUntil, null, 'which no longer applies the exception, and has nothing left to expire');
@@ -119,7 +119,7 @@ t.test('one request resolves everything from the version it loaded', async t => 
   const { versionId } = await seedCandidate(db, snapshot);
   await activateSeeded(db, versionId);
 
-  const request = requestCatalog(env, quietLog);
+  const request = requestCatalog(cacheDepsOf(env, quietLog));
   t.equal(request.loaded(), null, 'a route that needs no registry loads none');
 
   const [ loaded, again ] = await Promise.all([ request.load(), request.load() ]);
@@ -165,18 +165,18 @@ t.test('a request that cannot reach D1 is served the last version it named', asy
   }) as D1Database;
 
   const flakyEnv = { ...env, APP_DB: flaky } as Env;
-  const loaded   = await requestCatalog(flakyEnv, quietLog).load();
+  const loaded   = await requestCatalog(cacheDepsOf(flakyEnv, quietLog)).load();
   t.equal(loaded.versionId, versionId);
 
   reachable = false;
-  const request = requestCatalog(flakyEnv, quietLog);
+  const request = requestCatalog(cacheDepsOf(flakyEnv, quietLog));
   const catalog = await request.load();
   t.equal(catalog.versionId, versionId, 'the version the cache holds answers the request');
   t.type(request.staleFor(), 'number', 'and the request knows the answer is an older one');
   t.equal(catalog, loaded,
     'the catalog this isolate already holds is reused: an outage is when rebuilding it is least affordable');
 
-  const closed = requestCatalog({ ...flakyEnv, REGISTRY_STALE_FALLBACK_MAX_S: '0' } as Env, quietLog);
+  const closed = requestCatalog(cacheDepsOf({ ...flakyEnv, REGISTRY_STALE_FALLBACK_MAX_S: '0' } as Env, quietLog));
   await t.rejects(closed.load(), { name: 'RegistryUnavailable' },
     'with no window configured the route fails rather than answering from the cache');
 });
@@ -194,18 +194,18 @@ t.test('a market route fails the way a registry route does', async t => {
   const db  = await freshDatabase();
   const env = await environmentOf(db);
 
-  const inactive = await requestCatalog(env, quietLog).load().then(() => null, (error: unknown) => error);
+  const inactive = await requestCatalog(cacheDepsOf(env, quietLog)).load().then(() => null, (error: unknown) => error);
   t.match(inactive, { name: 'ApiError', status: 503, code: 'REGISTRY_NOT_ACTIVE', message: 'No active registry snapshot is available' },
     'nothing active is answered as the registry\'s active reads answer it');
 
-  const fault = await requestCatalog({ ...env, APP_DB: failingDatabase('D1_ERROR: no such table: registry_state: SQLITE_ERROR') } as Env, quietLog)
+  const fault = await requestCatalog(cacheDepsOf({ ...env, APP_DB: failingDatabase('D1_ERROR: no such table: registry_state: SQLITE_ERROR') } as Env, quietLog))
     .load().then(() => null, (error: unknown) => error as Error);
   t.not(fault?.name, 'RegistryUnavailable', 'a database that answered with a fault is not an outage');
   t.match(fault?.message, /no such table/, 'it is raised as the fault it is');
 
   const { kv_registry } = await server.getWorker<Env>().getEnv();
   t.equal((await kv_registry.list()).keys.length, 0, 'with nothing cached to fall back on');
-  const down = await requestCatalog({ ...env, APP_DB: failingDatabase('D1_ERROR: Network connection lost.') } as Env, quietLog)
+  const down = await requestCatalog(cacheDepsOf({ ...env, APP_DB: failingDatabase('D1_ERROR: Network connection lost.') } as Env, quietLog))
     .load().then(() => null, (error: unknown) => error as Error);
   t.equal(down?.name, 'RegistryUnavailable', 'a database that did not answer is the registry being unavailable');
   t.match((down?.cause as Error | undefined)?.message, /Network connection lost/, 'and why is its cause, for the log');

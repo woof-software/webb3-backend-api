@@ -10,7 +10,7 @@ import { executionContext, settledWithin } from '../../util/execution-context.js
 import { MemoryKv } from '../../util/kv.js';
 import { quietLog } from '../../util/quiet-log.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
-import { ADMIN_TOKEN, adminTestEnv } from '../../util/test-env.js';
+import { ADMIN_TOKEN, adminTestEnv, failingStatements } from '../../util/test-env.js';
 
 import '../../../shim/node-self.js';
 
@@ -30,27 +30,8 @@ let seed = 0;
 
 type Envelope = { error: { code: string, message: string } };
 
-/*
- * The database as requests reach it: every statement fails as D1 does when it
- * cannot be reached while `down()` says so, and the statements `failing`
- * matches fail that way always.
- */
-function reachable(db: D1Database, { down = () => false, failing = /^$/ }: { down?: () => boolean, failing?: RegExp } = {}): D1Database {
-  const lost = () => { throw new Error('D1_ERROR: Network connection lost.'); };
-  const statement = { bind: () => statement, all: lost, first: lost, run: lost, raw: lost };
-  return new Proxy(db, {
-    get(target, property) {
-      const value = Reflect.get(target, property) as unknown;
-      if (property === 'prepare') {
-        return (sql: string) => down() ? lost() : failing.test(sql) ? statement : (value as D1Database['prepare']).call(target, sql);
-      }
-      if (property === 'batch') {
-        return (statements: D1PreparedStatement[]) => down() ? lost() : (value as D1Database['batch']).call(target, statements);
-      }
-      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
-    },
-  });
-}
+// matches no statement, so that a database fails only while it is down
+const NO_STATEMENT = /^$/;
 
 function envOf(db: D1Database, kv: KVNamespace, overrides: Partial<Env> = {}): Promise<Env> {
   return adminTestEnv({
@@ -62,7 +43,7 @@ function envOf(db: D1Database, kv: KVNamespace, overrides: Partial<Env> = {}): P
 }
 
 /*
- * Without an execution context, so the cache writes the records an outage
+ * Without an execution context, so the request writes the records an outage
  * reads before it answers, not past the answer: what a request records is
  * there for the request after it.
  */
@@ -187,7 +168,7 @@ t.test('during an outage the active reads answer with the decisions last recorde
   const logs = captureLogs(t);
   let down = false;
   const kv  = MemoryKv({});
-  const env = await envOf(reachable(registry.db, { down: () => down }), kv);
+  const env = await envOf(failingStatements(registry.db, NO_STATEMENT, { down: () => down }), kv);
 
   await decide('usdt', 'mETH', true);
   t.equal((await get(env, '/registry/v1/active')).status, 200, 'a read while the database answers caches the version');
@@ -215,7 +196,7 @@ t.test('a decision a command makes is recorded at once, for an outage to answer 
   const { registry, market } = await fixture(t);
   captureLogs(t);
   let down = false;
-  const env = await envOf(reachable(registry.db, { down: () => down }), MemoryKv({}));
+  const env = await envOf(failingStatements(registry.db, NO_STATEMENT, { down: () => down }), MemoryKv({}));
   t.same(flaggedIn((await json<ActiveSnapshotV1>(env, '/registry/v1/active')).networks), [], 'nothing is deprecated at first');
 
   const usdc  = market('usdc');
@@ -244,7 +225,7 @@ t.test('decisions the database does not give are answered from the record, and s
   await decide('wbtc', 'LBTC', true);
   await json(await envOf(registry.db, kv), '/registry/v1/active');
 
-  const env = await envOf(reachable(registry.db, { failing: /FROM deprecated_collaterals/ }), kv);
+  const env = await envOf(failingStatements(registry.db, /FROM deprecated_collaterals/), kv);
   const response = await get(env, '/registry/v1/active');
   t.equal(response.status, 200, 'a version the database confirms is answered');
   t.equal(response.headers.get('x-registry-version'), registry.versionId);
@@ -262,13 +243,13 @@ t.test('without a record to answer with, decisions the database does not give ar
   await decide('wbtc', 'LBTC', true);
   const failing = /FROM deprecated_collaterals/;
 
-  const fresh = await envOf(reachable(registry.db, { failing }), MemoryKv({}));
+  const fresh = await envOf(failingStatements(registry.db, failing), MemoryKv({}));
   const unrecorded = await get(fresh, '/registry/v1/active');
   t.equal(unrecorded.status, 503, 'nothing recorded is nothing to answer with');
   t.equal((await unrecorded.json() as Envelope).error.code, 'UPSTREAM_UNAVAILABLE');
 
   const garbled = MemoryKv({ seed: { [DEPRECATED_KEY]: { collaterals: 'not a list' } } });
-  t.equal((await get(await envOf(reachable(registry.db, { failing }), garbled), '/registry/v1/active')).status, 503,
+  t.equal((await get(await envOf(failingStatements(registry.db, failing), garbled), '/registry/v1/active')).status, 503,
     'nor is a record that is not one');
 
   /*
@@ -280,7 +261,7 @@ t.test('without a record to answer with, decisions the database does not give ar
   const windowless = { REGISTRY_STALE_FALLBACK_MAX_S: '0' };
   await json(await envOf(registry.db, kv, windowless), '/registry/v1/active');
   t.equal(await kv.get(DEPRECATED_KEY), null, 'without a window, a read records nothing');
-  t.equal((await get(await envOf(reachable(registry.db, { failing }), kv, windowless), '/registry/v1/active')).status, 503,
+  t.equal((await get(await envOf(failingStatements(registry.db, failing), kv, windowless), '/registry/v1/active')).status, 503,
     'and decisions the database does not give are a 503 there');
 });
 
@@ -303,7 +284,7 @@ t.test('a market read the version refuses is refused as before, whatever the dec
     [ '/registry/v1/networks/0x1/markets/0x0000000000000000000000000000000000000001', 400, 'BAD_REQUEST' ],
   ] as const;
   for (const [ setting, overrides ] of [ [ 'nothing recorded', {} ], [ 'no fallback window', { REGISTRY_STALE_FALLBACK_MAX_S: '0' } ] ] as const) {
-    const env = await envOf(reachable(registry.db, { failing }), MemoryKv({}), overrides);
+    const env = await envOf(failingStatements(registry.db, failing), MemoryKv({}), overrides);
     for (const [ path, status, code ] of refused) {
       const response = await get(env, path);
       t.same([ response.status, (await response.json() as Envelope).error.code ], [ status, code ], `${setting}: ${path} is refused`);

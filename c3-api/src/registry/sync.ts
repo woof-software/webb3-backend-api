@@ -1,6 +1,6 @@
 import type { DeploymentPath } from '../../lib/model/comet-registry.js';
 
-import { Clock, nowOf } from './clock.js';
+import { Clock, ClockOption, nowOf } from './clock.js';
 import { RegistryError } from './errors.js';
 import type {
   RegistryVersionRow,
@@ -46,12 +46,6 @@ type RunInput = {
   // leave the candidate open for review once no root is left to attempt, whether or not the run gave roots up
   holdForReview?:  boolean,
 };
-
-/*
- * An injectable clock, so lease expiry and retry behavior can be exercised
- * without waiting for real time to pass.
- */
-type ClockOption = { now?: Clock | undefined };
 
 type LeaseOptions = ClockOption & {
   leaseSeconds: number,
@@ -649,7 +643,7 @@ async function recordUpstreamCheck(db: D1Database, options: ClockOption = {}): P
   ).bind(timestamp).run();
 }
 
-export type { ClockOption, Fence, ImportRun, LeaseOptions, RootCheckpoint, RunFinish, RunInput };
+export type { Fence, ImportRun, LeaseOptions, RootCheckpoint, RunFinish, RunInput };
 
 export {
   MAX_ITEM_ATTEMPTS,

@@ -5,10 +5,11 @@
  */
 type Clock = () => Date;
 
-// the time by the clock a caller injected, or by the wall clock where it injected none
+type ClockOption = { now?: Clock | undefined };
+
 function nowOf(clock: Clock | undefined): Date {
   return clock?.() ?? new Date();
 }
 
-export type { Clock };
+export type { Clock, ClockOption };
 export { nowOf };

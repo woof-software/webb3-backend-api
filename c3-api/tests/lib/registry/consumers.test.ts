@@ -25,14 +25,8 @@ import { rewardGroups, rewardsInclusion, rewardsSummary } from '../../../src/acc
 import type { MarketRouteData } from '../../../src/router.js';
 import { streamEventsOf, streamKeyOf } from '../../../src/transaction-history-handler/cursor.js';
 
-import * as Compute    from '../../../lib/symbolic/computation.js';
-import * as Debug      from '../../../lib/debug-log.js';
-import * as Evaluator  from '../../../lib/symbolic/evaluator.js';
-import * as Flags      from '../../../lib/flags.js';
-import { BigNumber }   from '../../../lib/bignumber.js';
-import { MemoryCache } from '../../../lib/symbolic/cache.js';
-
 import { consoleLines } from '../../util/console.js';
+import { evaluatorOver, stub } from '../../util/evaluator.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 
 /*
@@ -129,10 +123,8 @@ t.test('the account rewards route reconciles each market\'s reward token with th
   const OTHER = '0x2222222222222222222222222222222222222222';
   const COMP  = '0xc00e94Cb662C3520282E6f5717214004A7f26888';
   const paid: Record<string, string> = { [USDC]: COMP, [WETH]: OTHER, [USDT]: Eth.NullAddress, [WBTC]: COMP };
-  const stub = (answer: (context: any) => unknown) => Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
   const read: string[] = [];
-  const flags = { ...Flags.parseWithDefaults(process.env), evaluatorAlgorithm: 'workingset', batchingEnabled: true } as Flags.SomeFlags;
-  const evaluator = Evaluator.instantiate<any>({
+  const evaluator = evaluatorOver({
     ethGetBlock:            stub(() => ({ number: 23_500_000, timestamp: 1_790_000_000 })),
     // every other market of the fixture, Base's, is paid nothing here
     getRewardConfigsSleuth: stub(({ cometMarkets }) => cometMarkets.map((comet: any) => ({
@@ -144,7 +136,7 @@ t.test('the account rewards route reconciles each market\'s reward token with th
       const amount = BigFixnum.from({ value: 1 });
       return { status: 'success', chainId: 1, comet: { address: contract.address }, amountOwed: amount, walletBalance: amount, supplyBalance: amount, borrowBalance: amount };
     }),
-  } as any, { cache: new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]), debug: Debug.MakeLogger([]).configure(process.env), flags });
+  });
 
   t.capture(console, 'warn');
   const answer = await (await rewardsSummary(
@@ -197,8 +189,8 @@ t.test('the base price feed of a rewards APR follows the unit of the reward feed
 
   t.equal(usdBasePriceFeedFor(usdc), null, 'a USD-quoted market needs no conversion');
   t.equal(usdBasePriceFeedFor(weth), null, 'nor does one whose reward feed is quoted in its base asset');
-  t.equal(usdBasePriceFeedFor(wbtc)?.address, '0xf4030086522a5beea4988f8ca5b36dbc97bee88c',
-    'a USD reward feed against a base-quoted market converts through the USD feed');
+  // which feed that is, the APR's own test reads (rewards-apr.test.ts)
+  t.not(usdBasePriceFeedFor(wbtc), null, 'a USD reward feed against a base-quoted market converts through the USD feed');
 });
 
 /*
@@ -242,6 +234,7 @@ t.test('a computation takes only a Comet the registry materialized', async t => 
     marketOf<comet.AssetPrice>(usdc),
     marketOf<comet.BasePrice>(usdc),
     marketOf<comet.BaseUsdPrice>(usdc),
+    marketOf<comet.CometBasePrice>(usdc),
     marketOf<market.Collaterals>(usdc),
     marketOf<market.MarketSummary>(usdc),
     marketOf<market.MarketDaySummary>(usdc),
@@ -271,6 +264,8 @@ t.test('a computation takes only a Comet the registry materialized', async t => 
   marketOf<comet.BasePrice>(constant);
   // @ts-expect-error and its USD price through the feed the version's quote calls for
   marketOf<comet.BaseUsdPrice>(constant);
+  // @ts-expect-error and through the feed the Comet names for it, at the scale its version states
+  marketOf<comet.CometBasePrice>(constant);
   // @ts-expect-error and every collateral of a market is the version's, priced as it says
   marketOf<market.Collaterals>(constant);
   // @ts-expect-error so a market summary prices with its version

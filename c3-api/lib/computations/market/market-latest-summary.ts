@@ -13,6 +13,7 @@ import type {
   TotalSupply,
   Utilization,
 } from '../comet.js';
+import { convertsToUsd } from '../comet/base-usd-price.js';
 
 import type { BorrowApr } from './borrow-apr.js';
 import type { SupplyApr } from './supply-apr.js';
@@ -90,8 +91,8 @@ function collateralSummary({ asset, symbol, price }: Collateral): CollateralStat
 
 const { implement, pipe } = Compute.Functor<MarketLatestSummary>({});
 const marketLatestSummary = implement({
-  // 3: without reserves, the rate model or each collateral's price and parameters
-  version: 3,
+  // 4: where the base feed the version names reverts, the base asset is priced through the one the Comet names
+  version: 4,
   compute({ apiHost, nodeHost, nodeKey, network, contract, block }) {
     const { chainId } = Fallible.must(
       KnownNetwork.lookup({ name: network })
@@ -124,7 +125,7 @@ const marketLatestSummary = implement({
           : null;
         const totalCollateral = collateralValue(collateralDetails);
         // what converts a total to USD, as marketSummary converts it (inUsd), or null where that could not be read
-        const inUsd = contract.registry.market.collateralValueQuote === 'usd'
+        const inUsd = !convertsToUsd(contract.registry.market)
           ? (total: BigFixnum) => total
           : baseUsdPrice.status === 'success' ? (total: BigFixnum) => total.mul(baseUsdPrice.price) : null;
         const identity = {

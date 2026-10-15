@@ -1,6 +1,6 @@
 import type { Env } from '../../entrypoint.js';
 
-import { isAddress, normalizeAddress, parseMarketKey } from '../../lib/model/comet-registry.js';
+import { Address, isAddress, normalizeAddress, parseMarketKey } from '../../lib/model/comet-registry.js';
 
 import { authenticateAdmin } from '../http/bearer-auth.js';
 import { clientOf } from '../http/client-address.js';
@@ -26,10 +26,7 @@ import {
   postDeprecatedCollateralApply,
   postDeprecatedCollateralReview,
 } from './deprecated-collateral-handlers.js';
-import type {
-  DecisionList as DeprecatedDecisionList,
-  ListedDecision as ListedDeprecatedDecision,
-} from './deprecated-collateral-repository.js';
+import type { ListedDecision as ListedDeprecatedDecision } from './deprecated-collateral-repository.js';
 import {
   RegistryContext,
   applyProposal,
@@ -59,7 +56,7 @@ import {
   postTokenPolicyApply,
   postTokenPolicyReview,
 } from './token-handlers.js';
-import type { DecisionList, ListedDecision } from './token-policy-repository.js';
+import type { ListedDecision } from './token-policy-repository.js';
 
 /*
  * Reads the decimals of the feeds an overlay introduces, through the same
@@ -517,27 +514,89 @@ function overlayDocuments(body: Record<string, unknown>, versionId: string, acto
   return { versionId, actor, reason, networks, markets };
 }
 
-const DECISION_KEYS = [ 'chainId', 'tokenAddress', 'symbol', 'isStrategic', 'reason' ];
+// what a field of a listed decision must be, by the kind of field: as a row is told, and as it is checked
+const DECISION_FIELDS = {
+  chainId: { must: 'must be a positive integer', valid: (value: unknown) => typeof(value) === 'number' && Number.isSafeInteger(value) && value > 0 },
+  address: { must: 'must be an address',         valid: (value: unknown) => isAddress(value) },
+  name:    { must: 'must be null or a string',   valid: (value: unknown) => value === undefined || value === null || typeof(value) === 'string' },
+  flag:    { must: 'must be a boolean',          valid: (value: unknown) => typeof(value) === 'boolean' },
+};
 
 /*
- * The body of `POST /token-policies/review` and `/apply`: a list as the export
- * answers it, edited. `registryVersion` says where it was exported from and
- * is not checked, since a decision belongs to no version. Every problem of
- * every row is reported at once, so a file is fixed in one pass.
+ * A kind of decision list, as its review and apply take it: the members of
+ * the body, the one that holds the rows, what the list is called, a row's
+ * fields in the order they are checked, and the decision a valid row is. Two
+ * rows about the same addresses on one chain are one decision.
  */
-function decisionList(body: Record<string, unknown>): DecisionList {
-  requireExactKeys(body, [ 'registryVersion', 'reason', 'policies' ]);
+type DecisionListSpec<Listed extends { chainId: number }> = {
+  bodyKeys:    string[],
+  listKey:     string,
+  what:        string,
+  fields:      Array<[ string, keyof typeof DECISION_FIELDS ]>,
+  decisionOf:  (value: Record<string, unknown>, reason: string | null) => Listed,
+  addressesOf: (decision: Listed) => Address[],
+};
+
+const TOKEN_POLICY_LIST: DecisionListSpec<ListedDecision> = {
+  bodyKeys:    [ 'registryVersion', 'reason', 'policies' ],
+  listKey:     'policies',
+  what:        'token policies',
+  fields:      [ [ 'chainId', 'chainId' ], [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ], [ 'isStrategic', 'flag' ] ],
+  decisionOf:  (value, reason) => ({
+    chainId:      value.chainId as number,
+    tokenAddress: normalizeAddress(value.tokenAddress as string),
+    symbol:       (value.symbol as string | null | undefined) ?? null,
+    isStrategic:  value.isStrategic as boolean,
+    reason,
+  }),
+  addressesOf: decision => [ decision.tokenAddress ],
+};
+
+// `retained` names the decisions the active version does not hold, and is not read
+const DEPRECATED_COLLATERAL_LIST: DecisionListSpec<ListedDeprecatedDecision> = {
+  bodyKeys:    [ 'registryVersion', 'reason', 'collaterals', 'retained' ],
+  listKey:     'collaterals',
+  what:        'deprecated collaterals',
+  fields:      [
+    [ 'chainId', 'chainId' ], [ 'cometAddress', 'address' ], [ 'deploymentKey', 'name' ],
+    [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ], [ 'isDeprecated', 'flag' ],
+  ],
+  decisionOf:  (value, reason) => ({
+    chainId:       value.chainId as number,
+    cometAddress:  normalizeAddress(value.cometAddress as string),
+    deploymentKey: (value.deploymentKey as string | null | undefined) ?? null,
+    tokenAddress:  normalizeAddress(value.tokenAddress as string),
+    symbol:        (value.symbol as string | null | undefined) ?? null,
+    isDeprecated:  value.isDeprecated as boolean,
+    reason,
+  }),
+  addressesOf: decision => [ decision.cometAddress, decision.tokenAddress ],
+};
+
+/*
+ * The body of a list's review and apply (`POST /token-policies/review` and
+ * `/apply`, `POST /deprecated-collaterals/review` and `/apply`): a list as
+ * the export answers it, edited. `registryVersion` says where it was exported
+ * from and is not checked, since a decision belongs to no version. Every
+ * problem of every row is reported at once, so a file is fixed in one pass.
+ */
+function decisionListOf<Listed extends { chainId: number }>(
+  body: Record<string, unknown>,
+  spec: DecisionListSpec<Listed>,
+): { reason: string | null, decisions: Listed[] } {
+  requireExactKeys(body, spec.bodyKeys);
   const problems: string[] = [];
   const reason = optionalReason(body.reason, 'reason', problems);
 
-  const policies = body.policies;
-  if (!Array.isArray(policies) || policies.length === 0 || policies.length > MAX_DECISIONS_PER_REQUEST) {
-    throw new ApiError('BAD_REQUEST', `policies must be a list of 1 to ${MAX_DECISIONS_PER_REQUEST} decisions`);
+  const rows = body[spec.listKey];
+  if (!Array.isArray(rows) || rows.length === 0 || rows.length > MAX_DECISIONS_PER_REQUEST) {
+    throw new ApiError('BAD_REQUEST', `${spec.listKey} must be a list of 1 to ${MAX_DECISIONS_PER_REQUEST} decisions`);
   }
 
+  const keys = [ ...spec.fields.map(([ name ]) => name), 'reason' ];
   const seen = new Map<string, number>();
-  const decisions: ListedDecision[] = [];
-  policies.forEach((entry: unknown, index: number) => {
+  const decisions: Listed[] = [];
+  rows.forEach((entry: unknown, index: number) => {
     const row = `row ${index + 1}`;
     if (typeof(entry) !== 'object' || entry === null || Array.isArray(entry)) {
       problems.push(`${row} must be an object`);
@@ -546,132 +605,34 @@ function decisionList(body: Record<string, unknown>): DecisionList {
     const value  = entry as Record<string, unknown>;
     const before = problems.length;
 
-    const unexpected = Object.keys(value).filter(key => !DECISION_KEYS.includes(key));
+    const unexpected = Object.keys(value).filter(key => !keys.includes(key));
     if (unexpected.length > 0) {
       problems.push(`${row} has unexpected properties: ${unexpected.sort().join(', ')}`);
     }
-    const { chainId, tokenAddress, symbol, isStrategic } = value;
-    if (typeof(chainId) !== 'number' || !Number.isSafeInteger(chainId) || chainId <= 0) {
-      problems.push(`${row}: chainId must be a positive integer`);
-    }
-    if (!isAddress(tokenAddress)) {
-      problems.push(`${row}: tokenAddress must be an address`);
-    }
-    if (symbol !== undefined && symbol !== null && typeof(symbol) !== 'string') {
-      problems.push(`${row}: symbol must be null or a string`);
-    }
-    if (typeof(isStrategic) !== 'boolean') {
-      problems.push(`${row}: isStrategic must be a boolean`);
+    for (const [ name, field ] of spec.fields) {
+      if (!DECISION_FIELDS[field].valid(value[name])) {
+        problems.push(`${row}: ${name} ${DECISION_FIELDS[field].must}`);
+      }
     }
     const rowReason = optionalReason(value.reason, `${row}: reason`, problems);
     if (problems.length > before) {
       return;
     }
 
-    const address = normalizeAddress(tokenAddress as string);
-    const key     = `${chainId}:${address}`;
-    const first   = seen.get(key);
+    const decision  = spec.decisionOf(value, rowReason);
+    const addresses = spec.addressesOf(decision);
+    const key       = `${decision.chainId}:${addresses.join(':')}`;
+    const first     = seen.get(key);
     if (first !== undefined) {
-      problems.push(`${row} repeats row ${first} (chain ${chainId}, ${address})`);
+      problems.push(`${row} repeats row ${first} (chain ${decision.chainId}, ${addresses.join(', ')})`);
       return;
     }
     seen.set(key, index + 1);
-    decisions.push({
-      chainId:      chainId as number,
-      tokenAddress: address,
-      symbol:       (symbol as string | null | undefined) ?? null,
-      isStrategic:  isStrategic as boolean,
-      reason:       rowReason,
-    });
+    decisions.push(decision);
   });
 
   if (problems.length > 0) {
-    throw new ApiError('BAD_REQUEST', `the list of token policies is invalid`, { problems });
-  }
-  return { reason, decisions };
-}
-
-const DEPRECATED_DECISION_KEYS = [ 'chainId', 'cometAddress', 'deploymentKey', 'tokenAddress', 'symbol', 'isDeprecated', 'reason' ];
-
-/*
- * The body of `POST /deprecated-collaterals/review` and `/apply`: a list as
- * the export answers it, edited, read as a list of token policies is read.
- * `registryVersion` and `retained` say where it was exported from and which
- * decisions the active version does not hold, and are not read, since a
- * decision belongs to no version. Every problem of every row is reported at
- * once, so a file is fixed in one pass.
- */
-function deprecatedCollateralList(body: Record<string, unknown>): DeprecatedDecisionList {
-  requireExactKeys(body, [ 'registryVersion', 'reason', 'collaterals', 'retained' ]);
-  const problems: string[] = [];
-  const reason = optionalReason(body.reason, 'reason', problems);
-
-  const collaterals = body.collaterals;
-  if (!Array.isArray(collaterals) || collaterals.length === 0 || collaterals.length > MAX_DECISIONS_PER_REQUEST) {
-    throw new ApiError('BAD_REQUEST', `collaterals must be a list of 1 to ${MAX_DECISIONS_PER_REQUEST} decisions`);
-  }
-
-  const seen = new Map<string, number>();
-  const decisions: ListedDeprecatedDecision[] = [];
-  collaterals.forEach((entry: unknown, index: number) => {
-    const row = `row ${index + 1}`;
-    if (typeof(entry) !== 'object' || entry === null || Array.isArray(entry)) {
-      problems.push(`${row} must be an object`);
-      return;
-    }
-    const value  = entry as Record<string, unknown>;
-    const before = problems.length;
-
-    const unexpected = Object.keys(value).filter(key => !DEPRECATED_DECISION_KEYS.includes(key));
-    if (unexpected.length > 0) {
-      problems.push(`${row} has unexpected properties: ${unexpected.sort().join(', ')}`);
-    }
-    const { chainId, cometAddress, deploymentKey, tokenAddress, symbol, isDeprecated } = value;
-    if (typeof(chainId) !== 'number' || !Number.isSafeInteger(chainId) || chainId <= 0) {
-      problems.push(`${row}: chainId must be a positive integer`);
-    }
-    if (!isAddress(cometAddress)) {
-      problems.push(`${row}: cometAddress must be an address`);
-    }
-    if (deploymentKey !== undefined && deploymentKey !== null && typeof(deploymentKey) !== 'string') {
-      problems.push(`${row}: deploymentKey must be null or a string`);
-    }
-    if (!isAddress(tokenAddress)) {
-      problems.push(`${row}: tokenAddress must be an address`);
-    }
-    if (symbol !== undefined && symbol !== null && typeof(symbol) !== 'string') {
-      problems.push(`${row}: symbol must be null or a string`);
-    }
-    if (typeof(isDeprecated) !== 'boolean') {
-      problems.push(`${row}: isDeprecated must be a boolean`);
-    }
-    const rowReason = optionalReason(value.reason, `${row}: reason`, problems);
-    if (problems.length > before) {
-      return;
-    }
-
-    const comet = normalizeAddress(cometAddress as string);
-    const token = normalizeAddress(tokenAddress as string);
-    const key   = `${chainId}:${comet}:${token}`;
-    const first = seen.get(key);
-    if (first !== undefined) {
-      problems.push(`${row} repeats row ${first} (chain ${chainId}, ${comet}, ${token})`);
-      return;
-    }
-    seen.set(key, index + 1);
-    decisions.push({
-      chainId:       chainId as number,
-      cometAddress:  comet,
-      deploymentKey: (deploymentKey as string | null | undefined) ?? null,
-      tokenAddress:  token,
-      symbol:        (symbol as string | null | undefined) ?? null,
-      isDeprecated:  isDeprecated as boolean,
-      reason:        rowReason,
-    });
-  });
-
-  if (problems.length > 0) {
-    throw new ApiError('BAD_REQUEST', `the list of deprecated collaterals is invalid`, { problems });
+    throw new ApiError('BAD_REQUEST', `the list of ${spec.what} is invalid`, { problems });
   }
   return { reason, decisions };
 }
@@ -814,9 +775,9 @@ async function routeAdmin(
     case 'exportTokenPolicies':
       return await getTokenPolicyExport(context);
     case 'reviewTokenPolicies':
-      return await postTokenPolicyReview(context, decisionList(body));
+      return await postTokenPolicyReview(context, decisionListOf(body, TOKEN_POLICY_LIST));
     case 'applyTokenPolicies':
-      return await postTokenPolicyApply(context, decisionList(body));
+      return await postTokenPolicyApply(context, decisionListOf(body, TOKEN_POLICY_LIST));
     case 'deprecatedCollateral':
       // a chain id, the Comet and the token, as on the token routes
       return await getDeprecatedCollateral(context, versionId!, second!, third!);
@@ -838,9 +799,9 @@ async function routeAdmin(
     case 'exportDeprecatedCollaterals':
       return await getDeprecatedCollateralExport(context);
     case 'reviewDeprecatedCollaterals':
-      return await postDeprecatedCollateralReview(context, deprecatedCollateralList(body));
+      return await postDeprecatedCollateralReview(context, decisionListOf(body, DEPRECATED_COLLATERAL_LIST));
     case 'applyDeprecatedCollaterals':
-      return await postDeprecatedCollateralApply(context, deprecatedCollateralList(body));
+      return await postDeprecatedCollateralApply(context, decisionListOf(body, DEPRECATED_COLLATERAL_LIST));
   }
 }
 

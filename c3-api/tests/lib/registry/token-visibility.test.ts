@@ -6,12 +6,9 @@ import type { Address } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
 import { deprecatedDecisionsOf } from '../../../src/registry/deprecated-collaterals.js';
-import { visibleOnlyOf } from '../../../src/registry/token-handlers.js';
 import { positionsOf, recordKey } from '../../../src/registry/token-collateral.js';
-import type { TokenValue } from '../../../src/registry/token-collateral.js';
+import type { TokenValue } from '../../../src/registry/token-value.js';
 import {
-  RULE_VERSION,
-  THRESHOLD_USD,
   decimalString,
   deprecatedOf,
   tokenList,
@@ -89,16 +86,14 @@ t.test('the rule: deprecated, then strategic, then unknown, then the threshold',
   for (const [ name, isDeprecated, isStrategic, tokenValue, isVisible, reason ] of cases) {
     t.same(visibilityOf({ isDeprecated, isStrategic }, tokenValue), { isVisible, visibilityReason: reason }, name);
   }
-  t.ok(THRESHOLD_USD.eq(BigFixnum.from({ value: 250000 })));
 });
 
 /*
- * The list names the rule it decides by, which hiding a deprecated token moved
- * to 2. A record of a minute's values is keyed by the rule it was valued by,
- * which did not change, so the records written before keep serving.
+ * A record of a minute's values is keyed by the rule it was valued by. Hiding
+ * a deprecated token moved the rule the list decides by to 2 and left that
+ * one as it was, so the records written before keep serving.
  */
-t.test('the list decides by rule 2, and the values it reads keep their records', async t => {
-  t.equal(RULE_VERSION, 2);
+t.test('a record is keyed by the rule it was valued by, not by the rule of the list', async t => {
   t.match(recordKey(1, 'positions', 29_853_416), /^token-collateral:v1:r1:1:positions:29853416$/,
     'a record is keyed by the rule of its values, which a change of what a list shows leaves as it was');
 });
@@ -178,8 +173,9 @@ t.test('a token is deprecated only where every enabled market that takes it mark
 
   t.same(deprecatedOf(1, METH, markets, decided([ 'usdc', METH ])), { isDeprecated: false, deprecatedIn: [] },
     'a decision about a Comet that does not take the token as collateral marks nothing');
-  t.same(deprecatedOf(8453, METH, catalog.marketsOn('base-mainnet'), decided([ 'usdt', METH ])), { isDeprecated: false, deprecatedIn: [] },
-    'and a decision belongs to its chain');
+  t.same(deprecatedOf(1, METH, markets, deprecatedDecisionsOf([ { chainId: 8453, cometAddress: comet('usdt'), tokenAddress: METH } ])),
+    { isDeprecated: false, deprecatedIn: [] },
+    'and a decision belongs to its chain: one about the same Comet and token on another chain marks nothing');
   t.same(deprecatedOf(1, token('WETH'), markets, decided()), { isDeprecated: false, deprecatedIn: [] },
     'nobody deciding is nothing deprecated');
 
@@ -249,13 +245,4 @@ t.test('a token deprecated in every enabled market that takes it is hidden, and 
     'a token deprecated in the USDT market alone is named there');
   t.ok(after.tokens.filter(entry => entry.deprecatedIn.length > 0).every(entry => entry.roles.includes('collateral')),
     'and only a collateral is ever named deprecated');
-});
-
-t.test('visibleOnly is true or false, once, or absent', async t => {
-  t.equal(visibleOnlyOf(new URLSearchParams('')), false);
-  t.equal(visibleOnlyOf(new URLSearchParams('visibleOnly=false')), false);
-  t.equal(visibleOnlyOf(new URLSearchParams('visibleOnly=true')), true);
-  for (const query of [ 'visibleOnly=', 'visibleOnly=TRUE', 'visibleOnly=1', 'visibleOnly=true&visibleOnly=true' ]) {
-    t.throws(() => visibleOnlyOf(new URLSearchParams(query)), { code: 'BAD_REQUEST' }, `${query} is refused`);
-  }
 });

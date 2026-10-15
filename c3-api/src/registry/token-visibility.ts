@@ -17,7 +17,8 @@ import {
 
 import type { Catalog, CatalogMarket } from './catalog.js';
 import type { DeprecatedDecisions } from './deprecated-collaterals.js';
-import { CollateralView, Position, TokenValue, tokenValue } from './token-collateral.js';
+import type { CollateralView, Position } from './token-collateral.js';
+import { TokenValue, tokenValue } from './token-value.js';
 
 /*
  * Which tokens discovery shows: a token an administrator marked strategic, or

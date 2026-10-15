@@ -1,19 +1,13 @@
 import t from 'tap';
 import { Interface } from '@ethersproject/abi';
 
-import * as Debug    from '../../../../lib/debug-log.js';
-import * as Flags    from '../../../../lib/flags.js';
-import { BigNumber } from '../../../../lib/bignumber.js';
 import { BigFixnum } from '../../../../lib/bigfixnum.js';
-
-import * as Compute    from '../../../../lib/symbolic/computation.js';
-import * as Evaluator  from '../../../../lib/symbolic/evaluator.js';
-import { MemoryCache } from '../../../../lib/symbolic/cache.js';
 
 import * as account from '../../../../lib/computations/account.js';
 
 import { checksumAddress } from '../../../../lib/model/comet-registry.js';
 
+import { evaluatorOver, stub } from '../../../util/evaluator.js';
 import { fixtureCatalog } from '../../../util/registry-fixture.js';
 
 import '../../../../shim/node-self.js';
@@ -25,8 +19,6 @@ import '../../../../shim/node-self.js';
  * does not — a collateral a market listed, or a reward token it started
  * paying, after the version's import.
  */
-const debug = Debug.MakeLogger([]).configure(process.env);
-
 // the history route evaluates recursively, the market routes on the working set; it must not matter which
 const ALGORITHMS = [ 'recursive', 'workingset' ] as const;
 
@@ -63,23 +55,18 @@ function logOf(address: string, event: string, values: unknown[], index: number)
   };
 }
 
-function stub(answer: (context: any) => unknown) {
-  return Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
-}
-
 /*
  * The actions of one page of history over `logs`, with every token whose
  * decimals were asked of the chain. Both queries the computation makes are
  * answered with every log, which it merges by transaction and log index.
  */
 async function pageOf(algorithm: typeof ALGORITHMS[number], logs: unknown[], decimals: Record<string, number>) {
-  const flags = { ...Flags.parseWithDefaults(process.env), evaluatorAlgorithm: algorithm, batchingEnabled: true } as Flags.SomeFlags;
   const asked: string[] = [];
-  const { evaluate, pull1 } = Evaluator.instantiate<any>({
+  const { evaluate, pull1 } = evaluatorOver({
     rawTransactionHistoryItems: account.rawTransactionHistoryItems,
     ethGetLogs:    stub(() => logs),
     erc20Decimals: stub(({ contract }) => { asked.push(contract.address); return decimals[contract.address.toLowerCase()]; }),
-  } as any, { cache: new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]), debug, flags });
+  }, { algorithm });
 
   const items = await evaluate(pull1({ rawTransactionHistoryItems: {
     apiHost: '', nodeHost: '', nodeKey: '', network, accountAddress: ACCOUNT, proxyAddresses: [],

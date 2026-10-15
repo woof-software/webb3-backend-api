@@ -1,10 +1,9 @@
 import t from 'tap';
 
 import type { TokenListV1 } from '../../../lib/model/comet-registry.js';
-import { activateVersion } from '../../../src/registry/repository.js';
-import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
-import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { freshActive } from '../../util/registry-admin.js';
+import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 import { registryHarness } from '../../util/registry-harness.js';
 
 /*
@@ -22,43 +21,13 @@ const { server } = harness;
 
 const snapshot = loadRegistrySnapshotFixture();
 const SCROLL   = 534352;
-const scroll   = snapshot.networks.find(network => network.chainId === SCROLL)!.markets[0]!;
-const COMP     = scroll.rewardAsset!.token.address;
 
 type ErrorBody = { error: { code: string, message: string, details?: { registryVersion?: { id: string } } } };
 
 const tokensPath = (chainId: string | number, query = '') => `/registry/v1/networks/${chainId}/tokens${query}`;
 
-async function freshDatabase(
-  { activate, through }: { activate: boolean, through?: string },
-): Promise<{ db: D1Database, versionId: string }> {
-  const db = await harness.freshDatabase({ through });
-  const { versionId } = await seedCandidate(db, snapshot);
-  await validateSeeded(db, versionId);
-  if (activate) {
-    await activateVersion(db, { versionId, action: 'activate', actor: 'test-seed', reason: 'seeded for a token list test' });
-  }
-  return { db, versionId };
-}
-
-async function list(query = ''): Promise<TokenListV1> {
-  const response = await server.fetch(tokensPath(SCROLL, query));
-  if (response.status !== 200) {
-    throw new Error(`the token list answered ${response.status}: ${await response.text()}`);
-  }
-  return await response.json() as TokenListV1;
-}
-
-const decide = (db: D1Database, isStrategic: boolean) => setTokenPolicy(db, {
-  chainId:      SCROLL,
-  tokenAddress: COMP,
-  isStrategic,
-  actor:        'test',
-  reason:       'decided for a token list test',
-});
-
 t.test('a chain whose collateral cannot be read is still listed, failing open', async t => {
-  const { versionId } = await freshDatabase({ activate: true });
+  const { versionId } = await freshActive(harness, { activate: true });
 
   const response = await server.fetch(tokensPath(SCROLL));
   t.equal(response.status, 200, 'a node that does not answer is not a failure of the list');
@@ -94,32 +63,13 @@ t.test('a chain whose collateral cannot be read is still listed, failing open', 
   t.ok(body.tokens.every(token => token.address === token.address.toLowerCase()), 'addresses are lowercase');
 });
 
-t.test('a strategic token is shown whatever its value, and the next request sees a decision', async t => {
-  const { db } = await freshDatabase({ activate: true });
-
-  t.same((await list('?visibleOnly=true')).tokens.map(token => token.symbol), [ 'WETH', 'wstETH' ],
-    'visibleOnly lists what discovery shows');
-
-  await decide(db, true);
-  const decided = await list();
-  const comp = decided.tokens.find(token => token.symbol === 'COMP')!;
-  t.same([ comp.isStrategic, comp.isVisible, comp.visibilityReason, comp.collateralValueUsd ], [ true, true, 'strategic', '0' ],
-    'a strategic token is shown, and its value is still told');
-  t.same((await list('?visibleOnly=true')).tokens.map(token => token.symbol), [ 'COMP', 'WETH', 'wstETH' ]);
-  t.equal((await list('?visibleOnly=false')).tokens.length, 4, 'visibleOnly=false lists every token');
-
-  await decide(db, false);
-  t.same((await list('?visibleOnly=true')).tokens.map(token => token.symbol), [ 'WETH', 'wstETH' ],
-    'a decision taken back is seen at once: decisions are read on every request');
-});
-
 t.test('a request the list cannot answer is refused, with CORS', async t => {
-  const { versionId } = await freshDatabase({ activate: true });
+  const { versionId } = await freshActive(harness, { activate: true });
 
   for (const chainId of [ '0', '-1', 'scroll-mainnet', '1.5' ]) {
     t.equal((await server.fetch(tokensPath(chainId))).status, 400, `chain id ${chainId} is refused`);
   }
-  for (const query of [ '?visibleOnly=', '?visibleOnly=TRUE', '?visibleOnly=1', '?visibleOnly=true&visibleOnly=false' ]) {
+  for (const query of [ '?visibleOnly=', '?visibleOnly=TRUE', '?visibleOnly=1', '?visibleOnly=true&visibleOnly=false', '?visibleOnly=true&visibleOnly=true' ]) {
     const response = await server.fetch(tokensPath(SCROLL, query));
     t.equal(response.status, 400, `${query} is refused`);
     t.match((await response.json() as ErrorBody).error.message, /visibleOnly must be true or false/);
@@ -147,7 +97,7 @@ t.test('a request the list cannot answer is refused, with CORS', async t => {
 });
 
 t.test('without an active version there is nothing to list', async t => {
-  await freshDatabase({ activate: false });
+  await freshActive(harness, { activate: false });
 
   const response = await server.fetch(tokensPath(SCROLL));
   t.equal(response.status, 503);
@@ -159,7 +109,7 @@ t.test('without an active version there is nothing to list', async t => {
  * threshold, so a list that cannot read them is not answered at all.
  */
 t.test('a database without the token policy migration says so', async t => {
-  await freshDatabase({ activate: true, through: '0004' });
+  await freshActive(harness, { activate: true, through: '0004' });
 
   const response = await server.fetch(tokensPath(SCROLL));
   t.equal(response.status, 503);

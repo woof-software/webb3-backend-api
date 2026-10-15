@@ -9,7 +9,9 @@ import * as evm     from '../lib/computations/evm.js';
 import * as market  from '../lib/computations/market.js';
 import * as rewards from '../lib/computations/rewards.js';
 
-import { snakeifyCamelObject } from '../lib/camel-snake.js';
+import { snakeifyCamelObject }   from '../lib/camel-snake.js';
+import { ROUTE_EVALUATOR_FLAGS } from '../lib/flags.js';
+import { throttle }              from '../lib/throttle.js';
 
 import type { RegistryComet } from '../lib/model/comet-registry.js';
 import type { MarketIdentity } from '../lib/computations/market/market-summary.js';
@@ -83,24 +85,18 @@ function unreachedMarket(contract: RegistryComet, latestBlock: Pick<Eth.Block, '
 }
 
 /*
- * When this isolate last reported each market the chain has not reached, by
+ * When this isolate reports each market the chain has not reached, by
  * network and Comet. Every route that lists the market answers it on every
  * request, and a line for each would bury everything else in the log: one a
  * minute per market names it for as long as it lasts, as a feed that reverts
  * is named (get-price.ts).
  */
-const reported = new Map<string, number>();
-
-const REPORT_EVERY_MS = 60_000;
+const due = throttle(60_000);
 
 function reportUnreached(contract: RegistryComet, message: string): void {
-  const key  = `${contract.network}:${contract.address.toLowerCase()}`;
-  const at   = Date.now();
-  const last = reported.get(key);
-  if (last !== undefined && at - last < REPORT_EVERY_MS) {
+  if (!due(`${contract.network}:${contract.address.toLowerCase()}`)) {
     return;
   }
-  reported.set(key, at);
   console.warn(`creation block not reached: ${contract.address} on ${contract.network}: ${message}`);
 }
 
@@ -113,8 +109,7 @@ async function latestSummary(
   const { evaluate, pipe1, pull1, split, value } = context.instantiateEvaluator('mainnet', {
     flags: {
       ...context.flags,
-      batchingEnabled: true,
-      evaluatorAlgorithm: 'workingset',
+      ...ROUTE_EVALUATOR_FLAGS,
     },
   });
 
@@ -196,8 +191,7 @@ async function latestRewardsSummary(
   const { evaluate, pipe1, pull1, value } = context.instantiateEvaluator('mainnet', {
     flags: {
       ...context.flags,
-      batchingEnabled: true,
-      evaluatorAlgorithm: 'workingset',
+      ...ROUTE_EVALUATOR_FLAGS,
     },
   });
 
@@ -365,8 +359,7 @@ async function rewardsDappData(
   const evaluator = context.instantiateEvaluator('mainnet', {
     flags: {
       ...context.flags,
-      batchingEnabled: true,
-      evaluatorAlgorithm: 'workingset',
+      ...ROUTE_EVALUATOR_FLAGS,
     },
   });
 

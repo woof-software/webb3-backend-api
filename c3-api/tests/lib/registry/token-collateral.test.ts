@@ -1,16 +1,6 @@
 import t, { Test } from 'tap';
 
-import * as Debug    from '../../../lib/debug-log.js';
-import * as Flags    from '../../../lib/flags.js';
-import { BigNumber } from '../../../lib/bignumber.js';
 import { BigFixnum } from '../../../lib/bigfixnum.js';
-
-import * as Evaluator  from '../../../lib/symbolic/evaluator.js';
-import { MemoryCache } from '../../../lib/symbolic/cache.js';
-
-import * as evm    from '../../../lib/computations/evm.js';
-import * as comet  from '../../../lib/computations/comet.js';
-import * as market from '../../../lib/computations/market.js';
 
 import type { PriceExceptionV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
@@ -27,15 +17,16 @@ import {
   positionSetOf,
   positionsOf,
   recordKey,
-  tokenValue,
 } from '../../../src/registry/token-collateral.js';
 
 import { deprecatedDecisionsOf } from '../../../src/registry/deprecated-collaterals.js';
+import { tokenValue } from '../../../src/registry/token-value.js';
 import { tokenList } from '../../../src/registry/token-visibility.js';
 
-import { FakeNode, NodeScript, batches, blockReads, fakeNode } from '../../util/fake-node.js';
+import { NodeScript, batches, blockReads, fakeNode, serve } from '../../util/fake-node.js';
 import { MemoryKv } from '../../util/kv.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
+import { tokenCollateralDeps } from '../../util/token-collateral.js';
 
 import '../../../shim/node-self.js';
 
@@ -44,9 +35,6 @@ import '../../../shim/node-self.js';
  * what reaches the node, what is kept in KV, and what a request answers when
  * the node fails it in part, in whole, or not at all.
  */
-const flags = { ...Flags.parseWithDefaults(process.env), evaluatorAlgorithm: 'workingset', batchingEnabled: true } as Flags.SomeFlags;
-const debug = Debug.MakeLogger([]).configure(process.env);
-
 const snapshot = loadRegistrySnapshotFixture();
 const NOW      = new Date('2026-10-05T12:00:30.000Z');
 const LATEST   = { number: 23_500_000, timestamp: Math.floor(NOW.getTime() / 1000) };
@@ -61,12 +49,6 @@ const BASE_USDC   = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
 const BASE_USDC_FEED = '0x3e6d1cca8eee6d02f1f578b613374eb53e6823b4';
 
 const nodeOf = (script: NodeScript = {}) => fakeNode(snapshot, LATEST, script);
-
-function useNode(t: { teardown: (fn: () => void) => void }, node: FakeNode): void {
-  const before = globalThis.fetch;
-  globalThis.fetch = node.fetch as typeof globalThis.fetch;
-  t.teardown(() => { globalThis.fetch = before; });
-}
 
 // the lines a dashboard reads, taken off the console for the length of a test
 function captureEvents(t: Test): Array<Record<string, any>> {
@@ -98,29 +80,8 @@ function countedKv(store: KVNamespace = MemoryKv({}) as unknown as KVNamespace) 
   return { kv, counts, store };
 }
 
-/*
- * The dependencies of one isolate, which is what one KV binding object is.
- * What it hands to waitUntil is kept, so a test can wait for the work a
- * request left running.
- */
-function depsOf(
-  kv: KVNamespace,
-  overrides: Partial<TokenCollateralDeps> = {},
-): TokenCollateralDeps & { background: Array<Promise<unknown>> } {
-  const cache = new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]);
-  const background: Array<Promise<unknown>> = [];
-  return {
-    frame:           { apiHost: '', nodeHost: 'node.test', nodeKey: 'key' },
-    evaluator:       () => Evaluator.instantiate({ ...evm, ...comet, ...market } as any, { cache, debug, flags }) as any,
-    kv:              () => kv,
-    maxStaleMinutes: 15,
-    now:             () => NOW,
-    debug:           { error: () => {} },
-    waitUntil:       work => { background.push(work); },
-    background,
-    ...overrides,
-  };
-}
+// the dependencies of one isolate, at NOW unless a test moves its clock
+const depsOf = (kv: KVNamespace, overrides: Partial<TokenCollateralDeps> = {}) => tokenCollateralDeps(kv, { now: () => NOW, ...overrides });
 
 // a clock a test moves by hand, starting at NOW
 function clock() {
@@ -152,7 +113,7 @@ const outcomeOf = (view: CollateralView, token: string) => view.current!.positio
 
 t.test('a cold minute costs the latest block and one batch, and is kept for the rest of the minute', async t => {
   const node = nodeOf();
-  useNode(t, node);
+  serve(t, node);
   const events = captureEvents(t);
   const { kv, counts } = countedKv();
   const deps = depsOf(kv);
@@ -187,7 +148,7 @@ t.test('a cold minute costs the latest block and one batch, and is kept for the 
 
 t.test('another isolate reads the minute from KV', async t => {
   const node = nodeOf();
-  useNode(t, node);
+  serve(t, node);
   const shared = countedKv();
   await collateralView(depsOf(shared.kv), chain1);
 
@@ -232,7 +193,7 @@ t.test('a token held in several markets is the sum of its positions, each in its
     [`${cWBTC}:0x40fcee8cdda01522846d197df9d9c1199b1cb1d3`]: priced(1n, 100_000n), // USDC / BTC, 0.00001
     [`${cWBTC}:0xf4030086522a5beea4988f8ca5b36dbc97bee88c`]: priced(100_000n),     // BTC / USD, the conversion
   };
-  useNode(t, nodeOf({
+  serve(t, nodeOf({
     answer: read => read.name === 'totalsCollateral' ? (totals[`${read.comet}:${read.argument}`] === undefined ? undefined : [ totals[`${read.comet}:${read.argument}`] ])
       : read.name === 'getPrice' ? (prices[`${read.comet}:${read.argument}`] === undefined ? undefined : [ prices[`${read.comet}:${read.argument}`] ])
       : undefined,
@@ -276,7 +237,7 @@ t.test('a delisted collateral is valued through the constant feed its Comet now 
       : read.name === 'getPrice' && read.argument === BTC_USD ? [ (100_000n * 10n ** 8n).toString() ]
       : undefined,
   });
-  useNode(t, node);
+  serve(t, node);
   captureEvents(t);
   const view = await collateralView(depsOf(countedKv().kv), chain1);
   const list = tokenList({
@@ -313,7 +274,7 @@ t.test('one call the node refuses costs only its own position', async t => {
   ];
   for (const [ name, chain, feed, token ] of cases) {
     const node = nodeOf({ answer: read => read.name === 'getPrice' && read.argument === feed ? 'fail' : undefined });
-    useNode(t, node);
+    serve(t, node);
     const { kv, counts } = countedKv();
 
     const view = await collateralView(depsOf(kv), chain);
@@ -338,7 +299,7 @@ t.test('a revert is an answer about its position, kept with the minute', async t
       : undefined
     ),
   });
-  useNode(t, node);
+  serve(t, node);
   const events = captureEvents(t);
   const { kv, counts } = countedKv();
 
@@ -360,7 +321,7 @@ t.test('a revert is an answer about its position, kept with the minute', async t
 
 t.test('a node that fails the latest block leaves the earlier minutes', async t => {
   const node = nodeOf({ block: () => 'fail' });
-  useNode(t, node);
+  serve(t, node);
   const { kv, store, counts } = countedKv();
   await store.put(recordKey(1, positionSetOf(mainnet), MINUTE - 3), JSON.stringify(recordAt(MINUTE - 3)));
 
@@ -374,7 +335,7 @@ t.test('a node that fails the latest block leaves the earlier minutes', async t 
 
 t.test('a node that hangs is waited for only so long, and says so', async t => {
   const node = nodeOf({ hold: () => 'forever' });
-  useNode(t, node);
+  serve(t, node);
   const events = captureEvents(t);
   const started = Date.now();
   const view = await collateralView(depsOf(countedKv().kv, { deadlineMs: 50 }), chain1);
@@ -388,7 +349,7 @@ t.test('the node gets one deadline, for the latest block and the minute together
   let arrived!: () => void;
   const batchArrived = new Promise<void>(resolve => { arrived = resolve; });
   const node = nodeOf({ hold: request => request.calls[0]!.method === 'eth_getBlockByNumber' ? sleep(500) : (arrived(), 'forever') });
-  useNode(t, node);
+  serve(t, node);
   const events = captureEvents(t);
   const started = Date.now();
   const view = await collateralView(depsOf(countedKv().kv, { deadlineMs: 1_000 }), chain8453);
@@ -409,7 +370,7 @@ t.test('the node gets one deadline, for the latest block and the minute together
  */
 t.test('a minute slower than the deadline is finished for the next request', async t => {
   const node = nodeOf({ hold: request => request.calls[0]!.method === 'eth_getBlockByNumber' ? undefined : sleep(1_500) });
-  useNode(t, node);
+  serve(t, node);
   const events = captureEvents(t);
   const deps = depsOf(countedKv().kv, { deadlineMs: 500 });
 
@@ -431,7 +392,7 @@ t.test('a computation that never finishes is started again once the runtime woul
   // the first batch is never answered, as one the runtime cancelled would not be; every later one is
   let sent = 0;
   const node = nodeOf({ hold: request => request.calls[0]!.method !== 'eth_getBlockByNumber' && sent++ === 0 ? 'forever' : undefined });
-  useNode(t, node);
+  serve(t, node);
   const time = clock();
   const deps = depsOf(countedKv().kv, { deadlineMs: 1_000, now: time.now });
 
@@ -454,7 +415,7 @@ t.test('a minute that failed in part is read again after seconds, one that faile
   ];
   for (const [ name, answer, backoff ] of cases) {
     const node = nodeOf({ answer: answer! });
-    useNode(t, node);
+    serve(t, node);
     const time = clock();
     const deps = depsOf(countedKv().kv, { now: time.now });
 
@@ -471,24 +432,24 @@ t.test('a minute that failed in part is read again after seconds, one that faile
 
 t.test('an isolate\'s incomplete minute does not hide the complete one another isolate wrote', async t => {
   const store = MemoryKv({}) as unknown as KVNamespace;
-  const usdcFails = (read: { name: string, argument: string }) => read.name === 'getPrice' && read.argument === BASE_USDC_FEED ? 'fail' as const : undefined;
+  const usdcFails: NodeScript['answer'] = read => read.name === 'getPrice' && read.argument === BASE_USDC_FEED ? 'fail' : undefined;
   const earlierBlock = { number: LATEST.number - 30, timestamp: LATEST.timestamp - 60 };
 
   // this isolate cannot value USDC in the minute before
   let block = earlierBlock;
   const node = nodeOf({ block: () => block, answer: usdcFails });
-  useNode(t, node);
+  serve(t, node);
   const isolate = depsOf(countedKv(store).kv);
   t.same(outcomeOf(await collateralView(isolate, chain8453), BASE_USDC), [ 'transport' ]);
 
   // another isolate can, and writes that minute to KV
   const healthy = nodeOf({ block: () => block });
-  useNode(t, healthy);
+  serve(t, healthy);
   await collateralView(depsOf(countedKv(store).kv), chain8453);
 
   // in this minute this isolate fails again, and looks back
   block = LATEST;
-  useNode(t, node);
+  serve(t, node);
   const view = await collateralView(isolate, chain8453);
   t.same(view.earlier.map(record => record.minute), [ MINUTE - 1 ], 'the complete minute in KV is found');
   t.equal(tokenValue(BASE_USDC, view, base, THRESHOLD, NOW).status, 'stale', 'and answers for USDC');
@@ -499,7 +460,7 @@ t.test('what an isolate found looking back is kept, even when the block lags the
     block:  () => ({ number: LATEST.number - 8, timestamp: LATEST.timestamp - 90 }),
     answer: read => read.name === 'getPrice' && read.argument === XAUT_FEED ? 'revert' : undefined,
   });
-  useNode(t, node);
+  serve(t, node);
   const { kv, counts } = countedKv();
   const deps = depsOf(kv);
 
@@ -517,7 +478,7 @@ t.test('the stale window reaches back exactly as far as it is set', async t => {
   const withBlock = countedKv();
   await put(withBlock.store, MINUTE - 15);
   await put(withBlock.store, MINUTE - 16);
-  useNode(t, nodeOf({ answer: revertingXaut }));
+  serve(t, nodeOf({ answer: revertingXaut }));
   const looked = await collateralView(depsOf(withBlock.kv), chain1);
   t.same(looked.earlier.map(record => record.minute), [ MINUTE - 15 ], 'the fifteenth minute before is the last one used');
   t.same(tokenValue(XAUT, looked, mainnet, THRESHOLD, NOW).staleAgeSeconds, LATEST.timestamp - (MINUTE - 15) * 60);
@@ -526,14 +487,14 @@ t.test('the stale window reaches back exactly as far as it is set', async t => {
   const withoutBlock = countedKv();
   await put(withoutBlock.store, MINUTE - 14);
   await put(withoutBlock.store, MINUTE - 15);
-  useNode(t, nodeOf({ block: () => 'fail' }));
+  serve(t, nodeOf({ block: () => 'fail' }));
   const blind = await collateralView(depsOf(withoutBlock.kv), chain1);
   t.same(blind.earlier.map(record => record.minute), [ MINUTE - 14 ], 'the clock\'s own minute counts as one of the fifteen');
 });
 
 t.test('concurrent requests of one minute compute it once', async t => {
   const node = nodeOf();
-  useNode(t, node);
+  serve(t, node);
   const deps = depsOf(countedKv().kv);
   const [ first, second ] = await Promise.all([ collateralView(deps, chain1), collateralView(deps, chain1) ]);
   t.equal(batches(node).length, 1, 'one batch between them');
@@ -543,7 +504,7 @@ t.test('concurrent requests of one minute compute it once', async t => {
 
 t.test('an entry KV cannot give is a miss', async t => {
   const node = nodeOf();
-  useNode(t, node);
+  serve(t, node);
   const { kv, store } = countedKv();
   await store.put(recordKey(1, positionSetOf(mainnet), MINUTE), '{"not":"a record"}');
   const view = await collateralView(depsOf(kv), chain1);
@@ -591,74 +552,4 @@ t.test('the stale window comes from the environment, and an empty value is unset
   for (const value of [ '31', '-1', '1.5', 'ten' ]) {
     t.equal(maxStaleMinutesOf({ TOKEN_COLLATERAL_MAX_STALE_MINUTES: value }), 15, `${value} is out of range`);
   }
-});
-
-/*
- * A token's value from a view, by the rule: fresh or exception, then the D7
- * lower bound, then the newest complete earlier minute, then nothing.
- */
-t.test('a token takes the newest value it can stand behind', async t => {
-  const remap = { kind: 'deprecated_price_remap', priceFeedAddress: '0x0000000000000000000000000000000000000001', replacementPriceFeed: { address: '0x0000000000000000000000000000000000000002', decimals: 8 }, provenance: 'x', expiresAt: null };
-  // two positions of one token, of a version whose network holds the remap
-  const comet = { registry: { priceExceptions: [ remap ] } };
-  const positions = [
-    { key: 'a@1#0', token: '0x00000000000000000000000000000000000000aa', assetIndex: 0, comet },
-    { key: 'b@1#0', token: '0x00000000000000000000000000000000000000aa', assetIndex: 0, comet },
-  ] as any[];
-  const TOKEN = '0x00000000000000000000000000000000000000aa';
-  const block = (minute: number) => ({ number: minute, timestamp: minute * 60 });
-  const usd = (value: string) => ({ status: 'success' as const, valueUsd: { value, decimals: 0 } });
-  const record = (minute: number, outcomes: unknown[]): CollateralMinute => ({
-    chainId: 1, minute, positionSet: 'x', block: block(minute),
-    positions: positions.map((position, index) => ({ key: position.key, token: TOKEN, outcome: outcomes[index] as any })),
-  });
-  const valueOf = (view: CollateralView) => tokenValue(TOKEN, view, positions, THRESHOLD, NOW);
-  const reverted = { status: 'error', reason: 'price_reverted' };
-
-  const fresh = valueOf({ block: block(100), current: record(100, [ usd('100000'), usd('150000') ]), earlier: [] });
-  t.same([ fresh.status, fresh.valueUsd?.toString(), fresh.staleAgeSeconds ], [ 'fresh', '250000', 0 ], 'complete now is fresh');
-
-  const excepted = valueOf({ block: block(100), current: record(100, [
-    { status: 'exception', valueUsd: { value: '1', decimals: 0 }, exceptions: [ remap ] },
-    { status: 'exception', valueUsd: { value: '1', decimals: 0 }, exceptions: [ remap ] },
-  ]), earlier: [] });
-  t.same([ excepted.status, excepted.exceptions.length ], [ 'exception', 1 ], 'an exception is named once, whatever it priced');
-
-  const partial = valueOf({ block: block(100), current: record(100, [ usd('300000'), reverted ]), earlier: [ record(99, [ usd('1'), usd('1') ]) ] });
-  t.same([ partial.status, partial.valueUsd?.toString() ], [ 'partial', '300000' ], 'what was read already reaching the threshold proves it (D7)');
-  const partialExcepted = valueOf({ block: block(100), current: record(100, [
-    { status: 'exception', valueUsd: { value: '300000', decimals: 0 }, exceptions: [ remap ] },
-    reverted,
-  ]), earlier: [] });
-  t.same([ partialExcepted.status, partialExcepted.exceptions ], [ 'partial', [ remap ] ], 'and names the exceptions of what it read');
-
-  const stale = valueOf({ block: block(100), current: record(100, [ usd('1'), reverted ]), earlier: [ record(97, [ usd('2'), usd('3') ]) ] });
-  t.same([ stale.status, stale.valueUsd?.toString(), stale.staleAgeSeconds, stale.block ], [ 'stale', '5', 180, block(97) ],
-    'below the threshold, the newest complete minute answers, and says how old it is');
-  const staleExcepted = valueOf({ block: block(100), current: null, earlier: [ record(97, [
-    { status: 'exception', valueUsd: { value: '2', decimals: 0 }, exceptions: [ remap ] },
-    usd('3'),
-  ]) ] });
-  t.same([ staleExcepted.status, staleExcepted.exceptions ], [ 'stale', [ remap ] ], 'with the exceptions that minute applied');
-
-  /*
-   * Why an exception was added and until when it applies change no value, so
-   * a record is shared by versions that differ only in them: each answers
-   * with its own description, whichever valued the minute.
-   */
-  const redescribed = { ...remap, provenance: 'y', expiresAt: '2999-01-01T00:00:00.000Z' };
-  const answering   = positions.map(position => ({ ...position, comet: { registry: { priceExceptions: [ redescribed ] } } }));
-  const remapped    = { status: 'exception', valueUsd: { value: '1', decimals: 0 }, exceptions: [ remap ] };
-  t.same(tokenValue(TOKEN, { block: block(100), current: record(100, [ remapped, remapped ]), earlier: [] }, answering, THRESHOLD, NOW).exceptions,
-    [ redescribed ], 'an exception of this minute is described as the version answering describes it');
-  t.same(tokenValue(TOKEN, { block: block(100), current: null, earlier: [ record(97, [ remapped, usd('3') ]) ] }, answering, THRESHOLD, NOW).exceptions,
-    [ redescribed ], 'and so is one of an earlier minute');
-
-  const unavailable = valueOf({ block: null, current: null, earlier: [ record(97, [ usd('1'), reverted ]) ] });
-  t.same([ unavailable.status, unavailable.valueUsd, unavailable.block ], [ 'unavailable', null, null ],
-    'an earlier minute that could not value it either is not an answer');
-
-  const absent = tokenValue('0x00000000000000000000000000000000000000bb', { block: null, current: null, earlier: [] }, positions, THRESHOLD, NOW);
-  t.same([ absent.status, absent.valueUsd?.toString() ], [ 'fresh', '0' ],
-    'a token without a collateral position is worth nothing, whether or not the node answers');
 });

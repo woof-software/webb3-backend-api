@@ -117,14 +117,14 @@ function isMigratorAddress(address: Eth.Address, network: KnownNetwork.Name) {
 }
 
 function createTransactionAction({
-  log,
+  decoded,
   network,
   contractAddress,
   proxyAddresses,
   catalog,
   decimalsOf,
 }: {
-  log: Eth.Event.Log,
+  decoded: ReturnType<typeof coders.decode>,
   network: KnownNetwork.Name,
   contractAddress: Eth.Address,
   proxyAddresses: Eth.Address[],
@@ -133,7 +133,6 @@ function createTransactionAction({
   decimalsOf: (address: Eth.Address) => number,
 }): RawTransactionHistoryAction | null {
   const lowerCasedProxyAddresses = proxyAddresses.map(address => address.toLowerCase());
-  const decoded = coders.decode(log);
   switch (decoded.name) {
     case 'Supply': {
       return {
@@ -465,6 +464,7 @@ const rawTransactionHistoryItems = implement({
           .sort((a, b) => {
             return parseInt(a.blockNumber, 16) - parseInt(b.blockNumber, 16);
           });
+        const decodedLogs = finalLogs.map(log => ({ log, decoded: coders.decode(log) }));
         /*
          * The tokens the logs name that the version does not describe, each
          * read once for the decimals it reports, at the block the page ends at.
@@ -473,8 +473,8 @@ const rawTransactionHistoryItems = implement({
          * working-set evaluator answers a join of redexes nested in another
          * join's continuation with the outer join's results.
          */
-        const undescribed = [ ...new Set(finalLogs
-          .flatMap(log => tokensNamedBy(coders.decode(log)))
+        const undescribed = [ ...new Set(decodedLogs
+          .flatMap(({ decoded }) => tokensNamedBy(decoded))
           .filter(address => describedDecimals(catalog, network, address) === null)
           .map(address => address.toLowerCase() as Eth.Address)) ];
         return pipe_([
@@ -494,13 +494,13 @@ const rawTransactionHistoryItems = implement({
             //
             const items: RawTransactionHistoryItem[] = [];
             let prevHash = `0x0`;
-            for (let i = 0; i < finalLogs.length; i++) {
-              const log = finalLogs[i];
+            for (let i = 0; i < decodedLogs.length; i++) {
+              const { log, decoded } = decodedLogs[i];
               if (!Eth.parseAddress(log.address)){
                 throw new Error(`log address invalid: ${log.address}`);
               }
               const action = createTransactionAction({
-                log,
+                decoded,
                 network,
                 contractAddress: log.address, // log.address is contract address in string, but we know it must be an Eth.Address
                 proxyAddresses,

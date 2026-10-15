@@ -13,6 +13,7 @@ import {
   marketKey,
 } from '../../lib/model/comet-registry.js';
 
+import { ClockOption, nowOf } from './clock.js';
 import { RegistryError } from './errors.js';
 import type {
   MarketAssetRow,
@@ -121,14 +122,18 @@ type Replacement = Pick<RegistryVersionRow, 'id' | 'attempt' | 'source_repositor
  * same draft cannot collide: the second changes nothing. Returns the ids this
  * call actually closed.
  */
-async function supersedeEarlierAttempts(db: D1Database, replacement: Replacement): Promise<string[]> {
+async function supersedeEarlierAttempts(
+  db: D1Database,
+  replacement: Replacement,
+  options: ClockOption = {},
+): Promise<string[]> {
   const { results } = await db.prepare(
     `SELECT id FROM registry_versions
      WHERE source_repository = ?1 AND source_commit_sha = ?2 AND attempt < ?3 AND status = 'importing'`
   ).bind(replacement.source_repository.toLowerCase(), replacement.source_commit_sha, replacement.attempt)
     .all<{ id: string }>();
 
-  const createdAt = new Date().toISOString();
+  const createdAt = nowOf(options.now).toISOString();
   const details   = JSON.stringify({ supersededBy: replacement.id, attempt: replacement.attempt });
   const closed: string[] = [];
   for (const { id } of results ?? []) {
@@ -161,7 +166,12 @@ async function supersedeEarlierAttempts(db: D1Database, replacement: Replacement
  * existed — or by a call that failed to close them — are closed the next time
  * the commit is checked. With no successful attempt, nothing is closed.
  */
-async function supersedeStaleAttempts(db: D1Database, repository: string, commitSha: string): Promise<string[]> {
+async function supersedeStaleAttempts(
+  db: D1Database,
+  repository: string,
+  commitSha: string,
+  options: ClockOption = {},
+): Promise<string[]> {
   const newest = await db.prepare(
     `SELECT version.id, version.attempt, version.source_repository, version.source_commit_sha
      FROM registry_versions AS version
@@ -183,7 +193,7 @@ async function supersedeStaleAttempts(db: D1Database, repository: string, commit
      ORDER BY version.attempt DESC
      LIMIT 1`
   ).bind(repository.toLowerCase(), commitSha).first<Replacement>();
-  return newest === null || newest === undefined ? [] : supersedeEarlierAttempts(db, newest);
+  return newest === null || newest === undefined ? [] : supersedeEarlierAttempts(db, newest, options);
 }
 
 /*

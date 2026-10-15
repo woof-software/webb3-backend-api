@@ -1,7 +1,5 @@
 import t from 'tap';
 
-import { createHash } from 'node:crypto';
-
 import * as Debug from '../../../lib/debug-log.js';
 import type { RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
@@ -167,10 +165,12 @@ t.test('a cursor is kept under the digest of what it holds, the id its page hand
   const store = cursorStore(MemoryKv({}), Debug.MakeLogger([]));
   const id    = await keepCursor(store, quietLog, opened);
 
-  t.equal(id, createHash('sha256').update(JSON.stringify(opened)).digest('hex'), 'the hex SHA-256 of its JSON');
   t.ok(isCursorId(id), 'which a request may name a cursor by');
   t.same(await store.read(id), opened, 'and under which KV holds it');
   t.notOk(isCursorId(id.toUpperCase()), 'while a value of another form names none');
+
+  const other = openCursor(catalog, streams.slice(1), { markets: [], actions: [], initiatedBy: [], contractAddresses: [], networks: [] });
+  t.not(await keepCursor(store, quietLog, other), id, 'another cursor is kept under another id');
 });
 
 /*

@@ -1,13 +1,7 @@
 import t from 'tap';
 
-import * as Debug    from '../../../lib/debug-log.js';
-import * as Flags    from '../../../lib/flags.js';
 import { BigNumber } from '../../../lib/bignumber.js';
 import { BigFixnum } from '../../../lib/bigfixnum.js';
-
-import * as Compute    from '../../../lib/symbolic/computation.js';
-import * as Evaluator  from '../../../lib/symbolic/evaluator.js';
-import { MemoryCache } from '../../../lib/symbolic/cache.js';
 
 import * as market from '../../../lib/computations/market.js';
 import type { PositionValue } from '../../../lib/computations/market/asset-collateral-value.js';
@@ -16,6 +10,7 @@ import type { PriceExceptionV1, RegistrySnapshotV1 } from '../../../lib/model/co
 
 import { catalogOf } from '../../../src/registry/catalog.js';
 
+import { evaluatorOver, stub } from '../../util/evaluator.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 
 import '../../../shim/node-self.js';
@@ -25,9 +20,6 @@ import '../../../shim/node-self.js';
  * answer from tables instead of a node: the position's info and amount as the
  * Comet reports them, and the prices of its feeds.
  */
-const flags = { ...Flags.parseWithDefaults(process.env), evaluatorAlgorithm: 'workingset', batchingEnabled: true } as Flags.SomeFlags;
-const debug = Debug.MakeLogger([]).configure(process.env);
-
 const BLOCK = 23_500_000;
 
 const units = (amount: string | number, decimals: number) => BigFixnum.from({ value: amount, decimals });
@@ -42,10 +34,6 @@ type Chain = {
   // what getPrice answers, by feed address
   prices:  Record<string, unknown>,
 };
-
-function stub(answer: (context: any) => unknown) {
-  return Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
-}
 
 /*
  * The value of `symbol` in market `deploymentKey` on `network`, for a snapshot
@@ -63,7 +51,7 @@ async function valueOf(
   const asset = entry.market.collateralAssets.find(candidate => candidate.token.symbol === symbol)!;
   const feedsRead: string[] = [];
 
-  const { evaluate, pull1 } = Evaluator.instantiate<any>({
+  const { evaluate, pull1 } = evaluatorOver({
     assetCollateralValue: market.assetCollateralValue,
     collateralAssetInfo: stub(({ contract, assetIndex }) => {
       const own = entry.market.collateralAssets.find(candidate => candidate.assetIndex === assetIndex)!;
@@ -82,7 +70,7 @@ async function valueOf(
       feedsRead.push(`${priceFeed.address}/${priceFeed.decimals}`);
       return chain.prices[priceFeed.address] ?? price(1);
     }),
-  } as any, { cache: new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]), debug, flags });
+  });
 
   const value = await evaluate(pull1({ assetCollateralValue: {
     apiHost: '', nodeHost: '', nodeKey: '', network, contract: entry.comet, assetIndex: asset.assetIndex, blockNumber: BLOCK,
@@ -255,6 +243,26 @@ t.test('a remapped feed is read in place of the one the Comet names', async t =>
   t.same(feedsRead, [ `${REPLACEMENT}/18` ], 'the replacement, at its own decimals');
   t.equal(value.status, 'exception');
   t.ok(usdOf(value).eq(BigFixnum.from({ value: 2500 })));
+});
+
+/*
+ * Unlike a summary, the token list does not fall back on the feed a remap
+ * replaces (pricePlanOf): it values the latest block, where the replacement
+ * answers, and a stale answer of the retired feed must not decide whether a
+ * token is shown.
+ */
+t.test('a remapped feed whose replacement reverts is not read from the feed it replaces', async t => {
+  const REPLACEMENT = '0x1111111111111111111111111111111111111111';
+  const snapshot = withException(fixture, {
+    kind: 'deprecated_price_remap', priceFeedAddress: XAUT_FEED,
+    replacementPriceFeed: { address: REPLACEMENT, decimals: 18 }, provenance: 'test', expiresAt: null,
+  });
+  const { value, feedsRead } = await valueOf(snapshot, 'ethereum-mainnet', 'usdt', 'XAUt', {
+    totals: { [`${USDT_COMET}:${XAUT}`]: total('1000000') },
+    prices: { [REPLACEMENT]: reverted, [XAUT_FEED]: price('250000000000') },
+  });
+  t.same(value, { status: 'error', reason: 'price_reverted' }, 'the position fails, though the Comet\'s own feed answers');
+  t.same(feedsRead, [ `${REPLACEMENT}/18` ], 'which is not read');
 });
 
 /*

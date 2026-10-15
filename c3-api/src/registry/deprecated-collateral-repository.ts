@@ -9,30 +9,34 @@ import type {
   VersionRefV1,
 } from '../../lib/model/comet-registry.js';
 
-import { ApiError } from '../http/errors.js';
-
+import {
+  DecisionKind,
+  Planned,
+  StateRow,
+  activeVersionOf,
+  applyDecisions,
+  readDecision,
+  reviewDecisions,
+  setDecision,
+} from './decision-store.js';
 import { conflict } from './errors.js';
-import type { DeprecatedCollateralEventRow } from './rows.js';
-import { changedRows } from './sql-condition.js';
-import { activeVersionOf, refusal, rowsOf } from './token-policy-repository.js';
+import type { DeprecatedCollateralEventRow, DeprecatedCollateralRow } from './rows.js';
+import { rowsOf } from './sql-condition.js';
 
 /*
  * Deprecated collaterals: which collaterals of which Comets an administrator
  * has marked deprecated, and the audit of every change to that decision.
  *
- * It is written as the token policies are (token-policy-repository.ts), for
- * a collateral of a Comet in place of a token. A decision is keyed by chain
- * id, Comet address and token address, all lowercase, rather than by a
- * versioned row, so it outlives every activation; the migration that creates
- * the tables (0006, under the names 0007 gave them) explains why and enforces
- * the rest in the database. Every read here that answers for the active
- * version resolves it in the same statement or batch as the decisions, so an
- * answer never names one version while describing another.
- *
- * One decision and a whole list of them are written the same way, by one
- * batch whose statements take the collaterals as one JSON parameter: a list
- * of any length is a handful of statements, and it is written completely or
- * not at all.
+ * They are a kind of the decision store (decision-store.ts), as token
+ * policies are: the store writes, reads, reviews and applies both, and this
+ * module describes a collateral of a Comet to it, answers in the decisions'
+ * own types, and reads what only these decisions are read for. A decision is
+ * keyed by chain id, Comet address and token address, all lowercase, rather
+ * than by a versioned row, so it outlives every activation; the migration
+ * that creates the tables (0006, under the names 0007 gave them) explains why
+ * and enforces the rest in the database. Every read here that answers for
+ * the active version resolves it in the same statement or batch as the
+ * decisions, so an answer never names one version while describing another.
  */
 
 // how many changes one decision read lists, newest first; a collateral's decision changes rarely
@@ -45,7 +49,7 @@ type DeprecatedCollateral = {
   tokenAddress: Address,
 };
 
-// one decision to write
+// what one write records for a collateral: a command's decision, or one row of a list
 type Decision = DeprecatedCollateral & {
   isDeprecated: boolean,
   // null for a row that leaves its collateral as it is, and so needs no reason
@@ -60,42 +64,15 @@ type ListedDecision = Decision & { deploymentKey: string | null, symbol: string 
 type DecisionList   = { reason: string | null, decisions: ListedDecision[] };
 
 /*
- * The collaterals a statement is about, as the one JSON parameter it reads
- * with json_each: `i` is the event id a write records for the collateral, `c`
- * its chain, `m` its Comet, `t` its token, `s` the decision as 0 or 1, `r` the
- * reason or null.
+ * Each collateral of a JSON parameter (`c` its chain, `m` its Comet, `t` its
+ * token) as the active version and the stored decision describe it. A miss is
+ * a chain the version does not hold, a Comet that is no market of it, or a
+ * token that is no collateral of that market.
  */
-function keyed(decisions: Decision[]): string {
-  return JSON.stringify(decisions.map(decision => ({
-    i: crypto.randomUUID(),
-    c: decision.chainId,
-    m: decision.cometAddress,
-    t: decision.tokenAddress,
-    s: decision.isDeprecated ? 1 : 0,
-    r: decision.reason,
-  })));
-}
-
-/*
- * Each collateral of a list as the active version and the stored decision
- * describe it, in the list's order. The pointer is a seeded singleton, so
- * every collateral has a row and every miss is a null column: a chain the
- * version does not hold, a Comet that is no market of it, or a token that is
- * no collateral of that market. `written_id` names the event a write recorded
- * for the collateral, and is null where it changed nothing.
- */
-type CollateralState = {
-  version_id:     string | null,
-  checksum:       string | null,
-  network_id:     string | null,
+type CollateralState = StateRow & {
   market_id:      string | null,
   deployment_key: string | null,
-  token_id:       string | null,
-  symbol:         string | null,
   is_deprecated:  number | null,
-  updated_at:     string | null,
-  updated_by:     string | null,
-  written_id:     string | null,
 };
 
 /*
@@ -160,41 +137,18 @@ function missingFrom(state: CollateralState, collateral: DeprecatedCollateral): 
   return null;
 }
 
-/*
- * The version a request about one collateral resolves against, refusing a
- * chain, a Comet or a token that version does not hold. A decision is about a
- * collateral of a market the registry serves; one about anything else would be
- * a decision nobody could check.
- */
-function requireActiveCollateral(state: CollateralState | undefined, collateral: DeprecatedCollateral): VersionRefV1 {
-  const registryVersion = activeVersionOf(state);
-  const missing = missingFrom(state!, collateral);
-  if (missing !== null) {
-    throw refusal('NOT_FOUND', missing, registryVersion);
+// what a row names that the active version names otherwise: its market, or its token's symbol
+function misnamed(decision: ListedDecision, state: CollateralState): string | null {
+  if (decision.deploymentKey !== null && state.deployment_key !== decision.deploymentKey) {
+    return `the list names ${decision.cometAddress} ${decision.deploymentKey}, which the active registry calls ${state.deployment_key}`;
   }
-  return registryVersion;
+  if (decision.symbol !== null && state.symbol !== decision.symbol) {
+    return `the list names ${decision.tokenAddress} ${decision.symbol}, which the active registry calls ${state.symbol}`;
+  }
+  return null;
 }
 
-/*
- * The statements of a write, each reading the collaterals from ?1, with the
- * actor as ?2 and the time as ?3.
- *
- * The event and the decision row are written only for a collateral whose
- * stored decision differs from the one asked for, where a collateral without
- * a row is not deprecated, and only for a row that states a reason. The
- * condition is evaluated inside the batch, against what is stored when the
- * batch runs, not against a read taken before it: two identical requests
- * write one event between them, and a request for what already applies writes
- * nothing.
- *
- * The triggers check, row by row, that the collateral is in the active
- * version and that each decision row is written beside its newest event. The
- * expectations then state what every collateral of the request must hold now,
- * the ones left unchanged included, and abort the transaction where one does
- * not: a version activated meanwhile without the collateral, or a decision
- * someone else changed meanwhile for a row that states no reason and so was
- * not written.
- */
+// the statements of a write, which writeDecisions (decision-store.ts) explains: a collateral without a row is not deprecated
 const WRITE_EVENTS = `
   INSERT INTO deprecated_collateral_events (
     id, chain_id, comet_address, token_address, previous_is_deprecated, is_deprecated, actor, reason, created_at
@@ -233,123 +187,74 @@ const EXPECT_DECISIONS = `
   FROM json_each(?1) AS row`;
 
 /*
- * Writes the decisions of `collaterals` (as keyed() wrote them) in one batch,
- * and reads back what each collateral holds when it is done. The answer comes
- * from the batch's own final read, never from what the request saw on the way
- * in.
+ * Deprecated collaterals, as the store takes them. A decision is about a
+ * collateral of a market the registry serves; one about anything else would
+ * be a decision nobody could check.
  */
-async function writeDecisions(
-  db: D1Database,
-  collaterals: string,
-  actor: string,
-  conflicts: { left: () => ApiError, changed: () => ApiError },
-): Promise<CollateralState[]> {
-  const timestamp = new Date().toISOString();
+const DEPRECATED_COLLATERAL_KIND: DecisionKind<Decision, ListedDecision, CollateralState> = {
+  label:       'deprecated collateral',
+  listOf:      'deprecated collaterals',
+  subject:     'collateral',
+  identity:    decision => ({ c: decision.chainId, m: decision.cometAddress, t: decision.tokenAddress }),
+  keyOf:       decision => `${decision.chainId}:${decision.cometAddress}:${decision.tokenAddress}`,
+  flagOf:      decision => decision.isDeprecated,
+  storedOf:    state => state.is_deprecated,
+  states:      statesStatement,
+  writes:      { events: WRITE_EVENTS, rows: WRITE_DECISIONS, expectations: EXPECT_DECISIONS },
+  leftAbort:   'collateral is not in the active registry',
+  missingFrom,
+  misnamed,
+  named:       (state, decision) => `${state.symbol ?? decision.tokenAddress} of ${state.deployment_key ?? decision.cometAddress}`,
+};
 
-  let results: D1Result[];
-  try {
-    results = await db.batch([
-      db.prepare(WRITE_EVENTS).bind(collaterals, actor, timestamp),
-      db.prepare(WRITE_DECISIONS).bind(collaterals, actor, timestamp),
-      db.prepare(EXPECT_DECISIONS).bind(collaterals),
-      statesStatement(db, collaterals),
-    ]);
-  } catch (error) {
-    const message = String(error);
-    if (message.includes('collateral is not in the active registry')) {
-      throw conflicts.left();
-    }
-    if (message.includes('changed while they were being written')) {
-      throw conflicts.changed();
-    }
-    throw error;
-  }
-
-  const audited = changedRows(results[0]!);
-  const written = changedRows(results[1]!);
-  const states  = rowsOf<CollateralState>(results[3]);
-  // both writes carry one condition, so a difference is a defect, and it must not be reported as a success
-  if (audited !== written || states.filter(state => state.written_id !== null).length !== written) {
-    throw new Error(`deprecated collateral writes and their audit disagree: ${audited} event(s), ${written} row(s)`);
-  }
-  return states;
-}
-
-/*
- * The write of one decision alone, without the read before it: what
- * setDeprecatedCollateral does once that read has passed, and what a test
- * calls to make the active version change in between.
- */
-async function writeDeprecatedCollateral(db: D1Database, change: DeprecatedChange): Promise<DeprecatedCollateralResultV1> {
-  const left = conflict(
+// the administrative command for one collateral (setDecision)
+async function setDeprecatedCollateral(db: D1Database, change: DeprecatedChange): Promise<DeprecatedCollateralResultV1> {
+  const after = await setDecision(db, DEPRECATED_COLLATERAL_KIND, change, () => conflict(
     'COLLATERAL_LEFT_REGISTRY',
     `${change.tokenAddress} left the collateral of ${change.cometAddress} in the active registry on chain ${change.chainId} `
       + `while its decision was being written`,
-  );
-  const [ after ] = await writeDecisions(db, keyed([ change ]), change.actor, { left: () => left, changed: () => left });
+  ));
   return {
     registryVersion: activeVersionOf(after),
     chainId:         change.chainId,
     cometAddress:    change.cometAddress,
     tokenAddress:    change.tokenAddress,
-    isDeprecated:    after!.is_deprecated === 1,
-    changed:         after!.written_id !== null,
-    updatedAt:       after!.updated_at,
+    isDeprecated:    after.is_deprecated === 1,
+    changed:         after.written_id !== null,
+    updatedAt:       after.updated_at,
   };
 }
 
 /*
- * The administrative command for one collateral: refuse a request the active
- * version cannot answer before writing anything, then write.
- *
- * The read first is only for a precise refusal — an unknown chain, Comet or
- * collateral, no active version — and decides nothing: the write checks
- * membership again inside its own transaction.
- */
-async function setDeprecatedCollateral(db: D1Database, change: DeprecatedChange): Promise<DeprecatedCollateralResultV1> {
-  const [ before ] = rowsOf<CollateralState>(await statesStatement(db, keyed([ change ])).all());
-  requireActiveCollateral(before, change);
-  return await writeDeprecatedCollateral(db, change);
-}
-
-/*
- * One collateral's decision and the changes that led to it, read in one batch
- * so that the history and the decision it explains are the same moment's.
+ * One collateral's decision and the changes that led to it (readDecision).
+ * `inActiveVersion` says whether the decision applies now.
  *
  * The changes are listed in the order they were committed, newest first,
  * which is rowid order (migrations/0006_legacy_collaterals.sql says why), so
  * the first one is always the change that set the decision in force.
- *
- * A decision outlives a version that drops its collateral, and applies again
- * when a later version brings it back, so it stays readable meanwhile:
- * `inActiveVersion` says whether it applies now. Only a collateral the active
- * version does not hold and nobody ever decided about is not found.
  */
 async function readDeprecatedCollateral(db: D1Database, collateral: DeprecatedCollateral): Promise<DeprecatedCollateralDetailV1> {
-  const [ head, events ] = await db.batch([
-    statesStatement(db, keyed([ { ...collateral, isDeprecated: false, reason: null } ])),
-    db.prepare(
+  const { registryVersion, state, events } = await readDecision(
+    db,
+    DEPRECATED_COLLATERAL_KIND,
+    { ...collateral, isDeprecated: false, reason: null },
+    () => db.prepare(
       `SELECT * FROM deprecated_collateral_events
        WHERE chain_id = ?1 AND comet_address = ?2 AND token_address = ?3
        ORDER BY rowid DESC
        LIMIT ?4`
     ).bind(collateral.chainId, collateral.cometAddress, collateral.tokenAddress, MAX_DEPRECATED_EVENTS),
-  ]);
-
-  const [ state ] = rowsOf<CollateralState>(head);
-  const history   = rowsOf<DeprecatedCollateralEventRow>(events);
-  const decided   = (state !== undefined && state.is_deprecated !== null) || history.length > 0;
-  const registryVersion = decided ? activeVersionOf(state) : requireActiveCollateral(state, collateral);
+  );
   return {
     registryVersion,
     chainId:         collateral.chainId,
     cometAddress:    collateral.cometAddress,
     tokenAddress:    collateral.tokenAddress,
-    inActiveVersion: state!.token_id !== null,
-    isDeprecated:    state!.is_deprecated === 1,
-    updatedAt:       state!.updated_at,
-    updatedBy:       state!.updated_by,
-    events: history.map(event => ({
+    inActiveVersion: state.token_id !== null,
+    isDeprecated:    state.is_deprecated === 1,
+    updatedAt:       state.updated_at,
+    updatedBy:       state.updated_by,
+    events: rowsOf<DeprecatedCollateralEventRow>(events).map(event => ({
       id:                   event.id,
       previousIsDeprecated: event.previous_is_deprecated === null ? null : event.previous_is_deprecated === 1,
       isDeprecated:         event.is_deprecated === 1,
@@ -361,25 +266,20 @@ async function readDeprecatedCollateral(db: D1Database, collateral: DeprecatedCo
 }
 
 /*
- * The collaterals an administrator has marked deprecated, of every chain or
- * of one, for the reads that mark collaterals with them. Unlike the reads
- * above, this one does not resolve the active version: each of those reads
- * marks the version it has already resolved, and a decision belongs to no
- * version.
+ * The collaterals an administrator has marked deprecated, of every chain, for
+ * the reads that mark collaterals with them. The active reads and the token
+ * list take this one statement, and each picks out the decisions of the chain
+ * it marks by DeprecatedDecisions.has, which is keyed by chain. Unlike the
+ * reads above, this one does not resolve the active version: each of those
+ * reads marks the version it has already resolved, and a decision belongs to
+ * no version.
  */
-async function readDeprecatedCollaterals(db: D1Database, chainId?: number): Promise<DeprecatedCollateral[]> {
-  const statement = chainId === undefined
-    ? db.prepare(
-        `SELECT chain_id, comet_address, token_address FROM deprecated_collaterals
-         WHERE is_deprecated = 1
-         ORDER BY chain_id, comet_address, token_address`
-      )
-    : db.prepare(
-        `SELECT chain_id, comet_address, token_address FROM deprecated_collaterals
-         WHERE chain_id = ?1 AND is_deprecated = 1
-         ORDER BY comet_address, token_address`
-      ).bind(chainId);
-  const { results } = await statement.all<{ chain_id: number, comet_address: Address, token_address: Address }>();
+async function readDeprecatedCollaterals(db: D1Database): Promise<DeprecatedCollateral[]> {
+  const { results } = await db.prepare(
+    `SELECT chain_id, comet_address, token_address FROM deprecated_collaterals
+     WHERE is_deprecated = 1
+     ORDER BY chain_id, comet_address, token_address`
+  ).all<{ chain_id: number, comet_address: Address, token_address: Address }>();
   return (results ?? []).map(row => ({ chainId: row.chain_id, cometAddress: row.comet_address, tokenAddress: row.token_address }));
 }
 
@@ -461,14 +361,7 @@ async function exportDeprecatedCollaterals(
       symbol:        row.symbol,
       isDeprecated:  row.is_deprecated === 1,
     })),
-    retained: rowsOf<{
-      chain_id:      number,
-      comet_address: Address,
-      token_address: Address,
-      is_deprecated: number,
-      updated_at:    string,
-      updated_by:    string,
-    }>(kept).map(row => ({
+    retained: rowsOf<DeprecatedCollateralRow>(kept).map(row => ({
       chainId:      row.chain_id,
       cometAddress: row.comet_address,
       tokenAddress: row.token_address,
@@ -479,161 +372,70 @@ async function exportDeprecatedCollaterals(
   };
 }
 
-/*
- * A list compared with what is stored, row by row: what each row would change,
- * and why the list cannot be applied where it cannot. Review answers this as
- * it is; apply refuses on any problem before writing anything.
- */
-type Planned = {
-  registryVersion: VersionRefV1,
-  rows:            Array<DeprecatedCollateralReviewV1['collaterals'][number]>,
-};
-
-// each row with the reason it is written with: its own, or the list's
-function decisionsOf(list: DecisionList): ListedDecision[] {
-  const decisions = list.decisions.map(decision => ({ ...decision, reason: decision.reason ?? list.reason }));
-  const keys = new Set(decisions.map(decision => `${decision.chainId}:${decision.cometAddress}:${decision.tokenAddress}`));
-  if (keys.size !== decisions.length) {
-    // the router refuses a repeated collateral; two events for one collateral in one write would break its history
-    throw new Error(`a list of deprecated collaterals names a collateral twice`);
-  }
-  return decisions;
-}
-
-// what a row names that the active version names otherwise: its market, or its token's symbol
-function misnamed(decision: ListedDecision, state: CollateralState): string | null {
-  if (decision.deploymentKey !== null && state.deployment_key !== decision.deploymentKey) {
-    return `the list names ${decision.cometAddress} ${decision.deploymentKey}, which the active registry calls ${state.deployment_key}`;
-  }
-  if (decision.symbol !== null && state.symbol !== decision.symbol) {
-    return `the list names ${decision.tokenAddress} ${decision.symbol}, which the active registry calls ${state.symbol}`;
-  }
-  return null;
-}
-
-async function planDecisions(db: D1Database, list: DecisionList): Promise<Planned> {
-  const decisions = decisionsOf(list);
-  const states    = rowsOf<CollateralState>(await statesStatement(db, keyed(decisions)).all());
-  const registryVersion = activeVersionOf(states[0]);
-
-  const rows = decisions.map((decision, index) => {
-    const state   = states[index]!;
-    const current = state.is_deprecated === 1;
-    const action  = current === decision.isDeprecated ? 'unchanged' as const : 'change' as const;
-    const named   = `${state.symbol ?? decision.tokenAddress} of ${state.deployment_key ?? decision.cometAddress}`;
-    const problem = missingFrom(state, decision)
-      ?? misnamed(decision, state)
-      ?? (action === 'change' && decision.reason === null
-        ? `${decision.tokenAddress} (${named}) changes, and needs a reason: its own or the list's`
-        : null);
-    return {
-      row:           index + 1,
-      chainId:       decision.chainId,
-      cometAddress:  decision.cometAddress,
-      deploymentKey: state.deployment_key,
-      tokenAddress:  decision.tokenAddress,
-      symbol:        state.symbol,
-      current,
-      requested:     decision.isDeprecated,
-      action,
-      reason:        decision.reason,
-      problem,
-    };
-  });
-  return { registryVersion, rows };
+// a row of a list, as review answers it
+function reviewRow(
+  { row, decision, state, current, action, problem }: Planned<ListedDecision, CollateralState>,
+): DeprecatedCollateralReviewV1['collaterals'][number] {
+  return {
+    row,
+    chainId:       decision.chainId,
+    cometAddress:  decision.cometAddress,
+    deploymentKey: state.deployment_key,
+    tokenAddress:  decision.tokenAddress,
+    symbol:        state.symbol,
+    current,
+    requested:     decision.isDeprecated,
+    action,
+    reason:        decision.reason,
+    problem,
+  };
 }
 
 async function reviewDeprecatedCollaterals(db: D1Database, list: DecisionList): Promise<DeprecatedCollateralReviewV1> {
-  const { registryVersion, rows } = await planDecisions(db, list);
+  const { registryVersion, summary, planned } = await reviewDecisions(db, DEPRECATED_COLLATERAL_KIND, list);
+  return { registryVersion, summary, collaterals: planned.map(reviewRow) };
+}
+
+// the administrative command for a list (applyDecisions)
+async function applyDeprecatedCollaterals(db: D1Database, list: DecisionList, actor: string): Promise<DeprecatedCollateralApplyV1> {
+  const { registryVersion, summary, applied } = await applyDecisions(db, DEPRECATED_COLLATERAL_KIND, list, actor, {
+    problemOf: ({ row, decision, problem }) => (
+      { row, chainId: decision.chainId, cometAddress: decision.cometAddress, tokenAddress: decision.tokenAddress, problem }
+    ),
+    conflicts: {
+      left: () => conflict(
+        'COLLATERAL_LEFT_REGISTRY',
+        `a version that does not hold every collateral of the list was activated while it was being applied; nothing was written`,
+      ),
+      changed: () => conflict(
+        'DECISION_CHANGED',
+        `a decision of the list was changed by someone else while it was being applied; nothing was written`,
+      ),
+    },
+  });
   return {
     registryVersion,
-    summary: {
-      change:    rows.filter(row => row.action === 'change').length,
-      unchanged: rows.filter(row => row.action === 'unchanged').length,
-      problems:  rows.filter(row => row.problem !== null).length,
-    },
-    collaterals: rows,
+    summary,
+    collaterals: applied.map(({ row, decision, state }) => ({
+      row,
+      chainId:       decision.chainId,
+      cometAddress:  decision.cometAddress,
+      deploymentKey: state.deployment_key!,
+      tokenAddress:  decision.tokenAddress,
+      symbol:        state.symbol!,
+      isDeprecated:  state.is_deprecated === 1,
+      changed:       state.written_id !== null,
+      updatedAt:     state.updated_at,
+    })),
   };
-}
-
-/*
- * The write of a list alone, without the review before it: every decision it
- * changes, with one event each, in one transaction that also requires every
- * row to hold what the list says once it is done. A list that met a
- * concurrent activation or change writes nothing.
- */
-async function writeDeprecatedCollateralList(db: D1Database, list: DecisionList, actor: string): Promise<DeprecatedCollateralApplyV1> {
-  const states = await writeDecisions(db, keyed(decisionsOf(list)), actor, {
-    left: () => conflict(
-      'COLLATERAL_LEFT_REGISTRY',
-      `a version that does not hold every collateral of the list was activated while it was being applied; nothing was written`,
-    ),
-    changed: () => conflict(
-      'DECISION_CHANGED',
-      `a decision of the list was changed by someone else while it was being applied; nothing was written`,
-    ),
-  });
-  const applied = list.decisions.map((decision, index) => ({
-    row:           index + 1,
-    chainId:       decision.chainId,
-    cometAddress:  decision.cometAddress,
-    deploymentKey: states[index]!.deployment_key!,
-    tokenAddress:  decision.tokenAddress,
-    symbol:        states[index]!.symbol!,
-    isDeprecated:  states[index]!.is_deprecated === 1,
-    changed:       states[index]!.written_id !== null,
-    updatedAt:     states[index]!.updated_at,
-  }));
-  return {
-    registryVersion: activeVersionOf(states[0]),
-    summary: {
-      changed:   applied.filter(row => row.changed).length,
-      unchanged: applied.filter(row => !row.changed).length,
-    },
-    collaterals: applied,
-  };
-}
-
-/*
- * The administrative command for a list: refuse it whole, before writing
- * anything, if any row cannot be applied, then write it.
- *
- * The list is compared with the decisions in force when it is applied, not
- * when it was reviewed. Only the rows that comparison finds to change are
- * written. Every other row is stated without a reason, so the write asserts
- * it rather than writing it: a decision someone makes on such a collateral
- * between the comparison and the write aborts the list instead of being
- * reverted.
- */
-async function applyDeprecatedCollaterals(db: D1Database, list: DecisionList, actor: string): Promise<DeprecatedCollateralApplyV1> {
-  const { registryVersion, rows } = await planDecisions(db, list);
-  const problems = rows.filter(row => row.problem !== null);
-  if (problems.length > 0) {
-    throw refusal(
-      'UNPROCESSABLE',
-      `${problems.length} row(s) of the list cannot be applied; nothing was written`,
-      registryVersion,
-      {
-        problems: problems.map(({ row, chainId, cometAddress, tokenAddress, problem }) => (
-          { row, chainId, cometAddress, tokenAddress, problem }
-        )),
-      },
-    );
-  }
-  const decisions = decisionsOf(list).map((decision, index) =>
-    rows[index]!.action === 'change' ? decision : { ...decision, reason: null });
-  return await writeDeprecatedCollateralList(db, { reason: null, decisions }, actor);
 }
 
 export type { DecisionList, DeprecatedChange, DeprecatedCollateral, ListedDecision };
 export {
-  MAX_DEPRECATED_EVENTS,
   applyDeprecatedCollaterals,
   exportDeprecatedCollaterals,
   readDeprecatedCollateral,
   readDeprecatedCollaterals,
   reviewDeprecatedCollaterals,
   setDeprecatedCollateral,
-  writeDeprecatedCollateral,
-  writeDeprecatedCollateralList,
 };

@@ -14,8 +14,9 @@ type MarketMinutelySummary = Compute.Spec<{
 
 const { implement, pull1 } = Compute.Functor<MarketMinutelySummary>({});
 const marketMinutelySummary = implement({
-  // 6: the latest summary, without reserves, the rate model or each collateral's price and parameters
-  version: 6,
+  // 8: the latest summary prices the base asset through the feed the Comet names where the version's reverts.
+  // Not 7: dev caches another answer under 7, without the totals in USD, in a KV two deployments of develop can share
+  version: 8,
   index: Index.MinutelyBlockIndex,
   key(name, {block, ...context}) {
     const { block: projected } = Fallible.must(this.index.project({ block, ...context }));

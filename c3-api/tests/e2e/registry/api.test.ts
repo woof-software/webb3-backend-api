@@ -6,6 +6,7 @@ import type { Env } from '../../../entrypoint.js';
 import type { ActiveSnapshotV1 } from '../../../lib/model/comet-registry.js';
 import { overlayOfMarket } from '../../../src/registry/overlay.js';
 
+import { seedValidated } from '../../util/registry-admin.js';
 import { loadRegistrySnapshotFixture, overlayOfNetwork, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 import { registryHarness } from '../../util/registry-harness.js';
 import { recordValidationResults } from '../../util/registry-repository.js';
@@ -23,16 +24,6 @@ import { ADMIN_TOKEN } from '../../util/test-env.js';
 const { server, freshDatabase } = await registryHarness({ admin: true });
 
 const snapshot = loadRegistrySnapshotFixture();
-
-/*
- * Seeds the fixture as a validated version. Activation goes through the API
- * itself wherever a test is about activation.
- */
-async function seedValidated(db: D1Database, versionId?: string): Promise<string> {
-  const { versionId: id } = await seedCandidate(db, snapshot, versionId === undefined ? {} : { versionId, attempt: 2 });
-  await validateSeeded(db, id);
-  return id;
-}
 
 type AdminRequest = { method: string, headers: Record<string, string>, body: string };
 
@@ -362,7 +353,7 @@ t.test('a retained version can be refetched by id', async t => {
   const db      = await freshDatabase();
   const first   = await seedValidated(db);
   await server.fetch(...admin(`/registry/v1/admin/versions/${first}/activate`, { reason: 'activate' }));
-  const second  = await seedValidated(db, randomUUID());
+  const second  = await seedValidated(db, { versionId: randomUUID() });
   await server.fetch(...admin(`/registry/v1/admin/versions/${second}/activate`, { reason: 'activate the second' }));
 
   const pinned = await server.fetch(`/registry/v1/versions/${first}`);
@@ -426,7 +417,7 @@ t.test('administrative routes are authenticated and closed to browsers', async t
 t.test('activation and rollback are idempotent and audited', async t => {
   const db     = await freshDatabase();
   const first  = await seedValidated(db);
-  const second = await seedValidated(db, randomUUID());
+  const second = await seedValidated(db, { versionId: randomUUID() });
 
   const activated = await server.fetch(...admin(`/registry/v1/admin/versions/${first}/activate`, { reason: 'first' }));
   t.equal(activated.status, 200);
@@ -469,8 +460,8 @@ t.test('activation and rollback are idempotent and audited', async t => {
 t.test('a move decided against a version someone has since replaced is refused', async t => {
   const db    = await freshDatabase();
   const first = await seedValidated(db);
-  const second = await seedValidated(db, randomUUID());
-  const third  = await seedValidated(db, randomUUID());
+  const second = await seedValidated(db, { versionId: randomUUID() });
+  const third  = await seedValidated(db, { versionId: randomUUID() });
   const move = async (action: string, versionId: string, expected: string | null) => server.fetch(...admin(
     `/registry/v1/admin/versions/${versionId}/${action}`,
     { reason: `${action} against ${expected}`, expectedActiveVersionId: expected },

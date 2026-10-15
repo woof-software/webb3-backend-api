@@ -1,6 +1,8 @@
 import * as Eth      from '../lib/eth-constants.js';
 import * as Fallible from '../lib/fallible/fallible.js';
 
+import { ROUTE_EVALUATOR_FLAGS } from '../lib/flags.js';
+
 import * as KnownNetwork  from '../lib/well-known/networks/network.js';
 import * as ContractUtils from '../lib/well-known/contracts/utils.js';
 
@@ -16,6 +18,7 @@ import type { RegistryComet } from '../lib/model/comet-registry.js';
 import { ApiError, failureResponse } from './http/errors.js';
 import { knownFailure } from './http/failures.js';
 import { refuseTestnet, refuseTestnetsParameter } from './testnets.js';
+import { cacheDepsOf } from './registry/cache.js';
 import type { Catalog } from './registry/catalog.js';
 import { RequestCatalog, catalogHeadersOf, requestCatalog } from './registry/request-catalog.js';
 
@@ -173,7 +176,7 @@ async function route(
    * first handler that needs it, and every response whose content depended on
    * it says which version answered.
    */
-  const registry = requestCatalog(context.env, context.debug, context.waitUntil);
+  const registry = requestCatalog({ ...cacheDepsOf(context.env, context.debug), defer: context.waitUntil });
   const { requestId } = context;
   const answer = async (): Promise<Response> => {
     try {
@@ -320,8 +323,7 @@ async function unsafeRoute(
             {
               flags: {
                 ...context.flags,
-                batchingEnabled: true,
-                evaluatorAlgorithm: 'workingset',
+                ...ROUTE_EVALUATOR_FLAGS,
               },
             }
           ),

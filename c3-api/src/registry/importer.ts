@@ -199,7 +199,12 @@ async function underFence<T>(deps: ImporterDeps, fence: Fence, work: (fence: Fen
   try {
     return await work(fence);
   } catch (error) {
-    const carrier = isTransportFailure(error) || isUnreachable(error);
+    /*
+     * A registry error is judged by its code, never by its text: a parser
+     * quotes what it refused, and a key named "timeout" would otherwise pass
+     * for a database that did not answer, leaving the run no error to say why.
+     */
+    const carrier = isTransportFailure(error) || (!isRegistryError(error) && isUnreachable(error));
     try {
       await releaseLease(deps.db, fence, carrier ? {} : { error: diagnosticOf(error) });
     } catch (unreleased) {
@@ -277,7 +282,7 @@ async function startImport(
    * as it did before and the next discovery tries again.
    */
   try {
-    await supersedeStaleAttempts(db, source.repository, commitSha);
+    await supersedeStaleAttempts(db, source.repository, commitSha, { now: deps.now });
   } catch (error) {
     deps.debug.warn(`registry stale drafts not closed`, { error });
   }
@@ -478,7 +483,7 @@ async function closeEarlierAttempts(deps: ImporterDeps, versionId: string): Prom
   try {
     const version = await readVersion(deps.db, versionId);
     if (version !== null) {
-      await supersedeEarlierAttempts(deps.db, version);
+      await supersedeEarlierAttempts(deps.db, version, { now: deps.now });
     }
   } catch (error) {
     deps.debug.warn(`registry earlier drafts not closed`, { versionId, error });

@@ -1,6 +1,3 @@
-import { Address, isAddress, normalizeAddress } from '../../lib/model/comet-registry.js';
-
-import { ApiError } from '../http/errors.js';
 import { jsonResponse } from '../http/json.js';
 
 import {
@@ -12,14 +9,14 @@ import {
   reviewDeprecatedCollaterals,
   setDeprecatedCollateral,
 } from './deprecated-collateral-repository.js';
-import { RegistryContext, chainIdOf } from './handlers.js';
+import { RegistryContext, addressOf, chainIdOf } from './handlers.js';
 import { registryHeaders } from './version-headers.js';
 
 /*
  * The deprecated collateral routes: which collaterals of which Comets an
  * administrator has marked deprecated, and the audit of every change to that
- * decision. They are the token policy routes (token-handlers.ts) for a
- * collateral of a Comet in place of a token.
+ * decision. They and the token policy routes (token-handlers.ts) answer for
+ * the two kinds of one store of decisions (decision-store.ts).
  *
  * A decision belongs to no registry version, but whether a collateral may
  * carry one is decided by the active version, so every answer names that
@@ -28,14 +25,6 @@ import { registryHeaders } from './version-headers.js';
  * A command records the decisions in force once it has committed, for an
  * outage to mark the active reads with (deprecated-collaterals.ts).
  */
-
-// an address in any case, stored and answered lowercase, as every address the registry holds
-function addressOf(value: string): Address {
-  if (!isAddress(value)) {
-    throw new ApiError('BAD_REQUEST', `${value} is not an address`);
-  }
-  return normalizeAddress(value);
-}
 
 // a collateral, as a path names it: by its chain, its Comet and its token
 function collateralOf(chainId: string, cometAddress: string, tokenAddress: string): DeprecatedCollateral {

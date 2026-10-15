@@ -10,12 +10,12 @@ import type {
   CollateralAssetV1,
   PriceExceptionV1,
   PriceFeedV1,
-  RegistryAnnotation,
   RegistryComet,
 } from '../../model/comet-registry.js';
 import { normalizeAddress } from '../../model/comet-registry.js';
 
-import { exceptionFor } from '../comet/asset-price.js';
+import { pricePlanOf, type PricePlan } from '../comet/asset-price.js';
+import { convertsToUsd } from '../comet/base-usd-price.js';
 import type { CollateralAssetInfo, CollateralAssetInfoRead } from '../comet/collateral-asset-info.js';
 import type { CollateralTotal, CollateralTotalRead } from '../comet/collateral-total.js';
 import type { GetPrice, PriceRead } from '../comet/get-price.js';
@@ -72,30 +72,6 @@ type AssetCollateralValue = Compute.Spec<{
   returns: PositionValue,
 }>;
 
-/*
- * How one feed is priced. Decision D1 of the TOK-0 audit: a zero or fixed
- * price stated by the registry replaces the read altogether, since the feed it
- * describes is known not to answer; a remap reads the feed it names instead.
- */
-type Price = (
-  | { read: PriceFeedV1, exception: PriceExceptionV1 | null }
-  | { fixed: BigFixnum, exception: PriceExceptionV1 }
-);
-
-function priceOf(annotation: RegistryAnnotation, feed: PriceFeedV1): Price {
-  const exception = exceptionFor(annotation, feed.address);
-  switch (exception?.kind) {
-    case 'zero_price':
-      return { fixed: BigFixnum.from({ value: 0, decimals: feed.decimals }), exception };
-    case 'fixed_price':
-      return { fixed: BigFixnum.from({ value: exception.price.value, decimals: exception.price.decimals }), exception };
-    case 'deprecated_price_remap':
-      return { read: exception.replacementPriceFeed, exception };
-    default:
-      return { read: feed, exception: null };
-  }
-}
-
 const failed = (reason: PositionFailure): PositionValue => ({ status: 'error', reason });
 
 /*
@@ -106,7 +82,7 @@ const failed = (reason: PositionFailure): PositionValue => ({ status: 'error', r
  */
 function positionValue(
   position: CollateralAssetV1,
-  plans: { price: Price, usd: PriceFeedV1 | null | 'missing' },
+  plans: { price: PricePlan, usd: PriceFeedV1 | null | 'missing' },
   reads: { info: CollateralAssetInfoRead, total: CollateralTotalRead, price: PriceRead, usd: PriceRead | null },
 ): PositionValue {
   const { info, total, price, usd } = reads;
@@ -160,10 +136,16 @@ const assetCollateralValue = implement({
     }
 
     const market = annotation.market;
-    const price  = priceOf(annotation, position.priceFeed);
+    /*
+     * A remap is read from its replacement alone. A summary falls back on the
+     * feed it replaces, but the token list values the latest block, and a
+     * stale answer of a retired feed must not decide whether a token is shown.
+     */
+    const price  = pricePlanOf(annotation, position.priceFeed);
     /*
      * The quote decides whether a conversion is read, never the presence of a
-     * USD feed: a USD-quoted market's base may carry one for other uses.
+     * USD feed: validation refuses a USD-quoted market that carries one
+     * (base-usd-feed-matches-quote).
      *
      * The conversion is read as it is. A price exception describes a
      * collateral feed; a base asset's USD feed is changed in its market's
@@ -171,14 +153,14 @@ const assetCollateralValue = implement({
      * exception written for a collateral that shares the feed must not reprice
      * the whole market here.
      */
-    const usd = market.collateralValueQuote === 'usd' || price.exception?.kind === 'zero_price'
+    const usd = !convertsToUsd(market) || price.exception?.kind === 'zero_price'
       ? null
       : market.baseAsset.usdPriceFeed === null
         ? 'missing' as const
         : market.baseAsset.usdPriceFeed;
 
     const frame = { apiHost, nodeHost, nodeKey, network, contract, blockNumber };
-    const read  = (plan: Price) => 'fixed' in plan
+    const read  = (plan: PricePlan) => 'fixed' in plan
       ? value<PriceRead>({ status: 'success', price: plan.fixed })
       : pull1({ getPrice: { ...frame, priceFeed: plan.read } });
 
@@ -204,4 +186,4 @@ const assetCollateralValue = implement({
 });
 
 export type { PositionFailure, PositionValue };
-export { AssetCollateralValue, assetCollateralValue, positionValue, priceOf };
+export { AssetCollateralValue, assetCollateralValue };

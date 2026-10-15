@@ -1,4 +1,3 @@
-import * as Fallible     from '../../lib/fallible/fallible.js';
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
 import { canonicalJson } from '../../lib/canonical-json.js';
@@ -48,6 +47,11 @@ type CatalogMarket = {
   comet:         RegistryComet,
 };
 
+type CatalogNetwork = {
+  name:    KnownNetwork.Name,
+  network: NetworkV1,
+};
+
 type Catalog = {
   versionId: string,
   checksum:  string,
@@ -80,8 +84,12 @@ type Catalog = {
    * resolve one.
    */
   markets(): CatalogMarket[],
-  // the networks the API serves: those with a market it may resolve
-  networks(): NetworkV1[],
+  /*
+   * The network the API serves on a chain, and the name it serves it under,
+   * or null where it serves none. A network is served while it has a market
+   * the API may resolve.
+   */
+  networkOn(chainId: number): CatalogNetwork | null,
   marketAt(network: KnownNetwork.Name, cometAddress: Address): CatalogMarket | null,
   marketsOn(network: KnownNetwork.Name): CatalogMarket[],
   /*
@@ -100,8 +108,7 @@ type Catalog = {
 };
 
 function networkName(network: NetworkV1): KnownNetwork.Name | null {
-  const known = KnownNetwork.lookup({ name: network.key });
-  return Fallible.isFailure(known) ? null : (network.key as KnownNetwork.Name);
+  return KnownNetwork.castName(network.key) ? network.key : null;
 }
 
 /*
@@ -311,8 +318,8 @@ function historyKeyOf(network: NetworkV1, served: ServedMarket[]): string {
  */
 function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalog {
   const asOf = now.getTime();
-  const markets: CatalogMarket[] = [];
-  const networks: NetworkV1[]    = [];
+  const markets: CatalogMarket[]   = [];
+  const networks: CatalogNetwork[] = [];
   // every token of the version, by network and lowercased address
   const tokens = new Map<string, TokenV1>();
   const bases  = new Map<string, TokenV1>();
@@ -334,7 +341,7 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
       // a network this API cannot name is not one it can serve
       continue;
     }
-    networks.push(network);
+    networks.push({ name, network });
     historyKeys.set(name, historyKeyOf(network, served));
     const exceptions = applicableExceptions(network.priceExceptions, asOf);
     expiries.push(...exceptions.map(expiryOf).filter((expiry): expiry is number => expiry !== null));
@@ -363,7 +370,7 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
     }
   }
 
-  const renamed = new Map<string, string>(networks.flatMap(network => renamesOf(network)
+  const renamed = new Map<string, string>(networks.flatMap(({ network }) => renamesOf(network)
     .map(override => [ `${network.key}:${override.tokenAddress}`, override.symbol ] as const)));
 
   return {
@@ -373,7 +380,7 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
     key:           () => `registry:${snapshot.registryVersion.checksum.slice(0, 16)}`,
     historyKeyFor: network => `registry:${network}:${historyKeys.get(network) ?? 'none'}`,
     markets:       () => markets,
-    networks:      () => networks,
+    networkOn:     chainId => networks.find(entry => entry.network.chainId === chainId) ?? null,
     tokenAt:     (network, address) => tokens.get(`${network}:${address.toLowerCase()}`) ?? null,
     baseTokenAt: (network, address) => bases.get(`${network}:${address.toLowerCase()}`) ?? null,
     renamedSymbolAt: (network, address) => renamed.get(`${network}:${address.toLowerCase()}`) ?? null,
@@ -382,5 +389,5 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
   };
 }
 
-export type { Catalog, CatalogMarket, RegistryComet, ServedMarket };
+export type { Catalog, CatalogMarket, CatalogNetwork, RegistryComet, ServedMarket };
 export { catalogOf, isServed, servedNetworks };

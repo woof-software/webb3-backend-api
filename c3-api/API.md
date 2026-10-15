@@ -108,12 +108,15 @@ summaries, their history, the rewards routes and `/account/{address}/rewards`
   leave that collateral out, and `collaterals` says which it was.
 - `error`: the base asset could not be priced, or — for the rewards routes —
   a price the rewards are valued in: the reward token's, the base asset's, or
-  the USD price a base-quoted reward is converted with. `/summary` still
-  reports every field that does not need a price that failed — the section
-  on `/summary` below says which — and its `total_collateral_value` leaves
-  out a collateral that could not be priced, as in `partially`. Elsewhere —
-  on the other routes, and on each such day of a history — only what
-  identifies the market is reported, with the node's message:
+  the USD price a base-quoted reward is converted with. The base asset is
+  priced through the base feed the registry version names, and where that
+  one reverts, through the feed the market's Comet names at the block, so
+  its price fails only where neither answers. `/summary` still reports every
+  field that does not need a price that failed — the section on `/summary`
+  below says which — and its `total_collateral_value` leaves out a
+  collateral that could not be priced, as in `partially`. Elsewhere — on the
+  other routes, and on each such day of a history — only what identifies the
+  market is reported, with the node's message:
 
 ```json
 { "chain_id": 1, "comet": { "address": "0xe85d…9293" }, "status": "error", "message": "execution reverted" }
@@ -125,8 +128,10 @@ so its `error` is `{ "status": "error", "message": … }` alone.
 `/account/{address}/rewards` also answers a market as `error` when its
 rewards contract pays another token than the one the registry version
 describes: what the account is owed is an amount of the token paid, and
-reading it as the described one would scale, price and name it wrongly. It
-stays so until a version describing the token paid is active:
+reading it as the described one would scale, price and name it wrongly. A
+version imported from the rewards contract describes the very token it pays,
+which CometRewards sets once, so this guards against a version that was not.
+The market stays so until a version describing the token paid is active:
 
 ```json
 { "chain_id": 1, "comet": { "address": "0xc3d6…cdc3" }, "status": "error", "message": "the rewards contract pays 0x…, not the COMP the registry version describes" }
@@ -233,25 +238,29 @@ meanwhile ([REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md#a-market-that-changed-on-
 Where the Comet now holds another asset at a collateral's index, that
 collateral is `error`, and its `message` names the asset the Comet holds
 there. Each is priced through the feed the Comet reads for it at the block
-summarized, and the base asset through the feed the version names for it.
+summarized, and the base asset through the feed the version names for it,
+or, where that one reverts, through the feed the Comet names for it at the
+block.
 
-The base asset has two prices, both read through feeds the registry version
-names: its price in the market's unit, through the version's base feed,
-which values `total_borrow_value` and `total_supply_value`; and its price in
-USD, `base_usd_price` — on a market quoted in USD through that same base
-feed, so both fail together, and on one quoted in its base asset through the
-version's USD feed. The market is `error` where either could not be read,
-with the node's message for the first where it failed, otherwise for the
-second, and still reports every field that does not need a price that
-failed: it leaves out `total_borrow_value` and `total_supply_value` where
-the first failed, and `base_usd_price` where the second did. A total in USD
-is there where its total is and, on a market quoted in its base asset, where
-`base_usd_price` is as well. So an `error` reports neither
-`total_borrow_value_usd` nor `total_supply_value_usd`, and reports
-`total_collateral_value_usd` on a market quoted in USD, the same number as
-`total_collateral_value`, and on one quoted in its base asset where
-`base_usd_price` is there. The totals stay in the market's unit: on a market
-quoted in its base asset they are in ETH or BTC, and without
+The base asset has two prices: its price in the market's unit, read through
+the base feed the registry version names — or, where that reverts, through
+the feed the Comet names at the block — which values `total_borrow_value`
+and `total_supply_value`; and its price in USD, `base_usd_price`. On a
+market quoted in USD that is the same read, with the same fallback, so the
+two fail together, and only where neither feed answers. On one quoted in its
+base asset it is read through the USD feed the version names, which the
+Comet does not name, so nothing stands in for it. The market is `error`
+where either could not be read, with the node's message for the first where
+it failed, otherwise for the second, and still reports every field that does
+not need a price that failed: it leaves out `total_borrow_value` and
+`total_supply_value` where the first failed, and `base_usd_price` where the
+second did. A total in USD is there where its total is and, on a market
+quoted in its base asset, where `base_usd_price` is as well. So an `error`
+reports neither `total_borrow_value_usd` nor `total_supply_value_usd`, and
+reports `total_collateral_value_usd` on a market quoted in USD, the same
+number as `total_collateral_value`, and on one quoted in its base asset
+where `base_usd_price` is there. The totals stay in the market's unit: on a
+market quoted in its base asset they are in ETH or BTC, and without
 `base_usd_price` nothing here converts them to USD. `total_collateral_value`
 leaves out each collateral that is `error`, as in `partially`. A USDC market
 whose base feed reverts:
@@ -371,14 +380,18 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
 ]
 ```
 
-Every day reads the base asset's price and its USD price from the feeds the
-active version names: a day before such a feed was deployed — before
-governance moved the market to it, say — answers `error`
-([Market status](#market-status)). A collateral the version remaps to
-another feed (`deprecated_price_remap`) is read from that feed, and where it
-does not answer — on a day before it was deployed — from the feed its Comet
-named that day; the collateral is `error`, and the day `partially`, only
-when neither answers.
+Every day reads the base asset's price from the base feed the active version
+names, and where that feed does not answer — on a day before it was
+deployed, or after Chainlink retired it while the version still names it —
+from the feed the market's Comet named that day. The USD price of a market
+quoted in its base asset is read from the USD feed the version names alone,
+which its Comet does not name. A day is `error`
+([Market status](#market-status)) only where neither feed gave the base
+asset's price, or where its USD price could not be read. A collateral the
+version remaps to another feed (`deprecated_price_remap`) is read from that
+feed, and where it does not answer — on a day before it was deployed — from
+the feed its Comet named that day; the collateral is `error`, and the day
+`partially`, only when neither answers.
 
 A market whose creation block is past the latest block has no day to
 sample ([Market status](#market-status)). It reports the same days as the
@@ -1231,7 +1244,7 @@ was imported counts once a version that includes it is switched on.
 | `fresh` | Every position of the token, valued at this minute's block |
 | `exception` | The same, but at least one position was priced by a registry price exception — a stated price, or a feed read in place of the one the Comet names; `exceptions` names each |
 | `partial` | Some positions could not be valued at this minute's block, and the ones that could already reach the threshold: a lower bound, with the exceptions those applied |
-| `stale` | Not every position could be valued at this minute's block, and the ones that could fall short of the threshold; this is the newest earlier minute that valued all of them, within the stale window (15 minutes by default), with the exceptions it applied. `staleAgeSeconds` says how much older it is than the latest block |
+| `stale` | Not every position could be valued at this minute's block, and the ones that could fall short of the threshold; this is the newest earlier minute that valued all of them, within the stale window (15 minutes by default), with the exceptions it applied. `staleAgeSeconds` says how much older it is than the latest block, or than the list's `computedAt` when `block` is `null`, and is never less than 1 |
 | `unavailable` | The same, but no minute in the stale window valued all of them: `collateralValueUsd` is `null` |
 
 `valueAt` and `valueBlock` say which block a token's value was read at: the
@@ -2339,8 +2352,11 @@ done. A list is applied completely or not at all:
 The list is compared with the decisions in force when it is applied, not when
 it was reviewed, so review it right before applying it: a decision someone
 made in between is changed like any other row the list contradicts, and shows
-in the answer as a change. A row the comparison finds unchanged is not
-written, only checked, so a decision made on that token while the list is
+in the answer as a change. A list of only the rows the review shows as
+changes, which is what the runbook applies
+([A reviewed list of strategic tokens](./REGISTRY_RUNBOOK.md#a-reviewed-list-of-strategic-tokens)),
+leaves every other decision as it is. A row the comparison finds unchanged is
+not written, only checked, so a decision made on that token while the list is
 being written is never reverted by it. Applying the same list again changes
 nothing.
 
@@ -2572,11 +2588,16 @@ is applied completely or not at all:
   writes nothing.
 
 The list is compared with the decisions in force when it is applied, not when
-it was reviewed, so review it right before applying it. A row the comparison
-finds unchanged is not written, only checked, so a decision made on that
-collateral while the list is being written is never reverted by it. Applying
-the same list again changes nothing. Once it has committed, the command
-records the decisions in force, as a single change does.
+it was reviewed, so review it right before applying it: a decision someone
+made in between is changed like any other row the list contradicts, and shows
+in the answer as a change. A list of only the rows the review shows as
+changes, which is what the runbook applies
+([A reviewed list of deprecated collaterals](./REGISTRY_RUNBOOK.md#a-reviewed-list-of-deprecated-collaterals)),
+leaves every other decision as it is. A row the comparison finds unchanged is
+not written, only checked, so a decision made on that collateral while the
+list is being written is never reverted by it. Applying the same list again
+changes nothing. Once it has committed, the command records the decisions in
+force, as a single change does.
 
 ```json
 {

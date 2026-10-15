@@ -11,12 +11,13 @@ import type * as evm    from '../../lib/computations/evm.js';
 import type * as market from '../../lib/computations/market.js';
 import type { PositionFailure, PositionValue } from '../../lib/computations/market/asset-collateral-value.js';
 
-import type { Address, BlockRefV1, CollateralValueStatusV1, PriceExceptionV1 } from '../../lib/model/comet-registry.js';
+import type { Address, BlockRefV1, PriceExceptionV1 } from '../../lib/model/comet-registry.js';
 
 import type * as Evaluator from '../evaluator.js';
 import type { Log } from '../log.js';
 
 import type { Catalog, RegistryComet } from './catalog.js';
+import { TIMED_OUT, withDeadline } from './deadline.js';
 
 /*
  * The collateral value of every token of a chain, for the token list.
@@ -35,7 +36,7 @@ import type { Catalog, RegistryComet } from './catalog.js';
  * records of the one before it, and one that changes anything a value depends
  * on starts afresh. Why an exception was added and until when it applies
  * change no value, so a list takes them from the version it answers from,
- * never from a record (tokenValue).
+ * never from a record (token-value.ts).
  *
  * Nothing here is written to D1: values are recomputed, never stored.
  */
@@ -144,7 +145,7 @@ type TokenCollateralDeps = {
    * would never finish, and every other request would wait for it.
    */
   waitUntil:       (work: Promise<unknown>) => void,
-  deadlineMs?:     number,
+  deadlineMs:      number,
 };
 
 /*
@@ -249,18 +250,6 @@ function remember<T>(map: Map<string, T>, key: string, value: T): void {
   // the oldest entry goes first: a Map iterates in insertion order
   while (map.size > RECENT_RECORDS) {
     map.delete(map.keys().next().value!);
-  }
-}
-
-const TIMED_OUT = Symbol('timed out');
-
-async function withDeadline<T>(work: Promise<T>, milliseconds: number): Promise<T | typeof TIMED_OUT> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<typeof TIMED_OUT>(resolve => { timer = setTimeout(() => resolve(TIMED_OUT), milliseconds); });
-  try {
-    return await Promise.race([ work, deadline ]);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -512,7 +501,7 @@ async function collateralView(
   const kv          = deps.kv(networkEnv);
   const started     = Date.now();
   // elapsed time is the runtime's, not the injected clock's: the clock names minutes, it does not time requests
-  const left        = () => Math.max(0, started + (deps.deadlineMs ?? DEADLINE_MS) - Date.now());
+  const left        = () => Math.max(0, started + deps.deadlineMs - Date.now());
   const positionSet = positionSetOf(request.positions);
   const keyed       = { ...request, positionSet };
 
@@ -566,133 +555,24 @@ async function collateralView(
   return { block, current, earlier: earlier === TIMED_OUT ? [] : earlier };
 }
 
-/*
- * One token's value from a view: this minute's complete value; or, with
- * decision D7 of the TOK-0 audit, the part of this minute that could be read,
- * when that part alone already reaches the threshold; or the newest complete
- * earlier minute; or nothing.
- *
- * A token without an enabled collateral position is worth exactly nothing,
- * whatever the node says, so its value never depends on the node answering.
- */
-type CollateralValueStatus = CollateralValueStatusV1;
-
-type TokenValue = {
-  status:          CollateralValueStatus,
-  valueUsd:        BigFixnum | null,
-  block:           BlockRef | null,
-  staleAgeSeconds: number | null,
-  exceptions:      PriceExceptionV1[],
-};
-
-const ok = (outcome: PositionOutcome): outcome is Exclude<PositionOutcome, { status: 'error' }> => outcome.status !== 'error';
-
-function sumOf(outcomes: Array<Exclude<PositionOutcome, { status: 'error' }>>): BigFixnum {
-  return outcomes.reduce((sum, outcome) => sum.add(valueOf(outcome.valueUsd)), BigFixnum.from({ value: 0 }));
-}
-
-// an exception as a record and a version both name it: what it does, and to which feed
-const exceptionKey = (exception: PriceExceptionV1) => `${exception.kind}:${exception.priceFeedAddress}`;
-
-/*
- * Each exception once, however many positions of the token it priced, as the
- * answering version describes it rather than as the record does: a record is
- * shared by every version that values its positions the same way, and may
- * have been valued under one that described an exception otherwise. Each of
- * those versions holds every exception the record names.
- */
-function exceptionsOf(outcomes: PositionOutcome[], described: ReadonlyMap<string, PriceExceptionV1>): PriceExceptionV1[] {
-  const seen = new Map<string, PriceExceptionV1>();
-  for (const outcome of outcomes) {
-    if (outcome.status === 'exception') {
-      for (const exception of outcome.exceptions) {
-        const key = exceptionKey(exception);
-        seen.set(key, described.get(key) ?? exception);
-      }
-    }
-  }
-  return [ ...seen.values() ];
-}
-
-function tokenValue(
-  token: Address,
-  view: CollateralView,
-  positions: Position[],
-  threshold: BigFixnum,
-  now: Date,
-): TokenValue {
-  const held = positions.filter(position => position.token === token);
-  const keys = new Set(held.map(position => position.key));
-  if (keys.size === 0) {
-    return { status: 'fresh', valueUsd: BigFixnum.from({ value: 0 }), block: view.block, staleAgeSeconds: 0, exceptions: [] };
-  }
-  const of = (record: CollateralMinute) => record.positions.filter(entry => keys.has(entry.key)).map(entry => entry.outcome);
-  // the exceptions of the network as the answering version describes them, which its positions carry
-  const described = new Map(held.flatMap(position => position.comet.registry.priceExceptions)
-    .map(exception => [ exceptionKey(exception), exception ] as const));
-  const exceptionsIn = (outcomes: PositionOutcome[]) => exceptionsOf(outcomes, described);
-
-  if (view.current !== null) {
-    const outcomes = of(view.current);
-    const readable = outcomes.filter(ok);
-    if (readable.length === outcomes.length) {
-      const exceptions = exceptionsIn(outcomes);
-      return {
-        status:          exceptions.length === 0 ? 'fresh' : 'exception',
-        valueUsd:        sumOf(readable),
-        block:           view.current.block,
-        staleAgeSeconds: 0,
-        exceptions,
-      };
-    }
-    // values are never negative, so what could be read is a lower bound of the whole
-    const partial = sumOf(readable);
-    if (partial.gte(threshold)) {
-      return { status: 'partial', valueUsd: partial, block: view.current.block, staleAgeSeconds: 0, exceptions: exceptionsIn(readable) };
-    }
-  }
-
-  for (const record of view.earlier) {
-    const outcomes = of(record);
-    const readable = outcomes.filter(ok);
-    if (readable.length === outcomes.length) {
-      const reference = view.block?.timestamp ?? Math.floor(now.getTime() / 1000);
-      return {
-        status:          'stale',
-        valueUsd:        sumOf(readable),
-        block:           record.block,
-        staleAgeSeconds: Math.max(1, reference - record.block.timestamp),
-        exceptions:      exceptionsIn(outcomes),
-      };
-    }
-  }
-
-  return { status: 'unavailable', valueUsd: null, block: null, staleAgeSeconds: null, exceptions: [] };
-}
-
 export type {
   BlockRef,
   CollateralMinute,
-  CollateralValueStatus,
   CollateralView,
   Dependencies,
   Position,
   PositionOutcome,
   TokenCollateralDeps,
-  TokenValue,
 };
 export {
   ABANDONED_AFTER_MS,
   CHAIN_FAILURE_BACKOFF_MS,
   DEADLINE_MS,
-  DEFAULT_MAX_STALE_MINUTES,
   INCOMPLETE_BACKOFF_MS,
-  LOOKBACK_DEADLINE_MS,
-  MAX_SPLIT_EVALUATIONS,
   collateralView,
   maxStaleMinutesOf,
   positionSetOf,
   positionsOf,
   recordKey,
-  tokenValue,
+  valueOf,
 };

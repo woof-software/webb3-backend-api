@@ -1,13 +1,6 @@
-import t from 'tap';
+import t, { Test } from 'tap';
 
-import * as Debug    from '../../lib/debug-log.js';
-import * as Flags    from '../../lib/flags.js';
-import { BigNumber } from '../../lib/bignumber.js';
-import { BigFixnum } from '../../lib/bigfixnum.js';
-
-import * as Compute    from '../../lib/symbolic/computation.js';
-import * as Evaluator  from '../../lib/symbolic/evaluator.js';
-import { MemoryCache } from '../../lib/symbolic/cache.js';
+import * as Flags from '../../lib/flags.js';
 
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
@@ -24,6 +17,8 @@ import {
   type UninstantiatedContext,
 } from '../../src/router.js';
 
+import { consoleLines } from '../util/console.js';
+import { evaluatorOver, stub } from '../util/evaluator.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../util/registry-fixture.js';
 
 import '../../shim/node-self.js';
@@ -34,7 +29,6 @@ import '../../shim/node-self.js';
  * identifies it — and a node that fails still fails the request.
  */
 const flags = Flags.parseWithDefaults(process.env);
-const debug = Debug.MakeLogger([]).configure(process.env);
 
 const catalog = fixtureCatalog();
 
@@ -66,12 +60,13 @@ const COMPUTATIONS = [
 ] as const;
 
 function evaluatorOf(answer: Answer, overrides: Flags.SomeFlags = {}) {
-  const computations = Object.fromEntries(COMPUTATIONS.map(name => [
-    name, Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(name, context) }),
-  ]));
-  const cache     = new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]);
+  const computations = Object.fromEntries(COMPUTATIONS.map(name => [ name, stub(context => answer(name, context)) ]));
+  // on what the handler asks for, and otherwise on what the environment sets
   const evaluator = Object.assign(
-    Evaluator.instantiate<any>(computations as any, { cache, debug, flags: { ...flags, ...overrides } }),
+    evaluatorOver(computations, {
+      algorithm: overrides.evaluatorAlgorithm ?? flags.evaluatorAlgorithm,
+      batching:  overrides.batchingEnabled ?? flags.batchingEnabled,
+    }),
     { evaluations: 0 },
   );
   // a handler takes evaluate off the evaluator, so the count is put where it reads it
@@ -134,9 +129,6 @@ function uninstantiated(answer: Answer) {
 function instantiated(answer: Answer, overrides: Flags.SomeFlags = {}): Context {
   return { flags: { ...flags, environment: 'local' }, evaluator: evaluatorOf(answer, overrides) } as unknown as Context;
 }
-
-// what the router sets for account rewards (router.ts)
-const BATCHED = { batchingEnabled: true, evaluatorAlgorithm: 'workingset' } as const;
 
 type Entry = { chain_id: number, comet: { address: string }, status: string, message?: string };
 
@@ -220,8 +212,8 @@ t.test('the rewards summary reads the reward feed its version states', async t =
   t.equal(asked.length, 1, 'one summary is asked for');
   t.equal(asked[0].rewardsTokenPriceFeed, feed, 'of the feed the version states');
   t.equal(
-    await rewards.rewardsSummary.key('rewardsSummary-v4', asked[0]),
-    `rewardsSummary-v4:(block:${asked[0].block.number};contract:${usdc.key()};network:${MAINNET};`
+    await rewards.rewardsSummary.key('rewardsSummary-v5', asked[0]),
+    `rewardsSummary-v5:(block:${asked[0].block.number};contract:${usdc.key()};network:${MAINNET};`
       + `rewardsTokenPriceFeed:(address:${feed.address};decimals:${feed.decimals}))`,
     'and kept under that feed',
   );
@@ -230,7 +222,7 @@ t.test('the rewards summary reads the reward feed its version states', async t =
 t.test('the rewards of an account format only the markets that were valued', async t => {
   const response = await accountRewardsSummary(
     { apiHost: '', nodeHost: '', nodeKey: '', account: ACCOUNT, catalog },
-    instantiated(answers([ WBTC ]), BATCHED),
+    instantiated(answers([ WBTC ]), Flags.ROUTE_EVALUATOR_FLAGS),
   );
 
   t.equal(response.status, 200);
@@ -266,7 +258,7 @@ t.test('a node that fails one market still fails the list', async t => {
     [ 'the summary of every network', () => marketHandlers.latestSummary(routeData(AllNetworks, AllContracts), uninstantiated(failing)) ],
     [ 'the rewards of a network',     () => marketHandlers.rewardsDappData(routeData(MAINNET, AllContracts), uninstantiated(failing)) ],
     [ 'the history of a network',     () => marketHandlers.historicalSummary(routeData(MAINNET, AllContracts), instantiated(failing)) ],
-    [ 'the rewards of an account',    () => accountRewardsSummary(account, instantiated(failing, BATCHED)) ],
+    [ 'the rewards of an account',    () => accountRewardsSummary(account, instantiated(failing, Flags.ROUTE_EVALUATOR_FLAGS)) ],
   ] as const) {
     await t.rejects(answered(), /the node did not serve usdc/, what);
   }
@@ -289,10 +281,8 @@ function createdAt(block: number, comets: string[]) {
 }
 
 // the warning a market the chain has not reached is logged with, kept out of the test's output
-function quiet(test: { teardown(fn: () => void): unknown }): void {
-  const warn = console.warn;
-  console.warn = () => {};
-  test.teardown(() => { console.warn = warn; });
+function quiet(t: Test): void {
+  consoleLines(t, [ 'warn' ]);
 }
 
 /*
@@ -316,7 +306,7 @@ t.test('the rewards of an account answer a market the chain has not reached as a
 
   const response = await accountRewardsSummary(
     { apiHost: '', nodeHost: '', nodeKey: '', account: ACCOUNT, catalog: createdAt(created, [ USDT, AERO ]) },
-    instantiated(answer, BATCHED),
+    instantiated(answer, Flags.ROUTE_EVALUATOR_FLAGS),
   );
 
   t.equal(response.status, 200);
@@ -353,7 +343,7 @@ t.test('the rewards of an account answer a market the chain has not reached as a
 
   const response = await accountRewardsSummary(
     { apiHost: '', nodeHost: '', nodeKey: '', account: ACCOUNT, catalog: createdAt(created, [ USDT ]) },
-    instantiated(answer, BATCHED),
+    instantiated(answer, Flags.ROUTE_EVALUATOR_FLAGS),
   );
 
   t.equal(response.status, 200);

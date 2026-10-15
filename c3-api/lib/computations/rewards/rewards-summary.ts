@@ -51,8 +51,8 @@ type RewardsSummary = Compute.Spec<{
 
 const { implement, pipe } = Compute.Functor<RewardsSummary>({});
 const rewardsSummary = implement({
-  // 4: its APRs read the base price from the feed the registry version names
-  version: 4,
+  // 5: where the feed the registry version names reverts, its APRs read the base price from the one the Comet names
+  version: 5,
   /*
    * Since RewardsSummary['expects'] is just MarketDaySummary['expects']
    * but with an added rewardsTokenPriceFeed address, we can also reuse

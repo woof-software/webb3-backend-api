@@ -164,14 +164,14 @@ t.test(`historical-market-day-summaries@startBlock:${startBlock.number}`, async 
   ));
   const cachedKeys1 = Object.keys(cache.store);
   const expectedKeys = enumerated.flatMap(({ contract, network, block }) => [
-    `marketSummary-v7:(block:${block.number};`
+    `marketSummary-v8:(block:${block.number};`
       + `contract:${contract.key()};network:${network})`,
-    `marketDaySummary-v7:(contract:${contract.key()};`
+    `marketDaySummary-v8:(contract:${contract.key()};`
       + `date:${Eth.Timestamp.toDateString(Eth.estimateBlockTimestamp(network, block))};`
       + `network:${network})`,
   ])
   .concat([
-    `historicalMarketDaySummaries-v7:(contract:${contract.key()};`
+    `historicalMarketDaySummaries-v8:(contract:${contract.key()};`
       + `daysBack:30;`
       + `network:${network};`
       + `startDate:${Eth.Timestamp.toDateString(startBlock.timestamp)})`,

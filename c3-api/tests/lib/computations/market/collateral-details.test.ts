@@ -1,13 +1,7 @@
 import t from 'tap';
 
-import * as Debug    from '../../../../lib/debug-log.js';
-import * as Flags    from '../../../../lib/flags.js';
 import { BigNumber } from '../../../../lib/bignumber.js';
 import { BigFixnum } from '../../../../lib/bigfixnum.js';
-
-import * as Compute    from '../../../../lib/symbolic/computation.js';
-import * as Evaluator  from '../../../../lib/symbolic/evaluator.js';
-import { MemoryCache } from '../../../../lib/symbolic/cache.js';
 
 import * as comet  from '../../../../lib/computations/comet.js';
 import * as market from '../../../../lib/computations/market.js';
@@ -19,6 +13,7 @@ import { checksumAddress } from '../../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../../src/registry/catalog.js';
 
+import { evaluatorOver, stub } from '../../../util/evaluator.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../../util/registry-fixture.js';
 
 import '../../../../shim/node-self.js';
@@ -28,9 +23,6 @@ import '../../../../shim/node-self.js';
  * version describes it: the computation runs on the real evaluator, over
  * reads of the Comet that answer from a table instead of a node.
  */
-const flags = Flags.parseWithDefaults(process.env);
-const debug = Debug.MakeLogger([]).configure(process.env);
-
 const network     = 'ethereum-mainnet' as const;
 const usdt        = fixtureCatalog().marketsOn(network).find(entry => entry.deploymentKey === 'usdt')!.comet;
 const blockNumber = 50_000_000;
@@ -42,17 +34,8 @@ const one = (decimals = 8) => BigFixnum.from({ decimals, value: BigNumber.from(1
 const read     = (price: BigFixnum) => ({ status: 'success' as const, price });
 const reverted = { status: 'error' as const, message: 'execution reverted' };
 
-function stub(answer: (context: any) => unknown) {
-  return Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
-}
-
 // the market routes evaluate on the working set; the recursive evaluator must answer the same
 const ALGORITHMS = [ 'recursive', 'workingset' ] as const;
-
-function evaluator(computations: Record<string, unknown>, algorithm: typeof ALGORITHMS[number]) {
-  const cache = new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]);
-  return Evaluator.instantiate<any>(computations as any, { cache, debug, flags: { ...flags, evaluatorAlgorithm: algorithm, batchingEnabled: true } });
-}
 
 /*
  * The collaterals of a Comet as the chain answers at a block: how many it had
@@ -75,13 +58,13 @@ function collateralsAt(
     return answer(context);
   });
   const described = (assetNumber: number) => contract.registry.market.collateralAssets[assetNumber]?.token.address ?? `0x${'9'.repeat(40)}`;
-  const { evaluate, pull1 } = evaluator({
+  const { evaluate, pull1 } = evaluatorOver({
     collateralDetails:    market.collateralDetails,
     numAssets:            stub(() => chain.numAssets),
     assetInfo:            counted('assetInfo', ({ assetNumber }) => ({ asset: checksumAddress(chain.assetAt?.[assetNumber] ?? described(assetNumber)) })),
     assetTotalCollateral: counted('assetTotalCollateral', ({ assetNumber }) => BigFixnum.from({ value: assetNumber + 1 })),
     assetPrice:           counted('assetPrice', ({ assetNumber }) => chain.price?.(assetNumber) ?? read(BigFixnum.from({ value: 2 }))),
-  }, algorithm);
+  }, { algorithm });
   const collaterals = evaluate(pull1({
     collateralDetails: { apiHost: '', nodeHost: '', nodeKey: '', network, contract, blockNumber },
   })) as Promise<Collateral[]>;
@@ -217,7 +200,7 @@ t.test('the seeded exceptions price wUSDM and pumpBTC where their Comet still re
   // what one market's collaterals are priced at, when the Comet reads `feeds` in place of the ones the version describes
   const pricedAt = async (contract: RegistryComet, feeds: Record<number, string>) => {
     const asked: string[] = [];
-    const { evaluate, pull1 } = evaluator({
+    const { evaluate, pull1 } = evaluatorOver({
       collateralDetails:    market.collateralDetails,
       assetPrice:           comet.assetPrice,
       numAssets:            stub(() => contract.registry.market.collateralAssets.length),
@@ -234,7 +217,7 @@ t.test('the seeded exceptions price wUSDM and pumpBTC where their Comet still re
         asked.push(priceFeed.address.toLowerCase());
         return priceFeed.address.toLowerCase() === CONSTANT ? read(BigFixnum.from({ value: 1, decimals: 8 })) : read(one());
       }),
-    }, 'workingset');
+    });
     const collaterals = await evaluate(pull1({
       collateralDetails: { apiHost: '', nodeHost: '', nodeKey: '', network, contract, blockNumber },
     })) as Collateral[];

@@ -4,16 +4,18 @@ import C3Api, { Env } from '../../../entrypoint.js';
 
 import type { RegistrySnapshotV1, TokenListV1, TokenVisibilityV1 } from '../../../lib/model/comet-registry.js';
 
+import { catalogOf } from '../../../src/registry/catalog.js';
 import { setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
-import { DEADLINE_MS } from '../../../src/registry/token-collateral.js';
+import { DEADLINE_MS, positionSetOf, positionsOf, recordKey } from '../../../src/registry/token-collateral.js';
 import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
 import { consoleLines } from '../../util/console.js';
-import { executionContext } from '../../util/execution-context.js';
+import { executionContext, settledWithin } from '../../util/execution-context.js';
 import { FakeNode, NodeScript, batches, fakeNode } from '../../util/fake-node.js';
+import { MemoryKv } from '../../util/kv.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
-import { makeTestEnv } from '../../util/test-env.js';
+import { failingStatements, makeTestEnv } from '../../util/test-env.js';
 
 import '../../../shim/node-self.js';
 
@@ -73,21 +75,6 @@ async function listOf(response: Response): Promise<TokenListV1> {
 }
 
 const bySymbol = (list: TokenListV1) => new Map<string, TokenVisibilityV1>(list.tokens.map(token => [ token.symbol, token ]));
-
-/*
- * A database whose statements matching `failing` throw what D1 throws when it
- * cannot be reached, and whose other statements answer as before.
- */
-function unreachableFor(db: D1Database, failing: RegExp): D1Database {
-  const fail = async () => { throw new Error('D1_ERROR: Network connection lost.'); };
-  const statement = { bind: () => statement, all: fail, first: fail, run: fail, raw: fail };
-  return {
-    prepare: (sql: string) => failing.test(sql) ? statement : db.prepare(sql),
-    batch:   (statements: D1PreparedStatement[]) => db.batch(statements),
-    exec:    (sql: string) => db.exec(sql),
-    dump:    () => db.dump(),
-  } as unknown as D1Database;
-}
 
 // what the worker logged as errors, for the length of a test
 function captureErrors(t: Test): string[] {
@@ -185,6 +172,73 @@ t.test('a valuation the request stopped waiting for is left to waitUntil, and th
   t.equal(batches(node).length, 1, 'without another batch');
 });
 
+/*
+ * A namespace over `store` that holds back the writes of the minute records
+ * until `release`, and only those: the computation cache writes to the same
+ * namespace, and the one write a request is seen to wait for is the record.
+ */
+function heldMinuteRecords(store: KVNamespace): { kv: KVNamespace, release: () => void } {
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const kv = new Proxy(store, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === 'put' && typeof(value) === 'function') {
+        return async (...parameters: unknown[]) => {
+          if (String(parameters[0]).startsWith('token-collateral:')) {
+            await released;
+          }
+          return (value as (...parameters: unknown[]) => unknown).apply(target, parameters);
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as KVNamespace;
+  return { kv, release };
+}
+
+/*
+ * Without an execution context, as a test calls the worker, a request answers
+ * once everything it handed to waitUntil is done (entrypoint.ts), the token
+ * list's write of the minute's record included, so the record is there for
+ * the request after it.
+ */
+t.test('a request without an execution context answers once the minute\'s record is written', async t => {
+  const { env } = await workerOf(t, BASE_NODE);
+  const store = MemoryKv({});
+  const held  = heldMinuteRecords(store);
+
+  const answer = C3Api.fetch(new Request(`https://api.test.local/registry/v1/networks/${BASE}/tokens`), { ...env, kv_mainnet: held.kv });
+  t.notOk(await settledWithin(answer, 300), 'the request waits while the minute\'s record is held');
+
+  held.release();
+  t.equal((await answer).status, 200, 'and answers once it is written');
+  const positionSet = positionSetOf(positionsOf(catalogOf(fixture, new Date()), 'base-mainnet'));
+  t.same((await store.list({ prefix: 'token-collateral:' })).keys.map(entry => entry.name),
+    [ recordKey(BASE, positionSet, Math.floor(LATEST.timestamp / 60)) ], 'which is the record of the minute of the latest block');
+});
+
+/*
+ * A request refused for decisions it could not read answers before its
+ * valuation is done (token-handlers.ts), and the valuation hands its record
+ * over only once it is: past the answer, which a request without an
+ * execution context waits for as well.
+ */
+t.test('a request without an execution context waits for what its work hands over after the answer', async t => {
+  const { registry, env } = await workerOf(t, BASE_NODE);
+  captureErrors(t);
+  const store = MemoryKv({});
+  const held  = heldMinuteRecords(store);
+
+  const answer = C3Api.fetch(new Request(`https://api.test.local/registry/v1/networks/${BASE}/tokens`),
+    { ...env, APP_DB: failingStatements(registry.db, /FROM token_policies WHERE chain_id/), kv_mainnet: held.kv });
+  t.notOk(await settledWithin(answer, 300), 'the refusal waits while the record its valuation handed over is held');
+
+  held.release();
+  t.equal((await answer).status, 503, 'and is answered once the record is written');
+  t.equal((await store.list({ prefix: 'token-collateral:' })).keys.length, 1, 'the one record of the minute');
+});
+
 t.test('a strategic token is shown below the threshold, and a decision is read on every request', async t => {
   const { registry, get } = await workerOf(t, BASE_NODE);
   const usdc = assetOf(AERO, 'USDC').token.address;
@@ -193,10 +247,13 @@ t.test('a strategic token is shown below the threshold, and a decision is read o
   t.same(await visible(), [ 'WETH' ], 'visibleOnly lists what discovery shows');
 
   await decide(registry.db, BASE, usdc, true);
-  const decided = bySymbol(await listOf(await get(`/registry/v1/networks/${BASE}/tokens`))).get('USDC')!;
+  const listed  = await listOf(await get(`/registry/v1/networks/${BASE}/tokens`));
+  const decided = bySymbol(listed).get('USDC')!;
   t.same([ decided.isStrategic, decided.isVisible, decided.visibilityReason, decided.collateralValueUsd ], [ true, true, 'strategic', '1000' ],
     'a strategic token is shown, and its value is still told');
   t.same(await visible(), [ 'USDC', 'WETH' ]);
+  t.equal((await listOf(await get(`/registry/v1/networks/${BASE}/tokens?visibleOnly=false`))).tokens.length, listed.tokens.length,
+    'visibleOnly=false lists every token');
 
   await decide(registry.db, BASE, usdc, false);
   t.same(await visible(), [ 'WETH' ], 'a decision taken back is seen by the next request');
@@ -215,7 +272,7 @@ t.test('policies the database cannot give are a 503, and are logged', async t =>
   const { registry, get } = await workerOf(t, BASE_NODE);
   const errors = captureErrors(t);
 
-  const response = await get(`/registry/v1/networks/${BASE}/tokens`, unreachableFor(registry.db, /FROM token_policies WHERE chain_id/));
+  const response = await get(`/registry/v1/networks/${BASE}/tokens`, failingStatements(registry.db, /FROM token_policies WHERE chain_id/));
   t.equal(response.status, 503);
   const body = await response.json() as ErrorBody;
   t.same([ body.error.code, body.error.message ], [ 'UPSTREAM_UNAVAILABLE', 'the token policies could not be read' ]);
@@ -299,7 +356,7 @@ t.test('deprecated collateral decisions the database cannot give are a 503, and 
   const { registry, get } = await workerOf(t, BASE_NODE);
   const errors = captureErrors(t);
 
-  const response = await get(`/registry/v1/networks/${BASE}/tokens`, unreachableFor(registry.db, /FROM deprecated_collaterals\s+WHERE chain_id/));
+  const response = await get(`/registry/v1/networks/${BASE}/tokens`, failingStatements(registry.db, /FROM deprecated_collaterals\s+WHERE is_deprecated/));
   t.equal(response.status, 503, 'without them the list would call a deprecated collateral current, and show a token it hides');
   const body = await response.json() as ErrorBody;
   t.same([ body.error.code, body.error.message ], [ 'UPSTREAM_UNAVAILABLE', 'the deprecated collateral decisions could not be read' ]);
@@ -318,7 +375,7 @@ t.test('an answer from a version the database could not confirm is not stored', 
   const errors = captureErrors(t);
   await listOf(await get(`/registry/v1/networks/${BASE}/tokens`));
 
-  const response = await get(`/registry/v1/networks/${BASE}/tokens`, unreachableFor(registry.db, /FROM registry_state/));
+  const response = await get(`/registry/v1/networks/${BASE}/tokens`, failingStatements(registry.db, /FROM registry_state/));
   const list = await listOf(response);
   t.equal(response.headers.get('cache-control'), 'no-store');
   t.match(response.headers.get('x-registry-stale'), /^[0-9]+$/, 'and it says how old the version is');
@@ -365,10 +422,10 @@ t.test('every answer of the token list names the version it read, and only that'
     'a list names the version it was made from, and is kept briefly');
   t.same(await answer('GET', '10/tokens'), { status: 404, headers: { ...readable, ...json, ...version } },
     'a chain the version does not hold is refused under that version');
-  t.same(await answer('GET', tokens, unreachableFor(registry.db, /FROM token_policies WHERE chain_id/)),
+  t.same(await answer('GET', tokens, failingStatements(registry.db, /FROM token_policies WHERE chain_id/)),
     { status: 503, headers: { ...readable, ...json, ...version } },
     'and so is a list whose policies could not be read after the version was');
-  t.same(await answer('GET', tokens, unreachableFor(registry.db, /FROM deprecated_collaterals\s+WHERE chain_id/)),
+  t.same(await answer('GET', tokens, failingStatements(registry.db, /FROM deprecated_collaterals\s+WHERE is_deprecated/)),
     { status: 503, headers: { ...readable, ...json, ...version } },
     'or whose deprecated collateral decisions could not be');
   t.same(await answer('GET', `${tokens}?visibleOnly=yes`), { status: 400, headers: { ...readable, ...json } },
@@ -383,7 +440,7 @@ t.test('every answer of the token list names the version it read, and only that'
     },
   }, 'and its preflight is the public registry preflight');
 
-  const stale = await answer('GET', tokens, unreachableFor(registry.db, /FROM registry_state|FROM token_policies WHERE chain_id/));
+  const stale = await answer('GET', tokens, failingStatements(registry.db, /FROM registry_state|FROM token_policies WHERE chain_id/));
   const { 'x-registry-stale': age, ...rest } = stale.headers;
   t.match(age, /^[0-9]+$/, 'a refusal under a version the database could not confirm says how old it is');
   t.same({ status: stale.status, headers: rest }, { status: 503, headers: { ...readable, ...json, ...version, 'cache-control': 'no-store' } },

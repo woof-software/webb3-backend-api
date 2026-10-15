@@ -17,6 +17,7 @@ import {
   type BaseUsdPrice,
   type PriceError,
 } from '../comet.js';
+import { convertsToUsd } from '../comet/base-usd-price.js';
 
 import type { BorrowApr } from './borrow-apr.js';
 import type { SupplyApr } from './supply-apr.js';
@@ -87,8 +88,8 @@ type MarketSummary = Compute.Spec<{
 
 const { implement, pipe } = Compute.Functor<MarketSummary>({});
 const marketSummary = implement({
-  // 7: totals in USD beside the quoted ones; collateral and base feed as the registry version describes them
-  version: 7,
+  // 8: where the base feed the version names reverts, the base asset is priced through the one the Comet names
+  version: 8,
   /*
    * validate that the block requested does not predate the market
    * contract creation block.
@@ -173,9 +174,9 @@ const marketSummary = implement({
           supply:     totalSupply.mul(basePrice.price),
           collateral: collateralValue(collaterals),
         };
-        const inUsd = (value: BigFixnum) => contract.registry.market.collateralValueQuote === 'usd'
-          ? value
-          : value.mul(baseUsdPrice.price);
+        const inUsd = (value: BigFixnum) => convertsToUsd(contract.registry.market)
+          ? value.mul(baseUsdPrice.price)
+          : value;
         return {
           ...identity,
           status: statuses.some(collateral => collateral.status === 'error') ? 'partially' : 'success',

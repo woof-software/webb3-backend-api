@@ -185,7 +185,7 @@ t.test(`market-day-summary@block:16380543`, async t => {
    */
   const cachedKeys1 = Object.keys(cache.store);
   const expectedKeys = [
-    `marketSummary-v7:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`,
+    `marketSummary-v8:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`,
     /*
      * FIXME(jordan): since we project(..) within compute(..), the
      * index.includes(..) check fails on the block unless it happens

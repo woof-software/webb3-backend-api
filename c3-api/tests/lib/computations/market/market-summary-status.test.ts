@@ -1,13 +1,8 @@
 import t from 'tap';
 
-import * as Debug    from '../../../../lib/debug-log.js';
 import * as Flags    from '../../../../lib/flags.js';
 import { BigNumber } from '../../../../lib/bignumber.js';
 import { BigFixnum } from '../../../../lib/bigfixnum.js';
-
-import * as Compute    from '../../../../lib/symbolic/computation.js';
-import * as Evaluator  from '../../../../lib/symbolic/evaluator.js';
-import { MemoryCache } from '../../../../lib/symbolic/cache.js';
 
 import * as comet  from '../../../../lib/computations/comet.js';
 import * as market from '../../../../lib/computations/market.js';
@@ -18,6 +13,7 @@ import { checksumAddress } from '../../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../../src/registry/catalog.js';
 
+import { evaluatorOver, stub } from '../../../util/evaluator.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../../util/registry-fixture.js';
 
 import '../../../../shim/node-self.js';
@@ -28,7 +24,6 @@ import '../../../../shim/node-self.js';
  * answer from a table instead of a node.
  */
 const flags = Flags.parseWithDefaults(process.env);
-const debug = Debug.MakeLogger([]).configure(process.env);
 
 const network = 'ethereum-mainnet' as const;
 const usdt    = fixtureCatalog().marketsOn(network).find(entry => entry.deploymentKey === 'usdt')!.comet;
@@ -44,13 +39,9 @@ const one = (decimals = 8) => BigFixnum.from({ decimals, value: BigNumber.from(1
 const read     = (price: BigFixnum) => ({ status: 'success' as const, price });
 const reverted = { status: 'error' as const, message: 'execution reverted' };
 
-function stub(answer: (context: any) => unknown) {
-  return Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
-}
-
+// on the algorithm the environment sets, unless a test names one
 function evaluator(computations: Record<string, unknown>, algorithm: 'recursive' | 'workingset' = flags.evaluatorAlgorithm) {
-  const cache = new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]);
-  return Evaluator.instantiate<any>(computations as any, { cache, debug, flags: { ...flags, evaluatorAlgorithm: algorithm, batchingEnabled: true } });
+  return evaluatorOver(computations, { algorithm });
 }
 
 // the market routes evaluate on the working set; tests that build a summary's collateral run on both
@@ -154,13 +145,17 @@ t.test('a summary gives its totals in USD beside the quoted ones', async t => {
 /*
  * The base asset's USD price is the conversion the USD totals are made with,
  * so it is read from the feed the version's quote calls for, at the scale
- * the version states, and never from whichever feed happens to be there.
+ * the version states, and never from whichever feed happens to be there. On
+ * a market quoted in USD it is the base price, whose feed answers here, so
+ * the Comet is not asked for its own.
  */
 t.test('the base asset\'s USD price is read from the feed the quote calls for', async t => {
   const feeds: string[] = [];
   const { evaluate, pull1 } = evaluator({
-    baseUsdPrice: comet.baseUsdPrice,
-    getPrice:     stub(({ priceFeed }) => { feeds.push(`${priceFeed.address.toLowerCase()}/${priceFeed.decimals}`); return read(one()); }),
+    baseUsdPrice:   comet.baseUsdPrice,
+    basePrice:      comet.basePrice,
+    getPrice:       stub(({ priceFeed }) => { feeds.push(`${priceFeed.address.toLowerCase()}/${priceFeed.decimals}`); return read(one()); }),
+    cometBasePrice: stub(() => { feeds.push('the Comet\'s feed'); return read(one()); }),
   });
   const priceOf = (contract: typeof usdt) => evaluate(pull1({
     baseUsdPrice: { apiHost: '', nodeHost: '', nodeKey: '', network, contract, blockNumber: block.number },
@@ -192,10 +187,11 @@ t.test('the base asset\'s USD price is read from the feed the quote calls for', 
 
 /*
  * A market's base price is read from the feed the version names for its base
- * asset, at the scale the version states: the Comet is not asked for its
- * feed, so the evaluator below has nothing to answer such a call with. A
- * market quoted in USD prices its base asset in USD through the same feed,
- * which the summary route's evaluator then reads once for both.
+ * asset, at the scale the version states. The Comet is asked for its own feed
+ * only where that one reverts, and here it answers, so the evaluator below
+ * has nothing to answer such a call with. A market quoted in USD prices its
+ * base asset in USD with that same read, which the summary route's evaluator
+ * then makes once for both.
  */
 t.test('the base price is read from the feed the version names', async t => {
   const reads: string[] = [];
@@ -252,6 +248,44 @@ t.test('a base price that reverts makes the market an error', async t => {
       status:  'error',
       message: 'execution reverted',
     }, 'nothing of the market can be valued, so only what identifies it is reported');
+  }
+});
+
+/*
+ * Where the base feed the version names does not answer at the block — a day
+ * before it was deployed, or one after Chainlink retired it while the version
+ * still names it — the base asset is priced through the feed its Comet named
+ * at that block. A summary is what each day of the history is
+ * (market-day-summary.ts), so this is such a day: on a market quoted in USD,
+ * its totals and its base asset's USD price, one read, both through the
+ * Comet's feed.
+ */
+t.test('a summary whose base feed reverts is priced through the feed its Comet names', async t => {
+  const own = usdt.base.priceFeed.address;
+  t.equal(usdt.registry.market.collateralValueQuote, 'usd');
+  for (const algorithm of ALGORITHMS) {
+    const { evaluate, pull1 } = evaluator({
+      marketSummary:  market.marketSummary,
+      basePrice:      comet.basePrice,
+      baseUsdPrice:   comet.baseUsdPrice,
+      getPrice:       stub(({ priceFeed }) => priceFeed.address === own ? reverted : read(one())),
+      // the feed the Comet names at the block answers 0.99
+      cometBasePrice: stub(() => read(BigFixnum.from({ decimals: 2, value: 99 }))),
+      borrowApr:      stub(() => BigFixnum.from({ decimals: 2, value: 5 })),
+      supplyApr:      stub(() => BigFixnum.from({ decimals: 2, value: 3 })),
+      totalBorrow:    stub(() => BigFixnum.from({ value: 10 })),
+      totalSupply:    stub(() => BigFixnum.from({ value: 20 })),
+      collaterals:    stub(() => [ collateral(COMP, 'COMP', 3, read(one())) ]),
+      utilization:    stub(() => BigFixnum.from({ decimals: 2, value: 50 })),
+    }, algorithm);
+    const summary = await evaluate(pull1({ marketSummary: { apiHost: '', nodeHost: '', nodeKey: '', network, contract: usdt, block } }));
+    t.match(summary, {
+      status:               'success',
+      totalBorrowValue:     '9.9',  totalBorrowValueUsd:     '9.9',
+      totalSupplyValue:     '19.8', totalSupplyValueUsd:     '19.8',
+      totalCollateralValue: '3.0',  totalCollateralValueUsd: '3.0',
+      baseUsdPrice:         '0.99',
+    }, `${algorithm}: a success, its totals and its USD price at 0.99`);
   }
 });
 

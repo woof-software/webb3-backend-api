@@ -1,6 +1,7 @@
 import * as Eth                from '../../lib/eth-constants.js';
 import * as Fallible           from '../../lib/fallible/fallible.js';
 import { snakeifyCamelObject } from '../../lib/camel-snake.js';
+import { throttle }            from '../../lib/throttle.js';
 
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
@@ -53,10 +54,13 @@ function rewardGroups(
  *   can be claimed there, and the market is left out, as it always was;
  * - `read`: it pays the token the version describes, which the amounts are
  *   read, scaled, priced and labelled as;
- * - otherwise it pays another token — one set after the version's import —
- *   and an amount of one token scaled and priced as another would be a wrong
- *   number. The market is answered in the error envelope of a market whose
- *   rewards cannot be valued, until a version describes what it pays.
+ * - otherwise it pays another token. A version imported from this contract
+ *   cannot get here — CometRewards sets a market's token once
+ *   (`AlreadyConfigured`), and the import reads it there — but the check
+ *   stays, because an amount of one token scaled and priced as another would
+ *   be a wrong number. The market is answered in the error envelope of a
+ *   market whose rewards cannot be valued, until a version describes what it
+ *   pays.
  */
 type RewardsInclusion = 'none' | 'read' | MarketIdentity & PriceError;
 
@@ -82,24 +86,19 @@ function rewardsInclusion(comet: RegistryComet, paid: Eth.Address): RewardsInclu
 }
 
 /*
- * When this isolate last reported each market whose rewards contract pays
- * another token than the version describes. The chain drift check does not
- * read reward tokens, so this line is what tells an operator to import the
- * market again; once a minute per market names it for as long as it lasts,
- * as a feed that reverts is named (get-price.ts).
+ * When this isolate reports each market whose rewards contract pays another
+ * token than the version describes. That never happens to a version imported
+ * from the contract, so the line says the version was not built from it; the
+ * chain drift check does not read reward tokens, so the line is what tells an
+ * operator to import the market again. Once a minute per market names it for
+ * as long as it lasts, as a feed that reverts is named (get-price.ts).
  */
-const reported = new Map<string, number>();
-
-const REPORT_EVERY_MS = 60_000;
+const due = throttle(60_000);
 
 function reportMismatch(comet: RegistryComet, paid: Eth.Address): void {
-  const key  = `${comet.network}:${comet.address.toLowerCase()}`;
-  const at   = Date.now();
-  const last = reported.get(key);
-  if (last !== undefined && at - last < REPORT_EVERY_MS) {
+  if (!due(`${comet.network}:${comet.address.toLowerCase()}`)) {
     return;
   }
-  reported.set(key, at);
   console.warn(`reward token differs from the registry: ${comet.address} on ${comet.network} pays ${paid}, the version describes ${comet.registry.market.rewardAsset?.token.address}`);
 }
 

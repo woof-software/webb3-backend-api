@@ -1,4 +1,5 @@
 import { keccak256 } from '../../lib/hash.js';
+import { throttleBy } from '../../lib/throttle.js';
 
 import {
   ActiveMarketV1,
@@ -13,6 +14,7 @@ import {
 import type { CacheDeps } from './cache.js';
 import { RegistryUnavailable, isUnreachable } from './cache.js';
 import { nowOf } from './clock.js';
+import { withDeadline } from './deadline.js';
 import type { DeprecatedCollateral } from './deprecated-collateral-repository.js';
 import { readDeprecatedCollaterals } from './deprecated-collateral-repository.js';
 
@@ -214,16 +216,7 @@ async function rememberDeprecated(deps: CacheDeps, decisions: DeprecatedDecision
 
 // whether `work` settles within `milliseconds`: the runtime's own time, which is what cuts work off
 async function settlesWithin(work: Promise<void>, milliseconds: number): Promise<boolean> {
-  if (milliseconds <= 0) {
-    return false;
-  }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), milliseconds); });
-  try {
-    return await Promise.race([ work.then(() => true, () => true), timeout ]);
-  } finally {
-    clearTimeout(timer);
-  }
+  return milliseconds > 0 && await withDeadline(work.then(() => true, () => true), milliseconds) === true;
 }
 
 /*
@@ -282,21 +275,16 @@ async function recordedDeprecated(deps: CacheDeps, cause: unknown): Promise<Depr
 }
 
 /*
- * When this isolate last said it answers with the recorded decisions, per
- * database binding: once a minute, as the cache says it answers from an older
- * version, rather than once a request.
+ * When this isolate says it answers with the recorded decisions, per database
+ * binding: once a minute, as the cache says it answers from an older version,
+ * rather than once a request.
  */
-const reportedFallback = new WeakMap<D1Database, number>();
-
-const REPORT_FALLBACK_EVERY_MS = 60_000;
+const fallbackDue = throttleBy<D1Database>(60_000);
 
 function reportFallback(deps: CacheDeps, error: unknown): void {
-  const at   = timeOf(deps);
-  const last = reportedFallback.get(deps.db);
-  if (last !== undefined && at - last < REPORT_FALLBACK_EVERY_MS) {
+  if (!fallbackDue(deps.db, 'fallback', timeOf(deps))) {
     return;
   }
-  reportedFallback.set(deps.db, at);
   deps.debug.warn(`deprecated collateral decisions unreadable; answering with the ones last recorded`, { error });
 }
 

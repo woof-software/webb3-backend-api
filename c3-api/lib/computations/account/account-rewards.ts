@@ -47,8 +47,8 @@ type AccountRewards = Compute.Spec<{
 
 const { implement, pipe } = Compute.Functor<AccountRewards>({});
 const accountRewards = implement({
-  // 4: its market's APRs read the base price from the feed the registry version names
-  version: 4,
+  // 5: where the feed the registry version names reverts, its market's APRs read the base price from the one the Comet names
+  version: 5,
   index: Index.BlockIndexOnIntervalSeconds(60 * 5),
   key(name, { block, ...context }) {
     const { block: projected } = Fallible.must(this.index.project({ block, ...context }));

@@ -57,6 +57,9 @@ class ApiError extends Error {
    */
   readonly headers: Record<string, string>;
 
+  constructor(code: Exclude<ApiErrorCode, 'CONFLICT'>, message: string, details?: Record<string, unknown>, headers?: Record<string, string>);
+  // a CONFLICT names the conflict it met in details.code, which a script matches (API.md)
+  constructor(code: ApiErrorCode, message: string, details: Record<string, unknown> & { code: string }, headers?: Record<string, string>);
   constructor(
     code: ApiErrorCode,
     message: string,

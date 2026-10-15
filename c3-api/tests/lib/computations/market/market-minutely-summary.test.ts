@@ -115,7 +115,7 @@ t.test(`market-minutely-summary@block:16380543`, async (t) => {
    */
   const cachedKeys1 = Object.keys(cache.store);
   const expectedKeys = [
-    `marketSummary-v7:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`,
+    `marketSummary-v8:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`,
   ];
   for (const key of expectedKeys) {
     const similar = cachedKeys1.find(k => k.startsWith(key));
@@ -130,7 +130,7 @@ t.test(`market-minutely-summary@block:16380543`, async (t) => {
     result1,
     `the minute's block gives the same summary`
   );
-  const minutelyKey = `marketMinutelySummary-v6:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`;
+  const minutelyKey = `marketMinutelySummary-v8:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`;
   t.ok(
     Object.keys(cache.store).includes(minutelyKey),
     `the latest summary is cached under the minute's block, by its own version`

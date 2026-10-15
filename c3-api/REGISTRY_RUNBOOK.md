@@ -850,6 +850,13 @@ replacement that reverts while the feed it replaces answers — at a block
 before it was deployed — is not logged. The token list reads only the
 replacement, and logs it whenever it reverts.
 
+The market's base feed, its `baseAsset.priceFeed` there, is logged the same
+way: only when the feed its Comet names at that block did not answer either.
+So a base feed the Comet has moved off, which Chainlink retired while the
+version still names it, is not logged: the API prices the base asset
+through the Comet's feed meanwhile, and the daily chain check raises the
+difference ([A market that changed on chain](#a-market-that-changed-on-chain)).
+
 A price exception covers collateral feeds only. When the feed is the market's
 base feed, the Comet itself cannot price its base asset and only its
 governance can replace the feed. A reward feed or a base USD feed is changed
@@ -947,7 +954,10 @@ included: a day before its replacement was deployed is read from the feed
 the Comet named that day, and only a day neither answers stays `partially`.
 
 `GET /registry/v1/admin/status` does not report a market whose feed reverts:
-alert on the `price feed reverted:` log line instead.
+alert on the `price feed reverted:` log line instead, as well as on the
+status's `chain-drift`. A base feed of the version that reverts while the
+feed its Comet names answers is not logged, since the API reads the
+Comet's: the daily chain check, as `chain-drift`, is what reports it.
 
 ## A market that changed on chain
 
@@ -982,29 +992,37 @@ Until the version that agrees is on, the market routes serve what the version
 says. A summary prices each collateral the version describes with the feed
 its Comet reads at the block, so a collateral's new feed is priced right all
 along; but it names collateral as the version does and prices the base asset
-through the base feed the version stores. So a collateral the Comet added is
-left out of the summaries, and its amounts in a user's transaction history
-are read at the decimals the token reports, with no symbol; a collateral it
-replaced at an index is reported as one that could not be read
-(`partially`); and a base feed governance replaced is still read — once
-Chainlink retires it, every summary of the market answers `error`. The token
-list, which values the latest block, fails a position whose feed moved
-(`feed_mismatch`), and its token follows the list's rules for a value it
-could not read: a partial value that already reaches the threshold, an
-earlier minute's, or shown as `data_unavailable`. And `/registry/v1/*`
-serves the old facts, which a client that prices from the registry's feeds
-would use.
+through the base feed the version stores first. So a collateral the Comet
+added is left out of the summaries, and its amounts in a user's transaction
+history are read at the decimals the token reports, with no symbol; a
+collateral it replaced at an index is reported as one that could not be read
+(`partially`); and a base feed governance replaced is still read first — once
+Chainlink retires it, the summaries, their history and the rewards routes,
+`/account/{address}/rewards` among them, price the base asset through the
+feed the Comet names instead, and answer `error` only where that one reverts
+too. Until the market is imported again, the rewards still name the version's
+feed as the market's (`base_asset.priceFeed` of `/rewards/dapp-data`), even
+where they read the Comet's. The token list, which values the latest block,
+fails a position whose feed moved (`feed_mismatch`), and its token follows
+the list's rules for a value it could not read: a partial value that already
+reaches the threshold, an earlier minute's, or shown as `data_unavailable`.
+And `/registry/v1/*` serves the old facts, which a client that prices from
+the registry's feeds would use.
 
-The check does not read reward tokens. A rewards contract that starts paying
-another token than the version describes shows instead in the worker's log,
-once a minute per market for as long as it lasts:
+The check does not read reward tokens: a rewards contract cannot start paying
+another token, since CometRewards sets a market's token once, and the import
+reads it from the contract the version names. A version that describes
+another token than its rewards contract pays shows instead in the worker's
+log, once a minute per market for as long as it lasts:
 
 ```
 reward token differs from the registry: 0xc3d688B66703497DAA19211EEdff47f25384cdc3 on ethereum-mainnet pays 0x…, the version describes 0xc00e94cb662c3520282e6f5717214004a7f26888
 ```
 
-and `/account/{address}/rewards` answers that market as `error` until a
-version describes the token it pays: import the commit again as below.
+This line should never appear. If it does, the version was not built from
+that contract, and `/account/{address}/rewards` answers that market as
+`error` until a version describes the token it pays: import the commit again
+as below.
 
 ### 2. Import the commit again
 
@@ -1081,9 +1099,9 @@ finds the version agrees with the chain. Switching back to a version that
 stores what drifted keeps it raised.
 
 A version that changes a market's base feed prices the market's whole
-history through the new feed, whatever its quote: a day sampled before that
-feed existed answers `error`, and does until the history no longer samples
-it — up to 30 days.
+history through the new feed, whatever its quote, and a day sampled before
+that feed existed through the feed the Comet named that day. Such a day
+answers `error` only where neither feed answered.
 
 ## Switching back
 
@@ -1216,14 +1234,16 @@ Authorization: Bearer {{TOKEN}}
 on the approved tokens (or `false` to take a mark away) and write why in the
 `"reason"` at the top. A row may carry its own `"reason"`, which wins. Leave
 every other row as it is, or delete it: a row that changes nothing needs no
-reason, and a token the list does not name is left as it is.
+reason, and a token the list does not name is left as it is. Step 3 applies
+only the rows the review shows as changes.
 
-**2. See what it would change** — this writes nothing:
+**2. See what it would change** — this writes nothing, and keeps the answer
+for step 3:
 
 ```sh
 curl -s -X POST "$API/registry/v1/admin/token-policies/review" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @token-policies.json \
-  | jq 'if .error then .error else .summary, (.policies[] | select(.action == "change" or .problem != null)) end'
+  -H 'Content-Type: application/json' --data @token-policies.json > review.json
+jq 'if .error then .error else .summary, (.policies[] | select(.action == "change" or .problem != null)) end' review.json
 ```
 
 Postman:
@@ -1246,28 +1266,47 @@ list decides, each with what it is now (`current`), what the list wants
 is on does not hold, a symbol that is not that token's, or a change without a
 reason; fix the file and review it again.
 
-**3. Apply it** — the same file, right after the review:
+**3. Apply what it changes** — right after the review:
 
 ```sh
-curl -s -X POST "$API/registry/v1/admin/token-policies/apply" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @token-policies.json \
+jq 'if .error then error("the review failed: \(.error.message)")
+    elif .summary.problems > 0 then error("the review found problems: fix the file and review it again")
+    elif .summary.change == 0 then error("the review shows no change: there is nothing to apply")
+    else {reason: null, policies: [.policies[] | select(.action == "change") | {chainId, tokenAddress, symbol, isStrategic: .requested, reason}]}
+    end' review.json > reviewed.json \
+  && curl -s -X POST "$API/registry/v1/admin/token-policies/apply" -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' --data @reviewed.json \
   | jq 'if .error then .error else .summary end'
 ```
 
-Postman: the same request as step 2, to `…/token-policies/apply`.
+`jq` writes to `reviewed.json` only the rows the review shows under `change`,
+each with the `reason` the review showed, which is the one the change is
+recorded with, and the `symbol` the version names. If the review answered an
+error, found problems or shows no change, `jq` says so, and nothing is sent.
+
+Postman: the same request as step 2, to `…/token-policies/apply`, with
+`reviewed.json` as the body. Without `jq`, write the body from the rows the
+review shows under `change`: `{"reason": null, "policies": [ … ]}`, each row
+with its `chainId`, `tokenAddress`, `symbol`, `requested` as `isStrategic`,
+and `reason`.
 
 **You should see** `"changed"` equal to the number of changes the review
-showed. Apply compares the file with the decisions in force when it runs: if
-the number differs, someone decided one of its tokens after your review, and
-the answer's rows show which. The list is written in one go: if any row
+showed. Apply compares `reviewed.json` with the decisions in force when it
+runs: if the number differs, someone decided one of its tokens after your
+review, and the answer's rows show which. It can only be lower: a token
+someone gave the list's decision meanwhile is left as it is. Apply does not
+touch a token `reviewed.json` does not name, whoever decided it after your
+review; only a token of the list that someone changed and changed back since
+is written as the review showed. The list is written in one go: if any row
 cannot be applied (`422`, naming the rows), or a version is switched on or
 one of its tokens decided while it is being written (`409`), nothing is
-written. Applying the same file again changes nothing.
+written. Applying `reviewed.json` again changes nothing.
 
-To use the list in another environment, keep only the rows it decides: a list
-applies only where the version that is on holds every token it names, and
-another environment's version may not hold one of them. Review it there
-before applying it.
+To use the list in another environment, take the edited file, not
+`reviewed.json`, which holds only what changes here, and keep only the rows
+the list decides: a list applies only where the version that is on holds
+every token it names, and another environment's version may not hold one of
+them. Review it there and apply what it changes, as steps 2 and 3 do here.
 
 ### What the token list shows
 
@@ -1293,6 +1332,38 @@ other strategic token says `"visibilityReason": "strategic"`; any other is
 shown by `collateral_threshold` or hidden by `below_threshold`. A token that
 says `data_unavailable` is shown because its value could not be established
 — see [When something goes wrong](#when-something-goes-wrong).
+
+An isolate values a minute of a chain once and writes it to KV, where the
+isolates that ask afterwards read it. One that asks while the minute is
+being valued values it as well, and so does one in another location that read
+the minute's key before it was written: KV caches there that a key is
+missing too, for up to a minute. How many times a minute is valued, the
+worker's logs say (Workers Logs in the Cloudflare dashboard, or
+`npx wrangler tail --env production`):
+
+- take the lines with `"event": "token_collateral_minute"`;
+- keep those whose `failed` has no `transport` — the complete minutes, which
+  are the ones written to KV — and count them by `chainId`, `positionSet` and
+  `minute`. A line with `transport` is a minute the node left incomplete,
+  which is valued again after 10 seconds, or after 60 when no read of the
+  chain succeeded; a valuation still running after 30 seconds is started
+  again too, and each attempt that finishes logs a line of its own. That is
+  the node failing, not the work multiplied by KV;
+- count apart the errors `token collateral record could not be written` with
+  `KV PUT failed: 429`, from isolates that wrote one minute within a second
+  ([When something goes wrong](#when-something-goes-wrong)).
+
+If there are steadily more than about 3 complete lines per chain and minute,
+or the node provider's usage says as much, tell a developer. What can be done
+then:
+
+1. a Cache API layer in front of KV, shared by the isolates of a location. It
+   does nothing on `*.workers.dev`, so it is measured on the environment's own
+   domain;
+2. reading the record with a `cacheTtl` of 30 seconds, the least KV takes, so
+   that a missing key stays cached for 30 seconds rather than up to 60;
+3. answering with the previous minute while the current one is valued. That
+   changes what the list answers, and is the owner's to decide.
 
 ## Marking a collateral deprecated
 
@@ -1385,14 +1456,16 @@ write why in the `"reason"` at the top. A row may carry its own `"reason"`,
 which wins. Leave every other row as it is, or delete it. A row's
 `deploymentKey` and `symbol` are there for you to read, and are checked: a
 market or a symbol that is not the one the version that is on names is
-refused. `retained` is not read.
+refused. `retained` is not read. Step 3 applies only the rows the review
+shows as changes.
 
-**2. See what it would change** — this writes nothing:
+**2. See what it would change** — this writes nothing, and keeps the answer
+for step 3:
 
 ```sh
 curl -s -X POST "$API/registry/v1/admin/deprecated-collaterals/review" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @deprecated-collaterals.json \
-  | jq 'if .error then .error else .summary, (.collaterals[] | select(.action == "change" or .problem != null)) end'
+  -H 'Content-Type: application/json' --data @deprecated-collaterals.json > review.json
+jq 'if .error then .error else .summary, (.collaterals[] | select(.action == "change" or .problem != null)) end' review.json
 ```
 
 Postman:
@@ -1413,21 +1486,43 @@ token that is not a collateral of that Comet, a market or a symbol that is
 not that row's, or a change without a reason; fix the file and review it
 again.
 
-**3. Apply it** — the same file, right after the review:
+**3. Apply what it changes** — right after the review:
 
 ```sh
-curl -s -X POST "$API/registry/v1/admin/deprecated-collaterals/apply" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' --data @deprecated-collaterals.json \
+jq 'if .error then error("the review failed: \(.error.message)")
+    elif .summary.problems > 0 then error("the review found problems: fix the file and review it again")
+    elif .summary.change == 0 then error("the review shows no change: there is nothing to apply")
+    else {reason: null, collaterals: [.collaterals[] | select(.action == "change") | {chainId, cometAddress, deploymentKey, tokenAddress, symbol, isDeprecated: .requested, reason}]}
+    end' review.json > reviewed.json \
+  && curl -s -X POST "$API/registry/v1/admin/deprecated-collaterals/apply" -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' --data @reviewed.json \
   | jq 'if .error then .error else .summary end'
 ```
 
-Postman: the same request as step 2, to `…/deprecated-collaterals/apply`.
+`jq` writes to `reviewed.json` only the rows the review shows under `change`,
+each with the `reason` the review showed, which is the one the change is
+recorded with, and the `deploymentKey` and `symbol` the version names. If the
+review answered an error, found problems or shows no change, `jq` says so,
+and nothing is sent.
+
+Postman: the same request as step 2, to `…/deprecated-collaterals/apply`,
+with `reviewed.json` as the body. Without `jq`, write the body from the rows
+the review shows under `change`: `{"reason": null, "collaterals": [ … ]}`,
+each row with its `chainId`, `cometAddress`, `deploymentKey`, `tokenAddress`,
+`symbol`, `requested` as `isDeprecated`, and `reason`.
 
 **You should see** `"changed"` equal to the number of changes the review
-showed. The list is written in one go, as a list of strategic tokens is: if
-any row cannot be applied (`422`, naming the rows), or a version is switched
-on or one of its collaterals decided while it is being written (`409`),
-nothing is written. Applying the same file again changes nothing.
+showed. Apply compares `reviewed.json` with the decisions in force when it
+runs: if the number differs, someone decided one of its collaterals after
+your review, and the answer's rows show which. It can only be lower: a
+collateral someone gave the list's decision meanwhile is left as it is. Apply
+does not touch a collateral `reviewed.json` does not name, whoever decided it
+after your review; only a collateral of the list that someone changed and
+changed back since is written as the review showed. The list is written in
+one go, as a list of strategic tokens is: if any row cannot be applied
+(`422`, naming the rows), or a version is switched on or one of its
+collaterals decided while it is being written (`409`), nothing is written.
+Applying `reviewed.json` again changes nothing.
 
 ### The initial list of deprecated collaterals
 
@@ -1463,10 +1558,11 @@ Save it as `deprecated-collaterals-initial.json`:
 }
 ```
 
-Review it and apply it as steps 2 and 3 above, with
-`--data @deprecated-collaterals-initial.json`. **You should see** `"change": 12`
-and `"problems": 0` from the review, and `"changed": 12` from apply; in an
-environment where it was applied before, `"unchanged": 12`.
+Review it as step 2 above, with `--data @deprecated-collaterals-initial.json`,
+and apply what it changes as step 3. **You should see** `"change": 12` and
+`"problems": 0` from the review, and `"changed": 12` from apply. In an
+environment where it was applied before, the review shows `"change": 0` and
+`"unchanged": 12`: there is nothing to apply, and step 3 says so.
 
 Where the addresses come from: each is what the registry's own data in the
 repository holds for that market and that symbol — the registry's test
@@ -1531,8 +1627,9 @@ one of the two markets, or one of them does not take that symbol as
 collateral; more means one market has two collaterals of one symbol. Either
 way, do not apply the file: tell the frontend developer which collateral it
 is, since the app's list was written against what these markets took then.
-With the 8 lines as the table has them, review the file and apply it, as
-steps 2 and 3 above.
+With the 8 lines as the table has them, review the file as step 2 above, with
+`--data @deprecated-collaterals-wsteth-usds.json`, and apply what it changes
+as step 3.
 
 ## Keeping an eye on it
 
@@ -1565,7 +1662,7 @@ When `alerts` is not empty, each name says what to do:
 | `candidate-awaiting-activation` | A new commit was imported and validated, and is waiting to be switched on; `candidates.validated` names it | [When the source changes](#when-the-source-changes). The alert holds until a version at least that new is switched on: one you decide not to switch on keeps it raised until a newer commit's version is |
 | `candidate-drops-markets` | A version waiting to be switched on would stop serving markets the version on serves; its `unserved` in `candidates.validated` names them, by their keys in the version on. Nothing holds it back | Step 2 of [When the source changes](#when-the-source-changes): `markets.unserved` says where each Comet went. Confirm every one with a developer before switching it on, and describe a renamed one under its new key first. The alert holds until a version at least that new is switched on |
 | `commit-rejected` | The newest commit imported completely but did not validate, and the scheduled job will not import it again by itself; `sync.rejectedCommit` names it | Read why it failed (`GET /registry/v1/admin/versions/<versionId>`). If a decision was wrong, hold a new attempt (step 1 of [Describing a new market](#describing-a-new-market)), correct it there and validate; otherwise the alert clears when the source moves on |
-| `chain-drift` | The version on stores a price feed or a collateral asset its market's Comet no longer answers with: governance changed the market on chain after the import, and the source did not move. `chainCheck.drifts` names each, with what the version stores and what the chain answers. Until a version that agrees is on, the summaries leave out a collateral the Comet added and read the base feed the version stores ([A market that changed on chain](#a-market-that-changed-on-chain)) | [A market that changed on chain](#a-market-that-changed-on-chain): import the commit again with `forceNewAttempt`, check what it changes and switch it on. The alert clears once the next hourly invocation has checked the version on and found it agrees with the chain, within the hour of the switch |
+| `chain-drift` | The version on stores a price feed or a collateral asset its market's Comet no longer answers with: governance changed the market on chain after the import, and the source did not move. `chainCheck.drifts` names each, with what the version stores and what the chain answers. Until a version that agrees is on, the summaries leave out a collateral the Comet added and read the base feed the version stores, or where it reverts the one the Comet names ([A market that changed on chain](#a-market-that-changed-on-chain)) | [A market that changed on chain](#a-market-that-changed-on-chain): import the commit again with `forceNewAttempt`, check what it changes and switch it on. The alert clears once the next hourly invocation has checked the version on and found it agrees with the chain, within the hour of the switch |
 | `last-sync-failed` | The last import ended `failed`. `sync.lastRun.lastError` says how: `validation failed` is a draft that failed a check, and `cancelled by <actor>: <reason>` a run somebody cancelled. A root that fails does not fail the run, and neither do the checks of a run held for review — the first import of an environment, or one with `holdForReview`: it completes, its draft left open | After `validation failed`, read the draft's checks: `GET /registry/v1/admin/versions/<sync.lastRun.registryVersionId>` lists them under `validation.checks`, failed first, with their `details`. If `all-roots-imported` is among them, the run gave roots up: `GET /registry/v1/admin/sync-runs/<sync.lastRun.id>` lists them with `status` `failed`, and why in each `lastError`. Fix that — most often the node provider proxy — and the scheduled job tries the commit again, or force a new attempt. Otherwise `commit-rejected` is raised as well: follow it. After a cancel, import again as `sync-stalled` says |
 | `sync-failing` | The import that is running keeps failing: the last root it tried failed, or an invocation has failed since before trying one, and the roots left failed have spent two attempts or more between them — two roots once, or one root twice. A single failure does not raise it. `sync.lastRun.lastError` says why, once an invocation has recorded it | Read its run: `GET /registry/v1/admin/sync-runs/<id>` lists each root with why it failed and the `attempts` it has spent. `SOURCE_REQUEST_FAILED` and `CHAIN_REQUEST_FAILED` are GitHub or the node provider proxy not answering: fix the proxy, or wait for GitHub, and the next hourly invocation carries on. Until then an invocation that imports nothing spends an attempt of each root it tries, and a root is given up after five, whatever failed it. `the invocation importing this root did not finish` is an invocation stopped in the middle of that root — a deploy, or a Worker past its time or CPU: the next one tries it again, and if one market keeps stopping it, the worker's logs say what did. Until the next one records it, such a root is still `processing`, under a `leaseExpiresAt` already past, and the run's `lastError` is still that of the attempt before it — `null` if that one succeeded. `the database did not answer` is D1 failing under that root — restarted, overloaded or cut off. A restart or an overload spends the attempt all the same, and the next invocation tries the root again; if it keeps coming back, check the database's health. The worker's log line `registry root failed` has what D1 said, as it has the whole of a fault, which a root records as `an unexpected error interrupted the import`. Anything else is the root itself. A `lastError` that no root of the run carries — `OVERLAY_INVALID` naming a `version …`, or `an unexpected error interrupted the import` — is an invocation that failed before it tried a root: see `sync-stalled`, which the status raises as well once nothing has moved for two hours |
 | `sync-stalled` | A run says it is running, but nobody is continuing it: the hourly trigger is not firing, or every invocation fails before it imports a market | Read why in `sync.lastRun.lastError`; where it is `null`, the worker's log line `registry sync failed` names the service that did not answer — GitHub, the node provider proxy or the database — and once it answers, the hourly import resumes the run by itself. A `lastError` that comes back the same every hour does not pass: cancel the run — `POST /registry/v1/admin/sync-runs/<sync.lastRun.id>/cancel` with `{"reason": "…"}` — fix what it names, then import again with `{"forceNewAttempt": true, "reason": "…"}` (step 1 of [the first bring-up](#bringing-an-environment-up-for-the-first-time)). That attempt is of the commit the tracked ref names now: if the source has moved on since the run started — the cancel's answer names the run's `sourceCommitSha` — it imports the newer commit and leaves the run's draft open. To keep what was reviewed on that draft, send the run's `sourceCommitSha` with `forceNewAttempt` instead; otherwise close the draft as the row on a draft of an older commit in [When something goes wrong](#when-something-goes-wrong) says. Cancelling does not help with two of them, which a new attempt meets the same way. `an unexpected error interrupted the import` is a fault, which the log has whole as `registry sync failed unexpectedly`: see `INTERNAL` in [When something goes wrong](#when-something-goes-wrong). `OVERLAY_INVALID` naming a `version …` is a decision that version stores, the one on or an earlier attempt of the commit, which this release no longer takes: a developer's to fix, in a release. Once either is fixed, the hourly import resumes the run by itself |
@@ -1691,6 +1788,7 @@ whose reasons are in the draft it names.
 | `503 UPSTREAM_UNAVAILABLE` from the market and registry routes, or from `/admin/status` | The database could not be reached, and there is no version within the window to answer from. The token list does not wait for the window: it reads the token policies from the database on every request. Or, from a route that reads the chain — the market and account routes, transaction history, governance — the node provider proxy did not serve the request: no provider answered it, the worker could not reach the proxy or lost its answer, or the proxy answered a call with an error that is not a revert. Such an answer says `a node provider did not answer`, with the proxy's `Retry-After` when it sent one; the worker's log line `route failed` with the answer's `requestId` has the error — `HTTP 401` in it is the proxy refusing `NODE_PROXY_KEY` — and the proxy's own log has `upstream error` or `json-rpc error` | Check the database's health; nothing in the registry needs changing. For a node provider, fix the proxy, its binding or its key: the routes answer again as soon as it serves them |
 | `500 INTERNAL` from the market and registry routes | The database answered with a fault — most often a release deployed before its migrations — or a bug, such as a call the contract reverted where the route needed its value. A node provider that did not answer is a `503`, not this. The worker's log line `route failed` or `registry route failed` with the answer's `requestId` has the error | Apply the migrations if they are missing; otherwise report the log line |
 | A market reports `"status": "error"` with the message `creationBlock … is past the latest block, …`, and the log has the warning `creation block not reached` naming its Comet | The active version holds a creation block the market's chain has not reached — one no overlay write checked, such as one an import inherited. None of the market's values can be read, so the market routes and `/account/{address}/rewards` answer it as `error`, and the other markets as usual. This stops by itself once the chain reaches the block, but the market's history then repeats the day of that block for every day before it | Switch back, or give the market the block its Comet was deployed in, as step 7 of [the first bring-up](#7-check-that-it-is-on) says — after the error has stopped by itself too |
+| The worker's log has the error `token collateral record could not be written`, with `KV PUT failed: 429` | Isolates that valued the same minute of the token list wrote it within a second of each other, and KV takes one write a second to a key. The isolate answers from its own copy, and the others read the first write | Nothing, if it comes now and then. If it comes every minute, each minute is valued many times over: count how many, as [What the token list shows](#what-the-token-list-shows) says |
 | The worker's log has the warning `computation cache unreadable` or `computation cache unwritable`, with what KV answered | KV refused a call to the namespace computed values are cached in, `kv_mainnet` or `kv_testnet`: `429` is a value written twice in a second, `503` KV not answering. The request was answered without the cache — a value it could not read was computed again from the chain, and one it could not write was not kept — so it was slower, and asked the node provider more. Each isolate says each once a minute while it lasts | Nothing for a `429` now and then. A `503` that keeps coming back is KV not answering: every request reads the chain while it lasts, and transaction history fails (the next row), so check Cloudflare's status and the node provider proxy |
 | `500 INTERNAL` from transaction history, and the log line `route failed` has `KV GET failed` or `KV PUT failed` | KV refused a history cursor. Cursors are kept in `kv_mainnet` with the computed values, but nothing computes one again: a page whose cursor KV cannot read fails, and so does a page whose cursor it cannot keep, rather than hand out a cursor no later page could read. A first page fails so only after it has been read in full from the chain, since its cursor is written last. While KV does not answer, every page of history fails, though the other routes answer | Check Cloudflare's status; nothing in the registry needs changing. The client may ask again, and history answers as soon as KV does |
 | The worker's log has the warning `history cursor written twice in a second`, with KV's `429` | Two pages asked within a second kept the same cursor — the same page asked twice, or the first pages of two accounts without history at one block: a cursor's id is the digest of what it holds, and names no account. KV takes one write a second to a key, so it refused the second write of a cursor it had just taken, and the page was answered with it | Nothing |

@@ -46,8 +46,8 @@ type SupplyRewardsApr = Compute.Spec<{
 
 const { implement, pipe } = Compute.Functor<SupplyRewardsApr>({});
 const supplyRewardsApr = implement({
-  // 3: the base price is read from the feed the registry version names
-  version: 3,
+  // 4: where the feed the registry version names reverts, the base price is read from the one the Comet names
+  version: 4,
   compute({ apiHost, nodeHost, nodeKey, rewardsTokenPriceFeed, blockNumber, contract, network }) {
     const frame = { apiHost, nodeHost, nodeKey, blockNumber, contract, network };
     return pipe([

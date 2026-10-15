@@ -1,6 +1,7 @@
 import type { Env } from '../../entrypoint.js';
 
 import type { RegistrySnapshotV1, RegistryVersionRefV1 } from '../../lib/model/comet-registry.js';
+import { throttleBy } from '../../lib/throttle.js';
 
 import type { Log } from '../log.js';
 
@@ -124,8 +125,11 @@ const POINTER_RETRY_SECONDS = 60;
  * which is what an environment that would rather fail than serve an older
  * version sets. A value neither takes is answered with its default, and the
  * status names it.
+ *
+ * A request adds its waitUntil (`defer`) to these. The Cron and the status
+ * route take them as they are, and so wait for whatever they write.
  */
-function cacheDepsOf(env: Env, debug: CacheDeps['debug'], defer?: CacheDeps['defer']): CacheDeps {
+function cacheDepsOf(env: Env, debug: CacheDeps['debug']): CacheDeps {
   const { snapshotTtlSeconds, staleFallbackSeconds } = registryConfig(env);
   return {
     db:           env.APP_DB,
@@ -133,7 +137,6 @@ function cacheDepsOf(env: Env, debug: CacheDeps['debug'], defer?: CacheDeps['def
     ttlSeconds:   snapshotTtlSeconds,
     staleSeconds: staleFallbackSeconds,
     debug,
-    ...(defer === undefined ? {} : { defer }),
   };
 }
 
@@ -517,8 +520,7 @@ function unavailableOr(error: unknown): unknown {
 }
 
 /*
- * When this isolate last said it answers from the fallback, per database
- * binding.
+ * When this isolate says it answers from the fallback, per database binding.
  *
  * A database that cannot be reached is a failure an operator has to see, so
  * it is an error even while the fallback keeps every answer a success. It is
@@ -526,17 +528,12 @@ function unavailableOr(error: unknown): unknown {
  * serves for its whole window would otherwise write a line, with the whole
  * error, for every request it answered.
  */
-const reportedOutage = new WeakMap<D1Database, number>();
-
-const REPORT_OUTAGE_EVERY_MS = 60_000;
+const outageDue = throttleBy<D1Database>(60_000);
 
 function reportOutage(deps: CacheDeps, stale: { pointer: VersionRef, staleFor: number }, error: unknown): void {
-  const at   = nowOf(deps.now).getTime();
-  const last = reportedOutage.get(deps.db);
-  if (last !== undefined && at - last < REPORT_OUTAGE_EVERY_MS) {
+  if (!outageDue(deps.db, 'outage', nowOf(deps.now).getTime())) {
     return;
   }
-  reportedOutage.set(deps.db, at);
   deps.debug.error(`registry database unreachable; answering from the version it last named`, {
     versionId: stale.pointer.id,
     staleFor:  stale.staleFor,

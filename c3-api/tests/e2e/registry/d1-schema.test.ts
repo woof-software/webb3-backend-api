@@ -17,6 +17,7 @@ import {
   insertRow,
   insertStatement,
 } from '../../util/d1.js';
+import { count } from '../../util/registry-admin.js';
 import {
   loadRegistrySnapshotFixture,
   seedCandidate,
@@ -232,11 +233,6 @@ async function activate(db: D1Database, versionId: string, action: 'activate' | 
 
 async function activeVersionId(db: D1Database): Promise<string | null> {
   return db.prepare('SELECT active_version_id FROM registry_state').first<string | null>('active_version_id');
-}
-
-async function count(db: D1Database, table: string, where: string = '1 = 1', ...bindings: unknown[]): Promise<number> {
-  const value = await db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`).bind(...bindings).first<number>('n');
-  return value ?? 0;
 }
 
 async function run(db: D1Database, sql: string, ...bindings: unknown[]): Promise<D1Result> {

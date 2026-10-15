@@ -32,7 +32,7 @@ function envWith(overrides: Partial<Env>): Promise<Env> {
 }
 
 /*
- * Without an execution context, so the cache writes the records an outage
+ * Without an execution context, so the request writes the records an outage
  * reads before it answers, not past the answer: what a request records is
  * there for the request after it.
  */

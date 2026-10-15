@@ -3,6 +3,7 @@ import t from 'tap';
 import { randomUUID } from 'node:crypto';
 
 import { foreignKeyViolations } from '../../util/d1.js';
+import { count } from '../../util/registry-admin.js';
 import {
   clearCandidateSnapshot,
   loadRegistrySnapshotFixture,
@@ -45,11 +46,6 @@ const SOURCE = {
 
 async function candidate(db: D1Database, attempt: number = 1) {
   return createCandidate(db, { ...SOURCE, attempt, createdBy: 'test' });
-}
-
-async function count(db: D1Database, table: string, where: string = '1 = 1', ...bindings: unknown[]): Promise<number> {
-  const value = await db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`).bind(...bindings).first<number>('n');
-  return value ?? 0;
 }
 
 async function rejects(operation: () => Promise<unknown>, message: RegExp): Promise<void> {

@@ -89,9 +89,37 @@ function failingDatabase(failure: string | Error): D1Database {
   return { prepare: fail, batch: fail, exec: fail, dump: fail } as unknown as D1Database;
 }
 
+/*
+ * `db` with part of it out of reach: a statement `failing` matches fails when
+ * it is run, as D1 fails one it could not run, with `message`; while `down()`
+ * says the database is down, every statement and batch fails so. The rest is
+ * `db`'s to answer.
+ */
+function failingStatements(
+  db: D1Database,
+  failing: RegExp,
+  { down = () => false, message = 'D1_ERROR: Network connection lost.' }: { down?: () => boolean, message?: string } = {},
+): D1Database {
+  const fail = async () => { throw new Error(message); };
+  const statement = { bind: () => statement, all: fail, first: fail, run: fail, raw: fail };
+  return new Proxy(db, {
+    get(target, property) {
+      if (property === 'prepare') {
+        return (sql: string) => down() || failing.test(sql) ? statement : target.prepare(sql);
+      }
+      if (property === 'batch') {
+        return (statements: D1PreparedStatement[]) => down() ? fail() : target.batch(statements);
+      }
+      const value = Reflect.get(target, property) as unknown;
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  });
+}
+
 export {
   ADMIN_TOKEN,
   adminTestEnv,
   failingDatabase,
+  failingStatements,
   makeTestEnv,
 };

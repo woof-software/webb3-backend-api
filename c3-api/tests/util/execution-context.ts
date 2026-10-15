@@ -1,3 +1,5 @@
+import { withDeadline } from '../../src/registry/deadline.js';
+
 /*
  * An execution context as the runtime hands one to a request, for a test that
  * calls the worker from Node. It keeps whatever is handed to waitUntil, and
@@ -25,13 +27,7 @@ function executionContext(): { context: ExecutionContext, handed: Handed[] } {
  * a test holds back then fails the test rather than hanging it.
  */
 async function settledWithin(work: Promise<unknown>, milliseconds: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const late = new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), milliseconds); });
-  try {
-    return await Promise.race([ work.then(() => true, () => true), late ]);
-  } finally {
-    clearTimeout(timer);
-  }
+  return await withDeadline(work.then(() => true, () => true), milliseconds) === true;
 }
 
 export type { Handed };

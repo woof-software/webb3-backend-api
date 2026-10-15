@@ -10,7 +10,7 @@ import type { Env } from '../../../entrypoint.js';
 import type * as jsonRpc from '../../../lib/json-rpc.js';
 import type { RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
-import { cacheDepsOf } from '../../../src/registry/cache.js';
+import { cacheDepsOf, isUnreachable } from '../../../src/registry/cache.js';
 import { proxyTransport } from '../../../src/registry/enrichment.js';
 import { runInvocation } from '../../../src/registry/importer.js';
 import {
@@ -47,6 +47,7 @@ import {
 } from '../../util/registry-fixture.js';
 import { registryHarness } from '../../util/registry-harness.js';
 import { createCandidate, recordValidationResults } from '../../util/registry-repository.js';
+import { failingStatements } from '../../util/test-env.js';
 
 /*
  * The whole import, end to end against real local D1: discovery, the fenced
@@ -806,9 +807,9 @@ const statusOf = async (db: D1Database, versionId: string) => db.prepare(
 ).bind(versionId).first<string>('status');
 
 const supersededCheckOf = async (db: D1Database, versionId: string) => db.prepare(
-  `SELECT check_name, passed, details FROM validation_results
+  `SELECT check_name, passed, details, created_at FROM validation_results
    WHERE registry_version_id = ?1 AND check_name = ?2`
-).bind(versionId, SUPERSEDED_CHECK).first<{ check_name: string, passed: number, details: string }>();
+).bind(versionId, SUPERSEDED_CHECK).first<{ check_name: string, passed: number, details: string, created_at: string }>();
 
 t.test('a new attempt closes the draft it replaces', async t => {
   const db    = await freshDatabase();
@@ -859,6 +860,33 @@ t.test('discovery closes the drafts a validated attempt replaced', async t => {
     t.same(JSON.parse((await supersededCheckOf(db, draft.id))!.details), { supersededBy: current.id, attempt: 3 });
   }
   t.equal(await statusOf(db, current.id), 'validated', 'and the attempt that replaced them is untouched');
+});
+
+/*
+ * The check that closes a draft is written at the time of the clock the
+ * import runs on, as the candidate and the run are, whether the attempt that
+ * replaced the draft closes it or discovery does.
+ */
+t.test('a draft is closed at the time of the clock the import runs on', async t => {
+  const roots   = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+  const time    = new Date('2026-01-02T03:04:05.678Z');
+  const clocked = (db: D1Database) => ({ ...deps(db, roots), now: () => time });
+
+  const replacedDb = await freshDatabase();
+  const draft      = await runInvocation(clocked(replacedDb));
+  await runInvocation(clocked(replacedDb), { forceNewAttempt: true, reason: 'rebuild' });
+  t.equal((await supersededCheckOf(replacedDb, draft.versionId!))?.created_at, time.toISOString(),
+    'the attempt that replaced the draft closes it at the time of its clock');
+
+  const discoveredDb = await freshDatabase();
+  const make = (attempt: number) => createCandidate(discoveredDb, {
+    repository: REPOSITORY, commitSha: COMMIT, sourceChecksum: 'a'.repeat(64), attempt, createdBy: 'test-seed',
+  });
+  const stale = await make(1);
+  await validateSeeded(discoveredDb, (await make(2)).id);
+  t.equal((await runInvocation(clocked(discoveredDb))).kind, 'unchanged', 'discovery finds the commit imported');
+  t.equal((await supersededCheckOf(discoveredDb, stale.id))?.created_at, time.toISOString(),
+    'and closes the draft a validated attempt replaced at the time of its clock');
 });
 
 /*
@@ -1321,24 +1349,6 @@ t.test('an invocation that loses its lease before the candidate ends writes noth
   );
 });
 
-// a database that fails as `message` says on each statement `pattern` matches, and answers every other
-function failingOn(db: D1Database, pattern: RegExp, message: string): D1Database {
-  return new Proxy(db, {
-    get(target, property, receiver) {
-      const value = Reflect.get(target, property, receiver);
-      if (property === 'prepare') {
-        return (sql: string) => {
-          if (pattern.test(sql)) {
-            throw new Error(message);
-          }
-          return target.prepare(sql);
-        };
-      }
-      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
-    },
-  }) as D1Database;
-}
-
 /*
  * Once the run is closed, the import has happened. A database that stops
  * answering right after that does not turn it into a failure, which would
@@ -1398,7 +1408,7 @@ t.test('an invocation that fails gives the run back at once', async t => {
   const roots = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
 
   await t.rejects(
-    runInvocation({ ...deps(db, roots), db: failingOn(db, /SET status = 'processing'/, 'D1_ERROR: Network connection lost.') }),
+    runInvocation({ ...deps(db, roots), db: failingStatements(db, /SET status = 'processing'/) }),
     { message: /Network connection lost/ },
     'the database does not answer the claim of a root',
   );
@@ -1426,7 +1436,7 @@ t.test('an invocation that fails after losing the run leaves it to the one that 
      BEGIN UPDATE sync_runs SET lease_owner = 'another-invocation' WHERE id = NEW.id; END`
   ).run();
   await t.rejects(
-    runInvocation({ ...deps(db, roots), db: failingOn(db, /AS outstanding/, 'D1_ERROR: no such column: outstanding') }),
+    runInvocation({ ...deps(db, roots), db: failingStatements(db, /AS outstanding/, { message: 'D1_ERROR: no such column: outstanding' }) }),
     { message: /no such column/ },
   );
   await db.prepare(`DROP TRIGGER test_taken_over`).run();
@@ -1527,6 +1537,41 @@ t.test('a run that fails the same way every time says why, and an operator can e
     forceNewAttempt: true, reason: 'the name is fixed', requestedBy: 'registry-admin:test',
   });
   t.equal(forced.kind, 'imported', 'and once the cause is fixed, the attempt the operator forces imports');
+});
+
+/*
+ * A parser quotes what it refused, so a registry error can carry a word a
+ * database that did not answer uses too. The run keeps the failure as its
+ * error all the same: a registry error is told apart by its code, not by
+ * its text.
+ */
+t.test('a stored decision refused over a key named "timeout" is kept as the run\'s error', async t => {
+  const db     = await freshDatabase();
+  const active = await activateFixture(db);
+  const roots  = [ { path: USDC_ROOT, content: usdcContent, sha: await gitBlobSha(usdcContent) } ];
+  const usdc   = snapshot.networks.find(network => network.chainId === 1)!.markets
+    .find(market => market.deploymentKey === 'usdc')!.baseAsset.token.address;
+
+  // a display override with one key more than the parser takes
+  await db.prepare(`DROP TRIGGER registry_networks_update_requires_importing`).run();
+  const metadata = await db.prepare(`SELECT metadata FROM registry_networks WHERE registry_version_id = ?1 AND chain_id = 1`)
+    .bind(active).first<string>('metadata');
+  await db.prepare(`UPDATE registry_networks SET metadata = ?1 WHERE registry_version_id = ?2 AND chain_id = 1`).bind(
+    JSON.stringify({
+      ...JSON.parse(metadata!),
+      assetDisplayOverrides: [ { tokenAddress: usdc, displayAddress: usdc, symbol: 'USDC', name: 'USD Coin', timeout: 30 } ],
+    }),
+    active,
+  ).run();
+
+  const failure = await runInvocation(deps(db, roots)).then(() => null, (error: unknown) => error);
+  t.match(failure, { code: 'OVERLAY_INVALID', message: /has unexpected keys: timeout$/ },
+    'the import fails on the stored decision');
+  t.ok(isUnreachable(failure), 'with a message that, by its text alone, is a database that did not answer');
+
+  const run = await leaseOf(db);
+  t.equal(run?.lease_owner, null, 'the run is given back');
+  t.match(run?.last_error, /^OVERLAY_INVALID: .*has unexpected keys: timeout$/, 'with the failure as its error');
 });
 
 const usdcFixture = snapshot.networks.find(network => network.chainId === 1)!.markets

@@ -1,12 +1,10 @@
-import type { Env } from '../../entrypoint.js';
-
 import type { RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
 
 import { noActiveVersion } from '../http/errors.js';
 
 import { Catalog, catalogOf } from './catalog.js';
 import type { CacheDeps } from './cache.js';
-import { activeSnapshot, cacheDepsOf } from './cache.js';
+import { activeSnapshot } from './cache.js';
 import { nowOf } from './clock.js';
 import { registryHeaders } from './version-headers.js';
 
@@ -68,8 +66,7 @@ function catalogFor(snapshot: RegistrySnapshotV1, now: number): Catalog {
   return catalog;
 }
 
-function requestCatalog(env: Env, debug: CacheDeps['debug'], defer?: CacheDeps['defer']): RequestCatalog {
-  const deps = cacheDepsOf(env, debug, defer);
+function requestCatalog(deps: CacheDeps): RequestCatalog {
   let pending: Promise<Catalog> | null = null;
   let catalog: Catalog | null          = null;
   let staleFor: number | null          = null;

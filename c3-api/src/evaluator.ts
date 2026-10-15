@@ -24,10 +24,11 @@ interface Context {
   cache?: Cache.Cache;
   /*
    * Keeps work alive past the response, which the runtime otherwise cancels
-   * once the request has answered. Absent outside a request, such as in a
-   * test that calls a handler directly, where nothing is cancelled.
+   * once the request has answered. Every request has one: without an
+   * execution context, as a test calls the worker, the entrypoint answers
+   * only once that work is done.
    */
-  waitUntil?: (work: Promise<unknown>) => void;
+  waitUntil: (work: Promise<unknown>) => void;
 }
 
 /*

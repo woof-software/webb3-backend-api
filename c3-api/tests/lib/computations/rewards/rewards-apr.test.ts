@@ -5,14 +5,17 @@ import * as Flags    from '../../../../lib/flags.js';
 import { BigNumber } from '../../../../lib/bignumber.js';
 import { BigFixnum } from '../../../../lib/bigfixnum.js';
 
-import * as Compute    from '../../../../lib/symbolic/computation.js';
 import * as Evaluator  from '../../../../lib/symbolic/evaluator.js';
 import { MemoryCache } from '../../../../lib/symbolic/cache.js';
 
+import * as comet   from '../../../../lib/computations/comet.js';
 import * as rewards from '../../../../lib/computations/rewards.js';
 import { basePriceLookup, basePriceOf, rewardsAprOf } from '../../../../lib/computations/rewards/rewards-apr.js';
 
-import { fixtureCatalog } from '../../../util/registry-fixture.js';
+import { catalogOf } from '../../../../src/registry/catalog.js';
+
+import { evaluatorOver, stub } from '../../../util/evaluator.js';
+import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../../util/registry-fixture.js';
 
 import '../../../../shim/node-self.js';
 
@@ -93,10 +96,6 @@ t.test('the base price of an APR is the one the unit of its reward feed calls fo
   t.strictSame(basePriceOf({ baseUsdPrice: reverted('usd') }), reverted('usd'));
 });
 
-function stub(answer: (context: any) => unknown) {
-  return Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
-}
-
 /*
  * The APRs on the real evaluator, over reads that answer from a table instead
  * of a node: each side measures its own principal, amount and rate, against
@@ -138,4 +137,90 @@ t.test('each APR measures its own side', async t => {
     'a USD reward price against a market quoted in its base asset: over the USD value of the side');
   t.strictSame([ ...new Set(reads) ].sort(), [ 'baseUsdPrice', `getPrice ${rewardFeedOf(wbtc).address}` ],
     'at the USD price of its base asset, and not its own');
+});
+
+/*
+ * The same APRs over the real BaseUsdPrice: the USD price of a base asset an
+ * APR divides by is read from the feed the version names to convert its
+ * market to USD, as the summary converts it. A market quoted in its base asset
+ * without that feed, which validation refuses, fails as its summary does,
+ * rather than being measured in its base asset.
+ */
+t.test('the APR of a market quoted in its base asset reads the USD feed its version names', async t => {
+  // BTC / USD, the USD feed of the fixture's WBTC market, whose own feeds answer in BTC
+  const BTC_USD    = '0xf4030086522a5beea4988f8ca5b36dbc97bee88c';
+  const rewardFeed = wbtc.registry.market.rewardAsset!.priceFeed!;
+  const prices: Record<string, unknown> = { [rewardFeed.address]: read(50), [BTC_USD]: read(60_000) };
+
+  const reads: string[] = [];
+  const aprsOf = async (contract: typeof wbtc) => {
+    const { evaluate, pull } = evaluatorOver({
+      supplyRewardsApr:           rewards.supplyRewardsApr,
+      borrowRewardsApr:           rewards.borrowRewardsApr,
+      baseUsdPrice:               comet.baseUsdPrice,
+      totalsBasic:                stub(() => ({ totalSupplyBase: BigNumber.from(2_000), totalBorrowBase: BigNumber.from(1_000) })),
+      baseMinForRewards:          stub(() => BigNumber.from(500)),
+      totalSupply:                stub(() => BigFixnum.from({ value: 1_000_000 })),
+      totalBorrow:                stub(() => BigFixnum.from({ value: 500_000 })),
+      supplyRewardsRatePerSecond: stub(() => BigFixnum.from({ value: 1, decimals: 6 })),
+      borrowRewardsRatePerSecond: stub(() => BigFixnum.from({ value: 2, decimals: 6 })),
+      getPrice:                   stub(({ priceFeed }) => {
+        const address = priceFeed.address.toLowerCase();
+        reads.push(address);
+        return prices[address] ?? reverted('no feed answers at that address');
+      }),
+      basePrice:                  stub(() => { reads.push('basePrice'); return read(1); }),
+    });
+    const apr = { apiHost: '', nodeHost: '', nodeKey: '', network, contract, blockNumber: 1, rewardsTokenPriceFeed: rewardFeed };
+    const { supplyRewardsApr, borrowRewardsApr } = await evaluate(pull({ supplyRewardsApr: apr, borrowRewardsApr: apr })) as any;
+    return { supply: aprOf(supplyRewardsApr), borrow: aprOf(borrowRewardsApr) };
+  };
+
+  t.strictSame(await aprsOf(wbtc), { supply: '0.00000002628', borrow: '0.00000010512' },
+    'over the side at 60,000 USD per BTC');
+  t.strictSame([ ...new Set(reads) ].sort(), [ rewardFeed.address, BTC_USD ].sort(), 'read from BTC / USD, and not from its own base price');
+
+  const snapshot    = loadRegistrySnapshotFixture();
+  const unconverted = catalogOf({
+    ...snapshot,
+    networks: snapshot.networks.map(entry => entry.chainId !== 1 ? entry : {
+      ...entry,
+      markets: entry.markets.map(each => each.deploymentKey !== 'wbtc' ? each : { ...each, baseAsset: { ...each.baseAsset, usdPriceFeed: null } }),
+    }),
+  }).marketsOn(network).find(entry => entry.deploymentKey === 'wbtc')!.comet;
+  reads.length = 0;
+  await t.rejects(aprsOf(unconverted), /quoted in its base asset without a USD feed/,
+    'a market quoted in its base asset without one fails, as its summary does');
+  t.notOk(reads.includes('basePrice'), 'rather than dividing by its base price in BTC');
+});
+
+/*
+ * Where the base feed the version names reverts — Chainlink retired it, and
+ * the version still names it — an APR divides by the base price read through
+ * the feed the Comet names at the block, as the summary values the market,
+ * rather than answering the revert.
+ */
+t.test('the APR of a market whose base feed reverts divides by the price of the feed its Comet names', async t => {
+  const own        = usdt.base.priceFeed.address;
+  const rewardFeed = usdt.registry.market.rewardAsset!.priceFeed!;
+  const { evaluate, pull } = evaluatorOver({
+    supplyRewardsApr:           rewards.supplyRewardsApr,
+    borrowRewardsApr:           rewards.borrowRewardsApr,
+    basePrice:                  comet.basePrice,
+    totalsBasic:                stub(() => ({ totalSupplyBase: BigNumber.from(2_000), totalBorrowBase: BigNumber.from(1_000) })),
+    baseMinForRewards:          stub(() => BigNumber.from(500)),
+    totalSupply:                stub(() => BigFixnum.from({ value: 1_000_000 })),
+    totalBorrow:                stub(() => BigFixnum.from({ value: 500_000 })),
+    supplyRewardsRatePerSecond: stub(() => BigFixnum.from({ value: 1, decimals: 6 })),
+    borrowRewardsRatePerSecond: stub(() => BigFixnum.from({ value: 2, decimals: 6 })),
+    // the reward feed answers 50, and the base feed the version names reverts
+    getPrice:                   stub(({ priceFeed }) => priceFeed.address === own ? reverted('execution reverted') : read(50)),
+    // the feed the Comet names at the block answers 2
+    cometBasePrice:             stub(() => read(2)),
+  });
+  t.equal(usdt.registry.market.collateralValueQuote, 'usd', 'a market quoted in USD, whose APRs divide by its base price');
+  const apr = { apiHost: '', nodeHost: '', nodeKey: '', network, contract: usdt, blockNumber: 1, rewardsTokenPriceFeed: rewardFeed };
+  const { supplyRewardsApr, borrowRewardsApr } = await evaluate(pull({ supplyRewardsApr: apr, borrowRewardsApr: apr })) as any;
+  t.strictSame({ supply: aprOf(supplyRewardsApr), borrow: aprOf(borrowRewardsApr) }, { supply: '0.0007884', borrow: '0.0031536' },
+    'supply: 1576.8 a year over 1,000,000 at 2; borrow: 3153.6 a year over 500,000 at 2');
 });

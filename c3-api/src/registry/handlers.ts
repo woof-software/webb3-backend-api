@@ -1,5 +1,6 @@
 import {
   ActivationAction,
+  Address,
   NetworkV1,
   RegistrySnapshotV1,
   ServedMarket,
@@ -297,16 +298,24 @@ function chainIdOf(value: string): number {
 }
 
 /*
+ * An address a path names, in any case. It is stored and answered lowercase,
+ * as every address the registry holds.
+ */
+function addressOf(value: string): Address {
+  if (!isAddress(value)) {
+    throw new ApiError('BAD_REQUEST', `${value} is not an address`);
+  }
+  return normalizeAddress(value);
+}
+
+/*
  * A market is addressed by its Comet address. A disabled market is not
  * selectable, so it answers 404 even though it stays in the snapshot for
  * diagnostics; a deprecated one is still readable, because positions and
  * history in it must remain reachable.
  */
 function marketOf(network: NetworkV1, address: string): ServedMarket {
-  if (!isAddress(address)) {
-    throw new ApiError('BAD_REQUEST', `${address} is not an address`);
-  }
-  const comet  = normalizeAddress(address);
+  const comet  = addressOf(address);
   const market = network.markets.find(candidate => candidate.contracts.comet === comet);
   if (market === undefined || !isServed(market)) {
     throw new ApiError('NOT_FOUND', `no selectable market at ${comet} on chain ${network.chainId}`);
@@ -516,26 +525,37 @@ async function getSyncRun(context: RegistryContext, syncRunId: string): Promise<
 
 /*
  * What both sync run routes answer: the run read by id, or as a cancel left
- * it, listing what started it before how far it got, as it always has. Every
- * field is named, here and in syncRunSummary, so neither owner a row carries
- * leaves the worker.
+ * it, listing what started it before how far it got, as it always has. The
+ * literal keeps that order and this type keeps it whole: jsonResponse takes
+ * any value, so it is the type that refuses an answer missing a field of
+ * syncRunSummary. Every field is named, here and in syncRunSummary, so
+ * neither owner a row carries leaves the worker.
  */
+type SyncRunAnswer = ReturnType<typeof syncRunSummary> & {
+  sourceCommitSha: SyncRunRow['source_commit_sha'],
+  trackedRef:      SyncRunRow['tracked_ref'],
+  triggerKind:     SyncRunRow['trigger_kind'],
+  requestedBy:     SyncRunRow['requested_by'],
+  reason:          SyncRunRow['reason'],
+};
+
 function syncRunResponse(run: SyncRunRow, items: SyncRunItemRow[]): Response {
   const {
     id, registryVersionId, status, outcome, startedAt, completedAt,
     failedCount, expectedCount, completedCount, lastError, leaseExpiresAt,
   } = syncRunSummary(run);
+  const syncRun: SyncRunAnswer = {
+    id, registryVersionId,
+    sourceCommitSha: run.source_commit_sha,
+    trackedRef:      run.tracked_ref,
+    triggerKind:     run.trigger_kind,
+    requestedBy:     run.requested_by,
+    reason:          run.reason,
+    status, outcome, leaseExpiresAt, expectedCount, completedCount, failedCount, lastError,
+    startedAt, completedAt,
+  };
   return jsonResponse({
-    syncRun: {
-      id, registryVersionId,
-      sourceCommitSha: run.source_commit_sha,
-      trackedRef:      run.tracked_ref,
-      triggerKind:     run.trigger_kind,
-      requestedBy:     run.requested_by,
-      reason:          run.reason,
-      status, outcome, leaseExpiresAt, expectedCount, completedCount, failedCount, lastError,
-      startedAt, completedAt,
-    },
+    syncRun,
     items: items.map(item => ({
       rootPath:           item.root_path,
       upstreamNetworkKey: item.upstream_network_key,
@@ -816,6 +836,7 @@ async function postActivation(
 export type { RegistryContext };
 
 export {
+  addressOf,
   cancelSyncRun,
   chainIdOf,
   getActive,

@@ -1,18 +1,6 @@
 import t from 'tap';
 import { readFileSync, writeFileSync } from 'node:fs';
 
-import * as Debug    from '../../../lib/debug-log.js';
-import * as Flags    from '../../../lib/flags.js';
-import { BigNumber } from '../../../lib/bignumber.js';
-import { BigFixnum } from '../../../lib/bigfixnum.js';
-
-import * as Evaluator  from '../../../lib/symbolic/evaluator.js';
-import { MemoryCache } from '../../../lib/symbolic/cache.js';
-
-import * as evm    from '../../../lib/computations/evm.js';
-import * as comet  from '../../../lib/computations/comet.js';
-import * as market from '../../../lib/computations/market.js';
-
 import {
   ASSET_ROLES,
   COLLATERAL_VALUE_STATUSES,
@@ -24,13 +12,14 @@ import type { Address, MarketV1, RegistrySnapshotV1 } from '../../../lib/model/c
 import { catalogOf } from '../../../src/registry/catalog.js';
 import { deprecatedDecisionsOf } from '../../../src/registry/deprecated-collaterals.js';
 import { collateralView, positionsOf } from '../../../src/registry/token-collateral.js';
-import type { BlockRef, TokenCollateralDeps } from '../../../src/registry/token-collateral.js';
+import type { BlockRef } from '../../../src/registry/token-collateral.js';
 import { RULE_VERSION, tokenList } from '../../../src/registry/token-visibility.js';
 
-import { fakeNode } from '../../util/fake-node.js';
+import { fakeNode, serve } from '../../util/fake-node.js';
 import type { Read } from '../../util/fake-node.js';
 import { MemoryKv } from '../../util/kv.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
+import { tokenCollateralDeps } from '../../util/token-collateral.js';
 
 import '../../../shim/node-self.js';
 
@@ -40,10 +29,14 @@ import '../../../shim/node-self.js';
  *
  * The committed fixture is what the frontend builds against, and this test is
  * its executable description: exact key sets, value formats, ordering, and the
- * rules every status and reason obey. Each check collects every violation, so
- * a failing run lists all of them at once. The last test shows the fixture is
- * what the code answers: the scenario it was made from, valued by the real
- * evaluator against a fake node, reproduces it exactly.
+ * relations between a token's fields that every status and reason keep. The
+ * rules that decide a status, its age and a reason are tokenValue's and
+ * visibilityOf's, which token-value.test.ts and token-visibility.test.ts hold;
+ * a copy of either here would be a second statement of a rule, free to drift
+ * from the one the list applies. The last test holds the fixture to them: the
+ * scenario it was made from, valued by the real evaluator against a fake node,
+ * reproduces it exactly. Each check collects every violation, so a failing run
+ * lists all of them at once.
  */
 const FIXTURE_PATH = './tests/fixtures/token-visibility/token-list-v1.json';
 const raw  = readFileSync(FIXTURE_PATH, 'utf8');
@@ -238,19 +231,18 @@ t.test('every token is typed, listed once, and ordered by symbol then address', 
 });
 
 /*
- * The rules of each status, as tokenValue and tokenList keep them. A value is
- * unknown exactly when it is unavailable, and an unknown value has no block,
- * age or exception. A value read in the list's minute — fresh, exception or
- * partial — is 0 seconds old, at a block of that minute, which may be earlier
- * than the list's own block: the first request of a minute values it for every
- * request after. A stale value is from an earlier minute and says how much
- * older than the list's block it is. A token no market takes as collateral is
- * worth exactly 0 as of the list's block, whatever the node answered.
+ * What each status says of a token's other fields. A value is unknown exactly
+ * when it is unavailable, and an unknown value has no block, age or exception.
+ * A value read in the list's minute — fresh, exception or partial — is 0
+ * seconds old, at a block of that minute, which may be earlier than the list's
+ * own block: the first request of a minute values it for every request after.
+ * A stale value names the block it was read at, of an earlier minute than the
+ * list's. A token no market takes as collateral is worth exactly 0 as of the
+ * list's block, whatever the node answered.
  */
 t.test('each status carries the value, time, age and exceptions its rule gives it', async t => {
   const problems: Problems = [];
   const listBlock = blockOf(list.block);
-  const now       = Math.floor(Date.parse(list.computedAt) / 1000);
   const readNow   = [ 'fresh', 'exception', 'partial' ];
 
   typed.forEach((token, i) => {
@@ -296,13 +288,8 @@ t.test('each status carries the value, time, age and exceptions its rule gives i
     if (status === 'stale') {
       if (block === null) {
         problems.push(`${where}.valueBlock: a stale value names the block it was read at`);
-      } else {
-        if (listBlock !== null && !(minuteOf(block) < minuteOf(listBlock))) {
-          problems.push(`${where}.valueBlock: a stale value is from an earlier minute than the list's block`);
-        }
-        // measured from the list's block, or from the time of the list when there is none
-        const age = Math.max(1, (listBlock?.timestamp ?? now) - block.timestamp);
-        if (token.staleAgeSeconds !== age) problems.push(`${where}.staleAgeSeconds: expected ${age}`);
+      } else if (listBlock !== null && !(minuteOf(block) < minuteOf(listBlock))) {
+        problems.push(`${where}.valueBlock: a stale value is from an earlier minute than the list's block`);
       }
     }
 
@@ -315,22 +302,13 @@ t.test('each status carries the value, time, age and exceptions its rule gives i
 });
 
 /*
- * A token deprecated in every enabled market that takes it is hidden, whatever
- * else holds. Then strategic; then a value that could not be read, which is
- * shown (decision D4); then the threshold, which exactly 250000 reaches. Only
- * deprecated and below_threshold hide a token.
+ * The order the reasons are asked in is visibilityOf's, which
+ * token-visibility.test.ts holds; the last test holds the fixture to it.
  */
-t.test('a token is hidden when deprecated, and shown when strategic, when its value is unknown, or when its value reaches the threshold', async t => {
+t.test('only deprecated and below_threshold hide a token', async t => {
   const problems: Problems = [];
   typed.forEach((token, i) => {
-    const where  = `tokens[${i}] ${token.symbol}`;
-    const value  = token.collateralValueUsd;
-    const reason = token.isDeprecated === true ? 'deprecated'
-      : token.isStrategic === true ? 'strategic'
-      : value === null ? 'data_unavailable'
-      : typeof value === 'string' && reachesThreshold(value) ? 'collateral_threshold'
-      : 'below_threshold';
-    if (token.visibilityReason !== reason) problems.push(`${where}.visibilityReason: expected ${reason}`);
+    const where = `tokens[${i}] ${token.symbol}`;
     if (token.isVisible !== ![ 'deprecated', 'below_threshold' ].includes(token.visibilityReason)) {
       problems.push(`${where}.isVisible: only deprecated and below_threshold hide a token`);
     }
@@ -421,9 +399,6 @@ t.test('the fixture shows every case a client must handle', async t => {
  *   wstETH   110 in USDC × 2400.5; 20 in WETH, unpriced      264055, partial
  *   XAUt     held by the deprecated market only              0
  */
-const flags = { ...Flags.parseWithDefaults(process.env), evaluatorAlgorithm: 'workingset', batchingEnabled: true } as Flags.SomeFlags;
-const debug = Debug.MakeLogger([]).configure(process.env);
-
 const PUMPBTC_FEED = '0x351a133fd850ea81ed8a782016e308acbaddec91';
 const COMP         = '0xc00e94cb662c3520282e6f5717214004a7f26888';
 const WBTC         = '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599';
@@ -521,25 +496,13 @@ t.test('the scenario the fixture was made from reproduces it exactly', async t =
   let latest: BlockRef = { number: 0, timestamp: 0 };
   let reverting: string[] = [];
   let now = COMPUTED_AT;
-  const node = fakeNode(snapshot, latest, { block: () => latest, answer: read => answerOf(read, reverting) });
-  const before = globalThis.fetch;
-  globalThis.fetch = node.fetch as typeof globalThis.fetch;
-  t.teardown(() => { globalThis.fetch = before; });
+  serve(t, fakeNode(snapshot, latest, { block: () => latest, answer: read => answerOf(read, reverting) }));
 
-  const kv         = MemoryKv({}) as unknown as KVNamespace;
-  const cache      = new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]);
-  const background: Array<Promise<unknown>> = [];
-  const deps: TokenCollateralDeps = {
-    frame:           { apiHost: '', nodeHost: 'node.test', nodeKey: 'key' },
-    evaluator:       () => Evaluator.instantiate({ ...evm, ...comet, ...market } as any, { cache, debug, flags }) as any,
-    kv:              () => kv,
-    maxStaleMinutes: 15,
-    now:             () => now,
-    debug:           { error: () => {} },
-    waitUntil:       work => { background.push(work); },
+  const deps = tokenCollateralDeps(MemoryKv({}) as unknown as KVNamespace, {
+    now:        () => now,
     // a slow machine must not time a value out of the fixture
-    deadlineMs:      60_000,
-  };
+    deadlineMs: 60_000,
+  });
 
   // one request: the clock reads `at`, and the node answers with `block` and reverts the prices `failing` names
   const request = async (at: string, block: BlockRef, failing: string[]) => {
@@ -548,7 +511,7 @@ t.test('the scenario the fixture was made from reproduces it exactly', async t =
     reverting = failing;
     const view = await collateralView(deps, { chainId: 1, network: 'ethereum-mainnet', positions, versionId: snapshot.registryVersion.id });
     // what the request left to waitUntil, the minute's KV write among it, is done before the next one
-    await Promise.all(background);
+    await Promise.all(deps.background);
     return view;
   };
 

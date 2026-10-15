@@ -41,6 +41,7 @@ t.test('a market route evaluates in the mainnet storage, and a request for testn
     debug:     Debug.MakeLogger([]).configure({ DEBUG: '' }),
     flags:     Flags.parseWithDefaults({}),
     requestId: crypto.randomUUID(),
+    waitUntil: () => {},
   };
   const storageOf = async (path: string): Promise<string[]> => {
     environments.length = 0;

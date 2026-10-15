@@ -32,7 +32,7 @@ function envWith(overrides: Partial<Env>): Promise<Env> {
   return adminTestEnv({ MEMORY_CACHE_SEED: 'registry-kv-outage', kv_registry: refusingKv(), ...overrides });
 }
 
-// without an execution context, so the cache writes the records an outage reads before it answers
+// without an execution context, so the request writes the records an outage reads before it answers
 async function get(env: Env, path: string, headers: Record<string, string> = {}): Promise<Response> {
   return C3Api.fetch(new Request(`https://api.test.local${path}`, { headers }), env);
 }

@@ -1,3 +1,5 @@
+import { ROUTE_EVALUATOR_FLAGS } from '../../lib/flags.js';
+
 import { corsHeaders } from '../http/cors.js';
 import { ApiError, ApiErrorCode, failureResponse } from '../http/errors.js';
 import { knownFailure } from '../http/failures.js';
@@ -12,7 +14,7 @@ import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
 import { catalogHeadersOf, requestCatalog } from './request-catalog.js';
 import type * as TokenCollateral from './token-collateral.js';
-import { maxStaleMinutesOf } from './token-collateral.js';
+import { DEADLINE_MS, maxStaleMinutesOf } from './token-collateral.js';
 
 /*
  * The registry entry point: everything under /registry/v1 is answered here,
@@ -156,14 +158,14 @@ async function routeRegistry(
   }
   const cors = corsHeaders(route);
 
+  const deps = { ...cacheDepsOf(env, debug), defer: waitUntil };
   /*
    * The registry version of this request. It is loaded at most once, by the
    * first handler that needs it — the token list resolves every market and
    * token of its chain from it — and every answer given after it was loaded
    * says which version that was.
    */
-  const registry = requestCatalog(env, debug, waitUntil);
-  const deps     = cacheDepsOf(env, debug, waitUntil);
+  const registry = requestCatalog(deps);
   const context: RegistryContext = {
     db:      env.APP_DB,
     actor:   env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`,
@@ -190,14 +192,15 @@ async function routeRegistry(
       frame:           { apiHost: env.V3_API_HOST, nodeHost: env.NODE_PROXY_HOST, nodeKey: env.NODE_PROXY_KEY },
       // every collateral read of a chain in one batch, as the market summaries read theirs
       evaluator:       networkEnv => instantiateEvaluator(networkEnv, {
-        flags: { ...flags, batchingEnabled: true, evaluatorAlgorithm: 'workingset' },
+        flags: { ...flags, ...ROUTE_EVALUATOR_FLAGS },
       }),
       kv:              networkEnv => env[`kv_${networkEnv}`],
       maxStaleMinutes: maxStaleMinutesOf(env),
       now:             () => new Date(),
       debug,
       // keeps the valuation alive past the answer of the request that started it
-      waitUntil:       waitUntil ?? (() => {}),
+      waitUntil,
+      deadlineMs:      DEADLINE_MS,
     },
   };
 

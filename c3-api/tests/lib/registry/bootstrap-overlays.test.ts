@@ -1,15 +1,9 @@
 import t from 'tap';
-import { readdirSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 
-import * as Debug    from '../../../lib/debug-log.js';
 import * as Eth      from '../../../lib/eth-constants.js';
-import * as Flags    from '../../../lib/flags.js';
 import { BigNumber } from '../../../lib/bignumber.js';
 import { BigFixnum } from '../../../lib/bigfixnum.js';
-
-import * as Compute    from '../../../lib/symbolic/computation.js';
-import * as Evaluator  from '../../../lib/symbolic/evaluator.js';
-import { MemoryCache } from '../../../lib/symbolic/cache.js';
 
 import * as cometComputations from '../../../lib/computations/comet.js';
 
@@ -21,7 +15,9 @@ import { catalogOf } from '../../../src/registry/catalog.js';
 import { parseMarketOverlay, parseNetworkOverlay } from '../../../src/registry/overlay.js';
 import { staticComets } from '../../../src/registry/shadow.js';
 
+import { evaluatorOver, stub } from '../../util/evaluator.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
+import { sourceFiles } from '../../util/sources.js';
 
 import '../../../shim/node-self.js';
 
@@ -301,15 +297,13 @@ t.test('every seeded exception prices its feed as the branch it replaced did', a
     });
   const catalog = catalogOf({ ...snapshot, networks });
 
-  const flags = { ...Flags.parseWithDefaults(process.env), evaluatorAlgorithm: 'workingset', batchingEnabled: true } as Flags.SomeFlags;
-  const stub  = (answer: (context: any) => unknown) => Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
   const priceOf = async (network: typeof networks[number]['key'], feed: string) => {
     const read: string[] = [];
-    const { evaluate, pull1 } = Evaluator.instantiate<any>({
+    const { evaluate, pull1 } = evaluatorOver({
       assetPrice: cometComputations.assetPrice,
       assetInfo:  stub(() => ({ asset: '0xc00e94Cb662C3520282E6f5717214004A7f26888', priceFeed: feed, scale: BigNumber.from(10).pow(18) })),
       getPrice:   stub(({ priceFeed }) => { read.push(priceFeed.address); return { status: 'error', message: 'execution reverted' }; }),
-    } as any, { cache: new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]), debug: Debug.MakeLogger([]).configure(process.env), flags });
+    });
     const contract = catalog.marketsOn(network as any)[0]!.comet;
     const price = await evaluate(pull1({ assetPrice: {
       apiHost: '', nodeHost: '', nodeKey: '', network, contract, assetNumber: 0, blockNumber: 20_000_000,
@@ -337,9 +331,7 @@ t.test('every seeded exception prices its feed as the branch it replaced did', a
  * one of them matched, so nothing prices one of them but the registry.
  */
 t.test('the feeds the branches matched are named only by the bootstrap seed', async t => {
-  const sources = [ 'lib', 'src' ].flatMap(root => (readdirSync(root, { recursive: true }) as string[])
-    .filter(path => path.endsWith('.ts') && !path.split('/').includes('dist'))
-    .map(path => `${root}/${path}`));
+  const sources = sourceFiles();
   t.ok(sources.length > 200, 'every source file is read');
   const naming = sources.filter(path => {
     const text = readFileSync(path, 'utf8').toLowerCase();
