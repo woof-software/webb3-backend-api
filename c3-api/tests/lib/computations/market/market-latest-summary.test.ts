@@ -71,12 +71,12 @@ function summaryOf(reads: Reads): Promise<any> {
   const { evaluate, pull1 } = evaluatorOver({
     marketLatestSummary: market.marketLatestSummary,
     ...readsOf(reads),
-    collateralDetails:   stub(() => reads.collaterals),
+    collaterals:         stub(() => reads.collaterals),
   });
   return evaluate(pull1({ marketLatestSummary: contextOf(reads.contract ?? usdt) }));
 }
 
-// a collateral of the summary's market as collateralDetails reports it: `held` whole tokens of eighteen decimals at `price`
+// a collateral of the summary's market as collaterals reports it: `held` whole tokens of eighteen decimals at `price`
 function collateral(asset: string, symbol: string, held: number, price: PriceRead): Collateral {
   return {
     asset:           asset as Eth.Address,
@@ -107,6 +107,7 @@ t.test('a market whose every price reads reports every field, in the order the A
     totalCollateralValueUsd: '5154.99578686',
     utilization:             '500000000000000000',
     baseUsdPrice:            '0.99890608',
+    basePrice:               '0.99890608',
     collateralAssetSymbols:  [ 'COMP', 'WETH' ],
     collaterals: [
       { address: COMP, symbol: 'COMP', status: 'success' },
@@ -137,13 +138,14 @@ t.test('a market reports what marketSummary reports of it, as it reports it', as
       marketLatestSummary: market.marketLatestSummary,
       ...readsOf(reads),
       collaterals:         stub(() => reads.collaterals),
-      collateralDetails:   stub(() => reads.collaterals),
     });
     const context = contextOf(reads.contract);
-    const [ before, latest ] = await evaluate(split([
+    const [ before, { basePrice, ...latest } ] = await evaluate(split([
       pull1({ marketSummary: context }),
       pull1({ marketLatestSummary: context }),
     ])) as [ any, any ];
+    // which marketSummary keeps to itself
+    t.equal(basePrice, (reads.basePrice ?? READS.basePrice).price.toString(), `${status}: the base price its totals are valued at`);
 
     t.equal(before.status, status, `marketSummary reports the market as ${status}`);
     t.strictSame(latest, before, `${status}: every field as marketSummary reports it`);
@@ -168,7 +170,7 @@ t.test('a market quoted in USD whose base price reverts reports every field it c
   const after    = [ 'collateralAssetSymbols', 'collaterals' ];
   const cases = [
     { reads: { basePrice: BASE, baseUsdPrice: USD }, message: BASE.message, keys: [ ...unpriced, ...after ], name: 'both revert' },
-    { reads: { baseUsdPrice: USD },                  message: USD.message,  keys: [ ...priced, ...after ], name: 'its USD price reverts' },
+    { reads: { baseUsdPrice: USD },                  message: USD.message,  keys: [ ...priced, 'basePrice', ...after ], name: 'its USD price reverts' },
     { reads: { basePrice: BASE },                    message: BASE.message, keys: [ ...unpriced, 'baseUsdPrice', ...after ], name: 'its base price reverts' },
   ];
   for (const { reads, message, keys, name } of cases) {
@@ -200,7 +202,7 @@ t.test('a market quoted in USD whose base feed reverts is priced through the fee
       basePrice:           comet.basePrice,
       baseUsdPrice:        comet.baseUsdPrice,
       cometBasePrice:      comet.cometBasePrice,
-      collateralDetails:   stub(() => [ usdtComp(), usdtWeth() ]),
+      collaterals:         stub(() => [ usdtComp(), usdtWeth() ]),
       // the base feed the version names reverts, and any other answers 0.9999
       getPrice:            stub(({ priceFeed }) => priceFeed.address === own ? reverted() : read(at8(99_990_000))),
       // the Comet's one call, baseTokenPriceFeed(), answers `named`
@@ -217,7 +219,8 @@ t.test('a market quoted in USD whose base feed reverts is priced through the fee
     totalSupplyValueUsd:     '1999.8',
     totalCollateralValueUsd: '5154.99578686',
     baseUsdPrice:            '0.9999',
-  }, 'another feed: a success, its totals and its USD price at 0.9999');
+    basePrice:               '0.9999',
+  }, 'another feed: a success, its totals and both prices at 0.9999');
 
   const same = await summaryNaming(own);
   t.match(same, { status: 'error', message: 'execution reverted' }, 'the feed that reverts: an error');
@@ -249,21 +252,40 @@ t.test('a market quoted in its base asset whose base prices revert reports every
     totalBorrowValue:     '1000.0',
     totalSupplyValue:     '2000.0',
     totalCollateralValue: '4.2',
-  }, 'its USD price reverts: an error with its message, and the totals in ETH');
+    basePrice:            '1.0',
+  }, 'its USD price reverts: an error with its message, the totals in ETH, and the base price');
   t.notOk('baseUsdPrice' in unconverted, 'without the USD price that reverted');
   t.strictSame(unconverted.collaterals.map((each: any) => each.status), [ 'success', 'success', 'error' ], 'each collateral as its price read');
 
   const unpriced = await summaryOf({ contract: weth, basePrice: BASE, baseUsdPrice: USD, collaterals });
   t.match(unpriced, { status: 'error', message: BASE.message, totalCollateralValue: '4.2' }, 'both revert: the message of the base price');
-  t.notOk('totalBorrowValue' in unpriced || 'totalSupplyValue' in unpriced || 'baseUsdPrice' in unpriced, 'and no totals of the base asset, nor its USD price');
+  t.notOk('totalBorrowValue' in unpriced || 'totalSupplyValue' in unpriced || 'basePrice' in unpriced || 'baseUsdPrice' in unpriced, 'and no totals of the base asset, nor either price');
+});
+
+/*
+ * The WBTC market's feeds answer in BTC: its base price is WBTC in BTC, and
+ * its USD price that of BTC, so only the base price turns a total back into
+ * WBTC. Each is written with every digit its feed gives, and not rounded.
+ */
+t.test('the WBTC market\'s base price is WBTC in BTC, which values its total', async t => {
+  // the frontend's example: 29.05271362 WBTC supplied, at 0.9984988 BTC each, and 82731.39 USD per BTC
+  const wbtc = await summaryOf({
+    contract:     marketOf('wbtc'),
+    basePrice:    read(at8(99_849_880)),
+    baseUsdPrice: read(at8(8_273_139_000_000)),
+    totalSupply:  BigFixnum.from({ decimals: 8, value: 2_905_271_362 }),
+    collaterals:  [],
+  });
+  t.match(wbtc, { status: 'success', totalSupplyValue: '29.009099686313656', baseUsdPrice: '82731.39', basePrice: '0.9984988' },
+    'its total in BTC, the price of BTC in USD, and the price of WBTC in BTC its total is valued at');
 });
 
 /*
  * While a registry version no longer describes its market — the Comet listed
  * a collateral after the import, and holds another asset at an index the
  * version describes — the summary of the latest block and the history both
- * list the collateral of the version, by the same rules (collaterals.ts and
- * collateral-details.ts). The chain drift check raises the difference, and a
+ * list the collateral of the version, by the same rules (collaterals.ts). The
+ * chain drift check raises the difference, and a
  * new import ends it.
  */
 t.test('while the version and the chain differ, the summary and the history both follow the version', async t => {
@@ -278,7 +300,6 @@ t.test('while the version and the chain differ, the summary and the history both
     marketSummary:        market.marketSummary,
     marketLatestSummary:  market.marketLatestSummary,
     collaterals:          market.collaterals,
-    collateralDetails:    market.collateralDetails,
     ...readsOf({ collaterals: [] }),
     numAssets:            stub(() => 17),
     assetInfo:            stub(({ assetNumber }) => ({

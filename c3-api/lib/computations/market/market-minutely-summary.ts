@@ -14,9 +14,10 @@ type MarketMinutelySummary = Compute.Spec<{
 
 const { implement, pull1 } = Compute.Functor<MarketMinutelySummary>({});
 const marketMinutelySummary = implement({
-  // 8: the latest summary prices the base asset through the feed the Comet names where the version's reverts.
-  // Not 7: dev caches another answer under 7, without the totals in USD, in a KV two deployments of develop can share
-  version: 8,
+  // 9: the latest summary, with base_price and the totals in USD.
+  // Not 7: dev caches that answer without the totals in USD. Not 8: this branch caches it without base_price.
+  // Two deployments of develop can share the KV.
+  version: 9,
   index: Index.MinutelyBlockIndex,
   key(name, {block, ...context}) {
     const { block: projected } = Fallible.must(this.index.project({ block, ...context }));

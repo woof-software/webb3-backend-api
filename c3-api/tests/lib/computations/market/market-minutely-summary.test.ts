@@ -100,6 +100,7 @@ t.test(`market-minutely-summary@block:16380543`, async (t) => {
     totalCollateralValueUsd: "198600936.76810451139983159362475978",
     utilization: "555903304895608716",
     baseUsdPrice: "1.0",
+    basePrice: "1.0",
     collateralAssetSymbols: ["COMP", "WBTC", "WETH", "UNI", "LINK"],
     collaterals: [
       { address: "0xc00e94Cb662C3520282E6f5717214004A7f26888", symbol: "COMP", status: "success" },
@@ -130,7 +131,7 @@ t.test(`market-minutely-summary@block:16380543`, async (t) => {
     result1,
     `the minute's block gives the same summary`
   );
-  const minutelyKey = `marketMinutelySummary-v8:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`;
+  const minutelyKey = `marketMinutelySummary-v${market.marketMinutelySummary.version}:(block:${projected.block.number};contract:${context.contract.key()};network:${context.network})`;
   t.ok(
     Object.keys(cache.store).includes(minutelyKey),
     `the latest summary is cached under the minute's block, by its own version`
