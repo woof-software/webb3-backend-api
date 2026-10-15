@@ -960,6 +960,7 @@ const WETH_USD_priceFeed = PriceFeed(<const>{
 });
 
 const Comet_01weth = Comet(<const>{
+  displayName: "cWETHv3",
   // location
   aliases: ["01-weth", "cWETHv3"],
   network: "ethereum-mainnet",
@@ -1942,6 +1943,33 @@ const BaseL1StandardBridge = UntypedContract("BaseL1StandardBridge", {
   },
 });
 
+/*
+ * Optimism bridge contracts. Governance decodes the actions a proposal
+ * bridges to Optimism against these, exactly as it does for Base.
+ */
+const OptimismL1CrossDomainMessenger = UntypedContract(
+  "OptimismL1CrossDomainMessenger",
+  {
+    aliases: ["default"],
+    network: "ethereum-mainnet",
+    address: "0x25ace71c97B33Cc4729CF772ae268934F7ab5fA1",
+    block: {
+      number: 12686757,
+      timestamp: 1624400997,
+    },
+  },
+);
+
+const OptimismL1StandardBridge = UntypedContract("OptimismL1StandardBridge", {
+  aliases: ["default"],
+  network: "ethereum-mainnet",
+  address: "0x99C9fc46f92E8a1c0deC1b1747d010903E884bE1",
+  block: {
+    number: 12686786,
+    timestamp: 1624401464,
+  },
+});
+
 // Circle CCTP contract
 const CCTPTokenMessenger = UntypedContract("CCTPTokenMessenger", {
   aliases: ["default"],
@@ -1981,6 +2009,8 @@ const misc = <const>[
   // Base bridge contracts
   BaseL1CrossDomainMessenger,
   BaseL1StandardBridge,
+  OptimismL1CrossDomainMessenger,
+  OptimismL1StandardBridge,
   // Circle CCTP contract
   CCTPTokenMessenger,
 ];
