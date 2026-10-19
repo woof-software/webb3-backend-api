@@ -22,21 +22,21 @@ import { collateralStatusOf, type CollateralStatus, type MarketIdentity, type Ma
 
 /*
  * The summary of a market at the latest block, as the summary route answers
- * it: what marketSummary reports, with its collateral as the registry version
- * describes it (collaterals.ts).
+ * it: what marketSummary reports, and the base price its totals are valued
+ * at.
  *
  * It is a computation of its own because a day of the history is the whole
  * of a marketSummary (market-day-summary.ts): a field, a read or a status
  * added there would be in every day of the history, and read for each one.
- * The history keeps marketSummary as it was.
  *
  * Each field is reported where the reads it is made of were, and left out
  * where they were not. A market whose base asset could not be priced is an
  * error, as in marketSummary, but reports everything that does not need the
- * price that failed: it leaves out its base price and its totals where the
- * base price could not be read, its base asset's USD price where that
- * could not, and a total in USD where the total could not, or, on a market
- * quoted in its base asset, the USD price that converts it.
+ * price that failed, where marketSummary reports only what identifies it: it
+ * leaves out its base price and its totals where the base price could not be
+ * read, its base asset's USD price where that could not, and a total in USD
+ * where the total could not, or, on a market quoted in its base asset, the
+ * USD price that converts it.
  */
 
 // what the summary reports of a market however its base asset was priced

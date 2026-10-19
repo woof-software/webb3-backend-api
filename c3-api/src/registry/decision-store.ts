@@ -81,7 +81,6 @@ type DecisionKind<Decision extends DecisionBase, Listed extends Decision, State 
   named:       (state: State, decision: Decision) => string,
 };
 
-// a list as the router read it: its rows, and the reason it gives every row
 type DecisionList<Listed> = { reason: string | null, decisions: Listed[] };
 
 /*
@@ -261,7 +260,6 @@ async function readDecision<Decision extends DecisionBase, Listed extends Decisi
   return { registryVersion, state: state!, events: history };
 }
 
-// each row of a list with the reason it is written with: its own, or the list's
 function decisionsOf<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
   kind: DecisionKind<Decision, Listed, State>,
   list: DecisionList<NoInfer<Listed>>,

@@ -196,7 +196,6 @@ function readsSameStreams(payload: StoredCursor, streams: StreamEvent[]): boolea
   return streamsOf(payload.streamEvents) === streamsOf(streams);
 }
 
-// what a cursor a request sends comes to: the page it goes on with, or why it cannot go on
 type Resumption =
   | { kind: 'resumed',         payload: CursorPayload }
   | { kind: 'version-changed', cursorRegistryVersionId: string | null }

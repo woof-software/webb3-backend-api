@@ -15,8 +15,7 @@ type MarketMinutelySummary = Compute.Spec<{
 const { implement, pull1 } = Compute.Functor<MarketMinutelySummary>({});
 const marketMinutelySummary = implement({
   // 9: the latest summary, with base_price and the totals in USD.
-  // Not 7: dev caches that answer without the totals in USD. Not 8: this branch caches it without base_price.
-  // Two deployments of develop can share the KV.
+  // 7 and 8 are taken by values of another shape in the KV two deployments of develop can share.
   version: 9,
   index: Index.MinutelyBlockIndex,
   key(name, {block, ...context}) {

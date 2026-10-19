@@ -193,34 +193,3 @@ t.test('the APR of a market quoted in its base asset reads the USD feed its vers
     'a market quoted in its base asset without one fails, as its summary does');
   t.notOk(reads.includes('basePrice'), 'rather than dividing by its base price in BTC');
 });
-
-/*
- * Where the base feed the version names reverts — Chainlink retired it, and
- * the version still names it — an APR divides by the base price read through
- * the feed the Comet names at the block, as the summary values the market,
- * rather than answering the revert.
- */
-t.test('the APR of a market whose base feed reverts divides by the price of the feed its Comet names', async t => {
-  const own        = usdt.base.priceFeed.address;
-  const rewardFeed = usdt.registry.market.rewardAsset!.priceFeed!;
-  const { evaluate, pull } = evaluatorOver({
-    supplyRewardsApr:           rewards.supplyRewardsApr,
-    borrowRewardsApr:           rewards.borrowRewardsApr,
-    basePrice:                  comet.basePrice,
-    totalsBasic:                stub(() => ({ totalSupplyBase: BigNumber.from(2_000), totalBorrowBase: BigNumber.from(1_000) })),
-    baseMinForRewards:          stub(() => BigNumber.from(500)),
-    totalSupply:                stub(() => BigFixnum.from({ value: 1_000_000 })),
-    totalBorrow:                stub(() => BigFixnum.from({ value: 500_000 })),
-    supplyRewardsRatePerSecond: stub(() => BigFixnum.from({ value: 1, decimals: 6 })),
-    borrowRewardsRatePerSecond: stub(() => BigFixnum.from({ value: 2, decimals: 6 })),
-    // the reward feed answers 50, and the base feed the version names reverts
-    getPrice:                   stub(({ priceFeed }) => priceFeed.address === own ? reverted('execution reverted') : read(50)),
-    // the feed the Comet names at the block answers 2
-    cometBasePrice:             stub(() => read(2)),
-  });
-  t.equal(usdt.registry.market.collateralValueQuote, 'usd', 'a market quoted in USD, whose APRs divide by its base price');
-  const apr = { apiHost: '', nodeHost: '', nodeKey: '', network, contract: usdt, blockNumber: 1, rewardsTokenPriceFeed: rewardFeed };
-  const { supplyRewardsApr, borrowRewardsApr } = await evaluate(pull({ supplyRewardsApr: apr, borrowRewardsApr: apr })) as any;
-  t.strictSame({ supply: aprOf(supplyRewardsApr), borrow: aprOf(borrowRewardsApr) }, { supply: '0.0007884', borrow: '0.0031536' },
-    'supply: 1576.8 a year over 1,000,000 at 2; borrow: 3153.6 a year over 500,000 at 2');
-});

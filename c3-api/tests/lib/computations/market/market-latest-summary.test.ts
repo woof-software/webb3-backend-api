@@ -4,7 +4,6 @@ import * as Eth      from '../../../../lib/eth-constants.js';
 import { BigNumber } from '../../../../lib/bignumber.js';
 import { BigFixnum } from '../../../../lib/bigfixnum.js';
 
-import * as comet  from '../../../../lib/computations/comet.js';
 import * as market from '../../../../lib/computations/market.js';
 
 import type { PriceRead } from '../../../../lib/computations/comet.js';
@@ -13,9 +12,7 @@ import type { Collateral } from '../../../../lib/computations/market/collaterals
 import type { RegistryComet } from '../../../../lib/model/comet-registry.js';
 import { checksumAddress } from '../../../../lib/model/comet-registry.js';
 
-import { consoleLines } from '../../../util/console.js';
 import { evaluatorOver, stub } from '../../../util/evaluator.js';
-import { COMET } from '../../../util/fake-node.js';
 import { fixtureCatalog } from '../../../util/registry-fixture.js';
 
 import '../../../../shim/node-self.js';
@@ -157,7 +154,7 @@ t.test('a market reports what marketSummary reports of it, as it reports it', as
  * On a market quoted in USD, the base price and the base asset's USD price
  * are one read, with one fallback: of the base feed the version names, or,
  * where that reverts, of the feed the Comet names. They fail together, where
- * neither answers (the next test). Where one fails alone below, it shows
+ * neither answers (base-price.test.ts). Where one fails alone below, it shows
  * only that each field needs its own reads: a total in USD is the total
  * itself there, and needs what the total needs.
  */
@@ -183,51 +180,6 @@ t.test('a market quoted in USD whose base price reverts reports every field it c
     'the totals at the base price that was read');
   const usd = await summaryOf({ basePrice: BASE, collaterals: [ usdtComp(), usdtWeth() ] });
   t.equal(usd.baseUsdPrice, '0.99890608', 'and the USD price that was read');
-});
-
-/*
- * The same market over the real base prices, where the base feed the version
- * names reverts: both prices are read through the feed the Comet names at
- * the block, and where the Comet names the very feed that reverts, both are
- * missing together.
- */
-t.test('a market quoted in USD whose base feed reverts is priced through the feed its Comet names', async t => {
-  consoleLines(t, [ 'warn' ]);
-  const own   = usdt.base.priceFeed.address;
-  const OTHER = '0x2222222222222222222222222222222222222222';
-  const summaryNaming = (named: string): Promise<any> => {
-    const { evaluate, pull1 } = evaluatorOver({
-      marketLatestSummary: market.marketLatestSummary,
-      ...readsOf({ collaterals: [] }),
-      basePrice:           comet.basePrice,
-      baseUsdPrice:        comet.baseUsdPrice,
-      cometBasePrice:      comet.cometBasePrice,
-      collaterals:         stub(() => [ usdtComp(), usdtWeth() ]),
-      // the base feed the version names reverts, and any other answers 0.9999
-      getPrice:            stub(({ priceFeed }) => priceFeed.address === own ? reverted() : read(at8(99_990_000))),
-      // the Comet's one call, baseTokenPriceFeed(), answers `named`
-      ethCall:             stub(() => COMET.encodeFunctionResult('baseTokenPriceFeed', [ named ])),
-    });
-    return evaluate(pull1({ marketLatestSummary: contextOf(usdt) }));
-  };
-
-  t.match(await summaryNaming(OTHER), {
-    status:                  'success',
-    totalBorrowValue:        '999.9',
-    totalSupplyValue:        '1999.8',
-    totalBorrowValueUsd:     '999.9',
-    totalSupplyValueUsd:     '1999.8',
-    totalCollateralValueUsd: '5154.99578686',
-    baseUsdPrice:            '0.9999',
-    basePrice:               '0.9999',
-  }, 'another feed: a success, its totals and both prices at 0.9999');
-
-  const same = await summaryNaming(own);
-  t.match(same, { status: 'error', message: 'execution reverted' }, 'the feed that reverts: an error');
-  t.strictSame(Object.keys(same), [
-    'chainId', 'comet', 'status', 'message', 'borrowApr', 'supplyApr', 'totalCollateralValue', 'totalCollateralValueUsd',
-    'utilization', 'collateralAssetSymbols', 'collaterals',
-  ], 'without the totals of the base price and without its USD price, both missing together');
 });
 
 /*

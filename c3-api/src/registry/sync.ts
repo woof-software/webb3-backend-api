@@ -364,7 +364,6 @@ async function checkpoint(
   return changedRows(results[results.length - 1]!) === 1;
 }
 
-// records an attempt at one root that imported it, with what the root produced
 async function completeItem(
   db: D1Database,
   fence: Fence,

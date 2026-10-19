@@ -55,7 +55,6 @@ type Decision = {
 // the administrative command for one token
 type PolicyChange = Decision & { reason: string, actor: string };
 
-// a row of a list as the router read it, and the reason the list gives every row
 type ListedDecision = Decision & { symbol: string | null };
 type DecisionList   = { reason: string | null, decisions: ListedDecision[] };
 
@@ -86,7 +85,6 @@ function statesStatement(db: D1Database, tokens: string): D1PreparedStatement {
   ).bind(tokens);
 }
 
-// why the active version cannot take a decision about this token, or null where it can
 function missingFrom(state: TokenState, decision: { chainId: number, tokenAddress: Address }): string | null {
   if (state.network_id === null) {
     return `chain ${decision.chainId} is not part of the active registry`;
@@ -153,7 +151,6 @@ const TOKEN_POLICY_KIND: DecisionKind<Decision, ListedDecision, TokenState> = {
   named:       (state, decision) => state.symbol ?? decision.tokenAddress,
 };
 
-// the administrative command for one token (setDecision)
 async function setTokenPolicy(db: D1Database, change: PolicyChange): Promise<TokenPolicyResultV1> {
   const after = await setDecision(db, TOKEN_POLICY_KIND, change, () => conflict(
     'TOKEN_LEFT_REGISTRY',
@@ -349,7 +346,6 @@ async function exportTokenPolicies(db: D1Database): Promise<TokenPolicyListV1 & 
   };
 }
 
-// a row of a list, as review answers it
 function reviewRow(
   { row, decision, state, current, action, problem }: Planned<ListedDecision, TokenState>,
 ): TokenPolicyReviewV1['policies'][number] {
@@ -371,7 +367,6 @@ async function reviewTokenPolicies(db: D1Database, list: DecisionList): Promise<
   return { registryVersion, summary, policies: planned.map(reviewRow) };
 }
 
-// the administrative command for a list (applyDecisions)
 async function applyTokenPolicies(db: D1Database, list: DecisionList, actor: string): Promise<TokenPolicyApplyV1> {
   const { registryVersion, summary, applied } = await applyDecisions(db, TOKEN_POLICY_KIND, list, actor, {
     problemOf: ({ row, decision, problem }) => ({ row, chainId: decision.chainId, tokenAddress: decision.tokenAddress, problem }),

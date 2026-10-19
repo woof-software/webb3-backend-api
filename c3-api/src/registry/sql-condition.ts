@@ -71,7 +71,7 @@ function changedRows(result: D1Result): number {
   return (result as unknown as { meta?: { changes?: number } }).meta?.changes ?? 0;
 }
 
-// the rows a statement read, as the columns its query names them
+// the cast to T is not checked
 function rowsOf<T>(result: D1Result | undefined): T[] {
   return (result?.results ?? []) as T[];
 }

@@ -59,7 +59,6 @@ type Decision = DeprecatedCollateral & {
 // the administrative command for one collateral
 type DeprecatedChange = Decision & { reason: string, actor: string };
 
-// a row of a list as the router read it, and the reason the list gives every row
 type ListedDecision = Decision & { deploymentKey: string | null, symbol: string | null };
 type DecisionList   = { reason: string | null, decisions: ListedDecision[] };
 
@@ -123,7 +122,6 @@ function statesStatement(db: D1Database, collaterals: string): D1PreparedStateme
   ).bind(collaterals);
 }
 
-// why the active version cannot take a decision about this collateral, or null where it can
 function missingFrom(state: CollateralState, collateral: DeprecatedCollateral): string | null {
   if (state.network_id === null) {
     return `chain ${collateral.chainId} is not part of the active registry`;
@@ -207,7 +205,6 @@ const DEPRECATED_COLLATERAL_KIND: DecisionKind<Decision, ListedDecision, Collate
   named:       (state, decision) => `${state.symbol ?? decision.tokenAddress} of ${state.deployment_key ?? decision.cometAddress}`,
 };
 
-// the administrative command for one collateral (setDecision)
 async function setDeprecatedCollateral(db: D1Database, change: DeprecatedChange): Promise<DeprecatedCollateralResultV1> {
   const after = await setDecision(db, DEPRECATED_COLLATERAL_KIND, change, () => conflict(
     'COLLATERAL_LEFT_REGISTRY',
@@ -372,7 +369,6 @@ async function exportDeprecatedCollaterals(
   };
 }
 
-// a row of a list, as review answers it
 function reviewRow(
   { row, decision, state, current, action, problem }: Planned<ListedDecision, CollateralState>,
 ): DeprecatedCollateralReviewV1['collaterals'][number] {
@@ -396,7 +392,6 @@ async function reviewDeprecatedCollaterals(db: D1Database, list: DecisionList): 
   return { registryVersion, summary, collaterals: planned.map(reviewRow) };
 }
 
-// the administrative command for a list (applyDecisions)
 async function applyDeprecatedCollaterals(db: D1Database, list: DecisionList, actor: string): Promise<DeprecatedCollateralApplyV1> {
   const { registryVersion, summary, applied } = await applyDecisions(db, DEPRECATED_COLLATERAL_KIND, list, actor, {
     problemOf: ({ row, decision, problem }) => (

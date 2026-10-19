@@ -170,24 +170,35 @@ const BODY_BYTES: Partial<Record<string, number>> = {
 };
 
 /*
- * A reason is required wherever an operator changes what the registry serves,
- * because the audit row that records the change is only as useful as the
- * reason stored with it.
+ * A value as a reason, trimmed, or what keeps it from being one. A command
+ * and a list are held to this one rule, so they take the same reasons.
  */
-function requireReason(body: Record<string, unknown>): string {
-  const reason = body.reason;
-  if (typeof(reason) !== 'string' || reason.trim().length === 0 || reason.length > MAX_REASON) {
-    throw new ApiError('BAD_REQUEST', `a non-empty reason of at most ${MAX_REASON} characters is required`);
+function reasonOf(value: unknown): { reason: string } | { problem: 'malformed' | 'nul' } {
+  if (typeof(value) !== 'string' || value.trim().length === 0 || value.length > MAX_REASON) {
+    return { problem: 'malformed' };
   }
   /*
    * SQLite's text functions stop at a NUL, so the audit tables' checks would
    * read a reason that starts with one as empty and refuse it with a database
    * error, and one that only contains one would be stored cut short.
    */
-  if (reason.includes('\u0000')) {
-    throw new ApiError('BAD_REQUEST', `a reason cannot contain a NUL character`);
+  return value.includes('\u0000') ? { problem: 'nul' } : { reason: value.trim() };
+}
+
+/*
+ * A reason is required wherever an operator changes what the registry serves,
+ * because the audit row that records the change is only as useful as the
+ * reason stored with it.
+ */
+function requireReason(body: Record<string, unknown>): string {
+  const checked = reasonOf(body.reason);
+  if ('problem' in checked) {
+    throw new ApiError('BAD_REQUEST', {
+      malformed: `a non-empty reason of at most ${MAX_REASON} characters is required`,
+      nul:       `a reason cannot contain a NUL character`,
+    }[checked.problem]);
   }
-  return reason.trim();
+  return checked.reason;
 }
 
 /*
@@ -199,15 +210,15 @@ function optionalReason(value: unknown, where: string, problems: string[]): stri
   if (value === undefined || value === null) {
     return null;
   }
-  if (typeof(value) !== 'string' || value.trim().length === 0 || value.length > MAX_REASON) {
-    problems.push(`${where} must be null or a non-empty string of at most ${MAX_REASON} characters`);
+  const checked = reasonOf(value);
+  if ('problem' in checked) {
+    problems.push({
+      malformed: `${where} must be null or a non-empty string of at most ${MAX_REASON} characters`,
+      nul:       `${where} cannot contain a NUL character`,
+    }[checked.problem]);
     return null;
   }
-  if (value.includes('\u0000')) {
-    problems.push(`${where} cannot contain a NUL character`);
-    return null;
-  }
-  return value.trim();
+  return checked.reason;
 }
 
 function requireExactKeys(body: Record<string, unknown>, allowed: string[]): void {
@@ -514,7 +525,6 @@ function overlayDocuments(body: Record<string, unknown>, versionId: string, acto
   return { versionId, actor, reason, networks, markets };
 }
 
-// what a field of a listed decision must be, by the kind of field: as a row is told, and as it is checked
 const DECISION_FIELDS = {
   chainId: { must: 'must be a positive integer', valid: (value: unknown) => typeof(value) === 'number' && Number.isSafeInteger(value) && value > 0 },
   address: { must: 'must be an address',         valid: (value: unknown) => isAddress(value) },

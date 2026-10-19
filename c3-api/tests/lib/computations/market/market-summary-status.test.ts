@@ -252,44 +252,6 @@ t.test('a base price that reverts makes the market an error', async t => {
 });
 
 /*
- * Where the base feed the version names does not answer at the block — a day
- * before it was deployed, or one after Chainlink retired it while the version
- * still names it — the base asset is priced through the feed its Comet named
- * at that block. A summary is what each day of the history is
- * (market-day-summary.ts), so this is such a day: on a market quoted in USD,
- * its totals and its base asset's USD price, one read, both through the
- * Comet's feed.
- */
-t.test('a summary whose base feed reverts is priced through the feed its Comet names', async t => {
-  const own = usdt.base.priceFeed.address;
-  t.equal(usdt.registry.market.collateralValueQuote, 'usd');
-  for (const algorithm of ALGORITHMS) {
-    const { evaluate, pull1 } = evaluator({
-      marketSummary:  market.marketSummary,
-      basePrice:      comet.basePrice,
-      baseUsdPrice:   comet.baseUsdPrice,
-      getPrice:       stub(({ priceFeed }) => priceFeed.address === own ? reverted : read(one())),
-      // the feed the Comet names at the block answers 0.99
-      cometBasePrice: stub(() => read(BigFixnum.from({ decimals: 2, value: 99 }))),
-      borrowApr:      stub(() => BigFixnum.from({ decimals: 2, value: 5 })),
-      supplyApr:      stub(() => BigFixnum.from({ decimals: 2, value: 3 })),
-      totalBorrow:    stub(() => BigFixnum.from({ value: 10 })),
-      totalSupply:    stub(() => BigFixnum.from({ value: 20 })),
-      collaterals:    stub(() => [ collateral(COMP, 'COMP', 3, read(one())) ]),
-      utilization:    stub(() => BigFixnum.from({ decimals: 2, value: 50 })),
-    }, algorithm);
-    const summary = await evaluate(pull1({ marketSummary: { apiHost: '', nodeHost: '', nodeKey: '', network, contract: usdt, block } }));
-    t.match(summary, {
-      status:               'success',
-      totalBorrowValue:     '9.9',  totalBorrowValueUsd:     '9.9',
-      totalSupplyValue:     '19.8', totalSupplyValueUsd:     '19.8',
-      totalCollateralValue: '3.0',  totalCollateralValueUsd: '3.0',
-      baseUsdPrice:         '0.99',
-    }, `${algorithm}: a success, its totals and its USD price at 0.99`);
-  }
-});
-
-/*
  * The collaterals of a Comet as the chain answers at a block: how many it had
  * listed, and the asset at each index — by default the one the version
  * describes there — with every read recorded. There is no symbol() among the

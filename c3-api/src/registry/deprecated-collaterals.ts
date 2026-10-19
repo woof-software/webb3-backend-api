@@ -83,7 +83,6 @@ const DEPRECATED_KEY = 'deprecated-collaterals:v1';
 
 type DeprecatedRecord = { at: string, collaterals: DeprecatedCollateral[] };
 
-// the collaterals of a record, or null for a value that is not one
 function recordOf(value: unknown): DeprecatedCollateral[] | null {
   const record = value as DeprecatedRecord | null;
   if (record === null || typeof(record) !== 'object' || typeof(record.at) !== 'string' || !Array.isArray(record.collaterals)) {

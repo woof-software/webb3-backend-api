@@ -73,7 +73,6 @@ function tokenSymbol(catalog: RegistryLookup, network: KnownNetwork.Name, addres
   return catalog.renamedSymbolAt(network, token.address) ?? token.symbol;
 }
 
-// the scale the version reads a token's amounts at, or null for a token it does not describe
 function describedDecimals(catalog: RegistryLookup, network: KnownNetwork.Name, address: Eth.Address): number | null {
   return catalog.tokenAt(network, address)?.decimals
       ?? catalog.baseTokenAt(network, address)?.decimals
@@ -468,10 +467,6 @@ const rawTransactionHistoryItems = implement({
         /*
          * The tokens the logs name that the version does not describe, each
          * read once for the decimals it reports, at the block the page ends at.
-         *
-         * They are looked up as a list of lookups, not joined as redexes: the
-         * working-set evaluator answers a join of redexes nested in another
-         * join's continuation with the outer join's results.
          */
         const undescribed = [ ...new Set(decodedLogs
           .flatMap(({ decoded }) => tokensNamedBy(decoded))
