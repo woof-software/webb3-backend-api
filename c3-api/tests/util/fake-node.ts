@@ -138,12 +138,27 @@ function serve(t: Test, node: FakeNode): void {
 
 const isBlockRead = (request: { calls: Call[] }) => request.calls[0]!.method === 'eth_getBlockByNumber';
 
+// the function a call reads, or the node's method where it is no call to a contract
+const readOf = (call: Call) => call.method === 'eth_call' ? COMET.getFunction(call.params[0].data.slice(0, 10)).name : call.method;
+
+/*
+ * Whether a request values collateral positions, as the token list values a
+ * chain: it reads what a Comet's asset info says of a collateral and what the
+ * Comet holds of it in one batch, where a summary reads them in rounds of
+ * their own.
+ */
+const isValuation = (request: { calls: Call[] }) => {
+  const reads = new Set(request.calls.map(readOf));
+  return reads.has('getAssetInfo') && reads.has('totalsCollateral');
+};
+
 // what a node was asked: its latest-block reads, the batches of everything else, and the contracts it was called on
 const blockReads = (node: FakeNode) => node.requests.filter(isBlockRead);
 const batches    = (node: FakeNode) => node.requests.filter(request => !isBlockRead(request));
+const valuations = (node: FakeNode) => node.requests.filter(isValuation);
 const asked      = (node: FakeNode) => new Set<string>(node.requests.flatMap(request => request.calls
   .filter(call => call.method !== 'eth_getBlockByNumber')
   .map(call => call.params[0].to.toLowerCase())));
 
 export type { Block, Call, FakeNode, NodeError, NodeScript, Read };
-export { COMET, asked, batches, blockReads, fakeNode, serve };
+export { COMET, asked, batches, blockReads, fakeNode, isValuation, serve, valuations };

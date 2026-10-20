@@ -137,13 +137,14 @@ The market stays so until a version describing the token paid is active:
 { "chain_id": 1, "comet": { "address": "0xc3d6…cdc3" }, "status": "error", "message": "the rewards contract pays 0x…, not the COMP the registry version describes" }
 ```
 
-A summary lists every collateral with its own status:
+A summary lists every collateral with its own status, before what it says of
+the collateral's token ([Collateral tokens](#collateral-tokens)):
 
 ```json
 "status": "partially",
 "collaterals": [
-  { "address": "0xc00e…6888", "symbol": "COMP",  "status": "success" },
-  { "address": "0x57f5…7812", "symbol": "wUSDM", "status": "error", "message": "execution reverted" }
+  { "address": "0xc00e…6888", "symbol": "COMP",  "status": "success", … },
+  { "address": "0x57f5…7812", "symbol": "wUSDM", "status": "error", "message": "execution reverted", … }
 ]
 ```
 
@@ -183,7 +184,7 @@ the whole request, with `503 UPSTREAM_UNAVAILABLE`, and so does any other call
 that reverts, with `500 INTERNAL` ([Errors](#errors)).
 
 ```json
-{ "address": "0x1f98…f984", "symbol": "UNI", "status": "error", "message": "asset 3 of the Comet is 0x…, not the UNI the registry version describes" }
+{ "address": "0x1f98…f984", "symbol": "UNI", "status": "error", "message": "asset 3 of the Comet is 0x…, not the UNI the registry version describes", … }
 ```
 
 ## Market labels
@@ -294,6 +295,10 @@ Point-in-time summary at the current block of various market statistics:
   [Market registry fields](#market-registry-fields)
 - What could be priced: `status`, and `collaterals` with each collateral's
   own status — see [Market status](#market-status)
+- What the token list says of each collateral's token: its name and
+  decimals, whether this market has it deprecated, and its value, roles,
+  decisions and visibility across the whole chain — see
+  [Collateral tokens](#collateral-tokens) below
 
 Every form of the route answers a list: of the one market `{address}` names;
 for `all-contracts`, of every market the active version serves on
@@ -311,6 +316,81 @@ there. Each is priced through the feed the Comet reads for it at the block
 summarized, and the base asset through the feed the version names for it,
 or, where that one reverts, through the feed the Comet names for it at the
 block.
+
+#### Collateral tokens
+
+After what was read of it, each collateral says what the token list
+(`/registry/v1/networks/{chain_id}/tokens`) says of its token, in fields of
+its own, in every form of the route. The base asset has none of them.
+
+| Field | In the token list | Says it of | What it is |
+|---|---|---|---|
+| `name` | `name` | the token | its name, as the active version has it |
+| `decimals` | `decimals` | the token | its decimals, a number |
+| `is_deprecated` | — | this market | whether an administrator marked it deprecated as a collateral of this market's Comet, as `isDeprecated` on the market's collateral in `/registry/v1/active` |
+| `is_network_deprecated` | `isDeprecated` | the chain | whether it is deprecated in every enabled market of the chain that takes it |
+| `deprecated_in` | `deprecatedIn` | the chain | the Comets of the chain's markets that have it deprecated, checksummed, in the list's order |
+| `is_strategic` | `isStrategic` | the chain | whether an administrator marked the token strategic on the chain |
+| `network_roles` | `roles` | the chain | the roles it plays in the chain's markets: `base`, `reward`, `collateral` |
+| `total_network_collateral_value_usd` | `collateralValueUsd` | the chain | what the chain's enabled markets hold of it as collateral, in USD, a decimal string as the list writes it: `"1843210.123456"`, `"0"` |
+| `total_network_collateral_value_status` | `collateralValueStatus` | the chain | `fresh`, `exception`, `partial`, `stale` or `unavailable`, as the list has them |
+| `network_value_at` | `valueAt` | the chain | when that value was read, an instant |
+| `network_value_block` | `valueBlock` | the chain | the block it was read at, `{ "number", "timestamp" }` |
+| `network_value_stale_age_seconds` | `staleAgeSeconds` | the chain | how much older that block is than the latest |
+| `network_value_exceptions` | `exceptions` | the chain | the price exceptions of the registry the value applied: `kind`, `price_feed_address`, checksummed, `provenance`, and `expires_at`, an instant, or `null` for one that does not expire |
+| `is_visible` | `isVisible` | the chain | whether token discovery shows the token |
+| `visibility_reason` | `visibilityReason` | the chain | why: `deprecated`, `strategic`, `data_unavailable`, `collateral_threshold` or `below_threshold` |
+
+A field of the chain is about the token on the whole chain, never about this
+market: its value is what every enabled market of the chain holds, and
+`is_visible` is whether discovery shows the token, not whether this market
+offers it, which is what `is_deprecated` says. A token deprecated in this
+market and current in another enabled market that takes it is
+`is_deprecated: true` here and `is_network_deprecated: false`;
+a collateral can be `success` while its token's value is `unavailable`,
+because a position of another market could not be valued. Discovery decides
+by the token list's rule, version 2 (the list's `ruleVersion`): a token is
+shown when it is strategic, when it is worth at least USD 250,000 across the
+chain (the list's `thresholdUsd`), or when its value cannot be read, unless it
+is deprecated in every enabled market that takes it. Neither number is written
+on a collateral.
+
+The values are the token list's own: one record of each chain's minute,
+valued at the chain's latest block in one batch of reads, which the summary
+and the list both answer from, so from the same record they answer the same
+values. Whichever asks first values the minute, the summary at the latest
+block it read for its markets. The summary waits 2 seconds for a minute nobody
+has valued, where the list waits 4; past that, it answers without the minute —
+from the newest earlier minute, `stale`, or `unavailable` — and the valuation
+goes on, so the next request of the minute answers from it. A value that
+cannot be read never fails the summary: it is a status of the token.
+
+The decisions are read with every request. The deprecated ones are read as
+`/registry/v1/active` reads them: when the database cannot be reached, they
+are the ones the API last recorded, and the answer says it could not confirm
+them, with `X-Registry-Stale` — `0` where the version itself was read — and
+`Cache-Control: no-store`. Decisions that cannot be read at all leave out the
+fields they decide, and the summary is answered without them: without the
+deprecated ones, `is_deprecated`, `is_network_deprecated`, `deprecated_in`,
+`is_visible` and `visibility_reason`; without the strategic ones, which
+nothing records for an outage, `is_strategic`, `is_visible` and
+`visibility_reason`. A value that is not known is left out too, never `null`:
+`total_network_collateral_value_usd` of a token that is `unavailable`, and
+`network_value_at`, `network_value_block` and
+`network_value_stale_age_seconds` of a value nobody read.
+
+weETH is a collateral of the USDC, WETH and USDT markets of mainnet; marked
+deprecated in USDT's alone, it is deprecated there and still offered by the
+two others. mETH, which USDT's market alone takes, is deprecated there, so
+across the whole chain, and discovery hides it:
+
+```json
+{ "address": "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee", "symbol": "weETH", "status": "success", "name": "Wrapped eETH", "decimals": 18, "is_deprecated": true, "is_network_deprecated": false, "deprecated_in": [ "0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840" ], "is_strategic": false, "network_roles": [ "collateral" ], "total_network_collateral_value_usd": "93518204.27", "total_network_collateral_value_status": "fresh", "network_value_at": "2026-10-05T12:00:23.000Z", "network_value_block": { "number": 23512345, "timestamp": 1791201623 }, "network_value_stale_age_seconds": 0, "network_value_exceptions": [], "is_visible": true, "visibility_reason": "collateral_threshold" }
+{ "address": "0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa", "symbol": "mETH", "status": "success", "name": "mETH", "decimals": 18, "is_deprecated": true, "is_network_deprecated": true, "deprecated_in": [ "0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840" ], "is_strategic": false, "network_roles": [ "collateral" ], "total_network_collateral_value_usd": "1204.5", "total_network_collateral_value_status": "fresh", "network_value_at": "2026-10-05T12:00:23.000Z", "network_value_block": { "number": 23512345, "timestamp": 1791201623 }, "network_value_stale_age_seconds": 0, "network_value_exceptions": [], "is_visible": false, "visibility_reason": "deprecated" }
+```
+
+In the weETH of the USDC market, `is_deprecated` is `false`, and every field
+of the chain is the same.
 
 The base asset has two prices: its price in the market's unit, `base_price`,
 through the version's base feed — or, where that reverts, through the feed
@@ -357,8 +437,8 @@ bulker:
   "utilization": "0",
   "collateral_asset_symbols": [ "USDT", "WETH" ],
   "collaterals": [
-    { "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7", "symbol": "USDT", "status": "success" },
-    { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "status": "success" }
+    { "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7", "symbol": "USDT", "status": "success", "name": "Tether USD", "decimals": 6, … },
+    { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "status": "success", "name": "Wrapped Ether", "decimals": 18, … }
   ]
 } ]
 ```
@@ -394,11 +474,30 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
   "base_price": "0.99996",
   "collateral_asset_symbols": [ "COMP", "WBTC", "WETH", "UNI", "LINK" ],
   "collaterals": [
-    { "address": "0xc00e94Cb662C3520282E6f5717214004A7f26888", "symbol": "COMP", "status": "success" },
-    { "address": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", "symbol": "WBTC", "status": "success" },
-    { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "status": "success" },
-    { "address": "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "symbol": "UNI",  "status": "success" },
-    { "address": "0x514910771AF9Ca656af840dff83E8264EcF986CA", "symbol": "LINK", "status": "success" }
+    {
+      "address": "0xc00e94Cb662C3520282E6f5717214004A7f26888",
+      "symbol": "COMP",
+      "status": "success",
+      "name": "Compound",
+      "decimals": 18,
+      "is_deprecated": false,
+      "is_network_deprecated": false,
+      "deprecated_in": [],
+      "is_strategic": false,
+      "network_roles": [ "reward", "collateral" ],
+      "total_network_collateral_value_usd": "4825170.931506",
+      "total_network_collateral_value_status": "fresh",
+      "network_value_at": "2026-10-05T12:00:23.000Z",
+      "network_value_block": { "number": 23512345, "timestamp": 1791201623 },
+      "network_value_stale_age_seconds": 0,
+      "network_value_exceptions": [],
+      "is_visible": true,
+      "visibility_reason": "collateral_threshold"
+    },
+    { "address": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", "symbol": "WBTC", "status": "success", "name": "Wrapped BTC", "decimals": 8, … },
+    { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "status": "success", "name": "Wrapped Ether", "decimals": 18, … },
+    { "address": "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "symbol": "UNI",  "status": "success", "name": "Uniswap", "decimals": 18, … },
+    { "address": "0x514910771AF9Ca656af840dff83E8264EcF986CA", "symbol": "LINK", "status": "success", "name": "ChainLink Token", "decimals": 18, … }
   ]
 } ]
 ```
@@ -418,10 +517,12 @@ same numbers. A WETH market is quoted in ETH, and reports, for instance:
 30 days of historical `/summary`s — two in stage, and one in a local run —
 one block sampled per day, oldest first, up to the most recent day sampled.
 Each day carries its `date` and `timestamp`, its totals in USD converted at
-that day's price, and the fields of the summary but `base_price` and what
-the registry version says of the market
-([Market registry fields](#market-registry-fields)): its `comet` is the
-Comet's `address` alone.
+that day's price, and the fields of the summary but `base_price`, what the
+registry version says of the market
+([Market registry fields](#market-registry-fields)) — its `comet` is the
+Comet's `address` alone — and what the token list says of each collateral's
+token ([Collateral tokens](#collateral-tokens)): a collateral is its
+`address`, `symbol` and `status`, with its `message` where it is `error`.
 
 A day whose base asset could not be priced reports only what identifies the
 market, with the node's message ([Market status](#market-status)).

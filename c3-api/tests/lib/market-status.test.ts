@@ -1,6 +1,7 @@
 import t, { Test } from 'tap';
 
 import * as Flags from '../../lib/flags.js';
+import { BigFixnum } from '../../lib/bigfixnum.js';
 
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
@@ -21,6 +22,7 @@ import { consoleLines } from '../util/console.js';
 import { evaluatorOver, stub } from '../util/evaluator.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../util/registry-fixture.js';
 import { REGISTRY_KEYS } from '../util/summary-registry-fields.js';
+import { summaryTokens } from '../util/token-collateral.js';
 
 import '../../shim/node-self.js';
 
@@ -111,12 +113,22 @@ function routeData(network: MarketRouteData['network'], contract: MarketRouteDat
   return { apiHost: '', nodeHost: '', nodeKey: '', network, contract, catalog, queryParams: new URLSearchParams() };
 }
 
+/*
+ * What values the collateral of the summary's chains: a computation of its
+ * own, every position worth a dollar, since no node answers here. The
+ * summaries the computations above answer have no collaterals to add it to.
+ */
+const valuedAtADollar = () => evaluatorOver({
+  assetCollateralValue: stub(() => ({ status: 'success', valueUsd: BigFixnum.from({ value: 1 }) })),
+});
+
 // as the router hands a handler that makes its own evaluator, with the flags it asks for
 function uninstantiated(answer: Answer) {
   const made: Array<ReturnType<typeof evaluatorOf>> = [];
   const context = {
     // a local run, whose history samples one day
     flags: { ...flags, environment: 'local' },
+    tokens: summaryTokens({ evaluator: valuedAtADollar }),
     instantiateEvaluator: (_: string, overrides: { flags?: Flags.SomeFlags } = {}) => {
       const evaluator = evaluatorOf(answer, overrides.flags);
       made.push(evaluator);

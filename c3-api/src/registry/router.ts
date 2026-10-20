@@ -158,6 +158,33 @@ function withHeaders(response: Response, headers: Record<string, string>): Respo
   return response;
 }
 
+/*
+ * What the token list values collateral with: the node, an evaluator that
+ * reads every position of a chain in one batch, as the market summaries read
+ * theirs, KV and the clock. Both routers make it here, so the list and
+ * /summary value a chain alike and share its records; each says how long it
+ * waits for a minute.
+ */
+function tokenCollateralDeps(
+  { env, debug, flags, waitUntil }: Evaluator.Context,
+  instantiateEvaluator: Evaluator.InstantiateFn<TokenCollateral.Dependencies>,
+  deadlineMs: number,
+): TokenCollateral.TokenCollateralDeps {
+  return {
+    frame:           { apiHost: env.V3_API_HOST, nodeHost: env.NODE_PROXY_HOST, nodeKey: env.NODE_PROXY_KEY },
+    evaluator:       networkEnv => instantiateEvaluator(networkEnv, {
+      flags: { ...flags, ...ROUTE_EVALUATOR_FLAGS },
+    }),
+    kv:              networkEnv => env[`kv_${networkEnv}`],
+    maxStaleMinutes: maxStaleMinutesOf(env),
+    now:             () => new Date(),
+    debug,
+    // keeps the valuation alive past the answer of the request that started it
+    waitUntil,
+    deadlineMs,
+  };
+}
+
 async function routeRegistry(
   request: Request,
   // the request's context, with the id the entrypoint gave it, which its error answer and its log lines carry
@@ -207,20 +234,7 @@ async function routeRegistry(
     deprecated:       () => deprecatedDecisions(deps),
     recordDeprecated: () => recordDeprecatedCollaterals(deps),
     catalog: registry,
-    tokens: {
-      frame:           { apiHost: env.V3_API_HOST, nodeHost: env.NODE_PROXY_HOST, nodeKey: env.NODE_PROXY_KEY },
-      // every collateral read of a chain in one batch, as the market summaries read theirs
-      evaluator:       networkEnv => instantiateEvaluator(networkEnv, {
-        flags: { ...flags, ...ROUTE_EVALUATOR_FLAGS },
-      }),
-      kv:              networkEnv => env[`kv_${networkEnv}`],
-      maxStaleMinutes: maxStaleMinutesOf(env),
-      now:             () => new Date(),
-      debug,
-      // keeps the valuation alive past the answer of the request that started it
-      waitUntil,
-      deadlineMs:      DEADLINE_MS,
-    },
+    tokens:  tokenCollateralDeps({ env, debug, flags, waitUntil }, instantiateEvaluator, DEADLINE_MS),
   };
 
   let response: Response;
@@ -244,4 +258,4 @@ async function routeRegistry(
   return withHeaders(response, catalogHeadersOf(registry));
 }
 
-export { ERROR_STATUS, asApiError, isRegistryPath, routeRegistry };
+export { ERROR_STATUS, asApiError, isRegistryPath, routeRegistry, tokenCollateralDeps };

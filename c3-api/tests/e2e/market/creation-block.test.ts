@@ -7,7 +7,7 @@ import type { NetworkV1, RegistrySnapshotV1 } from '../../../lib/model/comet-reg
 import { failures, validateCandidate } from '../../../src/registry/validation.js';
 
 import { consoleLines } from '../../util/console.js';
-import { asked, fakeNode, serve } from '../../util/fake-node.js';
+import { asked, fakeNode, isValuation, serve } from '../../util/fake-node.js';
 import { makeTestEnv } from '../../util/test-env.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
@@ -130,7 +130,13 @@ t.test('the summaries answer a market created past the latest block as an error,
   t.equal(alone.status, 200, 'the summary of that market alone is its status, as a price that reverts is');
   t.strictSame(await alone.json(), [ UNREACHED_ON_SUMMARY ], 'answered as a list of one, as every form of the summary is');
 
-  t.notOk(asked(node).has(USDT), 'and nothing of it was read');
+  /*
+   * The collateral of its chain is valued as the token list values it, every
+   * position of every enabled market at the latest block, this market's too:
+   * that is the token list's to answer for, not the summary's.
+   */
+  const read = { ...node, requests: node.requests.filter(request => !isValuation(request)) };
+  t.notOk(asked(read).has(USDT), 'and nothing of it was read for its summary');
 });
 
 /*

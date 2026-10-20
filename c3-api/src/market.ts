@@ -18,6 +18,7 @@ import type { MarketIdentity } from '../lib/computations/market/market-summary.j
 
 import { ApiError } from './http/errors.js';
 import type { Catalog } from './registry/catalog.js';
+import { chainTokens, withTokenFields } from './registry/summary-tokens.js';
 
 import {
   AllNetworks,
@@ -28,6 +29,7 @@ import {
 
 type Dependencies = (
   | evm.Evm
+  | market.AssetCollateralValue
   | market.MarketDaySummary
   | market.HistoricalMarketDaySummaries
   | market.MarketRewards
@@ -137,8 +139,10 @@ async function latestSummary(
   context: UninstantiatedRouterContext,
 ): Promise<Response> {
   const selectedNetworks = networksOf(network);
+  // once for every network, while their latest blocks are read
+  const decisions = context.tokens.decisions();
 
-  const { evaluate, pipe1, split, value } = context.instantiateEvaluator('mainnet', {
+  const { evaluate, pipe1, pull1, split, value } = context.instantiateEvaluator('mainnet', {
     flags: {
       ...context.flags,
       ...ROUTE_EVALUATOR_FLAGS,
@@ -157,34 +161,36 @@ async function latestSummary(
       }
 
       /*
-       * One evaluation per network, not per market. Its markets share the
-       * latest block, read once, and every round of their reads reaches the
-       * node as one batch: four calls to the node provider proxy per network,
-       * whatever its market count. An evaluation per market made four for
-       * every market, and all networks at once took 116 — each call a round
-       * trip of its own, and a subrequest, of which an invocation has 10,000
-       * on the Workers Paid plan stage and production run on, and 50 on the
-       * Free plan (README, "Workers Plan").
+       * One evaluation per network for its markets, not one per market. They
+       * share the latest block, read once, and every round of their reads
+       * reaches the node as one batch: four calls to the node provider proxy
+       * per network, whatever its market count. An evaluation per market made
+       * four for every market, and all networks at once took 116 — each call
+       * a round trip of its own, and a subrequest, of which an invocation has
+       * 10,000 on the Workers Paid plan stage and production run on, and 50
+       * on the Free plan (README, "Workers Plan").
        *
        * Networks stay separate evaluations: within one, the batches of
-       * different networks would go to the node one after another.
+       * different networks would go to the node one after another. The
+       * token list's values of the network's collateral are read at the same
+       * block, beside the markets: one call more in a minute nobody has
+       * valued (summary-tokens.ts).
        */
-      const summary = await evaluate(
-        pipe1([
-          { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: "latest", network } },
-          (latestBlock) => split(selectedContracts.map((contract) => {
-            const origin = { apiHost, nodeHost, nodeKey, network, contract, block: latestBlock };
-            if (!market.marketMinutelySummary.index.covers(origin)) {
-              return value(described(unreachedMarket(contract, latestBlock), contract));
-            }
-            const projected = Fallible.must(market.marketMinutelySummary.index.project(origin));
-            projected.block.timestamp = latestBlock.timestamp;
-            return pipe1([ { marketMinutelySummary: projected }, computed => described(computed, contract) ]);
-          })),
-        ])
-      );
+      const latestBlock = await evaluate(pull1({ ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: "latest", network } }));
+      const [ entries, tokens ] = await Promise.all([
+        evaluate(split(selectedContracts.map((contract) => {
+          const origin = { apiHost, nodeHost, nodeKey, network, contract, block: latestBlock };
+          if (!market.marketMinutelySummary.index.covers(origin)) {
+            return value(described(unreachedMarket(contract, latestBlock), contract));
+          }
+          const projected = Fallible.must(market.marketMinutelySummary.index.project(origin));
+          projected.block.timestamp = latestBlock.timestamp;
+          return pipe1([ { marketMinutelySummary: projected }, computed => described(computed, contract) ]);
+        }))),
+        chainTokens(context.tokens.collateral, catalog, network, selectedContracts[0]!.registry.chainId, latestBlock, decisions),
+      ]);
 
-      return summary.map(snakeifyCamelObject);
+      return entries.map((entry, index) => withTokenFields(snakeifyCamelObject(entry), selectedContracts[index]!, tokens));
     })
   );
 
@@ -194,7 +200,16 @@ async function latestSummary(
    * would change its shape with an activation.
    */
   const flattedSummary = summary.flat();
-  return new Response(JSON.stringify(flattedSummary));
+  /*
+   * Collaterals marked by the deprecated decisions the worker last recorded,
+   * because D1 could not give them, are not confirmed, and the answer says
+   * so as /registry/v1/active does; the router sets the version's own age
+   * over it where the version came from the cache too.
+   */
+  const { deprecated } = await decisions;
+  return new Response(JSON.stringify(flattedSummary), {
+    headers: deprecated?.recorded ? { 'X-Registry-Stale': '0', 'Cache-Control': 'no-store' } : {},
+  });
 }
 
 async function latestRewardsSummary(

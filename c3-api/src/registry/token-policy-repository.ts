@@ -218,6 +218,18 @@ async function readStrategicTokens(db: D1Database, chainId: number): Promise<Set
   return new Set((results ?? []).map(row => row.token_address));
 }
 
+// the same for every chain at once, by chain id, for the summary of every network: one statement, not one a chain
+async function readStrategicTokensByChain(db: D1Database): Promise<Map<number, Set<Address>>> {
+  const { results } = await db.prepare(
+    `SELECT chain_id, token_address FROM token_policies WHERE is_strategic = 1`
+  ).all<{ chain_id: number, token_address: Address }>();
+  const strategic = new Map<number, Set<Address>>();
+  for (const row of results ?? []) {
+    strategic.set(row.chain_id, (strategic.get(row.chain_id) ?? new Set<Address>()).add(row.token_address));
+  }
+  return strategic;
+}
+
 /*
  * Every token one network of the active version holds, with the decision in
  * force for each, and beside them the decisions kept for tokens of the chain
@@ -401,6 +413,7 @@ export {
   applyTokenPolicies,
   exportTokenPolicies,
   readStrategicTokens,
+  readStrategicTokensByChain,
   readTokenPolicies,
   readTokenPolicy,
   reviewTokenPolicies,

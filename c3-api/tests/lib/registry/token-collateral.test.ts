@@ -146,6 +146,28 @@ t.test('a cold minute costs the latest block and one batch, and is kept for the 
   t.equal(counts.gets, gets, 'and takes the minute from the isolate, without reading KV');
 });
 
+/*
+ * A caller that has read the latest block for reads of its own, as the
+ * summary has, passes it: the minute is valued at that block, the view reads
+ * none of its own, and only what identifies the block is kept.
+ */
+t.test('a view given the latest block reads none, and values the minute at it', async t => {
+  const node = nodeOf();
+  serve(t, node);
+  const { kv, counts } = countedKv();
+  const given = { number: LATEST.number - 2, timestamp: LATEST.timestamp - 24 };
+  // as a block read answers it, with the transactions and the date it carries
+  const read  = { ...given, date: '2026-10-05', transactions: [] };
+
+  const view = await collateralView(depsOf(kv), chain1, read);
+  t.equal(blockReads(node).length, 0, 'the node is not asked for the latest block');
+  t.equal(batches(node).length, 1, 'only for the minute\'s batch');
+  t.strictSame(view.block, given, 'the view is of the block given, and of what identifies it alone');
+  t.strictSame(view.current!.block, given, 'and so is the minute\'s record');
+  t.same(counts.puts.map(put => put.key), [ recordKey(1, positionSetOf(mainnet), Math.floor(given.timestamp / 60)) ],
+    'written under the minute of that block');
+});
+
 t.test('another isolate reads the minute from KV', async t => {
   const node = nodeOf();
   serve(t, node);
