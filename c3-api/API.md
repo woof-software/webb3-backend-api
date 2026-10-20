@@ -91,8 +91,8 @@ could not be completed`, never with what failed — a database error, or what
 an upstream API such as Tally answered: that is in the log, under the
 `requestId`. A request with a malformed parameter is the exception to the
 envelope: the market, governance and account endpoints still answer it with
-a `400` and a short message, as they always have — a line of plain text, or
-`{"error": "…"}` from some market endpoints.
+a `400` and a short message — a line of plain text, or `{"error": "…"}`
+from some market endpoints.
 
 ## Market status
 
@@ -295,6 +295,11 @@ Point-in-time summary at the current block of various market statistics:
 - What could be priced: `status`, and `collaterals` with each collateral's
   own status — see [Market status](#market-status)
 
+Every form of the route answers a list: of the one market `{address}` names;
+for `all-contracts`, of every market the active version serves on
+`{network}`, an empty one where it serves none; and of every market of every
+network for `/market/all-networks/all-contracts/summary`.
+
 The collaterals are those the active registry version describes for the
 market, in the order the Comet numbers them, and named as the version names
 them: a collateral the Comet listed after the version was imported is left
@@ -333,7 +338,7 @@ whose base feed reverts, and which the version gives no rewards contract or
 bulker:
 
 ```json
-{
+[ {
   "chain_id": 1,
   "comet": { "address": "0xbc37…cCe8" },
   "deployment_key": "usdc-test-base-revert",
@@ -355,14 +360,14 @@ bulker:
     { "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7", "symbol": "USDT", "status": "success" },
     { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "status": "success" }
   ]
-}
+} ]
 ```
 
 ```sh
 $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3/summary'
 ```
 ```json
-{
+[ {
   "chain_id": 1,
   "comet": {
     "address": "0xc3d688B66703497DAA19211EEdff47f25384cdc3",
@@ -395,7 +400,7 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
     { "address": "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "symbol": "UNI",  "status": "success" },
     { "address": "0x514910771AF9Ca656af840dff83E8264EcF986CA", "symbol": "LINK", "status": "success" }
   ]
-}
+} ]
 ```
 
 The USDC market is quoted in USD, so its totals and their USD form are the
@@ -429,7 +434,7 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
   {
     "chain_id": 1,
     "comet": {
-      "address": "0xc3d688b66703497daa19211eedff47f25384cdc3"
+      "address": "0xc3d688B66703497DAA19211EEdff47f25384cdc3"
     },
     "status": "success",
     "borrow_apr": "0.014999999976144",
@@ -454,7 +459,7 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
   {
     "chain_id": 1,
     "comet": {
-      "address": "0xc3d688b66703497daa19211eedff47f25384cdc3"
+      "address": "0xc3d688B66703497DAA19211EEdff47f25384cdc3"
     },
     "status": "success",
     "borrow_apr": "0.024456245200128",
@@ -710,10 +715,14 @@ ordered by their delegated voting power (not by their actual COMP
 balance).
 
 Query parameters:
-- Pagination:
-  - `page_size` [default 5]
-  - `page_number`
-  - `addresses` - account addresses to filter down to from all accounts
+- Pagination, which is checked and not applied: without `addresses`, the
+  answer is the 20 accounts with the most voting power, as Tally ranks them.
+  - `page_size` - at most 20
+  - `page_number` - `1` only
+- `addresses` - account addresses to filter down to from all accounts
+
+A `page_size` over 20, another `page_number` or an address that is not one
+is a `400` with a line of plain text.
 
 ```sh
 $ curl 'localhost:8787/governance/mainnet/comp/accounts'
@@ -781,6 +790,7 @@ $ curl 'localhost:8787/governance/mainnet/comp/accounts'
     "proposals_voted": 79,
     "total_delegates": 25
     }
+    ...
   ]
 }
 ```
@@ -1094,13 +1104,28 @@ active, and `503 UPSTREAM_UNAVAILABLE` when the database cannot be reached
 and no older version may be served instead. A path is matched with or
 without a trailing slash.
 
+A public read that fails after the active version was read names that
+version in the same two headers: a chain or a market it does not serve
+(`404`), a malformed chain id or address on the market reads (`400`), and a
+`503` that came after it, such as one for deprecated flags that could not be
+read with nothing recorded, or for a database without migration `0007`. When
+that version came from the cache because the database could not be reached,
+the answer also carries `X-Registry-Stale` and `Cache-Control: no-store`. An
+answer given before any version was read names none: an unknown path, a
+method the route does not take, the two `503`s of the paragraph above, the
+token list's `400` for a malformed chain id or `visibleOnly`, which it gives
+before it reads the version, and a version id
+`/registry/v1/versions/{version_id}` does not know.
+
 A `{chain_id}` is written in decimal without a leading zero — `1`, never
 `01`, `0x1`, `1e0` or `1.0` — in every path that takes one and in the keys of
 `PUT …/overlays`, and is at most 9007199254740991; anything else is `400`,
 so that one resource has one URL.
 
 Administrative routes require `Authorization: Bearer <token>` — a `401` names
-the scheme in `WWW-Authenticate` — and answer no CORS headers at all. An
+the scheme in `WWW-Authenticate` — and answer no CORS headers at all. The
+scheme is read in any case, and one space or more may follow it; a header
+with anything after the token is answered as one without a token. An
 environment without a token hash it can use — none at all, or a value that is
 not 64 hex digits — answers every administrative request `403 FORBIDDEN`,
 whatever token it carries, and the message says which. Every administrative
@@ -1130,6 +1155,10 @@ for `POST …/token-policies/review`, `POST …/deprecated-collaterals/review` a
 their `…/apply` — and a larger one is refused with `413`. A `reason`, wherever
 a command takes one, is at most 1,000 characters, and a longer one is refused
 with `400`.
+
+The body is JSON, sent as `application/json` or as a `+json` type such as
+`application/merge-patch+json`, or without a `Content-Type`. The type is read
+in any case, and a body of any other type is refused with `400`.
 
 ## `/registry/v1/active`
 ### description:
@@ -1592,7 +1621,7 @@ can check that it is empty without knowing the registry's rules:
 | `last-sync-failed` | the most recent import run ended `failed`, and `sync.lastRun.lastError` says how: `validation failed` is a draft that failed its checks, which `GET /registry/v1/admin/versions/{version_id}` lists for the version `sync.lastRun.registryVersionId` names, and `cancelled by <actor>: <reason>` a run somebody cancelled. A root that fails does not fail the run, and neither do the checks of a run held for review: it completes, its draft left open |
 | `sync-failing` | the import that is running keeps failing: the last root it attempted failed, or an invocation has failed since before attempting one, and the roots left failed have spent two attempts or more between them — two roots once, or one root twice. One failure raises nothing, and neither does an attempt given back because the invocation had imported a market before it lost GitHub, the node provider or its connection to the database. An attempt whose invocation was stopped in the middle of it — a deploy, or a Worker past its time or CPU — has failed too, once that invocation's lease has run out. Each attempt moves the run, so attempts that fail never leave it stalled. It ends once no root is left to attempt, each imported or given up after five attempts, and one that gave roots up then ends `failed`, its draft unable to validate without them, unless it is held for review: then it completes, its draft left open. An invocation that fails before it attempts a root moves nothing: a run every invocation fails on that way is `sync-stalled` as well |
 | `sync-stalled` | a run says it is running, no invocation holds its lease — given back by an invocation that left work behind or failed, or run out — and none of its roots has moved for two hours, by when two hourly invocations should have continued it |
-| `sync-overdue` | the source has not been checked for more than twice the configured interval |
+| `sync-overdue` | the source has not been checked for more than twice the configured interval, or never: a fresh environment raises it beside `no-active-version` until its first import records a check, from the hourly job or `POST /registry/v1/admin/sync` |
 | `snapshot-not-cached` | the active version's bytes are not in the cache, so every cold isolate hydrates it from D1 again |
 | `cache-unreadable` | the KV namespace did not answer at all: there is no cache, and no fallback if the database fails next |
 
@@ -1779,6 +1808,40 @@ $ curl -s "$API/registry/v1/admin/versions?status=importing" -H "Authorization: 
 
 A version with its validation summary and activation history.
 
+`activations` lists every move that switched the version on or off, newest
+first, and names both versions of each: `targetVersionId` is the one the move
+switched on, and `previousVersionId` the one it switched off — `null` when
+nothing was on before. A record whose `previousVersionId` is this version is
+the move that switched it off.
+
+```json
+{
+  "version": { "id": "d9698ddd-…", "status": "validated", … },
+  "validation": { "attempt": 1, "passed": 42, "failed": 0, "checks": [ … ] },
+  "activations": [
+    {
+      "id": "3e96812b-…",
+      "action": "activate",
+      "previousVersionId": "d9698ddd-…",
+      "targetVersionId": "c0d77dad-…",
+      "actor": "registry-admin:stage",
+      "reason": "switch on the new commit",
+      "createdAt": "2026-10-19T08:12:44.019Z"
+    },
+    {
+      "id": "90e757e3-…",
+      "action": "activate",
+      "previousVersionId": null,
+      "targetVersionId": "d9698ddd-…",
+      "actor": "registry-admin:stage",
+      "reason": "first activation",
+      "createdAt": "2026-09-23T09:30:02.114Z"
+    }
+  ],
+  "unreviewed": { "networks": [], "markets": [] }
+}
+```
+
 ## `POST /registry/v1/admin/versions/{version_id}/validate`
 ### description:
 
@@ -1819,6 +1882,20 @@ it expected.
 
 ```json
 { "reason": "switch on the new commit", "expectedActiveVersionId": "d9698ddd-ab86-46bc-a412-c71df7d20414" }
+```
+
+It answers with the move it made. One that changed nothing answers
+`changed: false`, with `activationId` and `previousVersionId` null.
+
+```json
+{
+  "action": "activate",
+  "activationId": "3e96812b-…",
+  "previousVersionId": "d9698ddd-…",
+  "targetVersionId": "c0d77dad-…",
+  "changed": true,
+  "registryVersion": { "id": "c0d77dad-…", "checksum": "1bd74ebe…" }
+}
 ```
 
 ## `POST /registry/v1/admin/versions/{version_id}/rollback`
@@ -2124,54 +2201,12 @@ current digest in `details.digest`. The write is the one
 the same way, with the `digest` beside it. Only an importing version is
 writable.
 
-## `GET /registry/v1/admin/shadow`
-### `GET /registry/v1/admin/versions/{version_id}/shadow`
-### description:
-
-What the active version — or a validated candidate, before activating it —
-says against what the static constants in the Worker still say. `agrees` is
-the one flag a check can read; `differences` names every field the two answer
-differently, and `onlyInStatic` / `onlyInRegistry` the markets only one of
-them describes.
-
-`disabledInRegistry` names the markets the constants describe and the
-version holds but switches off. They are neither a difference nor a gap — an
-operator decided not to serve them — so `agrees` does not count them, and a
-disabled market's fields are not compared: its known differences leave
-`differences` with it. A market listed here that is meant to be served is a
-review to fix, however few differences the report shows.
-
-```json
-{
-  "agrees": false,
-  "shadow": {
-    "versionId": "8f1e0f3c-3b7a-4e8f-9a1b-1f0f0b9a2c44",
-    "checksum": "1bd74ebe...",
-    "networks": [ "ethereum-mainnet", "polygon-mainnet", "..." ],
-    "staticMarkets": 29,
-    "registryMarkets": 29,
-    "onlyInStatic": [],
-    "onlyInRegistry": [],
-    "disabledInRegistry": [],
-    "differences": [
-      {
-        "scope": "1/wbtc",
-        "field": "baseAsset.priceFeed",
-        "static": "0xf4030086522a5beea4988f8ca5b36dbc97bee88c",
-        "registry": "0xfdfd9c85ad200c506cf9e21f1fd8dd01932fbb23"
-      }
-    ]
-  }
-}
-```
-
 ## `GET /registry/v1/admin/versions/{version_id}/changes`
 ### description:
 
 What a version changes against the version that is on: the networks and
 markets it adds or drops, and every fact and decision of the others that
-differs. It is what to read before switching a newer version on, where the
-shadow comparison only measures against the static constants.
+differs. It is what to read before switching a newer version on.
 
 It answers for a candidate that is still importing as well, because that is
 when a market the source has added is described: such a market is listed

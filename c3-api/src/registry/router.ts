@@ -7,6 +7,7 @@ import { knownFailure } from '../http/failures.js';
 import type * as Evaluator from '../evaluator.js';
 
 import { routeAdmin } from './admin-router.js';
+import type { CachedSnapshot } from './cache.js';
 import { activeSnapshot, cacheDepsOf, isUnreachable, versionSnapshot, warmSnapshot } from './cache.js';
 import { deprecatedDecisions, recordDeprecatedCollaterals } from './deprecated-collaterals.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
@@ -15,6 +16,7 @@ import { routePublic } from './public-router.js';
 import { catalogHeadersOf, requestCatalog } from './request-catalog.js';
 import type * as TokenCollateral from './token-collateral.js';
 import { DEADLINE_MS, maxStaleMinutesOf } from './token-collateral.js';
+import { registryHeaders } from './version-headers.js';
 
 /*
  * The registry entry point: everything under /registry/v1 is answered here,
@@ -53,6 +55,21 @@ function isAdminPath(pathname: string): boolean {
  */
 function withoutTrailingSlash(pathname: string): string {
   return pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+}
+
+/*
+ * What a public answer that failed after the active version was read says of
+ * that version, as a legacy route's failure does: whether a chain or a market
+ * is known depends on the version, so a 404 that does not name it cannot be
+ * told apart from one an older version gave. A version the cache served
+ * because D1 could not be reached is named with its age, and the answer may
+ * not be kept.
+ */
+function servedHeaders({ snapshot, staleFor }: CachedSnapshot): Record<string, string> {
+  return {
+    ...registryHeaders(snapshot.registryVersion),
+    ...(staleFor === null ? {} : { 'X-Registry-Stale': String(staleFor), 'Cache-Control': 'no-store' }),
+  };
 }
 
 /*
@@ -166,12 +183,14 @@ async function routeRegistry(
    * says which version that was.
    */
   const registry = requestCatalog(deps);
+  // the active version a handler has read: a public answer that fails after that names it
+  let served: CachedSnapshot | null = null;
   const context: RegistryContext = {
     db:      env.APP_DB,
     actor:   env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`,
     requestId,
     debug,
-    active:  () => activeSnapshot(deps),
+    active:  async () => (served = await activeSnapshot(deps)),
     version: versionId => versionSnapshot(deps, versionId),
     /*
      * Warming is an optimization, and an optimization may not fail a command
@@ -219,7 +238,7 @@ async function routeRegistry(
       pathname,
       debug,
       label:   'registry route',
-      headers: cors,
+      headers: { ...cors, ...(route === 'public' && served !== null ? servedHeaders(served) : {}) },
     });
   }
   return withHeaders(response, catalogHeadersOf(registry));

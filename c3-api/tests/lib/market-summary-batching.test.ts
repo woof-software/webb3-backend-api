@@ -374,8 +374,8 @@ t.test('each market of the summary has what its version says of it, and its base
     'the summary of a network answers each of its markets alike');
 
   const wbtc  = catalog.marketAt('ethereum-mainnet', WBTC)!.comet;
-  const alone = await (await marketHandlers.latestSummary({ ...everyMarket(), network: 'ethereum-mainnet', contract: wbtc }, context())).json() as Summary;
-  t.equal(JSON.stringify(alone), JSON.stringify(entryOf(every, WBTC)), 'and so does the summary of one market');
+  const alone = await (await marketHandlers.latestSummary({ ...everyMarket(), network: 'ethereum-mainnet', contract: wbtc }, context())).json() as Summary[];
+  t.equal(JSON.stringify(alone), JSON.stringify([ entryOf(every, WBTC) ]), 'and so does the summary of one market, a list of it alone');
   t.equal(node.requests.length - asked, 8, 'four node requests each, as before');
 });
 
@@ -508,13 +508,11 @@ t.test('a market whose base feed reverts answers every field it can', async t =>
   )));
   const totals = [ 'total_borrow_value', 'total_supply_value', 'total_borrow_value_usd', 'total_supply_value_usd' ];
 
-  const described = VERSION_KEYS;
-
   const wbtc = entryOf(reverting, WBTC);
   t.strictSame(wbtc, { ...without(entryOf(reading, WBTC), ...totals, 'base_price'), status: 'error', message: 'execution reverted' },
     'WBTC: an error, and every field as read but its borrow and supply totals and its base price');
   t.strictSame(Object.keys(wbtc), [
-    'chain_id', 'comet', ...described, 'status', 'message', 'borrow_apr', 'supply_apr', 'total_collateral_value', 'total_collateral_value_usd',
+    'chain_id', 'comet', ...VERSION_KEYS, 'status', 'message', 'borrow_apr', 'supply_apr', 'total_collateral_value', 'total_collateral_value_usd',
     'utilization', 'base_usd_price', 'collateral_asset_symbols', 'collaterals',
   ], 'WBTC: its message after its status');
   t.equal(wbtc.base_usd_price, '86106.69', 'WBTC: its USD price, which is the price of BTC');
@@ -523,7 +521,7 @@ t.test('a market whose base feed reverts answers every field it can', async t =>
   t.strictSame(usdc, { ...without(entryOf(reading, USDC), ...totals, 'base_usd_price', 'base_price'), status: 'error', message: 'execution reverted' },
     'USDC: an error, and every field as read but its totals and both its prices');
   t.strictSame(Object.keys(usdc), [
-    'chain_id', 'comet', ...described, 'status', 'message', 'borrow_apr', 'supply_apr', 'total_collateral_value', 'total_collateral_value_usd',
+    'chain_id', 'comet', ...VERSION_KEYS, 'status', 'message', 'borrow_apr', 'supply_apr', 'total_collateral_value', 'total_collateral_value_usd',
     'utilization', 'collateral_asset_symbols', 'collaterals',
   ], 'USDC: its message after its status');
 
