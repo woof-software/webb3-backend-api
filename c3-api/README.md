@@ -185,7 +185,10 @@ statements or batches — and about thirty for the run.
 
 `wrangler.toml` sets no `[limits]`, so stage and production have the plan's
 defaults: an import of the whole source, or the summary of every market — four
-calls to the node provider proxy per network — stays far inside its
+calls to the node provider proxy per network, and two D1 statements for the
+decisions it marks collaterals with; in a minute nobody has valued a network's
+collateral in, one more call for that network, and a KV read and write of its
+record ([Token Visibility](#token-visibility)) — stays far inside its
 subrequests. The history of every market, with none of its days cached,
 stays inside them as well: three calls to the proxy per market and one per
 network, beside four KV operations for each day of each market — about 3,600

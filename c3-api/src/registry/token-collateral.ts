@@ -86,8 +86,12 @@ const LOOKBACK_DEADLINE_MS = 1_000;
  */
 const ABANDONED_AFTER_MS = 30_000;
 
-// how many minutes an isolate keeps, per KV namespace
-const RECENT_RECORDS = 64;
+/*
+ * How many records an isolate keeps, per KV namespace: the summary of every
+ * network makes one a minute for each of the ten mainnets, and a lookback,
+ * which reads from KV what is not kept, reaches back 15 minutes by default.
+ */
+const RECENT_RECORDS = 170;
 
 /*
  * A minute some of whose reads failed in transport is kept in the isolate
@@ -486,15 +490,44 @@ async function earlierMinutes(
   return records;
 }
 
+// the chain's latest block, or null where the node did not give it in time
+async function latestBlock(
+  deps: TokenCollateralDeps,
+  evaluator: Evaluator.Implementation<Dependencies>,
+  request: { chainId: number, network: KnownNetwork.Name },
+  started: number,
+  left: () => number,
+): Promise<BlockRef | null> {
+  try {
+    const latest = await withDeadline(
+      evaluator.evaluate(evaluator.pull1({
+        ethGetBlock: { ...deps.frame, network: request.network, blockReference: 'latest' },
+      })) as Promise<{ number: number, timestamp: number }>,
+      left(),
+    );
+    if (latest === TIMED_OUT) {
+      timedOut(request.chainId, 'block', started);
+      return null;
+    }
+    return latest;
+  } catch (error) {
+    deps.debug.error(`the latest block could not be read`, { chainId: request.chainId, error });
+    return null;
+  }
+}
+
 /*
  * What a request knows about the collateral of one chain. A latest block the
  * node does not give in time leaves only earlier minutes, looked back on from
  * the clock's minute; so does a minute that cannot be valued in time. The
- * node gets one deadline for both, and KV a short one of its own.
+ * node gets one deadline for both, and KV a short one of its own. A caller
+ * that has read the latest block for reads of its own, as the summary has,
+ * passes it, and the minute has the whole deadline.
  */
 async function collateralView(
   deps: TokenCollateralDeps,
   request: { chainId: number, network: KnownNetwork.Name, positions: Position[], versionId: string },
+  latest?: BlockRef,
 ): Promise<CollateralView> {
   const networkEnv  = KnownNetwork.isNameOfTestnet(request.network) ? 'testnet' : 'mainnet';
   const evaluator   = deps.evaluator(networkEnv);
@@ -505,23 +538,9 @@ async function collateralView(
   const positionSet = positionSetOf(request.positions);
   const keyed       = { ...request, positionSet };
 
-  let block: BlockRef | null = null;
-  try {
-    const latest = await withDeadline(
-      evaluator.evaluate(evaluator.pull1({
-        ethGetBlock: { ...deps.frame, network: request.network, blockReference: 'latest' },
-      })) as Promise<{ number: number, timestamp: number }>,
-      left(),
-    );
-    if (latest === TIMED_OUT) {
-      timedOut(request.chainId, 'block', started);
-    } else {
-      // only what identifies the block: the read carries its transactions too
-      block = { number: latest.number, timestamp: latest.timestamp };
-    }
-  } catch (error) {
-    deps.debug.error(`the latest block could not be read`, { chainId: request.chainId, error });
-  }
+  const found = latest ?? await latestBlock(deps, evaluator, request, started, left);
+  // only what identifies the block: a read of it carries its transactions too
+  const block = found === null ? null : { number: found.number, timestamp: found.timestamp };
 
   if (request.positions.length === 0) {
     return { block, current: null, earlier: [] };

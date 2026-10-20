@@ -6,6 +6,8 @@ import * as jsonRpc  from '../../lib/json-rpc.js';
 import { BigNumber } from '../../lib/bignumber.js';
 import { BigFixnum } from '../../lib/bigfixnum.js';
 
+import { checksumAddress } from '../../lib/model/comet-registry.js';
+
 import * as Evaluator  from '../../lib/symbolic/evaluator.js';
 import { MemoryCache } from '../../lib/symbolic/cache.js';
 
@@ -23,9 +25,11 @@ import {
 } from '../../src/router.js';
 
 import { consoleLines } from '../util/console.js';
-import { type Call, type FakeNode, fakeNode, serve } from '../util/fake-node.js';
+import { type Call, type FakeNode, fakeNode, isValuation, serve, valuations } from '../util/fake-node.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../util/registry-fixture.js';
 import { REGISTRY_KEYS } from '../util/summary-registry-fields.js';
+import { COLLATERAL_KEYS } from '../util/summary-token-fields.js';
+import { summaryTokens } from '../util/token-collateral.js';
 
 import '../../shim/node-self.js';
 
@@ -92,13 +96,17 @@ function everyMarket(): MarketRouteData {
 /*
  * What the router hands a handler that makes its own evaluator. Every
  * evaluation the handler starts is kept in `evaluations`: a summary that one
- * network fails answers without waiting for the others, and a test waits for
- * them, so none of them asks a node after it ends.
+ * network fails answers without waiting for the others, and a test waits
+ * until none of them is running and none starts, so none of them asks a node
+ * after it ends. The collateral of each chain is valued by an isolate of its
+ * own unless a test passes `tokens`, and what it leaves running is in their
+ * `background`.
  */
-function context(evaluations: Promise<unknown>[] = []): UninstantiatedContext {
+function context(evaluations: Promise<unknown>[] = [], tokens = summaryTokens()): UninstantiatedContext {
   const cache = new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]);
   return {
     flags,
+    tokens,
     instantiateEvaluator: (_: string, overrides: { flags?: Flags.SomeFlags } = {}) => {
       const evaluator = Evaluator.instantiate(
         { ...evm, ...comet, ...market, ...rewards } as any,
@@ -116,40 +124,62 @@ function context(evaluations: Promise<unknown>[] = []): UninstantiatedContext {
   } as unknown as UninstantiatedContext;
 }
 
-// how the summary of every market failed, once every evaluation it started has ended
+// how the summary of every market failed, once every evaluation and every valuation it started has ended, and no more start
 async function failureOf(node: FakeNode, t: Test): Promise<unknown> {
   serve(t, node);
   const evaluations: Promise<unknown>[] = [];
-  const failure = await marketHandlers.latestSummary(everyMarket(), context(evaluations)).then(
+  const tokens = summaryTokens();
+  const failure = await marketHandlers.latestSummary(everyMarket(), context(evaluations, tokens)).then(
     () => null,
     (error: unknown) => error,
   );
-  await Promise.allSettled(evaluations);
+  // a network's markets and its valuation start only once its block is read, which can be after the summary failed
+  for (let waited = -1; waited !== evaluations.length + tokens.collateral.background.length;) {
+    waited = evaluations.length + tokens.collateral.background.length;
+    await Promise.allSettled([ ...evaluations, ...tokens.collateral.background ]);
+  }
   return failure;
 }
 
-t.test('the summary of every market makes four node requests per network', async t => {
+const NETWORKS = [ ...new Set(catalog.markets().map(entry => entry.network)) ];
+
+// what the summary itself asked the node of a network: every request but the valuation of the network's collateral
+const summaryRequests = (node: FakeNode, network: string) => node.requests.filter(request => request.network === network && !isValuation(request));
+
+/*
+ * The collateral of each network is valued as the token list values it, at
+ * the latest block the summary read, in one batch beside the summary's own
+ * rounds, and only in a minute nobody has valued: the next request of the
+ * minute answers from the record of it.
+ */
+t.test('the summary of every market makes four node requests per network, and one to value its collateral in a minute nobody has', async t => {
   const node = nodeOf();
   serve(t, node);
+  const tokens = summaryTokens();
 
-  const response = await marketHandlers.latestSummary(everyMarket(), context());
+  const response = await marketHandlers.latestSummary(everyMarket(), context([], tokens));
   const body = await response.json() as Array<{ status: string }>;
 
   t.equal(response.status, 200);
   t.equal(body.length, catalog.markets().length, 'every market is answered');
   t.ok(body.every(entry => entry.status === 'success'));
 
-  const networks = [ ...new Set(catalog.markets().map(entry => entry.network)) ];
-  for (const network of networks) {
-    const requests = node.requests.filter(request => request.network === network);
-    t.equal(requests.length, 4, `${network}: the latest block, then three rounds of reads, whatever its market count`);
+  for (const network of NETWORKS) {
+    t.equal(summaryRequests(node, network).length, 4, `${network}: the latest block, then three rounds of reads, whatever its market count`);
+    t.equal(valuations(node).filter(request => request.network === network).length, 1, `${network}: and one batch that values its collateral`);
   }
-  t.equal(node.requests.length, 4 * networks.length);
+  t.equal(node.requests.length, 5 * NETWORKS.length);
 
   for (const { network, calls } of node.requests) {
     const distinct = new Set(calls.map(({ method, params }) => JSON.stringify([ method, params ])));
     t.equal(distinct.size, calls.length, `${network}: no call is sent twice in one batch`);
   }
+
+  // a summary whose computations are not cached, in the same minute of the same isolate
+  node.requests.length = 0;
+  t.equal((await marketHandlers.latestSummary(everyMarket(), context([], tokens))).status, 200);
+  t.equal(valuations(node).length, 0, 'the next request of the minute values no collateral');
+  t.equal(node.requests.length, 4 * NETWORKS.length, 'and makes the four requests of each network alone');
 });
 
 /*
@@ -352,8 +382,10 @@ t.test('each market of the summary has what its version says of it, and its base
   const node = nodeOf();
   serve(t, node);
   pricingWbtcInBtc(t);
+  // one isolate's: the forms after the first answer the collateral from the minute it valued
+  const tokens = summaryTokens();
 
-  const every = await (await marketHandlers.latestSummary(everyMarket(), context())).json() as Summary[];
+  const every = await (await marketHandlers.latestSummary(everyMarket(), context([], tokens))).json() as Summary[];
   t.equal(every.length, catalog.markets().length, 'every market is answered');
   for (const { network, deploymentKey, comet } of catalog.markets()) {
     const entry = entryOf(every, comet.address.toLowerCase());
@@ -369,14 +401,14 @@ t.test('each market of the summary has what its version says of it, and its base
     'the WBTC market: its base price, WBTC in BTC, beside the price of BTC in USD');
 
   const asked = node.requests.length;
-  const mainnet = await (await marketHandlers.latestSummary({ ...everyMarket(), network: 'ethereum-mainnet' }, context())).json() as Summary[];
+  const mainnet = await (await marketHandlers.latestSummary({ ...everyMarket(), network: 'ethereum-mainnet' }, context([], tokens))).json() as Summary[];
   t.equal(JSON.stringify(mainnet), JSON.stringify(every.filter(entry => entry.chain_id === 1)),
     'the summary of a network answers each of its markets alike');
 
   const wbtc  = catalog.marketAt('ethereum-mainnet', WBTC)!.comet;
-  const alone = await (await marketHandlers.latestSummary({ ...everyMarket(), network: 'ethereum-mainnet', contract: wbtc }, context())).json() as Summary[];
+  const alone = await (await marketHandlers.latestSummary({ ...everyMarket(), network: 'ethereum-mainnet', contract: wbtc }, context([], tokens))).json() as Summary[];
   t.equal(JSON.stringify(alone), JSON.stringify([ entryOf(every, WBTC) ]), 'and so does the summary of one market, a list of it alone');
-  t.equal(node.requests.length - asked, 8, 'four node requests each, as before');
+  t.equal(node.requests.length - asked, 8, 'four node requests each, as before, in a minute whose collateral is valued');
 });
 
 /*
@@ -456,6 +488,78 @@ t.test('a market whose version has no rewards contract, no bulker or no slug lea
   const rest = summary.filter(entry => entry !== usdt);
   t.strictSame(rest.map(entry => 'slug' in entry), rest.map(() => false), 'and no other market has a slug');
   t.strictSame(summary.map(entry => entry.status), summary.map(() => 'success'), 'each market a success all the same');
+});
+
+type Collateral = { address: string, symbol: string, status: string, [field: string]: unknown };
+
+const collateralsOf = (entry: Summary) => entry.collaterals as Collateral[];
+const collateralOf  = (entry: Summary, symbol: string) => collateralsOf(entry).find(collateral => collateral.symbol === symbol)!;
+
+/*
+ * After what was read of each collateral, the summary answers what the token
+ * list says of its token: its name and decimals, whether this market's Comet
+ * has it deprecated, and what holds of the token across the whole chain. A
+ * collateral whose price reverts keeps its message after its status, a market
+ * whose base asset could not be priced answers its collaterals so all the
+ * same, and a value of the chain nobody could read is left out. COMP's price
+ * reverts in USDC's market only, so its value across the chain is unknown in
+ * every market that takes it, USDT's too, where its own price was read.
+ */
+t.test('every collateral answers what the token list says of its token after what was read of it, in every form', async t => {
+  consoleLines(t, [ 'warn' ]);
+  const comp = marketOf(USDC).collateralAssets.find(asset => asset.token.symbol === 'COMP')!;
+  const node = nodeOf((comet, fragment, argument) => fragment === 'getPrice' && (
+    (comet === USDC && argument === comp.priceFeed.address) || (comet === WBTC && argument === marketOf(WBTC).baseAsset.priceFeed.address)
+  ) ? REVERT : undefined);
+  serve(t, node);
+  const tokens = summaryTokens();
+  const every = await (await marketHandlers.latestSummary(everyMarket(), context([], tokens))).json() as Summary[];
+
+  const unknown = [ 'total_network_collateral_value_usd', 'network_value_at', 'network_value_block', 'network_value_stale_age_seconds' ];
+  for (const entry of every) {
+    for (const collateral of collateralsOf(entry)) {
+      const keys = COLLATERAL_KEYS
+        .flatMap((key): string[] => key === 'status' && collateral.status === 'error' ? [ key, 'message' ] : [ key ])
+        .filter(key => collateral.symbol !== 'COMP' || entry.chain_id !== 1 || !unknown.includes(key));
+      t.strictSame(Object.keys(collateral), keys, `${entry.deployment_key} on ${entry.chain_id}, ${collateral.symbol}: what was read of it, then its token's fields`);
+    }
+  }
+
+  const usdc = collateralOf(entryOf(every, USDC), 'COMP');
+  t.strictSame(usdc, {
+    address:  checksumAddress(comp.token.address),
+    symbol:   'COMP',
+    status:   'error',
+    message:  'execution reverted',
+    name:     comp.token.name,
+    decimals: comp.token.decimals,
+    is_deprecated:         false,
+    is_network_deprecated: false,
+    deprecated_in:         [],
+    is_strategic:          false,
+    network_roles:         [ 'reward', 'collateral' ],
+    total_network_collateral_value_status: 'unavailable',
+    network_value_exceptions: [],
+    is_visible:        true,
+    visibility_reason: 'data_unavailable',
+  }, 'COMP in USDC\'s market: its message, then a value across the chain nobody could read, left out, and shown for it');
+  const usdt = collateralOf(entryOf(every, USDT), 'COMP');
+  t.strictSame(usdt, { ...without(usdc, 'message'), status: 'success' }, 'COMP in USDT\'s market: its own price read, and the same of the chain');
+
+  const wbtc = entryOf(every, WBTC);
+  t.equal(wbtc.status, 'error', 'WBTC\'s market, whose base asset could not be priced');
+  t.ok(collateralsOf(wbtc).every(collateral => collateral.total_network_collateral_value_status === 'fresh'), 'answers its collaterals\' tokens, valued all the same');
+  const pumpBtc = collateralOf(wbtc, 'pumpBTC');
+  t.strictSame(
+    [ pumpBtc.total_network_collateral_value_usd, pumpBtc.network_value_block, pumpBtc.network_value_at, pumpBtc.network_value_stale_age_seconds ],
+    [ '86106.69', LATEST, new Date(LATEST.timestamp * 1000).toISOString(), 0 ],
+    'pumpBTC, which WBTC\'s market alone takes: one at 1 BTC, at the USD price of BTC, a decimal string, at the latest block the summary read',
+  );
+
+  const mainnet = await (await marketHandlers.latestSummary({ ...everyMarket(), network: 'ethereum-mainnet' }, context([], tokens))).json() as Summary[];
+  t.equal(JSON.stringify(mainnet), JSON.stringify(every.filter(entry => entry.chain_id === 1)), 'the summary of a network answers its collaterals alike');
+  const alone = await (await marketHandlers.latestSummary({ ...everyMarket(), network: 'ethereum-mainnet', contract: catalog.marketAt('ethereum-mainnet', USDT)!.comet }, context([], tokens))).json() as Summary[];
+  t.equal(JSON.stringify(alone), JSON.stringify([ entryOf(every, USDT) ]), 'and so does the summary of one market');
 });
 
 /*
@@ -569,9 +673,8 @@ t.test('a base feed that reverts is read through the Comet\'s in the requests th
   const others = (entries: Summary[]) => entries.filter(entry => entry.comet.address.toLowerCase() !== USDC);
   t.strictSame(others(summary), others(reading), 'and every other market as read');
 
-  const networks = [ ...new Set(catalog.markets().map(entry => entry.network)) ];
-  for (const network of networks) {
-    t.equal(node.requests.filter(request => request.network === network).length, 4, `${network}: four requests, as without the revert`);
+  for (const network of NETWORKS) {
+    t.equal(summaryRequests(node, network).length, 4, `${network}: four requests, as without the revert`);
   }
   for (const { network, calls } of node.requests) {
     const distinct = new Set(calls.map(({ method, params }) => JSON.stringify([ method, params ])));
