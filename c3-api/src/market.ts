@@ -9,9 +9,8 @@ import * as evm     from '../lib/computations/evm.js';
 import * as market  from '../lib/computations/market.js';
 import * as rewards from '../lib/computations/rewards.js';
 
-import { snakeifyCamelObject }   from '../lib/camel-snake.js';
-import { ROUTE_EVALUATOR_FLAGS } from '../lib/flags.js';
-import { throttle }              from '../lib/throttle.js';
+import { snakeifyCamelObject } from '../lib/camel-snake.js';
+import { throttle }            from '../lib/throttle.js';
 
 import { checksumAddress, type RegistryComet } from '../lib/model/comet-registry.js';
 import type { MarketIdentity } from '../lib/computations/market/market-summary.js';
@@ -24,7 +23,8 @@ import {
   AllNetworks,
   AllContracts,
   type MarketRouteData,
-  type UninstantiatedContext as UninstantiatedRouterContext,
+  type Context as RouterContext,
+  type MarketContext,
 } from './router.js';
 
 type Dependencies = (
@@ -136,18 +136,13 @@ function described<Summary extends MarketIdentity>({ chainId, comet, ...summary 
 
 async function latestSummary(
   { apiHost, nodeHost, nodeKey, network, contract, catalog }: MarketRouteData,
-  context: UninstantiatedRouterContext,
+  context: MarketContext,
 ): Promise<Response> {
   const selectedNetworks = networksOf(network);
   // once for every network, while their latest blocks are read
   const decisions = context.tokens.decisions();
 
-  const { evaluate, pipe1, pull1, split, value } = context.instantiateEvaluator('mainnet', {
-    flags: {
-      ...context.flags,
-      ...ROUTE_EVALUATOR_FLAGS,
-    },
-  });
+  const { evaluate, pipe1, pull1, split, value } = context.evaluator;
 
   const summary = await Promise.all(
     selectedNetworks.map(async (network) => {
@@ -214,7 +209,7 @@ async function latestSummary(
 
 async function latestRewardsSummary(
   { apiHost, nodeHost, nodeKey, network, contract }: MarketRouteData,
-  context: UninstantiatedRouterContext,
+  context: RouterContext,
 ): Promise<Response> {
   if (network === AllNetworks) {
     return new Response(
@@ -234,12 +229,7 @@ async function latestRewardsSummary(
     );
   }
 
-  const { evaluate, pipe1, pull1, value } = context.instantiateEvaluator('mainnet', {
-    flags: {
-      ...context.flags,
-      ...ROUTE_EVALUATOR_FLAGS,
-    },
-  });
+  const { evaluate, pipe1, pull1, value } = context.evaluator;
 
   /*
    * A market the version gives no rewards has no reward price to value them
@@ -276,7 +266,7 @@ async function latestRewardsSummary(
 
 async function historicalSummary(
   { apiHost, nodeHost, nodeKey, network, contract, catalog }: MarketRouteData,
-  context: UninstantiatedRouterContext,
+  context: RouterContext,
 ): Promise<Response> {
   const selectedNetworks = networksOf(network);
 
@@ -302,12 +292,7 @@ async function historicalSummary(
    * network as one: a batch holds the days of one market, some 1,500 reads
    * for the largest, which the node provider proxy sends on in pieces of 100.
    */
-  const { evaluate, pull1 } = context.instantiateEvaluator('mainnet', {
-    flags: {
-      ...context.flags,
-      ...ROUTE_EVALUATOR_FLAGS,
-    },
-  });
+  const { evaluate, pull1 } = context.evaluator;
 
   /*
    * Backfill by presuming the 1st sample extrapolates back into the past
@@ -417,16 +402,11 @@ async function historicalSummary(
 
 async function rewardsDappData(
   { apiHost, nodeHost, nodeKey, network, contract, catalog }: MarketRouteData,
-  context: UninstantiatedRouterContext,
+  context: RouterContext,
 ): Promise<Response> {
   const selectedNetworks = networksOf(network);
 
-  const evaluator = context.instantiateEvaluator('mainnet', {
-    flags: {
-      ...context.flags,
-      ...ROUTE_EVALUATOR_FLAGS,
-    },
-  });
+  const evaluator = context.evaluator;
 
   const marketRewards = await Promise.all(
     selectedNetworks.map(async (networkName) => {

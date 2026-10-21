@@ -66,10 +66,7 @@ function withoutTrailingSlash(pathname: string): string {
  * not be kept.
  */
 function servedHeaders({ snapshot, staleFor }: CachedSnapshot): Record<string, string> {
-  return {
-    ...registryHeaders(snapshot.registryVersion),
-    ...(staleFor === null ? {} : { 'X-Registry-Stale': String(staleFor), 'Cache-Control': 'no-store' }),
-  };
+  return registryHeaders(snapshot.registryVersion, staleFor);
 }
 
 /*

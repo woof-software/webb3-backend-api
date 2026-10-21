@@ -52,11 +52,11 @@ interface Context extends Evaluator.Context {
 }
 
 /*
- * An UninstantiatedContext lets a handler instantiate its own evaluator.
+ * What the router hands a market handler: the evaluator it made for the
+ * route, and what the summary adds to each collateral from the token list
+ * (summary-tokens.ts).
  */
-interface UninstantiatedContext extends Evaluator.Context {
-  instantiateEvaluator: Evaluator.InstantiateFn<Scope>;
-  // what the summary adds to each collateral from the token list (summary-tokens.ts)
+interface MarketContext extends Context {
   tokens: SummaryTokens;
 }
 
@@ -438,9 +438,14 @@ async function unsafeRoute(
       queryParams: url.searchParams,
       catalog,
     };
-    // every market handler makes its own evaluator, with the flags its reads need
-    const handler = handlerMappings[resourceApi][strippedEndpointSuffix];
-    return handler(data, { ...context, instantiateEvaluator, tokens: summaryTokensOf(context, instantiateEvaluator) });
+    /*
+     * One evaluator for whichever market route answers: in the mainnet
+     * storage, as no market route reaches a testnet, and with
+     * ROUTE_EVALUATOR_FLAGS, whatever the environment sets.
+     */
+    const evaluator = instantiateEvaluator('mainnet', { flags: { ...context.flags, ...ROUTE_EVALUATOR_FLAGS } });
+    const handler   = handlerMappings[resourceApi][strippedEndpointSuffix];
+    return handler(data, { ...context, evaluator, tokens: summaryTokensOf(context, instantiateEvaluator) });
   }
 
   const maybeWellKnownContract = (() => {
@@ -517,7 +522,7 @@ export {
 
 export type {
   Context,
-  UninstantiatedContext,
+  MarketContext,
   // route data types
   V2RouteData,
   MarketRouteData,

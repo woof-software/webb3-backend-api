@@ -14,8 +14,8 @@ import {
   AllNetworks,
   type AccountRouteData,
   type Context,
+  type MarketContext,
   type MarketRouteData,
-  type UninstantiatedContext,
 } from '../../src/router.js';
 
 import { consoleLines } from '../util/console.js';
@@ -122,25 +122,21 @@ const valuedAtADollar = () => evaluatorOver({
   assetCollateralValue: stub(() => ({ status: 'success', valueUsd: BigFixnum.from({ value: 1 }) })),
 });
 
-// as the router hands a handler that makes its own evaluator, with the flags it asks for
+// as the router hands a market handler the evaluator it made, with the route's flags
 function uninstantiated(answer: Answer) {
-  const made: Array<ReturnType<typeof evaluatorOf>> = [];
+  const evaluator = evaluatorOf(answer, Flags.ROUTE_EVALUATOR_FLAGS);
   const context = {
     // a local run, whose history samples one day
     flags: { ...flags, environment: 'local' },
+    evaluator,
     tokens: summaryTokens({ evaluator: valuedAtADollar }),
-    instantiateEvaluator: (_: string, overrides: { flags?: Flags.SomeFlags } = {}) => {
-      const evaluator = evaluatorOf(answer, overrides.flags);
-      made.push(evaluator);
-      return evaluator;
-    },
-    evaluations: () => made.reduce((total, evaluator) => total + evaluator.evaluations, 0),
+    evaluations: () => evaluator.evaluations,
   };
-  return context as unknown as UninstantiatedContext & { evaluations(): number };
+  return context as unknown as MarketContext & { evaluations(): number };
 }
 
 // as the router hands a handler an evaluator it made: with the request's flags, and those it sets for the route
-function instantiated(answer: Answer, overrides: Flags.SomeFlags = {}): Context {
+function instantiated(answer: Answer, overrides: Flags.SomeFlags): Context {
   return { flags: { ...flags, environment: 'local' }, evaluator: evaluatorOf(answer, overrides) } as unknown as Context;
 }
 

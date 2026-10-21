@@ -45,8 +45,8 @@ const COMET = new Interface([
 
 type Block = { number: number, timestamp: number };
 type Call  = { id: number, method: string, params: any[] };
-// a call to a Comet, or to a token, with its argument where it takes one: an asset's index, a feed or a token
-type Read  = { network: string, comet: string, name: string, argument?: string | undefined };
+// a call to a Comet, or to a token, at the block it reads, with its argument where it takes one: an asset's index, a feed or a token
+type Read  = { network: string, comet: string, name: string, argument?: string | undefined, block: number };
 // what the node answers instead of the result of a call
 type NodeError = { code: number, message: string, data?: string };
 
@@ -82,11 +82,11 @@ function fakeNode(snapshot: RegistrySnapshotV1, latest: Block, script: NodeScrip
         ? { jsonrpc: '2.0', id, error: { code: -32000, message: 'header not found' } }
         : { jsonrpc: '2.0', id, result: { number: `0x${block.number.toString(16)}`, timestamp: `0x${block.timestamp.toString(16)}`, transactions: [] } };
     }
-    const [ { to, data } ] = params;
+    const [ { to, data }, tag ] = params;
     const contract = to.toLowerCase();
     const fragment = COMET.getFunction(data.slice(0, 10)) as FunctionFragment;
     const argument: string | undefined = COMET.decodeFunctionData(fragment, data)[0]?.toString().toLowerCase();
-    const scripted = script.answer?.({ network, comet: contract, name: fragment.name, argument });
+    const scripted = script.answer?.({ network, comet: contract, name: fragment.name, argument, block: Number.parseInt(tag, 16) });
     if (scripted !== undefined && !Array.isArray(scripted)) {
       return { jsonrpc: '2.0', id, error: scripted === 'revert' ? REVERTED : scripted === 'fail' ? FAILED : scripted };
     }
