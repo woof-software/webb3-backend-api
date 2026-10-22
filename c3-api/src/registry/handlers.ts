@@ -16,8 +16,8 @@ import { jsonResponse } from '../http/json.js';
 import type { Log } from '../log.js';
 
 import type { CachedSnapshot, PinnedVersion } from './cache.js';
-import type { DeprecatedDecisions, DeprecatedRead } from './deprecated-collaterals.js';
-import { deprecatedRepresentation, markedMarket, markedNetwork } from './deprecated-collaterals.js';
+import type { CollateralMarks, DeprecatedRead, HiddenRead } from './deprecated-collaterals.js';
+import { markedMarket, markedNetwork, markedRepresentation } from './deprecated-collaterals.js';
 import { conflict } from './errors.js';
 import type { RequestCatalog } from './request-catalog.js';
 import type { TokenCollateralDeps } from './token-collateral.js';
@@ -93,14 +93,17 @@ type RegistryContext = {
    */
   warm: (versionId: string) => Promise<void>,
   /*
-   * The deprecated decisions of every chain, which the active reads mark the
-   * collaterals of the active version with (deprecated-collaterals.ts): read
-   * from D1, or during an outage from the record the Worker keeps of them.
-   * `recordDeprecated` keeps that record, after a command that may have
-   * changed them; it never fails the command.
+   * The deprecated decisions of every chain, and the hidden ones, which the
+   * active reads mark the collaterals of the active version with
+   * (deprecated-collaterals.ts): read from D1, or during an outage from the
+   * record the Worker keeps of each kind. `recordDeprecated` and
+   * `recordHidden` keep those records, after a command that may have changed
+   * them; neither fails the command.
    */
   deprecated:       () => Promise<DeprecatedRead>,
+  hidden:           () => Promise<HiddenRead>,
   recordDeprecated: () => Promise<void>,
+  recordHidden:     () => Promise<void>,
   /*
    * The registry version of the request as the market routes load it, so the
    * token list values a chain's markets from the same catalog they use.
@@ -116,20 +119,21 @@ const SCHEMA_VERSION = 1;
  * The revision of what these routes send for a version. A body is the version
  * as this release presents it, and a release can change that for a version
  * that is already active: the one that stopped listing a network with no
- * served market did, so did the one that marked legacy collaterals, and so
- * did the one that renamed that mark `isDeprecated`. A tag that named the
- * version alone would then confirm, with a 304, a copy an earlier release
- * sent, for as long as that version stays active; so a release that changes
- * what a route sends for a version that already exists moves this on.
+ * served market did, so did the one that marked legacy collaterals, so did
+ * the one that renamed that mark `isDeprecated`, and so did the one that
+ * marked hidden collaterals beside it. A tag that named the version alone
+ * would then confirm, with a 304, a copy an earlier release sent, for as long
+ * as that version stays active; so a release that changes what a route sends
+ * for a version that already exists moves this on.
  */
-const REPRESENTATION_REVISION = 4;
+const REPRESENTATION_REVISION = 5;
 
 /*
  * The strong ETag of one representation: schema version, the revision of what
  * is sent, what was asked for, the version id, and its checksum. It needs
  * nothing but the reference to the version, and for a read that marks
- * deprecated collaterals the flags it marks, so a conditional request is
- * decided before any of its bytes are read.
+ * collaterals the flags it marks, so a conditional request is decided before
+ * any of its bytes are read.
  *
  * The representation is part of it because these routes serve different
  * bodies from the same version. An ETag that named the version alone would
@@ -161,9 +165,9 @@ async function snapshotResponse(
   const etag    = etagOf(ref, representation);
   /*
    * A stale answer is the version that was active when D1 last answered, or
-   * one marked with the deprecated decisions last recorded, and it must not be
-   * stored anywhere: not in a browser, not in a CDN, not under a conditional
-   * request. It names its own age, so a client that cares can refuse it.
+   * one marked with decisions last recorded, and it must not be stored
+   * anywhere: not in a browser, not in a CDN, not under a conditional request.
+   * It names its own age, so a client that cares can refuse it.
    */
   const stale   = staleFor !== undefined && staleFor !== null;
   const headers = {
@@ -214,35 +218,44 @@ async function activeSnapshot(context: RegistryContext): Promise<CachedSnapshot>
 }
 
 /*
- * The active snapshot and the deprecated decisions its collaterals are marked
- * with, read side by side. The version decides first: one that could not be
- * read fails the request, whatever the decisions did, and the decisions are
- * taken (`deprecated`) only once the version has selected what they mark, so
- * a request the version refuses — a chain id that is not one, a chain it does
- * not hold, a market it does not serve — is refused as it always has been.
- * Only a request the version answers fails for want of the decisions.
+ * The active snapshot and the decisions its collaterals are marked with, the
+ * deprecated and the hidden ones, read side by side. The version decides
+ * first: one that could not be read fails the request, whatever the decisions
+ * did, and the decisions are taken (`decided`) only once the version has
+ * selected what they mark, so a request the version refuses — a chain id that
+ * is not one, a chain it does not hold, a market it does not serve — is
+ * refused as it always has been. Only a request the version answers fails for
+ * want of the decisions, of either kind.
  *
- * Decisions that came from the record rather than from D1 are not confirmed
+ * Decisions that came from a record rather than from D1 are not confirmed
  * either, so the answer says so as one from an older version does: as that
  * version's age, or as 0 seconds old when the version itself was read now.
+ * One kind from its record is enough.
  */
-async function activeWithDeprecated(context: RegistryContext): Promise<{
-  snapshot:   RegistrySnapshotV1,
-  // the decisions, and how stale an answer marked with them is; it throws what reading them failed with
-  deprecated: () => { decisions: DeprecatedDecisions, staleFor: number | null },
+async function activeWithDecisions(context: RegistryContext): Promise<{
+  snapshot: RegistrySnapshotV1,
+  // the decisions, and how stale an answer marked with them is; it throws what reading either kind failed with
+  decided:  () => { marks: CollateralMarks, staleFor: number | null },
 }> {
-  const [ active, deprecated ] = await Promise.allSettled([ activeSnapshot(context), context.deprecated() ]);
+  const [ active, deprecated, hidden ] = await Promise.allSettled([ activeSnapshot(context), context.deprecated(), context.hidden() ]);
   if (active.status === 'rejected') {
     throw active.reason;
   }
   const { snapshot, staleFor } = active.value;
   return {
     snapshot,
-    deprecated: () => {
+    decided: () => {
       if (deprecated.status === 'rejected') {
         throw deprecated.reason;
       }
-      return { decisions: deprecated.value.decisions, staleFor: staleFor ?? (deprecated.value.recorded ? 0 : null) };
+      if (hidden.status === 'rejected') {
+        throw hidden.reason;
+      }
+      const recorded = deprecated.value.recorded || hidden.value.recorded;
+      return {
+        marks:    { deprecated: deprecated.value.decisions, hidden: hidden.value.decisions },
+        staleFor: staleFor ?? (recorded ? 0 : null),
+      };
     },
   };
 }
@@ -304,17 +317,18 @@ function marketOf(network: NetworkV1, address: string): ServedMarket {
  * order as the bootstrap snapshot; none of them resolves "latest" on its own.
  *
  * The bootstrap snapshot and the market reads mark every collateral with
- * whether it is deprecated in its Comet, by the decisions in force when they
- * answer, and their tags name the flags they carry (deprecatedRepresentation).
- * The flags are not part of the version, so the version read by id, which
- * serves the version as it was imported, carries none.
+ * whether it is deprecated in its Comet, and whether it is hidden there, by
+ * the decisions in force when they answer, and their tags name the flags they
+ * carry (markedRepresentation). The flags are not part of the version, so the
+ * version read by id, which serves the version as it was imported, carries
+ * none.
  */
 async function getActive(request: Request, context: RegistryContext, maxAge: number): Promise<Response> {
-  const { snapshot, deprecated } = await activeWithDeprecated(context);
-  const { decisions, staleFor } = deprecated();
+  const { snapshot, decided } = await activeWithDecisions(context);
+  const { marks, staleFor } = decided();
   const served   = selectable(snapshot);
-  const networks = served.networks.map(network => markedNetwork(network, decisions));
-  return snapshotResponse(request, versionRef(snapshot), deprecatedRepresentation('snapshot', networks), () => ({
+  const networks = served.networks.map(network => markedNetwork(network, marks));
+  return snapshotResponse(request, versionRef(snapshot), markedRepresentation('snapshot', networks), () => ({
     ...served,
     networks,
   }), { maxAge, staleFor });
@@ -330,12 +344,12 @@ async function getNetworks(request: Request, context: RegistryContext, maxAge: n
 }
 
 async function getMarkets(request: Request, context: RegistryContext, chainId: string, maxAge: number): Promise<Response> {
-  const { snapshot, deprecated } = await activeWithDeprecated(context);
+  const { snapshot, decided } = await activeWithDecisions(context);
   // the same selectability rule the market route and the catalog apply
   const selected = networkOf(selectable(snapshot), chainIdOf(chainId));
-  const { decisions, staleFor } = deprecated();
-  const network  = markedNetwork(selected, decisions);
-  const tagged   = deprecatedRepresentation(`markets:${network.chainId}`, [ network ]);
+  const { marks, staleFor } = decided();
+  const network  = markedNetwork(selected, marks);
+  const tagged   = markedRepresentation(`markets:${network.chainId}`, [ network ]);
   return snapshotResponse(request, versionRef(snapshot), tagged, () => ({
     registryVersion: versionRef(snapshot),
     chainId:         network.chainId,
@@ -350,12 +364,12 @@ async function getMarket(
   cometAddress: string,
   maxAge: number,
 ): Promise<Response> {
-  const { snapshot, deprecated } = await activeWithDeprecated(context);
+  const { snapshot, decided } = await activeWithDecisions(context);
   const network  = networkOf(snapshot, chainIdOf(chainId));
   const selected = marketOf(network, cometAddress);
-  const { decisions, staleFor } = deprecated();
-  const market   = markedMarket(network.chainId, selected, decisions);
-  const tagged   = deprecatedRepresentation(`market:${network.chainId}:${market.contracts.comet}`, [
+  const { marks, staleFor } = decided();
+  const market   = markedMarket(network.chainId, selected, marks);
+  const tagged   = markedRepresentation(`market:${network.chainId}:${market.contracts.comet}`, [
     { chainId: network.chainId, markets: [ market ] },
   ]);
   return snapshotResponse(request, versionRef(snapshot), tagged, () => ({

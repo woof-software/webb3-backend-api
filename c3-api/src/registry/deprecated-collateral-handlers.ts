@@ -15,8 +15,9 @@ import { registryHeaders } from './version-headers.js';
 /*
  * The deprecated collateral routes: which collaterals of which Comets an
  * administrator has marked deprecated, and the audit of every change to that
- * decision. They and the token policy routes (token-handlers.ts) answer for
- * the two kinds of one store of decisions (decision-store.ts).
+ * decision. They, the token policy routes (token-handlers.ts) and the hidden
+ * collateral routes (hidden-collateral-handlers.ts) answer for the kinds of
+ * one store of decisions (decision-store.ts).
  *
  * A decision belongs to no registry version, but whether a collateral may
  * carry one is decided by the active version, so every answer names that

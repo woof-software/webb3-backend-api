@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 
 import C3Api, { Env } from '../../../entrypoint.js';
 import { POINTER_KEY } from '../../../src/registry/cache.js';
-import { DEPRECATED_KEY } from '../../../src/registry/deprecated-collaterals.js';
+import { DEPRECATED_KEY, HIDDEN_KEY } from '../../../src/registry/deprecated-collaterals.js';
 import { maintainRegistryCache } from '../../../src/registry/scheduled.js';
 
 import { consoleLines } from '../../util/console.js';
@@ -37,9 +37,9 @@ async function get(env: Env, path: string, headers: Record<string, string> = {})
   return C3Api.fetch(new Request(`https://api.test.local${path}`, { headers }), env);
 }
 
-async function post(env: Env, path: string, body: unknown): Promise<Response> {
+async function post(env: Env, path: string, body: unknown, method: 'POST' | 'PATCH' = 'POST'): Promise<Response> {
   return C3Api.fetch(new Request(`https://api.test.local${path}`, {
-    method:  'POST',
+    method,
     headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
     body:    JSON.stringify(body),
   }), env);
@@ -100,6 +100,30 @@ t.test('a validation, an activation and a rollback answer as committed, though n
     'which the reads answer with at once');
 
   t.ok(logs.includes('warn: registry snapshot cache unwritable'), 'the bytes that could not be cached are a warning');
+  t.notOk(logs.some(line => line.startsWith('error:')), 'not an error');
+});
+
+/*
+ * A decision about a collateral records the decisions of its kind for an
+ * outage once it has committed (deprecated-collaterals.ts), each kind under
+ * its own key. A record the namespace does not take must not fail the
+ * command either: the next read that finds the record behind writes it.
+ */
+t.test('a deprecated or a hidden decision answers as committed, though its record could not be written', async t => {
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+  const logs = captureLogs(t);
+  const env  = await envWith({ APP_DB: registry.db });
+
+  const usdt = registry.snapshot.networks.find(network => network.chainId === 1)!.markets.find(market => market.deploymentKey === 'usdt')!;
+  const mEth = usdt.collateralAssets.find(asset => asset.token.symbol === 'mETH')!.token.address;
+  for (const [ kind, flag ] of [ [ 'deprecated', 'isDeprecated' ], [ 'hidden', 'isHidden' ] ] as const) {
+    const decided = await post(env, `/registry/v1/admin/networks/1/markets/${usdt.contracts.comet}/collaterals/${mEth}/${kind}`,
+      { [flag]: true, reason: 'the namespace does not answer' }, 'PATCH');
+    t.equal(decided.status, 200, `a ${kind} decision answers 200`);
+    t.match(await decided.json(), { [flag]: true, changed: true }, 'with the decision it committed');
+    t.ok(logs.includes(`warn: ${kind} collateral record unwritable`), 'its record, which the namespace did not take, a warning');
+  }
   t.notOk(logs.some(line => line.startsWith('error:')), 'not an error');
 });
 
@@ -187,8 +211,9 @@ t.test('a database that cannot be reached, with a namespace that does not answer
 
 /*
  * Bindings of `store` that hold back the writes of the records an outage
- * reads — the pointer record and the deprecated collateral decisions — until
- * `release`. Each binding is an isolate that has written neither yet.
+ * reads — the pointer record, and the deprecated and the hidden collateral
+ * decisions — until `release`. Each binding is an isolate that has written
+ * none of them yet.
  */
 function heldRecords(store: KVNamespace): { binding: () => KVNamespace, release: () => void } {
   let release!: () => void;
@@ -198,7 +223,7 @@ function heldRecords(store: KVNamespace): { binding: () => KVNamespace, release:
       const value = Reflect.get(target, property, receiver);
       if (property === 'put' && typeof(value) === 'function') {
         return async (...parameters: unknown[]) => {
-          if (parameters[0] === POINTER_KEY || parameters[0] === DEPRECATED_KEY) {
+          if (parameters[0] === POINTER_KEY || parameters[0] === DEPRECATED_KEY || parameters[0] === HIDDEN_KEY) {
             await released;
           }
           return (value as (...parameters: unknown[]) => unknown).apply(target, parameters);
@@ -232,16 +257,17 @@ t.test('a namespace slow to take a write holds no answer: the records an outage 
   const market = await request(`/market/${MAINNET}/${UNKNOWN}/summary`);
   t.ok(await settledWithin(Promise.all([ active.answer, tokens.answer, market.answer ]), 5000),
     'the registry routes and a market route answer while those writes are held');
-  t.same([ active.handed.length, tokens.handed.length, market.handed.length ], [ 2, 1, 1 ],
-    'each having handed its writes to waitUntil: the pointer record, and on /active the check of the decisions');
-  t.same([ await store.get(POINTER_KEY), await store.get(DEPRECATED_KEY) ], [ null, null ], 'none of which has landed');
+  t.same([ active.handed.length, tokens.handed.length, market.handed.length ], [ 3, 1, 1 ],
+    'each having handed its writes to waitUntil: the pointer record, and on /active the checks of either kind of decision');
+  t.same([ await store.get(POINTER_KEY), await store.get(DEPRECATED_KEY), await store.get(HIDDEN_KEY) ], [ null, null, null ],
+    'none of which has landed');
 
   held.release();
   t.same([ (await active.answer).status, (await tokens.answer).status, (await market.answer).status ], [ 200, 404, 400 ],
     'the token list of a chain the version does not hold, and a market of no version, refused after the version was read');
   await Promise.all([ ...active.handed, ...tokens.handed, ...market.handed ].map(entry => entry.work));
   t.ok(await store.get(POINTER_KEY) !== null, 'the pointer record lands once the namespace takes it');
-  t.ok(await store.get(DEPRECATED_KEY) !== null, 'and so does the record of the decisions');
+  t.ok(await store.get(DEPRECATED_KEY) !== null && await store.get(HIDDEN_KEY) !== null, 'and so does the record of each kind of decision');
 });
 
 // a request without an execution context, as a test makes one, writes them before it answers instead
@@ -258,7 +284,8 @@ t.test('without an execution context a request writes the records an outage read
   t.notOk(await settledWithin(answer, 300), 'the request waits while the writes are held');
   held.release();
   t.equal((await answer).status, 200, 'and answers once they land');
-  t.same([ await store.get(POINTER_KEY) !== null, await store.get(DEPRECATED_KEY) !== null ], [ true, true ], 'both records written');
+  t.same(await Promise.all([ POINTER_KEY, DEPRECATED_KEY, HIDDEN_KEY ].map(async key => await store.get(key) !== null)), [ true, true, true ],
+    'every record written');
 });
 
 t.test("the Cron's upkeep of a namespace that does not answer fails nothing", async t => {

@@ -9,7 +9,8 @@ import type { ActiveMarketV1, Address, RegistrySnapshotV1, TokenListV1 } from '.
 
 import { catalogOf } from '../../../src/registry/catalog.js';
 import { setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
-import { DEPRECATED_KEY } from '../../../src/registry/deprecated-collaterals.js';
+import { DEPRECATED_KEY, HIDDEN_KEY } from '../../../src/registry/deprecated-collaterals.js';
+import { setHiddenCollateral } from '../../../src/registry/hidden-collateral-repository.js';
 import { SUMMARY_DEADLINE_MS } from '../../../src/registry/summary-tokens.js';
 import { DEADLINE_MS, positionSetOf, positionsOf, recordKey } from '../../../src/registry/token-collateral.js';
 import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
@@ -27,11 +28,11 @@ import '../../../shim/node-self.js';
 
 /*
  * What /summary says of the token of each collateral, through the whole
- * worker: the legacy router, the decisions in D1 and the record the worker
- * keeps of the deprecated ones, the token list's record of the chain's minute
- * in KV, and a node behind the node proxy's service binding. What a collateral
- * says of its token across the chain is held to what the token list answers
- * in the same minute.
+ * worker: the legacy router, the decisions in D1 and the records the worker
+ * keeps of the deprecated and the hidden ones, the token list's record of the
+ * chain's minute in KV, and a node behind the node proxy's service binding.
+ * What a collateral says of its token across the chain is held to what the
+ * token list answers in the same minute.
  */
 const fixture = loadRegistrySnapshotFixture();
 const LATEST  = { number: 23_500_000, timestamp: 1_791_204_930 };
@@ -46,8 +47,9 @@ const OF_MAINNET    = '/market/ethereum-mainnet/all-contracts/summary';
 
 let seed = 0;
 
-async function workerOf(t: Test, script: NodeScript = {}, snapshot: RegistrySnapshotV1 = fixture) {
-  const registry = await activeRegistryDatabase({ snapshot });
+// `migrated` stops the database's migrations at `through`, as a release deployed before its own finds it
+async function workerOf(t: Test, script: NodeScript = {}, snapshot: RegistrySnapshotV1 = fixture, migrated: { through?: string } = {}) {
+  const registry = await activeRegistryDatabase({ snapshot, ...migrated });
   t.teardown(() => registry.dispose());
   const node = fakeNode(snapshot, LATEST, script);
   const env  = makeTestEnv({
@@ -114,6 +116,15 @@ const markDeprecated = (db: D1Database, key: string, symbol: string) => setDepre
   reason:       'decided for a summary test',
 });
 
+const hide = (db: D1Database, key: string, symbol: string) => setHiddenCollateral(db, {
+  chainId:      1,
+  cometAddress: cometOf(key),
+  tokenAddress: tokenOf(key, symbol),
+  isHidden:     true,
+  actor:        'test',
+  reason:       'decided for a summary test',
+});
+
 const FIXED = '0x351a133fd850ea81ed8a782016e308acbaddec91' as Address;
 
 // the fixture with pumpBTC priced through the feed the network's fixed price is stated for, which expires at `expiresAt`, or never
@@ -154,23 +165,31 @@ t.test('every form of the summary answers each collateral with the fields of its
 /*
  * The summary and the token list answer a minute from one record of the
  * chain. pumpBTC is priced through a price exception of the registry with an
- * expiry, XAUt is strategic, and weETH and mETH are deprecated in USDT's
- * market, so every field the list has is held to something.
+ * expiry, XAUt is strategic, weETH and mETH are deprecated in USDT's market,
+ * and weETH is hidden in USDC's, so every field the list has is held to
+ * something.
  */
 t.test('what a collateral says of its token is what the token list says of it in the same minute', async t => {
   const { registry, node, get } = await workerOf(t, {}, fixedPumpBtc('2999-01-01T00:00:00+01:00'));
   await decide(registry.db, 'usdt', 'XAUt');
   await markDeprecated(registry.db, 'usdt', 'weETH');
   await markDeprecated(registry.db, 'usdt', 'mETH');
+  await hide(registry.db, 'usdc', 'weETH');
 
   const every   = await summaryOf(await get(EVERY_NETWORK));
   const valued  = valuations(node).length;
   for (const chainId of new Set(every.map(entry => entry.chain_id))) {
     const tokens = new Map((await listOf(await get(`/registry/v1/networks/${chainId}/tokens`))).tokens.map(token => [ token.address, token ]));
     for (const read of collateralsOf(every).filter(({ entry }) => entry.chain_id === chainId)) {
-      const token = tokens.get(read.collateral.address.toLowerCase() as Address)!;
-      t.strictSame(without(read.collateral, 'address', 'symbol', 'status', 'message', 'is_deprecated'), onSummary(token),
-        `${nameOf(read)}: as the list says it of ${token.symbol}`);
+      const token          = tokens.get(read.collateral.address.toLowerCase() as Address)!;
+      const onMainnet      = read.entry.chain_id === 1;
+      const hiddenHere     = onMainnet && read.entry.deployment_key === 'usdc' && read.collateral.symbol === 'weETH';
+      const deprecatedHere = onMainnet && read.entry.deployment_key === 'usdt' && [ 'weETH', 'mETH' ].includes(read.collateral.symbol);
+      t.equal(read.collateral.is_hidden, hiddenHere, `${nameOf(read)}: ${hiddenHere ? 'hidden, as its Comet decided' : 'not hidden, which nobody decided'}`);
+      t.equal(read.collateral.is_deprecated, deprecatedHere,
+        `${nameOf(read)}: ${deprecatedHere ? 'deprecated, as its Comet decided' : 'not deprecated, which nobody decided'}`);
+      t.strictSame(without(read.collateral, 'address', 'symbol', 'status', 'message', 'is_deprecated', 'is_hidden'),
+        onSummary(token, { isHidden: hiddenHere, isDeprecated: deprecatedHere }), `${nameOf(read)}: as the list says it of ${token.symbol}`);
     }
   }
   t.equal(valuations(node).length, valued, 'the list answers from the record the summary made, valuing nothing again');
@@ -198,9 +217,10 @@ t.test('an exception that does not expire is answered with a null expiry, not wi
 /*
  * weETH is a collateral of the USDC, WETH and USDT markets of mainnet, and
  * mETH of the USDT market alone. Deprecated in USDT's, each is deprecated
- * there and nowhere else, as /registry/v1 marks the collaterals of a market;
- * across the chain, mETH is deprecated in every enabled market that takes it,
- * and hidden, while weETH is still offered by two.
+ * there and nowhere else, as /registry/v1 marks the collaterals of a market,
+ * and is not shown there: whether discovery shows a token is the market's own.
+ * Across the chain, mETH is deprecated in every enabled market that takes it,
+ * and not shown, while weETH is still offered by two.
  */
 t.test('is_deprecated is the decision of the market\'s own Comet, and is_network_deprecated the list\'s across the chain', async t => {
   const { registry, get } = await workerOf(t);
@@ -214,8 +234,8 @@ t.test('is_deprecated is the decision of the market\'s own Comet, and is_network
     return { is_deprecated, is_network_deprecated, deprecated_in, is_visible, visibility_reason };
   };
   t.strictSame(stateOf('usdt', 'weETH'),
-    { is_deprecated: true, is_network_deprecated: false, deprecated_in: [ usdt ], is_visible: false, visibility_reason: 'below_threshold' },
-    'weETH in USDT\'s market: deprecated there, and not across the chain, which decides its visibility by its value');
+    { is_deprecated: true, is_network_deprecated: false, deprecated_in: [ usdt ], is_visible: false, visibility_reason: 'deprecated' },
+    'weETH in USDT\'s market: deprecated there, and so not shown there, though not deprecated across the chain');
   for (const key of [ 'usdc', 'weth' ]) {
     t.strictSame(stateOf(key, 'weETH'),
       { is_deprecated: false, is_network_deprecated: false, deprecated_in: [ usdt ], is_visible: false, visibility_reason: 'below_threshold' },
@@ -223,7 +243,7 @@ t.test('is_deprecated is the decision of the market\'s own Comet, and is_network
   }
   t.strictSame(stateOf('usdt', 'mETH'),
     { is_deprecated: true, is_network_deprecated: true, deprecated_in: [ usdt ], is_visible: false, visibility_reason: 'deprecated' },
-    'mETH, which USDT\'s market alone takes: deprecated there and across the chain, and hidden');
+    'mETH, which USDT\'s market alone takes: deprecated there and across the chain, and not shown');
 
   for (const key of [ 'usdc', 'weth', 'usdt', 'wbtc' ]) {
     const { market } = await (await get(`/registry/v1/networks/1/markets/${cometOf(key)}`)).json() as { market: ActiveMarketV1 };
@@ -233,38 +253,141 @@ t.test('is_deprecated is the decision of the market\'s own Comet, and is_network
   }
 });
 
+/*
+ * A collateral is hidden as it is deprecated, by one Comet, and whether
+ * discovery shows the token is the market's own on the summary: weETH,
+ * strategic here, is hidden in USDC's market only, so it is not shown there
+ * while WETH's and USDT's markets show it, as the list does across the chain.
+ * mETH, hidden in USDT's, the one market that takes it, is not shown there
+ * nor by the list.
+ */
+t.test('is_hidden is the decision of the market\'s own Comet, and is_visible what discovery shows in that market', async t => {
+  const { registry, get } = await workerOf(t);
+  await decide(registry.db, 'usdt', 'weETH');
+  await hide(registry.db, 'usdc', 'weETH');
+  await hide(registry.db, 'usdt', 'mETH');
+
+  const mainnet = await summaryOf(await get(OF_MAINNET));
+  const [ usdc, usdt ] = [ checksumAddress(cometOf('usdc')), checksumAddress(cometOf('usdt')) ];
+  const stateOf = (key: string, symbol: string) => picked(collateralOf(entryOf(mainnet, key), symbol), 'is_hidden', 'hidden_in', 'is_visible', 'visibility_reason');
+  t.strictSame(stateOf('usdc', 'weETH'), { is_hidden: true, hidden_in: [ usdc ], is_visible: false, visibility_reason: 'hidden' },
+    'weETH in USDC\'s market: hidden there, and not shown in it');
+  for (const key of [ 'weth', 'usdt' ]) {
+    t.strictSame(stateOf(key, 'weETH'), { is_hidden: false, hidden_in: [ usdc ], is_visible: true, visibility_reason: 'strategic' },
+      `weETH in ${key.toUpperCase()}'s market: not hidden there, and shown for being strategic`);
+  }
+  t.strictSame(stateOf('usdt', 'mETH'), { is_hidden: true, hidden_in: [ usdt ], is_visible: false, visibility_reason: 'hidden' },
+    'mETH, which USDT\'s market alone takes: hidden there, and not shown');
+
+  const tokens = new Map((await listOf(await get('/registry/v1/networks/1/tokens'))).tokens.map(token => [ token.symbol, token ]));
+  t.strictSame([ 'weETH', 'mETH' ].map(symbol => picked(tokens.get(symbol)!, 'hiddenIn', 'isVisible', 'visibilityReason')), [
+    { hiddenIn: [ cometOf('usdc') ], isVisible: true, visibilityReason: 'strategic' },
+    { hiddenIn: [ cometOf('usdt') ], isVisible: false, visibilityReason: 'hidden' },
+  ], 'while the list says it of the chain: weETH shown, which two enabled markets still do not hide, and mETH not');
+
+  for (const key of [ 'usdc', 'weth', 'usdt', 'wbtc' ]) {
+    const { market } = await (await get(`/registry/v1/networks/1/markets/${cometOf(key)}`)).json() as { market: ActiveMarketV1 };
+    t.strictSame(entryOf(mainnet, key).collaterals!.map(collateral => [ collateral.symbol, collateral.is_hidden ]),
+      market.collateralAssets.map(asset => [ asset.token.symbol, asset.isHidden ]),
+      `${key.toUpperCase()}: every collateral as the market read of the registry marks it`);
+  }
+
+  // the Comet named checksummed, as a client may name it
+  for (const key of [ 'usdc', 'weth' ]) {
+    const alone = await summaryOf(await get(`/market/ethereum-mainnet/${checksumAddress(cometOf(key))}/summary`));
+    t.equal(JSON.stringify(alone), JSON.stringify([ entryOf(mainnet, key) ]),
+      `the summary of ${key.toUpperCase()}'s market alone answers it as the summary of the network does, by its own Comet's decisions`);
+  }
+});
+
+/*
+ * Where a market's status is deprecated, its Comet's decision may differ from
+ * the enabled markets': here USDT's market is deprecated. weETH, strategic,
+ * is hidden in the USDC and WETH markets, the enabled ones that take it, so
+ * the list does not show it, while USDT's market does not hide it, and the
+ * rest of the rule shows it there. mETH, strategic as well, is taken by
+ * USDT's market alone, which hides it and does not show it, while no enabled
+ * market takes it, and the list shows it.
+ */
+t.test('a market whose status is deprecated answers by its own Comet\'s decision where the enabled markets decide otherwise', async t => {
+  const snapshot: RegistrySnapshotV1 = {
+    ...fixture,
+    networks: fixture.networks.map(network => network !== MAINNET ? network : {
+      ...network,
+      markets: network.markets.map(entry => entry.deploymentKey === 'usdt' ? { ...entry, status: 'deprecated' as const } : entry),
+    }),
+  };
+  const { registry, get } = await workerOf(t, {}, snapshot);
+  await decide(registry.db, 'usdt', 'weETH');
+  await decide(registry.db, 'usdt', 'mETH');
+  await hide(registry.db, 'usdc', 'weETH');
+  await hide(registry.db, 'weth', 'weETH');
+  await hide(registry.db, 'usdt', 'mETH');
+
+  const tokens = new Map((await listOf(await get('/registry/v1/networks/1/tokens'))).tokens.map(token => [ token.symbol, token ]));
+  t.strictSame([ 'weETH', 'mETH' ].map(symbol => picked(tokens.get(symbol)!, 'hiddenIn', 'isVisible', 'visibilityReason')), [
+    { hiddenIn: [ cometOf('usdc'), cometOf('weth') ].sort(), isVisible: false, visibilityReason: 'hidden' },
+    { hiddenIn: [ cometOf('usdt') ], isVisible: true, visibilityReason: 'strategic' },
+  ], 'the list does not show weETH, which every enabled market that takes it hides, and shows mETH, which no enabled market takes');
+
+  const mainnet  = await summaryOf(await get(OF_MAINNET));
+  const stateOf  = (key: string, symbol: string) => picked(collateralOf(entryOf(mainnet, key), symbol), 'is_hidden', 'hidden_in', 'is_visible', 'visibility_reason');
+  const hiddenIn = tokens.get('weETH')!.hiddenIn.map(address => checksumAddress(address));
+  for (const key of [ 'usdc', 'weth' ]) {
+    t.strictSame(stateOf(key, 'weETH'), { is_hidden: true, hidden_in: hiddenIn, is_visible: false, visibility_reason: 'hidden' },
+      `weETH in ${key.toUpperCase()}'s market: hidden there, and not shown in it`);
+  }
+  t.strictSame(stateOf('usdt', 'weETH'), { is_hidden: false, hidden_in: hiddenIn, is_visible: true, visibility_reason: 'strategic' },
+    'weETH in USDT\'s market: not hidden there, and shown for being strategic, where the list does not show it');
+  t.strictSame(stateOf('usdt', 'mETH'), { is_hidden: true, hidden_in: [ checksumAddress(cometOf('usdt')) ], is_visible: false, visibility_reason: 'hidden' },
+    'mETH in USDT\'s market: hidden there, and not shown in it, where the list shows it');
+});
+
 // matches no statement, so that a database fails only while it is down
 const NO_STATEMENT = /^$/;
 
-// what the deprecated decisions decide, what the strategic ones decide, and what takes both
-const decidedBy = { deprecated: [ 'is_deprecated', 'is_network_deprecated', 'deprecated_in' ], strategic: [ 'is_strategic' ], both: [ 'is_visible', 'visibility_reason' ] };
+// what each kind of decision decides, and what takes them all
+const decidedBy = {
+  deprecated: [ 'is_deprecated', 'is_network_deprecated', 'deprecated_in' ],
+  hidden:     [ 'is_hidden', 'hidden_in' ],
+  strategic:  [ 'is_strategic' ],
+  all:        [ 'is_visible', 'visibility_reason' ],
+};
 
 /*
- * The deprecated decisions are read as the active reads read them: from D1,
- * or, while D1 cannot be reached, from the record the worker keeps of them,
- * and an answer marked with those says that it could not be confirmed. The
- * strategic ones have no record, and what they decide is left out. Either way
- * the summary is answered: a summary is every market's.
+ * The deprecated and the hidden decisions are read as the active reads read
+ * them: from D1, or, while D1 cannot be reached, from the record the worker
+ * keeps of each kind, and an answer marked with those says that it could not
+ * be confirmed. The strategic ones have no record, and what they decide is
+ * left out, but for a collateral its Comet hides or has deprecated, which is
+ * not shown there whatever they say. Either way the summary is answered: a
+ * summary is every market's.
  */
-t.test('while D1 cannot be reached, the deprecated decisions come from the record and are said to be unconfirmed', async t => {
+t.test('while D1 cannot be reached, the deprecated and the hidden decisions come from their records and are said to be unconfirmed', async t => {
   const { registry, env, get } = await workerOf(t);
   const logs = consoleLines(t, [ 'error', 'warn' ], { prefixed: true });
   await decide(registry.db, 'usdt', 'XAUt');
   await markDeprecated(registry.db, 'usdt', 'mETH');
+  await hide(registry.db, 'usdc', 'weETH');
   let down = false;
   const db = failingStatements(registry.db, NO_STATEMENT, { down: () => down });
 
   const confirmed = await get(OF_MAINNET, { APP_DB: db });
   t.same([ confirmed.headers.get('x-registry-stale'), confirmed.headers.get('cache-control') ], [ null, null ],
     'an answer D1 confirmed says nothing of the kind');
-  t.same((await env.kv_registry.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] }).collaterals,
-    [ { chainId: 1, cometAddress: cometOf('usdt'), tokenAddress: tokenOf('usdt', 'mETH') } ], 'and records the decisions it read');
+  const recorded = async (key: string) => (await env.kv_registry.get(key, 'json') as { collaterals: unknown[] }).collaterals;
+  t.same([ await recorded(DEPRECATED_KEY), await recorded(HIDDEN_KEY) ], [
+    [ { chainId: 1, cometAddress: cometOf('usdt'), tokenAddress: tokenOf('usdt', 'mETH') } ],
+    [ { chainId: 1, cometAddress: cometOf('usdc'), tokenAddress: tokenOf('usdc', 'weETH') } ],
+  ], 'and records the decisions it read, each kind apart');
   const before = await summaryOf(confirmed);
 
-  const partly = await get(OF_MAINNET, { APP_DB: failingStatements(registry.db, /FROM deprecated_collaterals/) });
-  t.same([ partly.headers.get('x-registry-stale'), partly.headers.get('cache-control') ], [ '0', 'no-store' ],
-    'decisions D1 did not give, the version it did: the decisions last recorded, said to be no older than now, and not to be kept');
-  t.equal(JSON.stringify(await summaryOf(partly)), JSON.stringify(before), 'which mark the collaterals as D1 did');
+  for (const [ kind, failing ] of [ [ 'deprecated', /FROM deprecated_collaterals/ ], [ 'hidden', /FROM hidden_collaterals/ ] ] as const) {
+    const partly = await get(OF_MAINNET, { APP_DB: failingStatements(registry.db, failing) });
+    t.same([ partly.headers.get('x-registry-stale'), partly.headers.get('cache-control') ], [ '0', 'no-store' ],
+      `${kind} decisions D1 did not give, the version it did: the decisions last recorded, said to be no older than now, and not to be kept`);
+    t.equal(JSON.stringify(await summaryOf(partly)), JSON.stringify(before), 'which mark the collaterals as D1 did');
+  }
 
   down = true;
   const response = await get(OF_MAINNET, { APP_DB: db });
@@ -274,16 +397,24 @@ t.test('while D1 cannot be reached, the deprecated decisions come from the recor
   const during = await summaryOf(response);
   t.strictSame(picked(collateralOf(entryOf(during, 'usdt'), 'mETH'), 'is_deprecated', 'is_network_deprecated'),
     { is_deprecated: true, is_network_deprecated: true }, 'its collaterals marked by the decisions last recorded');
-  const strategic = [ ...decidedBy.strategic, ...decidedBy.both ];
+  t.strictSame(picked(collateralOf(entryOf(during, 'usdc'), 'weETH'), 'is_hidden', 'is_visible', 'visibility_reason'),
+    { is_hidden: true, is_visible: false, visibility_reason: 'hidden' }, 'of either kind, and a collateral its Comet hides is not shown there');
+  t.strictSame(picked(collateralOf(entryOf(during, 'usdt'), 'mETH'), 'is_hidden', 'is_visible', 'visibility_reason'),
+    { is_hidden: false, is_visible: false, visibility_reason: 'deprecated' }, 'nor one its Comet has deprecated and does not hide');
+  const strategic = [ ...decidedBy.strategic, ...decidedBy.all ];
   for (const read of collateralsOf(during)) {
-    t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS.filter(key => !strategic.includes(key)),
-      `${nameOf(read)}: without what the strategic decisions decide`);
+    const decidedHere = (read.entry.deployment_key === 'usdc' && read.collateral.symbol === 'weETH')
+      || (read.entry.deployment_key === 'usdt' && read.collateral.symbol === 'mETH');
+    t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS.filter(key => !(decidedHere ? decidedBy.strategic : strategic).includes(key)),
+      `${nameOf(read)}: without what the strategic decisions decide${decidedHere ? ', but for whether it is shown, which its Comet\'s decision decides' : ''}`);
   }
   t.strictSame(during.map(entry => ({ ...entry, collaterals: entry.collaterals!.map(collateral => without(collateral, ...strategic)) })),
     before.map(entry => ({ ...entry, collaterals: entry.collaterals!.map(collateral => without(collateral, ...strategic)) })),
     'and everything else as when D1 answered');
-  t.ok(logs.some(line => line === 'warn: deprecated collateral decisions unreadable; answering with the ones last recorded'),
-    'the log says where the deprecated decisions came from');
+  for (const kind of [ 'deprecated', 'hidden' ]) {
+    t.ok(logs.some(line => line === `warn: ${kind} collateral decisions unreadable; answering with the ones last recorded`),
+      `the log says where the ${kind} decisions came from`);
+  }
   t.ok(logs.some(line => line === 'error: the summary could not read the token policies'), 'and which decisions could not be read');
 });
 
@@ -300,8 +431,9 @@ t.test('decisions that cannot be read leave out what they decide, and are logged
   const before = await summaryOf(await get(OF_MAINNET));
 
   const cases = [
-    [ 'the deprecated decisions, with none recorded', /FROM deprecated_collaterals/, [ ...decidedBy.deprecated, ...decidedBy.both ], 'deprecated collateral decisions' ],
-    [ 'the strategic decisions',                      /FROM token_policies WHERE is_strategic/, [ ...decidedBy.strategic, ...decidedBy.both ], 'token policies' ],
+    [ 'the deprecated decisions, with none recorded', /FROM deprecated_collaterals/, [ ...decidedBy.deprecated, ...decidedBy.all ], 'deprecated collateral decisions' ],
+    [ 'the hidden decisions, with none recorded',     /FROM hidden_collaterals/, [ ...decidedBy.hidden, ...decidedBy.all ], 'hidden collateral decisions' ],
+    [ 'the strategic decisions',                      /FROM token_policies WHERE is_strategic/, [ ...decidedBy.strategic, ...decidedBy.all ], 'token policies' ],
   ] as const;
   for (const [ what, failing, decided, logged ] of cases) {
     errors.length = 0;
@@ -311,7 +443,11 @@ t.test('decisions that cannot be read leave out what they decide, and are logged
       `${what}: the summary is answered, and says nothing is unconfirmed`);
     const answered = await summaryOf(response);
     for (const read of collateralsOf(answered)) {
-      t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS.filter(key => !(decided as readonly string[]).includes(key)), `${what}: ${nameOf(read)} without what they decide`);
+      // mETH, which USDT's Comet has deprecated, is not shown there whatever the strategic decisions say
+      const alone  = what === 'the strategic decisions' && read.entry.deployment_key === 'usdt' && read.collateral.symbol === 'mETH';
+      const unread = (alone ? decidedBy.strategic : decided) as readonly string[];
+      t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS.filter(key => !unread.includes(key)),
+        `${what}: ${nameOf(read)} without what they decide${alone ? ', but for whether it is shown, which its Comet\'s deprecating decides' : ''}`);
     }
     t.strictSame(answered.map(entry => ({ ...entry, collaterals: entry.collaterals!.map(collateral => without(collateral, ...decided)) })),
       before.map(entry => ({ ...entry, collaterals: entry.collaterals!.map(collateral => without(collateral, ...decided)) })),
@@ -324,6 +460,60 @@ t.test('decisions that cannot be read leave out what they decide, and are logged
     const again = await summaryOf(await get(OF_MAINNET, { APP_DB: db, kv_registry: MemoryKv({}) }));
     t.equal(JSON.stringify(again), JSON.stringify(answered), `${what}: a request right after leaves them out as well`);
     t.notOk(errors.includes(`the summary could not read the ${logged}`), `${what}: and is not logged again for that database within a minute`);
+  }
+});
+
+/*
+ * A release deployed before migration 0008 finds no table of hidden
+ * decisions to read, where the other routes that read them answer 503: the
+ * summary is answered without what they decide, as when D1 cannot give them,
+ * and the log says why.
+ */
+t.test('a database without the hidden collateral migration leaves out what the hidden decisions decide', async t => {
+  const { get } = await workerOf(t, {}, fixture, { through: '0007' });
+  const errors = consoleLines(t, [ 'error' ]);
+
+  const response = await get(OF_MAINNET, { kv_registry: MemoryKv({}) });
+  t.same([ response.status, response.headers.get('x-registry-stale'), response.headers.get('cache-control') ], [ 200, null, null ],
+    'the summary is answered, and says nothing is unconfirmed');
+  const unread = [ ...decidedBy.hidden, ...decidedBy.all ];
+  for (const read of collateralsOf(await summaryOf(response))) {
+    t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS.filter(key => !unread.includes(key)), `${nameOf(read)}: without what they decide`);
+  }
+  const logged = 'the summary could not read the hidden collateral decisions';
+  t.equal(errors.filter(line => line === logged).length, 1, 'the log says so once');
+  t.match(errors[errors.indexOf(logged) + 1], /no such table: hidden_collaterals/, 'with the table D1 does not have');
+});
+
+/*
+ * Whether discovery shows a token takes every kind of decision, but a Comet's
+ * hiding it decides that alone, since the rule asks it first. So a collateral
+ * its Comet hides is said not to be shown there even when the other decisions
+ * could not be read: a client told nothing would show it. Every other
+ * collateral is told nothing of it, as before.
+ */
+t.test('a collateral its Comet hides is not shown there, though the other decisions could not be read', async t => {
+  const { registry, get } = await workerOf(t);
+  consoleLines(t, [ 'error' ]);
+  await decide(registry.db, 'usdc', 'weETH');
+  await hide(registry.db, 'usdc', 'weETH');
+
+  const cases = [
+    [ 'the deprecated decisions, with none recorded', /FROM deprecated_collaterals/, decidedBy.deprecated ],
+    [ 'the strategic decisions',                      /FROM token_policies WHERE is_strategic/, decidedBy.strategic ],
+  ] as const;
+  for (const [ what, failing, decided ] of cases) {
+    const answered = await summaryOf(await get(OF_MAINNET, { APP_DB: failingStatements(registry.db, failing), kv_registry: MemoryKv({}) }));
+    t.strictSame(picked(collateralOf(entryOf(answered, 'usdc'), 'weETH'), 'is_hidden', 'is_visible', 'visibility_reason'),
+      { is_hidden: true, is_visible: false, visibility_reason: 'hidden' }, `${what}: weETH in USDC's market, which hides it, is not shown there`);
+    for (const read of collateralsOf(answered)) {
+      const hiddenHere = read.entry.deployment_key === 'usdc' && read.collateral.symbol === 'weETH';
+      const unread     = hiddenHere ? decided : [ ...decided, ...decidedBy.all ];
+      t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS.filter(key => !(unread as readonly string[]).includes(key)),
+        `${what}: ${nameOf(read)} ${hiddenHere ? 'says whether it is shown' : 'is told nothing of whether it is shown'}`);
+    }
+    t.strictSame(picked(collateralOf(entryOf(answered, 'weth'), 'weETH'), 'is_hidden', 'hidden_in'),
+      { is_hidden: false, hidden_in: [ checksumAddress(cometOf('usdc')) ] }, `${what}: while WETH's market says only where it is hidden`);
   }
 });
 
@@ -391,7 +581,7 @@ t.test('the summary keeps the versions and the keys of its computations, and add
   t.strictSame(written.filter(key => key.startsWith('token-collateral:')).sort(), [ ...records ].sort(), 'one record of each chain\'s minute');
   const others = written.filter(key => !key.startsWith('token-collateral:'));
   t.ok(others.length > 0 && others.every(key => key.startsWith('marketMinutelySummary-v9')), 'beside the minutely summaries of the markets, under the key they had');
-  t.ok((await keysOf(env.kv_registry)).every(key => key === 'active:v1' || key === DEPRECATED_KEY || key.startsWith('snapshot:')),
+  t.ok((await keysOf(env.kv_registry)).every(key => [ 'active:v1', DEPRECATED_KEY, HIDDEN_KEY ].includes(key) || key.startsWith('snapshot:')),
     'and in the registry\'s namespace nothing the active reads do not keep');
 
   node.requests.length = 0;

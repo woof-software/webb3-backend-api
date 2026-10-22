@@ -28,12 +28,13 @@ A client that must not act on an older version refuses such a response; one
 that only reads can use it. How long that is allowed is per environment, and
 a `503` with the code `UPSTREAM_UNAVAILABLE` is the answer once the window has
 passed. These endpoints and the registry's own fail the same way, with two
-exceptions. The token list reads the token policies and the deprecated
-collateral decisions from the database on every request, so it answers `503`
-as soon as the database cannot be reached. `/registry/v1/active` and the
-market reads under `/registry/v1/networks/{chain_id}/markets` mark every
-collateral with the deprecated collateral decisions, and when the database
-cannot be reached they use the ones the API last recorded: with none
+exceptions. The token list reads the token policies and the deprecated and
+hidden collateral decisions from the database on every request, so it
+answers `503` as soon as the database cannot be reached.
+`/registry/v1/active` and the market reads under
+`/registry/v1/networks/{chain_id}/markets` mark every collateral with the
+deprecated and the hidden collateral decisions, and when the database cannot
+be reached they use the ones the API last recorded: with either kind not
 recorded, they answer `503` inside the window too (see `/registry/v1/active`).
 
 Testnets are not served: the registry imports mainnets only. A request that
@@ -296,9 +297,9 @@ Point-in-time summary at the current block of various market statistics:
 - What could be priced: `status`, and `collaterals` with each collateral's
   own status — see [Market status](#market-status)
 - What the token list says of each collateral's token: its name and
-  decimals, whether this market has it deprecated, and its value, roles,
-  decisions and visibility across the whole chain — see
-  [Collateral tokens](#collateral-tokens) below
+  decimals, whether this market has it deprecated or hidden, whether
+  discovery shows it in this market, and its value, roles and decisions
+  across the whole chain — see [Collateral tokens](#collateral-tokens) below
 
 Every form of the route answers a list: of the one market `{address}` names;
 for `all-contracts`, of every market the active version serves on
@@ -330,6 +331,8 @@ its own, in every form of the route. The base asset has none of them.
 | `is_deprecated` | — | this market | whether an administrator marked it deprecated as a collateral of this market's Comet, as `isDeprecated` on the market's collateral in `/registry/v1/active` |
 | `is_network_deprecated` | `isDeprecated` | the chain | whether it is deprecated in every enabled market of the chain that takes it |
 | `deprecated_in` | `deprecatedIn` | the chain | the Comets of the chain's markets that have it deprecated, checksummed, in the list's order |
+| `is_hidden` | — | this market | whether an administrator hid it as a collateral of this market's Comet, as `isHidden` on the market's collateral in `/registry/v1/active` |
+| `hidden_in` | `hiddenIn` | the chain | the Comets of the chain's markets that hide it, checksummed, in the list's order |
 | `is_strategic` | `isStrategic` | the chain | whether an administrator marked the token strategic on the chain |
 | `network_roles` | `roles` | the chain | the roles it plays in the chain's markets: `base`, `reward`, `collateral` |
 | `total_network_collateral_value_usd` | `collateralValueUsd` | the chain | what the chain's enabled markets hold of it as collateral, in USD, a decimal string as the list writes it: `"1843210.123456"`, `"0"` |
@@ -338,22 +341,43 @@ its own, in every form of the route. The base asset has none of them.
 | `network_value_block` | `valueBlock` | the chain | the block it was read at, `{ "number", "timestamp" }` |
 | `network_value_stale_age_seconds` | `staleAgeSeconds` | the chain | how much older that block is than the latest |
 | `network_value_exceptions` | `exceptions` | the chain | the price exceptions of the registry the value applied: `kind`, `price_feed_address`, checksummed, `provenance`, and `expires_at`, an instant, or `null` for one that does not expire |
-| `is_visible` | `isVisible` | the chain | whether token discovery shows the token |
-| `visibility_reason` | `visibilityReason` | the chain | why: `deprecated`, `strategic`, `data_unavailable`, `collateral_threshold` or `below_threshold` |
+| `is_visible` | `isVisible` | this market | whether token discovery shows the token in this market |
+| `visibility_reason` | `visibilityReason` | this market | why: `hidden`, `deprecated`, `strategic`, `data_unavailable`, `collateral_threshold` or `below_threshold` |
 
 A field of the chain is about the token on the whole chain, never about this
-market: its value is what every enabled market of the chain holds, and
-`is_visible` is whether discovery shows the token, not whether this market
-offers it, which is what `is_deprecated` says. A token deprecated in this
-market and current in another enabled market that takes it is
-`is_deprecated: true` here and `is_network_deprecated: false`;
-a collateral can be `success` while its token's value is `unavailable`,
-because a position of another market could not be valued. Discovery decides
-by the token list's rule, version 2 (the list's `ruleVersion`): a token is
-shown when it is strategic, when it is worth at least USD 250,000 across the
-chain (the list's `thresholdUsd`), or when its value cannot be read, unless it
-is deprecated in every enabled market that takes it. Neither number is written
-on a collateral.
+market: its value is what every enabled market of the chain holds. A token
+deprecated in this market and current in another enabled market that takes it
+is `is_deprecated: true` here and `is_network_deprecated: false`; a collateral
+can be `success` while its token's value is `unavailable`, because a position
+of another market could not be valued.
+
+`is_visible` and `visibility_reason` are this market's: whether discovery
+shows the token here, not whether this market offers it, which is what
+`is_deprecated` says. Discovery decides by the token list's rule, version 3
+(the list's `ruleVersion`), asked with this market's decisions: a token
+this market's Comet hides is not shown here (`hidden`), whatever else holds;
+otherwise a token it has deprecated is not shown here (`deprecated`); and any
+other is shown when it is strategic, when it is worth at least USD 250,000
+across the chain (the list's `thresholdUsd`), or when its value cannot be
+read. Neither number is written on a collateral. A collateral answers what
+the list answers for its token, but where this market's decisions and the
+chain's differ:
+
+- a token this market hides or has deprecated is `hidden` or `deprecated`
+  here, while the list decides it by the rest of the rule where another
+  enabled market that takes it offers it with neither decision, or where no
+  enabled market decides so, this market's status being `deprecated`;
+- a token the list leaves out — every enabled market that takes it hides it
+  or has it deprecated — is answered by the rest of the rule in a market
+  whose status is `deprecated` and which decided neither, since its decisions
+  take no part in the list's. Such a market can say `is_visible: true` of a
+  token the list does not show.
+
+A collateral its Comet hides, or has deprecated, stays in `collaterals` and in
+`collateral_asset_symbols`, and counts in `total_collateral_value` as any
+other collateral: the decisions change nothing of what was read of the market,
+and only `is_visible` says whether discovery leaves its token out in this
+market.
 
 The values are the token list's own: one record of each chain's minute,
 valued at the chain's latest block in one batch of reads, which the summary
@@ -365,32 +389,49 @@ from the newest earlier minute, `stale`, or `unavailable` — and the valuation
 goes on, so the next request of the minute answers from it. A value that
 cannot be read never fails the summary: it is a status of the token.
 
-The decisions are read with every request. The deprecated ones are read as
-`/registry/v1/active` reads them: when the database cannot be reached, they
-are the ones the API last recorded, and the answer says it could not confirm
-them, with `X-Registry-Stale` — `0` where the version itself was read — and
+The decisions are read with every request. The deprecated and the hidden
+ones are read as `/registry/v1/active` reads them: when the database cannot
+be reached, they are the ones the API last recorded, and the answer says it
+could not confirm them — one kind from its record is enough — with
+`X-Registry-Stale` — `0` where the version itself was read — and
 `Cache-Control: no-store`. Decisions that cannot be read at all leave out the
 fields they decide, and the summary is answered without them: without the
-deprecated ones, `is_deprecated`, `is_network_deprecated`, `deprecated_in`,
-`is_visible` and `visibility_reason`; without the strategic ones, which
-nothing records for an outage, `is_strategic`, `is_visible` and
-`visibility_reason`. A value that is not known is left out too, never `null`:
-`total_network_collateral_value_usd` of a token that is `unavailable`, and
-`network_value_at`, `network_value_block` and
+deprecated ones, `is_deprecated`, `is_network_deprecated` and
+`deprecated_in`; without the hidden ones, `is_hidden` and `hidden_in`;
+without the strategic ones, which nothing records for an outage,
+`is_strategic`. `is_visible` and `visibility_reason` take all three kinds,
+and are left out where one of them could not be read, but for what the
+decisions read already decide: a collateral whose Comet hides its token is
+`is_visible: false` and `hidden` as soon as the hidden decisions are read, and
+one whose Comet has it deprecated and does not hide it is `false` and
+`deprecated` as soon as both of those kinds are read, whatever the strategic
+ones did, since the rule asks those first — a client told nothing shows a
+token, and one that is not to be shown must not be shown for want of another
+decision. A value that is not known is
+left out too, never `null`: `total_network_collateral_value_usd` of a token
+that is `unavailable`, and `network_value_at`, `network_value_block` and
 `network_value_stale_age_seconds` of a value nobody read.
 
-weETH is a collateral of the USDC, WETH and USDT markets of mainnet; marked
-deprecated in USDT's alone, it is deprecated there and still offered by the
-two others. mETH, which USDT's market alone takes, is deprecated there, so
-across the whole chain, and discovery hides it:
+weETH is a collateral of the USDC, WETH and USDT markets of mainnet. Marked
+deprecated in USDT's alone, it is deprecated there, so not shown there, and
+still offered by the two others; hidden in USDC's alone, it is not shown
+there, and WETH's market shows it by the rest of the rule. mETH, which USDT's market alone takes, is
+deprecated there, so across the whole chain, and discovery does not show it:
 
 ```json
-{ "address": "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee", "symbol": "weETH", "status": "success", "name": "Wrapped eETH", "decimals": 18, "is_deprecated": true, "is_network_deprecated": false, "deprecated_in": [ "0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840" ], "is_strategic": false, "network_roles": [ "collateral" ], "total_network_collateral_value_usd": "93518204.27", "total_network_collateral_value_status": "fresh", "network_value_at": "2026-10-05T12:00:23.000Z", "network_value_block": { "number": 23512345, "timestamp": 1791201623 }, "network_value_stale_age_seconds": 0, "network_value_exceptions": [], "is_visible": true, "visibility_reason": "collateral_threshold" }
-{ "address": "0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa", "symbol": "mETH", "status": "success", "name": "mETH", "decimals": 18, "is_deprecated": true, "is_network_deprecated": true, "deprecated_in": [ "0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840" ], "is_strategic": false, "network_roles": [ "collateral" ], "total_network_collateral_value_usd": "1204.5", "total_network_collateral_value_status": "fresh", "network_value_at": "2026-10-05T12:00:23.000Z", "network_value_block": { "number": 23512345, "timestamp": 1791201623 }, "network_value_stale_age_seconds": 0, "network_value_exceptions": [], "is_visible": false, "visibility_reason": "deprecated" }
+{ "address": "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee", "symbol": "weETH", "status": "success", "name": "Wrapped eETH", "decimals": 18, "is_deprecated": true, "is_network_deprecated": false, "deprecated_in": [ "0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840" ], "is_hidden": false, "hidden_in": [ "0xc3d688B66703497DAA19211EEdff47f25384cdc3" ], "is_strategic": false, "network_roles": [ "collateral" ], "total_network_collateral_value_usd": "93518204.27", "total_network_collateral_value_status": "fresh", "network_value_at": "2026-10-05T12:00:23.000Z", "network_value_block": { "number": 23512345, "timestamp": 1791201623 }, "network_value_stale_age_seconds": 0, "network_value_exceptions": [], "is_visible": false, "visibility_reason": "deprecated" }
+{ "address": "0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa", "symbol": "mETH", "status": "success", "name": "mETH", "decimals": 18, "is_deprecated": true, "is_network_deprecated": true, "deprecated_in": [ "0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840" ], "is_hidden": false, "hidden_in": [], "is_strategic": false, "network_roles": [ "collateral" ], "total_network_collateral_value_usd": "1204.5", "total_network_collateral_value_status": "fresh", "network_value_at": "2026-10-05T12:00:23.000Z", "network_value_block": { "number": 23512345, "timestamp": 1791201623 }, "network_value_stale_age_seconds": 0, "network_value_exceptions": [], "is_visible": false, "visibility_reason": "deprecated" }
 ```
 
-In the weETH of the USDC market, `is_deprecated` is `false`, and every field
-of the chain is the same.
+In the weETH of the USDC market, `is_deprecated` is `false` and `is_hidden`
+`true`, so discovery does not show it there: `is_visible` is `false`, and
+`visibility_reason` `hidden`. Every field of the chain is the same.
+
+Were weETH marked deprecated in WETH's market as well, no enabled market would
+offer it with neither decision, and the token list would leave it out
+(`hidden`), with `isDeprecated` still `false`. The WETH and USDT markets,
+which have it deprecated, would not show it either: `is_visible: false`, by
+`deprecated`.
 
 The base asset has two prices: its price in the market's unit, `base_price`,
 through the version's base feed — or, where that reverts, through the feed
@@ -443,6 +484,9 @@ bulker:
 } ]
 ```
 
+The USDC market of mainnet, abridged to six of its collaterals, weETH among
+them, hidden in this market as above:
+
 ```sh
 $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3/summary'
 ```
@@ -472,7 +516,7 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
   "utilization": "363775913612426560",
   "base_usd_price": "0.99996",
   "base_price": "0.99996",
-  "collateral_asset_symbols": [ "COMP", "WBTC", "WETH", "UNI", "LINK" ],
+  "collateral_asset_symbols": [ "COMP", "WBTC", "WETH", "UNI", "LINK", …, "weETH", … ],
   "collaterals": [
     {
       "address": "0xc00e94Cb662C3520282E6f5717214004A7f26888",
@@ -483,6 +527,8 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
       "is_deprecated": false,
       "is_network_deprecated": false,
       "deprecated_in": [],
+      "is_hidden": false,
+      "hidden_in": [],
       "is_strategic": false,
       "network_roles": [ "reward", "collateral" ],
       "total_network_collateral_value_usd": "4825170.931506",
@@ -497,7 +543,10 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
     { "address": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", "symbol": "WBTC", "status": "success", "name": "Wrapped BTC", "decimals": 8, … },
     { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "status": "success", "name": "Wrapped Ether", "decimals": 18, … },
     { "address": "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "symbol": "UNI",  "status": "success", "name": "Uniswap", "decimals": 18, … },
-    { "address": "0x514910771AF9Ca656af840dff83E8264EcF986CA", "symbol": "LINK", "status": "success", "name": "ChainLink Token", "decimals": 18, … }
+    { "address": "0x514910771AF9Ca656af840dff83E8264EcF986CA", "symbol": "LINK", "status": "success", "name": "ChainLink Token", "decimals": 18, … },
+    …,
+    { "address": "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee", "symbol": "weETH", "status": "success", "name": "Wrapped eETH", "decimals": 18, …, "is_hidden": true, "hidden_in": [ "0xc3d688B66703497DAA19211EEdff47f25384cdc3" ], …, "is_visible": false, "visibility_reason": "hidden" },
+    …
   ]
 } ]
 ```
@@ -1162,8 +1211,10 @@ it is; a monitor matches `details.code` for those. Besides
 a database that could not be reached, and a database without the migration of
 the tables a route reads — the token policies' on the token list and the token
 policy routes, the deprecated collaterals' on the token list, `/active`, the
-market reads and the deprecated collateral routes — are a `503`, here as on
-every endpoint ([Errors](#errors)): those are the answers worth trying again.
+market reads and the deprecated collateral routes, and the hidden
+collaterals' on the same reads and the hidden collateral routes — are a
+`503`, here as on every endpoint ([Errors](#errors)): those are the answers
+worth trying again.
 
 Every `CONFLICT` names in `details.code` the conflict it met, which is what a
 script matches; the message says the same to a person, and may change. An
@@ -1186,36 +1237,40 @@ overlay write below is any of `PUT …/overlay`, `PUT …/overlays` and
 | `PROPOSAL_CLOSED` | the proposal routes | a version of the registry has been activated |
 | `PROPOSAL_CHANGED` | `POST …/proposal/apply` | the proposal no longer has the digest sent; `details.digest` is the one it has |
 | `TOKEN_LEFT_REGISTRY` | `PATCH …/policy`, `POST …/token-policies/apply` | a version without the token, or without a token of the list, was activated while it was being written |
-| `COLLATERAL_LEFT_REGISTRY` | `PATCH …/deprecated`, `POST …/deprecated-collaterals/apply` | a version whose market does not take the collateral, or a collateral of the list, was activated while it was being written |
-| `DECISION_CHANGED` | `POST …/token-policies/apply`, `POST …/deprecated-collaterals/apply` | someone else changed a decision of the list while it was being applied |
+| `COLLATERAL_LEFT_REGISTRY` | `PATCH …/deprecated`, `POST …/deprecated-collaterals/apply`, `PATCH …/hidden`, `POST …/hidden-collaterals/apply` | a version whose market does not take the collateral, or a collateral of the list, was activated while it was being written |
+| `DECISION_CHANGED` | `POST …/token-policies/apply`, `POST …/deprecated-collaterals/apply`, `POST …/hidden-collaterals/apply` | someone else changed a decision of the list while it was being applied |
 
 Public reads carry `X-Registry-Version` and `X-Registry-Checksum`, which a
 browser can read. Every one of them but the token list is cacheable by its
 version, carries an `ETag`, and answers `304` to an `If-None-Match` that names
 what it would send; `/active` and the market reads are cacheable by the
-deprecated flags they carry as well, which their tag names. The token list's
-values change every minute, so it is kept for 30 seconds and carries none.
-The tags are compared weakly, as RFC 9110 has it: `W/"…"`, which is what a
-browser sends back for a response Cloudflare compressed, names the same as
-the tag itself; `*` names any; and a list of tags names what any tag in it
-names. A header that is none of those is answered with the body, and so is
-every request while an answer comes from the cache because the database
-cannot be reached. They answer `503 REGISTRY_NOT_ACTIVE` when no version is
-active, and `503 UPSTREAM_UNAVAILABLE` when the database cannot be reached
-and no older version may be served instead. A path is matched with or
-without a trailing slash.
+deprecated and the hidden flags they carry as well, which their tag names. A
+tag also names the revision of what this API sends for a version, which a
+release moves on when it changes that for a version already active, as the
+one that added `isHidden` did: a copy an earlier release sent is then sent
+again, not confirmed. The token list's values change every minute, so it is
+kept for 30 seconds and carries none. The tags are compared weakly, as
+RFC 9110 has it: `W/"…"`, which is what a browser sends back for a response
+Cloudflare compressed, names the same as the tag itself; `*` names any; and a
+list of tags names what any tag in it names. A header that is none of those
+is answered with the body, and so is every request while an answer comes from
+the cache because the database cannot be reached. They answer
+`503 REGISTRY_NOT_ACTIVE` when no version is active, and
+`503 UPSTREAM_UNAVAILABLE` when the database cannot be reached and no older
+version may be served instead. A path is matched with or without a trailing
+slash.
 
 A public read that fails after the active version was read names that
 version in the same two headers: a chain or a market it does not serve
 (`404`), a malformed chain id or address on the market reads (`400`), and a
-`503` that came after it, such as one for deprecated flags that could not be
-read with nothing recorded, or for a database without migration `0007`. When
-that version came from the cache because the database could not be reached,
-the answer also carries `X-Registry-Stale` and `Cache-Control: no-store`. An
-answer given before any version was read names none: an unknown path, a
-method the route does not take, the two `503`s of the paragraph above, the
-token list's `400` for a malformed chain id or `visibleOnly`, which it gives
-before it reads the version, and a version id
+`503` that came after it, such as one for deprecated or hidden flags that
+could not be read with nothing recorded, or for a database without migration
+`0007` or `0008`. When that version came from the cache because the database
+could not be reached, the answer also carries `X-Registry-Stale` and
+`Cache-Control: no-store`. An answer given before any version was read names
+none: an unknown path, a method the route does not take, the two `503`s of
+the paragraph above, the token list's `400` for a malformed chain id or
+`visibleOnly`, which it gives before it reads the version, and a version id
 `/registry/v1/versions/{version_id}` does not know.
 
 A `{chain_id}` is written in decimal without a leading zero — `1`, never
@@ -1240,11 +1295,14 @@ request is rate limited twice, reads as well as commands:
 - Then, once it is authenticated, by its token: 30 a minute for each token
   and each family of routes. Every read shares one budget, so a monitor
   polling the status spends it with an operator who holds the same token, and
-  each kind of command has one of its own. `POST …/token-policies/review`
-  and `POST …/deprecated-collaterals/review`, which write nothing, count as
-  reads; the decisions an administrator makes about what the app offers —
-  `PATCH …/policy`, `POST …/token-policies/apply`, `PATCH …/deprecated` and
-  `POST …/deprecated-collaterals/apply` — share one `policy` budget.
+  each kind of command has one of its own. `POST …/token-policies/review`,
+  `POST …/deprecated-collaterals/review` and
+  `POST …/hidden-collaterals/review`, which write nothing, count as reads;
+  the decisions an administrator makes about what the app offers and what
+  discovery shows — `PATCH …/policy`, `POST …/token-policies/apply`,
+  `PATCH …/deprecated`, `POST …/deprecated-collaterals/apply`,
+  `PATCH …/hidden` and `POST …/hidden-collaterals/apply` — share one
+  `policy` budget.
 
 Past either budget the answer is `429` `RATE_LIMITED`, saying in
 `Retry-After` how many seconds to wait, and in its message which budget ran
@@ -1252,10 +1310,10 @@ out: `too many administrative requests from this address`, or
 `too many <family> requests with this token`.
 
 A command's body is at most 64 KiB — 512 KiB for `PUT …/overlays`, and 1 MiB
-for `POST …/token-policies/review`, `POST …/deprecated-collaterals/review` and
-their `…/apply` — and a larger one is refused with `413`. A `reason`, wherever
-a command takes one, is at most 1,000 characters, and a longer one is refused
-with `400`.
+for `POST …/token-policies/review`, `POST …/deprecated-collaterals/review`,
+`POST …/hidden-collaterals/review` and their `…/apply` — and a larger one is
+refused with `413`. A `reason`, wherever a command takes one, is at most 1,000
+characters, and a longer one is refused with `400`.
 
 The body is JSON, sent as `application/json` or as a `+json` type such as
 `application/merge-patch+json`, or without a `Content-Type`. The type is read
@@ -1298,13 +1356,15 @@ while `isDeprecated` says so of one collateral of a market:
           "assetIndex": 1,
           "token": { "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", "symbol": "WETH", "name": "Wrapped Ether", "decimals": 18 },
           "priceFeed": { "address": "0x…", "decimals": 8 },
-          "isDeprecated": false
+          "isDeprecated": false,
+          "isHidden": false
         },
         {
           "assetIndex": 10,
           "token": { "address": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa", "symbol": "mETH", "name": "mETH", "decimals": 18 },
           "priceFeed": { "address": "0x…", "decimals": 8 },
-          "isDeprecated": true
+          "isDeprecated": true,
+          "isHidden": false
         }
       ]
     } ]
@@ -1312,24 +1372,41 @@ while `isDeprecated` says so of one collateral of a market:
 }
 ```
 
-The flag is not part of the version — a decision outlives every activation
-(`PATCH …/collaterals/{token_address}/deprecated` below) — so it is read with
+Every collateral also says, after `isDeprecated`, whether an administrator
+has hidden it in that market (`isHidden`). A hidden collateral is one token
+discovery does not show in that market
+([Collateral tokens](#collateral-tokens)), nor on the whole chain once every
+enabled market that takes it hides it or has it deprecated (the token list,
+below). It stays a collateral of its market: the market still takes it, and a
+user's positions in it and the actions on them are shown as before. To stop
+offering a collateral in a market, an administrator marks it deprecated
+instead.
+
+The flags are not part of the version — a decision outlives every activation
+(`PATCH …/collaterals/{token_address}/deprecated` and
+`PATCH …/collaterals/{token_address}/hidden` below) — so they are read with
 every answer, and the `ETag` names the flags an answer carries beside the
-version: a decision that changes them changes the tag, and a client holding a
-copy made before it is sent the new one rather than a `304`. A browser may
-still keep a copy for its `max-age`.
+version, the deprecated and the hidden ones apart: a decision that changes
+them changes the tag, and a client holding a copy made before it is sent the
+new one rather than a `304`. A browser may still keep a copy for its
+`max-age`. A tag is compared whole, and reads
+`"v1-r5-snapshot+deprecated-<digest>+hidden-<digest>-<version id>-<checksum>"`:
+the revision of what is sent — `5` since the release that added `isHidden` —
+and for each flag a digest of the collaterals it is set on; the market reads
+tag their own part of the version the same way.
 
 When the database cannot be reached, the flags are the decisions the API last
-recorded. Every decision records them once it has committed, and the reads
-keep that record in step: they check it against the decisions they read, and
-write those where it differs, whenever they find the decisions changed and at
-least every five minutes besides. A read that began before a decision can
-still write after it and put back the decisions before it; the next check
-puts that right, within about five minutes while the API is being read. An
-answer with the recorded flags carries `X-Registry-Stale` and `no-store`, as
-every answer from the cache does, with `X-Registry-Stale: 0` where the
-version was confirmed and the decisions alone could not be read; with nothing
-recorded it is `503 UPSTREAM_UNAVAILABLE`.
+recorded, in a record of each kind. Every decision records its kind's once it
+has committed, and the reads keep both records in step: they check each
+against the decisions they read, and write those where it differs, whenever
+they find the decisions changed and at least every five minutes besides. A
+read that began before a decision can still write after it and put back the
+decisions before it; the next check puts that right, within about five
+minutes while the API is being read. An answer with recorded flags of either
+kind carries `X-Registry-Stale` and `no-store`, as every answer from the cache
+does, with `X-Registry-Stale: 0` where the version was confirmed and the
+decisions alone could not be read; with either kind not recorded it is
+`503 UPSTREAM_UNAVAILABLE`.
 
 ```sh
 $ curl 'localhost:8787/registry/v1/active'
@@ -1345,8 +1422,8 @@ markets.
 ### description:
 
 The markets of one chain that are not `disabled`, in the same order the
-snapshot lists them, each collateral with its `isDeprecated` as
-`/registry/v1/active` has it. A chain the active version does not list
+snapshot lists them, each collateral with its `isDeprecated` and `isHidden`
+as `/registry/v1/active` has them. A chain the active version does not list
 answers `404`. The `ETag` names the flags of this chain's markets, so a
 decision about another chain leaves it as it is.
 
@@ -1354,43 +1431,55 @@ decision about another chain leaves it as it is.
 ### description:
 
 One market, addressed by its Comet, each collateral with its `isDeprecated`
-as `/registry/v1/active` has it, and an `ETag` that names this market's flags
-alone. A `disabled` market answers `404`; a `deprecated` one is served,
-because positions and history in it must stay reachable.
+and `isHidden` as `/registry/v1/active` has them, and an `ETag` that names
+this market's flags alone. A `disabled` market answers `404`; a `deprecated`
+one is served, because positions and history in it must stay reachable.
 
 ## `/registry/v1/networks/{chain_id}/tokens`
 ### description:
 
 Every token the active version serves on one chain — the base, reward and
 collateral tokens of its enabled and deprecated markets — with its strategic
-mark, the markets it is a deprecated collateral of, the USD value of its
-collateral across the chain's enabled markets, and whether token discovery
-shows it. `?visibleOnly=true` lists only the tokens it shows; `visibleOnly` is
-exactly `true` or `false`, and anything else answers `400`.
+mark, the markets it is a deprecated collateral of and the markets that hide
+it, the USD value of its collateral across the chain's enabled markets, and
+whether token discovery shows it. `?visibleOnly=true` lists only the tokens
+it shows; `visibleOnly` is exactly `true` or `false`, and anything else
+answers `400`.
 
 A token is shown when an administrator marked it strategic, or when its
 collateral is worth at least `thresholdUsd`, USD 250,000, compared exactly. A
 token whose value cannot be read is shown as well (`data_unavailable`): not
-knowing what a token is worth is no reason to hide one someone may hold. A
-token deprecated in every enabled market that takes it as collateral
-(`isDeprecated`, below) is hidden before any of that is asked
-(`deprecated`), whatever it is worth and even when it is strategic: no
-enabled market offers it as a collateral any longer, so discovery does not
-either. Only its collateral is asked about, so a token that is also the base
-or reward token of an enabled market is hidden all the same. Its value is
-still read and told, as any other token's.
+knowing what a token is worth is no reason to keep from discovery one someone
+may hold. A token deprecated in every enabled market that takes it as
+collateral (`isDeprecated`, below) is not shown, and that is asked before any
+of the above (`deprecated`), whatever it is worth and even when it is
+strategic: no enabled market offers it as a collateral any longer, so
+discovery does not either. A token an administrator hid in an enabled market
+that takes it as collateral, where every other enabled market that takes it
+hides it too or has it deprecated (`hiddenIn`, below), is not shown either,
+and that is asked first of all (`hidden`), before whether it is deprecated:
+hiding a collateral is a decision about discovery alone, and a market that has
+the token deprecated counts as one that does not offer it, so none of them
+offers the token and leaves it to discovery. In all, a token every enabled
+market that takes it hides or has deprecated is not shown, `hidden` where any
+of them hides it and `deprecated` where all of them have it deprecated and
+none hides it. Only its collateral is asked about, so a token that is also the
+base or reward token of an enabled market is not shown all the same. Its value
+is still read and told, as any other token's.
 
-Hiding a token from discovery takes nothing from a user who holds it. The app
-keeps showing a deprecated collateral to a user with a balance of it in that
-market, so that it can be withdrawn, whatever the list says: `isVisible`
-decides what discovery offers, not whether a holder sees a position.
+Leaving a token out of discovery takes nothing from a user who holds it. The
+app keeps showing a deprecated collateral to a user with a balance of it in
+that market, so that it can be withdrawn, whatever the list says: `isVisible`
+decides what discovery offers, not whether a holder sees a position. A hidden
+collateral stays a collateral of its market: the market still takes it, and
+a user's positions in it and the actions on them are shown as before.
 
 ```json
 {
   "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
   "chainId": 1,
   "thresholdUsd": "250000",
-  "ruleVersion": 2,
+  "ruleVersion": 3,
   "computedAt": "2026-10-05T12:00:31.204Z",
   "block": { "number": 23512345, "timestamp": 1791201623 },
   "tokens": [
@@ -1403,6 +1492,7 @@ decides what discovery offers, not whether a holder sees a position.
       "isStrategic": false,
       "isDeprecated": true,
       "deprecatedIn": [ "0xe85dc543813b8c2cfeaac371517b925a166a9293" ],
+      "hiddenIn": [],
       "collateralValueUsd": "182345.0912",
       "collateralValueStatus": "exception",
       "valueAt": "2026-10-05T12:00:23.000Z",
@@ -1420,6 +1510,25 @@ decides what discovery offers, not whether a holder sees a position.
       "visibilityReason": "deprecated"
     },
     {
+      "address": "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",
+      "symbol": "weETH",
+      "name": "Wrapped eETH",
+      "decimals": 18,
+      "roles": [ "collateral" ],
+      "isStrategic": false,
+      "isDeprecated": false,
+      "deprecatedIn": [ "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840" ],
+      "hiddenIn": [ "0xc3d688b66703497daa19211eedff47f25384cdc3" ],
+      "collateralValueUsd": "93518204.27",
+      "collateralValueStatus": "fresh",
+      "valueAt": "2026-10-05T12:00:23.000Z",
+      "valueBlock": { "number": 23512345, "timestamp": 1791201623 },
+      "staleAgeSeconds": 0,
+      "exceptions": [],
+      "isVisible": true,
+      "visibilityReason": "collateral_threshold"
+    },
+    {
       "address": "0x68749665ff8d2d112fa859aa293f07a622782f38",
       "symbol": "XAUt",
       "name": "Tether Gold",
@@ -1428,6 +1537,7 @@ decides what discovery offers, not whether a holder sees a position.
       "isStrategic": false,
       "isDeprecated": false,
       "deprecatedIn": [],
+      "hiddenIn": [],
       "collateralValueUsd": "1843210.123456",
       "collateralValueStatus": "fresh",
       "valueAt": "2026-10-05T12:00:23.000Z",
@@ -1468,10 +1578,13 @@ block this minute was valued at, which can be an earlier block of the same
 minute than `block`, or an earlier minute's for a `stale` value. `block` is
 the chain's latest, and is `null` when the node did not answer; a token no
 enabled market takes as collateral is then `"0"` with no block.
-`visibilityReason` is `deprecated`, `strategic`, `data_unavailable`,
-`collateral_threshold` or `below_threshold`, in the order the rule asks them;
-only `deprecated` and `below_threshold` hide a token. `ruleVersion` names the
-rule: `2` since a deprecated token is hidden, `1` before.
+`visibilityReason` is `hidden`, `deprecated`, `strategic`,
+`data_unavailable`, `collateral_threshold` or `below_threshold`, in the order
+the rule asks them; discovery shows a token for every reason but `hidden`,
+`deprecated` and `below_threshold`. `ruleVersion` names the rule: `3` since a
+token an enabled market hides is not shown where every other that takes it
+hides it too or has it deprecated, `2` since a deprecated one is not, `1`
+before.
 
 `deprecatedIn` lists, sorted, the Comets of the chain's served markets that
 take the token as a collateral an administrator has marked deprecated in that
@@ -1479,21 +1592,38 @@ market (`PATCH …/collaterals/{token_address}/deprecated`), and is empty for a
 token no market marks so — a base or reward token among them. `isDeprecated`
 is `true` when the token is a collateral of at least one enabled market and
 deprecated in every enabled market that takes it: no enabled market offers it
-as a current collateral any longer, and discovery hides it. The decision of a
-market whose status is `deprecated` is named in `deprecatedIn`, but takes no
-part in `isDeprecated`. A token deprecated in some enabled markets only is
-still offered in the others, and is shown or hidden by the rest of the rule;
-where to hide it is the app's decision, per market, by `isDeprecated` on that
-market's collateral.
+as a current collateral any longer, and discovery does not show it. The
+decision of a market whose status is `deprecated` is named in `deprecatedIn`,
+but takes no part in `isDeprecated`. A token deprecated in some enabled
+markets only is still offered in the others, and the rest of the rule decides
+whether discovery shows it — it does not where the others all hide it
+(`hiddenIn`, below); where to stop offering it is the app's decision, per
+market, by `isDeprecated` on that market's collateral.
+
+`hiddenIn` lists the same way the Comets of the chain's served markets that
+take the token as a collateral an administrator has hidden in that market
+(`PATCH …/collaterals/{token_address}/hidden`). A token hidden in an enabled
+market that takes it, where every other enabled market that takes it hides it
+too or has it deprecated, is not shown, and only its `visibilityReason` says
+so: the list has no flag of its own for it. So a token some of them have
+deprecated and the rest hide is `hidden`, with `isDeprecated` `false`, and so
+is one all of them have deprecated and one of them hides as well, rather than
+`deprecated`. The decisions of a market whose status is `deprecated` are named
+in `deprecatedIn` and `hiddenIn`, but take no part in that. A token another
+enabled market offers as a current collateral without hiding it is decided by
+the rest of the rule, and `/summary` says of each market whether discovery
+shows it there ([Collateral tokens](#collateral-tokens)).
 
 The list answers `200` whatever the node does: a token that cannot be valued
 is a status of that token, never a failure of the list. It answers `404` for a
 chain the active version does not list, as `/networks/{chain_id}/markets`
 does: one it does not hold, or one whose every market is disabled. It answers
 `503` when no version is active, or when the database cannot be reached for
-the token policies or the deprecated collateral decisions, or does not have
-their migrations yet — without them a strategic token would be listed as
-hidden, and a deprecated collateral as current, and shown. It carries
+the token policies or the deprecated or hidden collateral decisions, or does
+not have their migrations yet — without them a strategic token would be
+listed as not shown, a deprecated collateral as current, and a token every
+enabled market hides as shown. It does not answer from the decisions the API
+last recorded, as `/active` does. It carries
 `Cache-Control: public, max-age=30` and no `ETag`; an answer from a version
 the database could not confirm carries `X-Registry-Stale` and `no-store`
 instead.
@@ -1508,8 +1638,9 @@ $ curl 'localhost:8787/registry/v1/networks/1/tokens?visibleOnly=true'
 A validated version by id, so a session that pinned one can refetch exactly
 what it pinned even after another version was activated. It is the version as
 it was imported: the networks and markets `/registry/v1/active` serves for
-the same version, without the `isDeprecated` the active reads add to every
-collateral, since a deprecated collateral decision is no part of a version.
+the same version, without the `isDeprecated` and `isHidden` the active reads
+add to every collateral, since a decision about a collateral is no part of a
+version.
 It has an `ETag` of its own, and a client that sends it back is answered
 `304` without the version being read again.
 
@@ -2363,11 +2494,12 @@ source adds reads as a longer list and one more entry.
 
 Marks a token strategic, or takes the mark away. The token list
 (`/registry/v1/networks/{chain_id}/tokens`) shows a strategic token whatever
-its collateral value — unless it is deprecated in every enabled market that
-takes it — and reads the mark on every request, so a change is in its next
-answer. The list names only the tokens of served markets: a mark on a token
-only disabled markets name — every token of a chain whose markets are all
-disabled, for one — shows once a market that names it is served.
+its collateral value — unless every enabled market that takes it hides it or
+has it deprecated, `hidden` where any of them hides it and `deprecated` where
+all have it deprecated — and reads the mark on every request, so a change is
+in its next answer. The list names only the tokens of served markets: a mark
+on a token only disabled markets name — every token of a chain whose markets
+are all disabled, for one — shows once a market that names it is served.
 
 A policy belongs to the token — a chain id and an address — and not to a
 registry version, so it survives every activation, and a version that drops
@@ -2618,10 +2750,11 @@ deprecated collateral is one the app no longer offers in that market; it
 keeps showing it to a user who still holds some, so that it can be
 withdrawn. `/active` and the market reads mark it with `isDeprecated` on that
 collateral of that market, and the token list names the market's Comet in
-the token's `deprecatedIn`, and hides a token deprecated in every enabled
-market that takes it; all of them read the decisions on every request, so a
-change is in their next answer, and changes the `ETag` of every read whose
-flags it changes.
+the token's `deprecatedIn`, and does not show a token deprecated in every
+enabled market that takes it, or hidden in every one of them that still
+offers it; all of them read the decisions on every request, so a change is in
+their next answer, and changes the `ETag` of every read whose flags it
+changes.
 
 A decision belongs to the collateral of the Comet — a chain id, the Comet's
 address and the token's — and not to a registry version, so it survives every
@@ -2858,3 +2991,277 @@ the market reads and the token list, which read the decisions. These routes
 were `…/legacy` and `/registry/v1/admin/legacy-collaterals…`, with
 `isLegacy`, before migration `0007` renamed the feature; the old paths answer
 `404`.
+
+## `PATCH /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/collaterals/{token_address}/hidden`
+### description:
+
+Hides a collateral of a market from token discovery, or takes that decision
+back, which hands the collateral back to the rest of the rule rather than
+showing it. A hidden collateral stays a collateral of its market: the market
+still takes it, and a user's positions in it and the actions on them are shown
+as before; only discovery leaves it out. To stop offering a collateral in a
+market, mark it deprecated instead (`PATCH …/deprecated` above). `/active` and
+the market reads mark it with `isHidden` on that collateral of that market;
+`/summary` answers it in that market with `is_hidden: true`,
+`is_visible: false` and `visibility_reason: hidden`, whatever else holds
+([Collateral tokens](#collateral-tokens)); and the token list names the
+market's Comet in the token's `hiddenIn`, and does not show a token every
+enabled market that takes it hides or has deprecated, where any of them hides
+it, before anything else is asked: a market that has the token deprecated
+counts as one that does not offer it. All of them read the decisions on every
+request, so a change is in their next answer, and changes the `ETag` of every
+read whose flags it changes.
+
+A decision belongs to the collateral of the Comet — a chain id, the Comet's
+address and the token's — and not to a registry version, as a deprecated
+collateral's does: it survives every activation, and a version that drops the
+collateral from its market and a later one that brings it back bring the
+decision back with it. It is decided only for a collateral of a market of the
+active version, of any status: a chain the version does not hold, a Comet no
+market of that chain has there, or a token that is not one of that market's
+collateral answers `404`, and no active version answers
+`503 REGISTRY_NOT_ACTIVE`. A collateral a version adds can therefore be
+hidden only once that version is active: from the activation until the
+decision is written, the rest of the rule decides whether discovery shows its
+token in that market and, for an enabled market, on the token list, even
+where the list left the token out until then because every other enabled
+market that takes it hides it or has it deprecated. Hide it right after
+activating ([Hiding a collateral](./REGISTRY_RUNBOOK.md#hiding-a-collateral)).
+Both addresses may be in any case; they are stored and answered lowercase.
+
+The token is the one the version holds, as the token list and
+`GET …/hidden-collaterals` name it, not the one the app shows in its place.
+Where the app shows a wrapped native token as the chain's own coin, at the
+zero address — WETH as ETH on seven chains, WPOL as POL and WRON as RON — the
+decision is about the wrapped token: hiding WETH is what keeps the app's ETH
+out of discovery. On Ethereum the decision about wstETH is also the one about
+the stETH the app lets a user supply in its place. A decision about an
+address the app shows and the version does not hold answers `404`: no market
+takes that token.
+
+The body is exactly a boolean and the reason, which is required and stored
+with the audit event beside the actor:
+
+```json
+{ "isHidden": true, "reason": "Not shown by discovery in the USDC market" }
+```
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "chainId": 1,
+  "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3",
+  "tokenAddress": "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",
+  "isHidden": true,
+  "changed": true,
+  "updatedAt": "2026-10-21T09:12:44.512Z"
+}
+```
+
+A collateral nobody has decided about is not hidden. Asking for the decision
+already in force answers `changed: false`, writes nothing and keeps the time
+the decision was made, so a repeated or retried request is safe; `updatedAt`
+is `null` for a collateral nobody has ever decided about. A change is
+committed with its audit event before it is answered, and the answer names
+the version it was checked against, in the body and in `X-Registry-Version`.
+If a version without the collateral is activated while the change is being
+written, the write is rolled back, event and all, and the request answers
+`409` with `COLLATERAL_LEFT_REGISTRY`. Once it has committed, the command
+records the hidden decisions in force, apart from the deprecated ones, for
+`/active`, the market reads and `/summary` to answer with while the database
+cannot be reached.
+
+```sh
+$ curl -X PATCH 'localhost:8787/registry/v1/admin/networks/1/markets/0xc3d688B66703497DAA19211EEdff47f25384cdc3/collaterals/0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee/hidden' \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"isHidden": true, "reason": "Not shown by discovery in the USDC market"}'
+```
+
+## `GET /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/collaterals/{token_address}/hidden`
+### description:
+
+One collateral's hidden decision and the changes that led to it, at most
+100, newest first in the order they were committed, so the first is always
+the change that set the decision in force. `previousIsHidden` is `null` for
+the first decision about a collateral.
+
+A decision stays readable while the active version does not hold the
+collateral in that Comet, with `inActiveVersion: false`; it applies again once
+a version that holds it is activated. Only a collateral the active version
+does not hold and nobody has decided about answers `404`.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "chainId": 1,
+  "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3",
+  "tokenAddress": "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",
+  "inActiveVersion": true,
+  "isHidden": true,
+  "updatedAt": "2026-10-21T09:12:44.512Z",
+  "updatedBy": "registry-admin:stage",
+  "events": [
+    {
+      "id": "3b8f2c1d-5e6a-4f7b-8c9d-0e1f2a3b4c5d",
+      "previousIsHidden": null,
+      "isHidden": true,
+      "actor": "registry-admin:stage",
+      "reason": "Not shown by discovery in the USDC market",
+      "createdAt": "2026-10-21T09:12:44.512Z"
+    }
+  ]
+}
+```
+
+## `GET /registry/v1/admin/hidden-collaterals`
+### description:
+
+Every collateral of every market of the active version with the hidden
+decision in force, as a list review and apply take back: the file an operator
+edits instead of writing addresses by hand. Rows are ordered by chain, then
+by the market's deployment key, then by asset index, and a disabled market's
+collaterals are listed too: a decision about one applies once the market is
+served. The rows are under `hiddenCollaterals`, not `collaterals` as a list
+of deprecated collaterals has them, so that neither kind's review takes the
+other's file: one sent to the other kind's review or apply is refused with
+`400`, `unexpected properties: …`.
+
+`retained` lists the decisions kept for collaterals the active version does
+not hold in their Comet, each with when and by whom it was made. Each applies
+again as soon as a version whose market takes the collateral is activated,
+so it is worth reviewing before one is.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "reason": null,
+  "hiddenCollaterals": [
+    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "tokenAddress": "0x514910771af9ca656af840dff83e8264ecf986ca", "symbol": "LINK", "isHidden": false },
+    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "tokenAddress": "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee", "symbol": "weETH", "isHidden": true }
+  ],
+  "retained": [
+    {
+      "chainId": 1,
+      "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3",
+      "tokenAddress": "0xae78736cd615f374d3085123a210448e74fc6393",
+      "isHidden": true,
+      "updatedAt": "2026-10-20T14:20:11.903Z",
+      "updatedBy": "registry-admin:stage"
+    }
+  ]
+}
+```
+
+## `POST /registry/v1/admin/hidden-collaterals/review`
+### description:
+
+What applying a list would change, row by row, without writing anything. The
+body is a list as the export answers it, edited, of 1 to 500 rows and at most
+1 MiB:
+
+- `hiddenCollaterals[]`: `chainId`, `cometAddress` and `tokenAddress` (both
+  in any case) and `isHidden` are required; `deploymentKey` and `symbol` are
+  optional and only checked — a market or a symbol that is not the one the
+  active version names is reported as the mistake it usually is; `reason` is
+  optional.
+- `reason` at the top is the reason for every row that changes and has none of
+  its own. A row that changes a decision needs one or the other; a row that
+  leaves its collateral as it is needs neither.
+- `registryVersion` and `retained` say where the list was exported from and
+  what the active version does not hold, and are not read: a decision belongs
+  to no version.
+
+A malformed body answers `400` with every problem of every row in
+`details.problems`. A well-formed one answers `200`, with each row's
+`problem` in place of refusing:
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "summary": { "change": 1, "unchanged": 0, "problems": 0 },
+  "hiddenCollaterals": [
+    {
+      "row": 1,
+      "chainId": 1,
+      "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3",
+      "deploymentKey": "usdc",
+      "tokenAddress": "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",
+      "symbol": "weETH",
+      "current": false,
+      "requested": true,
+      "action": "change",
+      "reason": "Not shown by discovery in the USDC market",
+      "problem": null
+    }
+  ]
+}
+```
+
+A `problem` is one of: a chain the active version does not hold, a Comet no
+market of that chain has there, a token that is not one of that market's
+collateral — an address the app shows in place of the token the version
+holds among them — a market or a symbol that names another, or a change
+without a reason.
+
+## `POST /registry/v1/admin/hidden-collaterals/apply`
+### description:
+
+Applies a list — the same body as review — in one transaction, as
+`POST …/deprecated-collaterals/apply` applies one: every decision it changes
+is written with its own audit event, and the transaction requires every row,
+the unchanged ones included, to hold what the list says once it is done. A
+list is applied completely or not at all:
+
+- a list with any `problem` answers `422`, naming each such row in
+  `details.problems`, and writes nothing;
+- a version without one of its collaterals activated while the list is being
+  written answers `409` with `COLLATERAL_LEFT_REGISTRY`, and a decision of the
+  list changed by someone else meanwhile `409` with `DECISION_CHANGED`; either
+  writes nothing.
+
+The list is compared with the decisions in force when it is applied, not when
+it was reviewed, so review it right before applying it: a decision someone
+made in between is changed like any other row the list contradicts, and shows
+in the answer as a change. A list of only the rows the review shows as
+changes, which is what the runbook applies
+([A reviewed list of hidden collaterals](./REGISTRY_RUNBOOK.md#a-reviewed-list-of-hidden-collaterals)),
+leaves every other decision as it is. A row the comparison finds unchanged is
+not written, only checked, so a decision made on that collateral while the
+list is being written is never reverted by it. Applying the same list again
+changes nothing. Once it has committed, the command records the hidden
+decisions in force, as a single change does.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "summary": { "changed": 1, "unchanged": 0 },
+  "hiddenCollaterals": [
+    {
+      "row": 1,
+      "chainId": 1,
+      "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3",
+      "deploymentKey": "usdc",
+      "tokenAddress": "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",
+      "symbol": "weETH",
+      "isHidden": true,
+      "changed": true,
+      "updatedAt": "2026-10-21T09:12:44.512Z"
+    }
+  ]
+}
+```
+
+```sh
+$ curl -X POST 'localhost:8787/registry/v1/admin/hidden-collaterals/apply' \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    --data @hidden-collaterals.json
+```
+
+No list is applied when an environment is brought up: nothing is hidden until
+an administrator hides it.
+
+Every hidden collateral route answers `503 UPSTREAM_UNAVAILABLE` naming the D1
+migrations when the environment's database does not have migration `0008`
+yet — a release deployed before its migration — and so do `/active`, the
+market reads and the token list, which read the decisions; `/summary` is
+answered without the fields they decide.

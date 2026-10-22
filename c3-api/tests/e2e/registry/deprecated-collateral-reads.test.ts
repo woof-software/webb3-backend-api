@@ -95,11 +95,12 @@ t.test('the active reads mark every collateral by the decisions in force, and th
   const before = await json<ActiveSnapshotV1>(env, '/registry/v1/active');
   const assets = before.networks.flatMap(network => network.markets.flatMap(market => market.collateralAssets));
   t.ok(assets.length > 0 && assets.every(asset => asset.isDeprecated === false), 'every collateral is current while nobody has decided');
-  t.same(Object.keys(assets[0]!), [ 'assetIndex', 'token', 'priceFeed', 'isDeprecated' ], 'the flag stands beside what the version says');
+  t.same(Object.keys(assets[0]!), [ 'assetIndex', 'token', 'priceFeed', 'isDeprecated', 'isHidden' ],
+    'the flag stands beside what the version says, before the hidden one (hidden-collateral-reads.test.ts)');
   t.same(
     before.networks.map(network => ({ ...network, markets: network.markets.map(market => ({
       ...market,
-      collateralAssets: market.collateralAssets.map(({ isDeprecated: _isDeprecated, ...asset }) => asset),
+      collateralAssets: market.collateralAssets.map(({ isDeprecated: _isDeprecated, isHidden: _isHidden, ...asset }) => asset),
     })) })),
     registry.snapshot.networks,
     'and everything else is the version as it was stored',
@@ -135,9 +136,9 @@ t.test('a decision changes the tag of every answer whose flags it changes, and o
     '/registry/v1/networks',
   ];
   const first = Object.fromEntries(await Promise.all(paths.map(async path => [ path, await tag(path) ] as const)));
-  t.match(first['/registry/v1/active'], new RegExp(`^"v1-r4-snapshot\\+deprecated-[0-9a-f]{16}-${registry.versionId}-[0-9a-f]{64}"$`),
+  t.match(first['/registry/v1/active'], new RegExp(`^"v1-r5-snapshot\\+deprecated-[0-9a-f]{16}\\+hidden-[0-9a-f]{16}-${registry.versionId}-[0-9a-f]{64}"$`),
     'the bootstrap tag names the flags it carries beside the version');
-  t.equal(first[`/registry/v1/versions/${registry.versionId}`], `"v1-r4-snapshot-${registry.versionId}-${registry.snapshot.registryVersion.checksum}"`,
+  t.equal(first[`/registry/v1/versions/${registry.versionId}`], `"v1-r5-snapshot-${registry.versionId}-${registry.snapshot.registryVersion.checksum}"`,
     'and the version read by id, which carries none, is another representation');
 
   await decide('usdt', 'mETH', true);

@@ -2,7 +2,7 @@ import * as evm    from '../../lib/computations/evm.js';
 import * as comet  from '../../lib/computations/comet.js';
 import * as market from '../../lib/computations/market.js';
 
-import { deprecatedDecisionsOf } from '../../src/registry/deprecated-collaterals.js';
+import { deprecatedDecisionsOf, hiddenDecisionsOf } from '../../src/registry/deprecated-collaterals.js';
 import { SUMMARY_DEADLINE_MS } from '../../src/registry/summary-tokens.js';
 import type { SummaryDecisions, SummaryTokens } from '../../src/registry/summary-tokens.js';
 import { DEADLINE_MS } from '../../src/registry/token-collateral.js';
@@ -38,9 +38,10 @@ function tokenCollateralDeps(
   };
 }
 
-// decisions that were read, and that decide nothing: no token is strategic, and no collateral deprecated
+// decisions that were read, and that decide nothing: no token is strategic, and no collateral deprecated or hidden
 const NO_DECISIONS: SummaryDecisions = {
   deprecated: { decisions: deprecatedDecisionsOf([]), recorded: false },
+  hidden:     { decisions: hiddenDecisionsOf([]), recorded: false },
   strategic:  new Map(),
 };
 

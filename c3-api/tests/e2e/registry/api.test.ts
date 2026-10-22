@@ -58,15 +58,16 @@ t.test('the bootstrap read serves the active snapshot, or says there is none', a
   const body = await response.json() as ActiveSnapshotV1;
   t.equal(body.schemaVersion, 1);
   t.equal(body.registryVersion.id, versionId);
-  // every collateral also says whether it is deprecated in its Comet (deprecated-collateral-reads.test.ts)
+  // every collateral also says whether its Comet has it deprecated or hidden (deprecated- and hidden-collateral-reads.test.ts)
   const collaterals = body.networks.flatMap(network => network.markets.flatMap(market => market.collateralAssets));
-  t.ok(collaterals.every(asset => asset.isDeprecated === false), 'none of them deprecated, since nobody has decided about one');
+  t.ok(collaterals.every(asset => asset.isDeprecated === false && asset.isHidden === false),
+    'none of them deprecated or hidden, since nobody has decided about one');
   t.same(
     body.networks.map(network => ({
       ...network,
       markets: network.markets.map(market => ({
         ...market,
-        collateralAssets: market.collateralAssets.map(({ isDeprecated: _isDeprecated, ...asset }) => asset),
+        collateralAssets: market.collateralAssets.map(({ isDeprecated: _isDeprecated, isHidden: _isHidden, ...asset }) => asset),
       })),
     })),
     snapshot.networks,
@@ -85,8 +86,8 @@ t.test('a snapshot is cacheable by version and checksum', async t => {
 
   const first = await server.fetch('/registry/v1/active');
   const etag  = first.headers.get('etag');
-  t.match(etag, new RegExp(`^"v1-r4-snapshot\\+deprecated-[0-9a-f]{16}-${versionId}-${snapshot.registryVersion.checksum}"$`),
-    'the ETag identifies schema, revision, representation with the deprecated flags it carries, version, and checksum');
+  t.match(etag, new RegExp(`^"v1-r5-snapshot\\+deprecated-[0-9a-f]{16}\\+hidden-[0-9a-f]{16}-${versionId}-${snapshot.registryVersion.checksum}"$`),
+    'the ETag identifies schema, revision, representation with the deprecated and hidden flags it carries, version, and checksum');
   t.match(first.headers.get('cache-control'), /max-age=300/, 'with the configured cache lifetime');
 
   /*
@@ -114,11 +115,11 @@ t.test('a snapshot is cacheable by version and checksum', async t => {
 
   /*
    * The version read by id is the version as it was imported, without the
-   * deprecated flags of the active reads: another representation of the
+   * flags of the active reads: another representation of the
    * same version, under a tag of its own, decided from the version's row
    * alone.
    */
-  const pinnedTag = `"v1-r4-snapshot-${versionId}-${snapshot.registryVersion.checksum}"`;
+  const pinnedTag = `"v1-r5-snapshot-${versionId}-${snapshot.registryVersion.checksum}"`;
   const crossed   = await server.fetch(`/registry/v1/versions/${versionId}`, { headers: { 'If-None-Match': etag! } });
   t.equal(crossed.status, 200, 'the version read by id does not accept the bootstrap tag, which names other bytes');
   t.equal(crossed.headers.get('etag'), pinnedTag, 'and names its own');

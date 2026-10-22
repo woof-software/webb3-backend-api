@@ -6,8 +6,9 @@ import { parseDeploymentPath } from '../../../src/registry/source/roots.js';
 /*
  * Contract freeze for RegistrySnapshotV1, the body of GET
  * /registry/v1/versions/{id}, and of GET /registry/v1/active but for the
- * `isDeprecated` the active reads add to every collateral (ActiveSnapshotV1,
- * deprecated-collateral-reads.test.ts).
+ * `isDeprecated` and `isHidden` the active reads add to every collateral
+ * (ActiveSnapshotV1, deprecated-collateral-reads.test.ts and
+ * hidden-collateral-reads.test.ts).
  *
  * The type in lib/model/comet-registry.ts gives its shape to the compiler, and
  * nothing checks the shape at run time, so this test is the executable

@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 
 import type { Address } from '../../../lib/model/comet-registry.js';
 import { readDeprecatedCollateral, setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
+import { readHiddenCollateral, setHiddenCollateral } from '../../../src/registry/hidden-collateral-repository.js';
 import { readTokenPolicy, setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 import {
   Row,
@@ -33,15 +34,16 @@ import {
 } from '../../util/registry-rows.js';
 
 /*
- * The decisions of migrations 0005 and 0006, the second under the names 0007
- * gave it, in the database itself, run as d1-schema.test.ts runs the rest of
- * the schema: a token policy is decided for a token of the active registry,
- * and a deprecated collateral for a collateral of a Comet of it. Whatever
- * code writes them, the schema keeps their audit complete: a decision row is
- * written only beside the event describing that exact change, events are
- * never edited, replaced or deleted, and neither is a decision row.
+ * The decisions of migrations 0005, 0006 and 0008, the second under the names
+ * 0007 gave it, in the database itself, run as d1-schema.test.ts runs the
+ * rest of the schema: a token policy is decided for a token of the active
+ * registry, and a deprecated or a hidden collateral for a collateral of a
+ * Comet of it. Whatever code writes them, the schema keeps their audit
+ * complete: a decision row is written only beside the event describing that
+ * exact change, events are never edited, replaced or deleted, and neither is
+ * a decision row.
  *
- * Both kinds are one store of decisions (src/registry/decision-store.ts)
+ * All three kinds are one store of decisions (src/registry/decision-store.ts)
  * whose triggers are alike, so what they share is tested once, over a
  * description of each kind (DecisionTables), as decision-scenarios.ts tests
  * their routes. Beside it are what only a collateral has, its Comet, and the
@@ -320,8 +322,27 @@ const DEPRECATED_COLLATERALS: DecisionTables = {
   },
 };
 
+const HIDDEN_COLLATERALS: DecisionTables = {
+  name:         'a hidden collateral',
+  held:         'a collateral of an active Comet',
+  noun:         'collateral',
+  adjective:    'hidden',
+  rows:         'hidden_collaterals',
+  events:       'hidden_collateral_events',
+  expectations: 'hidden_collateral_expectations',
+  flag:         'is_hidden',
+  previous:     'previous_is_hidden',
+  candidate:    DEPRECATED_COLLATERALS.candidate,
+  history:      async (db, subject) => {
+    const collateral = { chainId: 1, cometAddress: subject.comet_address as Address, tokenAddress: subject.token_address as Address };
+    const decision   = await readHiddenCollateral(db, collateral);
+    return { decided: decision.isHidden, changes: decision.events.map(event => [ event.previousIsHidden, event.isHidden, event.createdAt ]) };
+  },
+};
+
 decisionTableScenarios(TOKEN_POLICIES);
 decisionTableScenarios(DEPRECATED_COLLATERALS);
+decisionTableScenarios(HIDDEN_COLLATERALS);
 
 /*
  * What only a collateral has, the Comet it is a collateral of: a decision is
@@ -329,25 +350,30 @@ decisionTableScenarios(DEPRECATED_COLLATERALS);
  * the address that version holds the market's Comet at, and it stays that
  * Comet's.
  */
-t.test('a deprecated collateral is decided for a collateral of the Comet it names, and stays with that Comet', async t => {
-  const { APP_DB: db } = await freshEnv();
-  const candidate = await insertCollateralCandidate(db);
-  const { decide, expect } = writerOf(db, DEPRECATED_COLLATERALS, { comet_address: COMET, token_address: candidate.token });
-  const NOT_ACTIVE = { message: /collateral is not in the active registry/ };
-  await validate(db, candidate.registry_version_id);
-  await activate(db, candidate.registry_version_id);
+function cometScenarios(kind: DecisionTables): void {
+  t.test(`${kind.name} is decided for a collateral of the Comet it names, and stays with that Comet`, async t => {
+    const { APP_DB: db } = await freshEnv();
+    const candidate = await insertCollateralCandidate(db);
+    const { decide, expect } = writerOf(db, kind, { comet_address: COMET, token_address: candidate.token });
+    const NOT_ACTIVE = { message: /collateral is not in the active registry/ };
+    await validate(db, candidate.registry_version_id);
+    await activate(db, candidate.registry_version_id);
 
-  await t.rejects(() => decide({ subject: { comet_address: address('another comet') }, value: 1, at: NOW }, null), NOT_ACTIVE,
-    'a Comet no market of the active version has');
-  await t.rejects(() => decide({ subject: { token_address: candidate.base }, value: 1, at: NOW }, null), NOT_ACTIVE,
-    'or a token of the market that is not one of its collateral: its base');
-  await t.rejects(() => expect(0, { token_address: candidate.base }), NOT_ACTIVE,
-    'and so does an expectation for a token that is no collateral of the Comet');
+    await t.rejects(() => decide({ subject: { comet_address: address('another comet') }, value: 1, at: NOW }, null), NOT_ACTIVE,
+      'a Comet no market of the active version has');
+    await t.rejects(() => decide({ subject: { token_address: candidate.base }, value: 1, at: NOW }, null), NOT_ACTIVE,
+      'or a token of the market that is not one of its collateral: its base');
+    await t.rejects(() => expect(0, { token_address: candidate.base }), NOT_ACTIVE,
+      'and so does an expectation for a token that is no collateral of the Comet');
 
-  await decide({ value: 1, at: NOW }, null);
-  await t.rejects(() => run(db, `UPDATE deprecated_collaterals SET comet_address = ?1`, address('moved')), { message: /belongs to one collateral/ },
-    'a decision cannot move to another Comet');
-});
+    await decide({ value: 1, at: NOW }, null);
+    await t.rejects(() => run(db, `UPDATE ${kind.rows} SET comet_address = ?1`, address('moved')), { message: /belongs to one collateral/ },
+      'a decision cannot move to another Comet');
+  });
+}
+
+cometScenarios(DEPRECATED_COLLATERALS);
+cometScenarios(HIDDEN_COLLATERALS);
 
 /*
  * Migration 0006 only adds tables, so it applies over a database a release
@@ -394,7 +420,7 @@ async function schemaOf(db: D1Database): Promise<SchemaObject[]> {
 }
 
 t.test('migration 0007 leaves the schema 0006 would have created under the deprecated names', async t => {
-  const { APP_DB: migrated } = await freshEnv();
+  const { APP_DB: migrated } = await freshEnv({ through: '0007' });
   const renamed = await schemaOf(migrated);
   t.same(renamed.filter(object => /legacy/.test(`${object.name} ${object.sql}`)), [], 'no object of 0001 to 0007 says legacy');
 
@@ -527,4 +553,67 @@ t.test('migration 0007 keeps the decisions and events made under 0006, and every
   t.same([ await schemaOf(db), (await db.prepare(`SELECT rowid, * FROM deprecated_collateral_events ORDER BY rowid`).all()).results ], before,
     'and changes nothing, since a migration is applied as one batch');
   t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
+});
+
+/*
+ * Migration 0008 only adds tables, as 0006 did, so it applies over a database
+ * a release before it serves from, while that release goes on serving: the
+ * version it activated and the decisions it made are left as they were.
+ */
+t.test('migration 0008 adds its tables beside a registry in use', async t => {
+  const { APP_DB: db } = await freshEnv({ through: '0007' });
+
+  const snapshot = loadRegistrySnapshotFixture();
+  const { versionId, counts } = await seedCandidate(db, snapshot);
+  await validate(db, versionId);
+  await activate(db, versionId);
+  const weth = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
+  const usdt = snapshot.networks.find(network => network.chainId === 1)!.markets.find(market => market.deploymentKey === 'usdt')!;
+  const mEth = {
+    chainId:      1,
+    cometAddress: usdt.contracts.comet!,
+    tokenAddress: usdt.collateralAssets.find(asset => asset.token.symbol === 'mETH')!.token.address,
+  };
+  await setTokenPolicy(db, { chainId: 1, tokenAddress: weth, isStrategic: true, actor: 'test-admin', reason: 'decided before 0008' });
+  await setDeprecatedCollateral(db, { ...mEth, isDeprecated: true, actor: 'test-admin', reason: 'decided before 0008' });
+
+  await applyMigration(db, '0008_hidden_collaterals.sql');
+
+  t.equal(await activeVersionId(db), versionId, 'the version that was on is on');
+  t.equal(await count(db, 'market_assets'), counts.market_assets, 'with every row of it');
+  t.equal((await readTokenPolicy(db, 1, weth)).isStrategic, true, 'and the token policies decided before it stand');
+  t.equal((await readDeprecatedCollateral(db, mEth)).isDeprecated, true, 'as do the deprecated collaterals');
+  t.same([ await count(db, 'hidden_collaterals'), await count(db, 'hidden_collateral_events') ], [ 0, 0 ],
+    'while nothing is hidden yet');
+  const hidden = await setHiddenCollateral(db, { ...mEth, isHidden: true, actor: 'test-admin', reason: 'decided after 0008' });
+  t.same([ hidden.changed, hidden.isHidden ], [ true, true ], 'and a collateral of the version on can be hidden at once');
+  t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
+});
+
+/*
+ * What 0008 creates for hidden collaterals is what 0007 left for deprecated
+ * ones: the same tables, indexes, triggers and view under the hidden names,
+ * so the schema holds both kinds of decision to the same rules, each in its
+ * own words. Statements are compared as 0007's are above.
+ */
+t.test('migration 0008 creates what 0007 left for deprecated collaterals, under the hidden names', async t => {
+  const schema = await schemaOf((await freshEnv()).APP_DB);
+  const of     = (kind: string) => schema.filter(object => object.tbl_name.startsWith(`${kind}_collateral`));
+
+  const hidden = of('hidden');
+  t.same(
+    [ 'table', 'index', 'trigger', 'view' ].map(type => hidden.filter(object => object.type === type && object.sql !== null).length),
+    [ 2, 2, 12, 1 ],
+    'two tables, their two indexes, ten triggers on the tables and two on the view, and the view',
+  );
+  t.same(
+    hidden,
+    of('deprecated').map(object => ({
+      type:     object.type,
+      name:     object.name.replaceAll('deprecated', 'hidden'),
+      tbl_name: object.tbl_name.replaceAll('deprecated', 'hidden'),
+      sql:      object.sql === null ? null : object.sql.replaceAll('deprecated', 'hidden'),
+    })),
+    'each the object deprecated collaterals have, statement for statement',
+  );
 });
