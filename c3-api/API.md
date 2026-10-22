@@ -769,7 +769,8 @@ Query parameters:
   - `false` filters receipts to votes `Against`;
   - `undefined` returns receipts regardless of vote direction
 - `with_proposal_data` - `true` or `false` - [optional] - [default false]
-  - `true` populates the `"proposal"` field of the response
+  - `true` populates the `"proposal"` field of the response; each proposal
+    is described as the proposal list describes it
   - `false` sets the `"proposal"` field to `null` (this is the default)
 
 Proposal:

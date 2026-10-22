@@ -508,8 +508,8 @@ migration `0005` enforces that in the database: a policy row is written only
 beside its token's newest event, which records that change; events are never
 edited, replaced or deleted, and a policy row is never deleted.
 
-A reviewed list of decisions — the seed — is a file, and nobody writes its
-addresses by hand: the export answers every token of every network of the
+A reviewed list of decisions is a file, and nobody writes its addresses by
+hand: the export answers every token of every network of the
 active version with its decision, in exactly the form review and apply take
 back. Mark the tokens the list decides, give the reason once for the list or
 on a row, review the diff, and apply the changes it shows. Apply writes the
