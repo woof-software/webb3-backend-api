@@ -9,7 +9,7 @@ import type * as Evaluator from '../evaluator.js';
 import { routeAdmin } from './admin-router.js';
 import type { CachedSnapshot } from './cache.js';
 import { activeSnapshot, cacheDepsOf, isUnreachable, versionSnapshot, warmSnapshot } from './cache.js';
-import { deprecatedDecisions, recordDeprecatedCollaterals } from './deprecated-collaterals.js';
+import { deprecatedDecisions, hiddenDecisions, recordDeprecatedCollaterals, recordHiddenCollaterals } from './deprecated-collaterals.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
@@ -101,14 +101,14 @@ const ERROR_STATUS: Record<RegistryErrorCode, ApiErrorCode> = {
 };
 
 /*
- * A release that reached an environment before its token policy or deprecated
- * collateral migration finds those tables missing. The remedy is known and is
- * an operator's, so it is said, rather than answered as an internal error only
- * the logs explain. Any other table missing is a fault like the rest, and
- * stays a 500.
+ * A release that reached an environment before its token policy, deprecated
+ * collateral or hidden collateral migration finds those tables missing. The
+ * remedy is known and is an operator's, so it is said, rather than answered
+ * as an internal error only the logs explain. Any other table missing is a
+ * fault like the rest, and stays a 500.
  */
 function missingSchema(error: unknown): boolean {
-  return /no such table: (token_polic|deprecated_collateral)/i.test(String(error));
+  return /no such table: (token_polic|deprecated_collateral|hidden_collateral)/i.test(String(error));
 }
 
 /*
@@ -229,7 +229,9 @@ async function routeRegistry(
       }
     },
     deprecated:       () => deprecatedDecisions(deps),
+    hidden:           () => hiddenDecisions(deps),
     recordDeprecated: () => recordDeprecatedCollaterals(deps),
+    recordHidden:     () => recordHiddenCollaterals(deps),
     catalog: registry,
     tokens:  tokenCollateralDeps({ env, debug, flags, waitUntil }, instantiateEvaluator, DEADLINE_MS),
   };

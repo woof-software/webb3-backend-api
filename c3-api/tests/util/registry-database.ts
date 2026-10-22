@@ -35,6 +35,11 @@ type Options = {
    * registry that has served a version must not fall back to serving none.
    */
   activate?: boolean,
+  /*
+   * The last migration to apply, for a test of a release deployed before its
+   * own migrations: every migration by default.
+   */
+  through?: string,
 };
 
 /*
@@ -42,7 +47,7 @@ type Options = {
  * is what a market, account, or history route needs before it can answer.
  */
 async function activeRegistryDatabase(options: Options = {}): Promise<RegistryDatabase> {
-  const { snapshot = loadRegistrySnapshotFixture(), activate = true } = options;
+  const { snapshot = loadRegistrySnapshotFixture(), activate = true, through } = options;
   const miniflare = new Miniflare({
     modules: true,
     script:  'export default { fetch() { return new Response(null, { status: 404 }); } };',
@@ -50,7 +55,7 @@ async function activeRegistryDatabase(options: Options = {}): Promise<RegistryDa
   });
 
   const db = await miniflare.getD1Database('APP_DB') as unknown as D1Database;
-  await applyMigrations(db);
+  await applyMigrations(db, undefined, through === undefined ? {} : { through });
 
   const { versionId } = await seedCandidate(db, snapshot);
   await validateSeeded(db, versionId);

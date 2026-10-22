@@ -490,9 +490,9 @@ async function unsafeRoute(
 
 /*
  * How the summary values a chain's collateral, as the token list does, and
- * where it reads the decisions: from D1, and the deprecated ones from the
- * record the worker keeps of them while D1 cannot be reached, as the active
- * reads do. Nothing is read until the summary asks.
+ * where it reads the decisions: from D1, and the deprecated and the hidden
+ * ones from the records the worker keeps of them while D1 cannot be reached,
+ * as the active reads do. Nothing is read until the summary asks.
  */
 function summaryTokensOf(context: Omit<Context, 'evaluator'>, instantiateEvaluator: Evaluator.InstantiateFn<Scope>): SummaryTokens {
   return {

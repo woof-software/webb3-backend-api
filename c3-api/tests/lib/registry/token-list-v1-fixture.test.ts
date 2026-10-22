@@ -10,7 +10,7 @@ import {
 import type { Address, MarketV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
-import { deprecatedDecisionsOf } from '../../../src/registry/deprecated-collaterals.js';
+import { deprecatedDecisionsOf, hiddenDecisionsOf } from '../../../src/registry/deprecated-collaterals.js';
 import { collateralView, positionsOf } from '../../../src/registry/token-collateral.js';
 import type { BlockRef } from '../../../src/registry/token-collateral.js';
 import { RULE_VERSION, tokenList } from '../../../src/registry/token-visibility.js';
@@ -55,7 +55,7 @@ const LIST_KEYS      = [ 'registryVersion', 'chainId', 'thresholdUsd', 'ruleVers
 const VERSION_KEYS   = [ 'id', 'checksum' ];
 const BLOCK_KEYS     = [ 'number', 'timestamp' ];
 const TOKEN_KEYS     = [
-  'address', 'symbol', 'name', 'decimals', 'roles', 'isStrategic', 'isDeprecated', 'deprecatedIn', 'collateralValueUsd',
+  'address', 'symbol', 'name', 'decimals', 'roles', 'isStrategic', 'isDeprecated', 'deprecatedIn', 'hiddenIn', 'collateralValueUsd',
   'collateralValueStatus', 'valueAt', 'valueBlock', 'staleAgeSeconds', 'exceptions', 'isVisible', 'visibilityReason',
 ];
 const EXCEPTION_KEYS = [ 'kind', 'priceFeedAddress', 'provenance', 'expiresAt' ];
@@ -192,13 +192,15 @@ t.test('every token is typed, listed once, and ordered by symbol then address', 
 
     checkBoolean(problems, token.isStrategic, `${where}.isStrategic`);
     checkBoolean(problems, token.isDeprecated, `${where}.isDeprecated`);
-    if (!Array.isArray(token.deprecatedIn)) {
-      problems.push(`${where}.deprecatedIn: expected an array`);
-    } else {
-      token.deprecatedIn.forEach((comet: unknown, c: number) => checkPattern(problems, comet, ADDRESS, `${where}.deprecatedIn[${c}]`));
-      if ([ ...token.deprecatedIn ].sort().join(',') !== token.deprecatedIn.join(',')
-        || new Set(token.deprecatedIn).size !== token.deprecatedIn.length) {
-        problems.push(`${where}.deprecatedIn: expected each Comet once, sorted`);
+    for (const field of [ 'deprecatedIn', 'hiddenIn' ]) {
+      const comets = token[field];
+      if (!Array.isArray(comets)) {
+        problems.push(`${where}.${field}: expected an array`);
+      } else {
+        comets.forEach((comet: unknown, c: number) => checkPattern(problems, comet, ADDRESS, `${where}.${field}[${c}]`));
+        if ([ ...comets ].sort().join(',') !== comets.join(',') || new Set(comets).size !== comets.length) {
+          problems.push(`${where}.${field}: expected each Comet once, sorted`);
+        }
       }
     }
     if (token.collateralValueUsd !== null) checkPattern(problems, token.collateralValueUsd, DECIMAL, `${where}.collateralValueUsd`);
@@ -305,12 +307,12 @@ t.test('each status carries the value, time, age and exceptions its rule gives i
  * The order the reasons are asked in is visibilityOf's, which
  * token-visibility.test.ts holds; the last test holds the fixture to it.
  */
-t.test('only deprecated and below_threshold hide a token', async t => {
+t.test('discovery shows every token but a hidden, a deprecated and a below_threshold one', async t => {
   const problems: Problems = [];
   typed.forEach((token, i) => {
     const where = `tokens[${i}] ${token.symbol}`;
-    if (token.isVisible !== ![ 'deprecated', 'below_threshold' ].includes(token.visibilityReason)) {
-      problems.push(`${where}.isVisible: only deprecated and below_threshold hide a token`);
+    if (token.isVisible !== ![ 'hidden', 'deprecated', 'below_threshold' ].includes(token.visibilityReason)) {
+      problems.push(`${where}.isVisible: only hidden, deprecated and below_threshold are not shown`);
     }
   });
   t.same(problems, []);
@@ -336,6 +338,27 @@ t.test('a token is deprecated only as a collateral, and in a Comet it names', as
   t.same(problems, []);
 });
 
+/*
+ * Hidden collateral (migration 0008): the same of a hidden one, which the
+ * list names by its Comets alone, and by its reason where it is hidden across
+ * the chain: an enabled market that takes it hides it, and every other one
+ * hides it or has it deprecated.
+ */
+t.test('a token is hidden only as a collateral, and in a Comet it names', async t => {
+  const problems: Problems = [];
+  typed.forEach((token, i) => {
+    const where    = `tokens[${i}] ${token.symbol}`;
+    const hiddenIn = Array.isArray(token.hiddenIn) ? token.hiddenIn : [];
+    if (!token.roles.includes('collateral') && (token.visibilityReason === 'hidden' || hiddenIn.length !== 0)) {
+      problems.push(`${where}: a token no market takes as collateral is hidden nowhere`);
+    }
+    if (token.visibilityReason === 'hidden' && hiddenIn.length === 0) {
+      problems.push(`${where}: a hidden token names the Comets it is hidden in`);
+    }
+  });
+  t.same(problems, []);
+});
+
 t.test('the fixture shows every case a client must handle', async t => {
   const missing = (expected: readonly string[], found: unknown[]) => expected.filter(entry => !found.includes(entry));
   const values  = typed.map(token => token.collateralValueUsd).filter((value): value is string => typeof value === 'string');
@@ -351,16 +374,21 @@ t.test('the fixture shows every case a client must handle', async t => {
     'a collateral only a deprecated market holds, worth 0 as well');
   t.ok(values.includes(THRESHOLD_USD), 'a value exactly at the threshold');
   t.ok(typed.some(token => token.visibilityReason === 'below_threshold' && token.collateralValueUsd !== '0'),
-    'and a collateral hidden by a value short of it');
+    'and a collateral not shown for a value short of it');
   t.ok(values.some(value => value.replace('.', '').length > 17), 'a value with more digits than a float keeps');
   t.ok(typed.some(token => token.exceptions.some((exception: any) => exception?.expiresAt !== null)), 'an exception that expires');
   t.ok(typed.some(token => token.collateralValueStatus === 'fresh' && blockOf(token.valueBlock) !== null && !sameBlock(blockOf(token.valueBlock), blockOf(list.block))),
     'a value read at an earlier block of the list\'s minute');
   t.ok(typed.some(token => token.isDeprecated === true), 'a token deprecated in every enabled market that takes it');
   t.ok(typed.some(token => token.isDeprecated === true && token.isStrategic === true && token.isVisible === false),
-    'and a strategic one, hidden all the same');
+    'and a strategic one, not shown all the same');
   t.ok(typed.some(token => token.isDeprecated === false && Array.isArray(token.deprecatedIn) && token.deprecatedIn.length > 0),
     'a token deprecated in a Comet, but current in another enabled market, or taken by none');
+  t.ok(typed.some(token => token.visibilityReason === 'hidden' && token.isStrategic === true), 'a hidden token that is strategic');
+  t.ok(typed.some(token => token.visibilityReason === 'hidden' && typeof token.collateralValueUsd === 'string' && reachesThreshold(token.collateralValueUsd)),
+    'a hidden token worth the threshold');
+  t.ok(typed.some(token => token.visibilityReason !== 'hidden' && Array.isArray(token.hiddenIn) && token.hiddenIn.length > 0),
+    'a token hidden in a Comet, but not across the chain');
 });
 
 /*
@@ -376,10 +404,16 @@ t.test('the fixture shows every case a client must handle', async t => {
  *
  * pumpBTC is deprecated collateral of the WBTC market, wstETH of the USDC
  * market, and XAUt of the USDT market, itself deprecated. pumpBTC is
- * deprecated in every enabled market that takes it, and hidden though it is
- * strategic; wstETH is not, being current in the WETH market, and nor is
- * XAUt, which no enabled market takes. LBTC is current, and hidden by its
+ * deprecated in every enabled market that takes it, and not shown though it
+ * is strategic; wstETH is not, being current in the WETH market, and nor is
+ * XAUt, which no enabled market takes. LBTC is current, and not shown for its
  * value alone, a quarter of a cent short of the threshold.
+ *
+ * COMP and WETH are hidden collateral of the USDC market, the one market that
+ * takes each, and XAUt of the USDT market. COMP and WETH are hidden in every
+ * enabled market that takes them, and not shown though COMP is strategic and
+ * WETH worth the threshold; XAUt is not, as no enabled market takes it, and is
+ * decided by the rest of the rule.
  *
  * Three requests value the chain. The first is three minutes back, when only
  * tBTC's price reverts. The second is the first of the current minute, when
@@ -417,6 +451,12 @@ const DEPRECATED: Record<string, string[]> = {
   usdc: [ 'wstETH' ],
   usdt: [ 'XAUt' ],
   wbtc: [ 'pumpBTC' ],
+};
+
+// the collaterals each market has hidden, by symbol
+const HIDDEN: Record<string, string[]> = {
+  usdc: [ 'COMP', 'WETH' ],
+  usdt: [ 'XAUt' ],
 };
 
 // what each market holds of each collateral, in whole tokens
@@ -457,6 +497,11 @@ const COMPUTED_AT = new Date('2026-10-05T12:55:25.123Z');
 const catalog     = catalogOf(snapshot, COMPUTED_AT);
 const positions   = positionsOf(catalog, 'ethereum-mainnet');
 const byComet     = new Map<string, MarketV1>(markets.map(entry => [ entry.contracts.comet!, entry ]));
+
+// the collaterals that DEPRECATED or HIDDEN names, as decisions name them
+const decided = (named: Record<string, string[]>) => markets.flatMap(entry => entry.collateralAssets
+  .filter(asset => (named[entry.deploymentKey] ?? []).includes(asset.token.symbol))
+  .map(asset => ({ chainId: 1, cometAddress: entry.contracts.comet!, tokenAddress: asset.token.address })));
 
 // whole units as the integer a read answers at `decimals`: '2.5' at 8 decimals is 250000000
 function unitsOf(amount: string, decimals: number): string {
@@ -527,9 +572,8 @@ t.test('the scenario the fixture was made from reproduces it exactly', async t =
     positions,
     view,
     strategic:       new Set<Address>([ COMP, WBTC, PUMPBTC ]),
-    deprecated:      deprecatedDecisionsOf(markets.flatMap(entry => entry.collateralAssets
-      .filter(asset => (DEPRECATED[entry.deploymentKey] ?? []).includes(asset.token.symbol))
-      .map(asset => ({ chainId: 1, cometAddress: entry.contracts.comet!, tokenAddress: asset.token.address })))),
+    deprecated:      deprecatedDecisionsOf(decided(DEPRECATED)),
+    hidden:          hiddenDecisionsOf(decided(HIDDEN)),
     now,
   });
   /*

@@ -196,14 +196,14 @@ async function latestSummary(
    */
   const flattedSummary = summary.flat();
   /*
-   * Collaterals marked by the deprecated decisions the worker last recorded,
-   * because D1 could not give them, are not confirmed, and the answer says
-   * so as /registry/v1/active does; the router sets the version's own age
-   * over it where the version came from the cache too.
+   * Collaterals marked by the deprecated or the hidden decisions the worker
+   * last recorded, because D1 could not give them, are not confirmed, and the
+   * answer says so as /registry/v1/active does; the router sets the version's
+   * own age over it where the version came from the cache too.
    */
-  const { deprecated } = await decisions;
+  const { deprecated, hidden } = await decisions;
   return new Response(JSON.stringify(flattedSummary), {
-    headers: deprecated?.recorded ? { 'X-Registry-Stale': '0', 'Cache-Control': 'no-store' } : {},
+    headers: deprecated?.recorded || hidden?.recorded ? { 'X-Registry-Stale': '0', 'Cache-Control': 'no-store' } : {},
   });
 }
 

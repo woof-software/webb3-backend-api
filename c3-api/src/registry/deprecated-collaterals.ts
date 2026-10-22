@@ -14,9 +14,10 @@ import {
 import type { CacheDeps } from './cache.js';
 import { RegistryUnavailable, isUnreachable } from './cache.js';
 import { nowOf } from './clock.js';
+import type { CollateralOfComet } from './collateral-decision-repository.js';
 import { withDeadline } from './deadline.js';
-import type { DeprecatedCollateral } from './deprecated-collateral-repository.js';
 import { readDeprecatedCollaterals } from './deprecated-collateral-repository.js';
+import { readHiddenCollaterals } from './hidden-collateral-repository.js';
 
 /*
  * The deprecated flags the active reads carry: which collaterals of which
@@ -37,22 +38,33 @@ import { readDeprecatedCollaterals } from './deprecated-collateral-repository.js
  * minutes besides. Such an answer says it could not be confirmed, as every
  * answer from the cache does. With nothing recorded there is nothing to
  * answer with, and the read fails as one does past the fallback window.
+ *
+ * The hidden collaterals (hidden-collateral-repository.ts) are decisions of
+ * the same shape about the same collaterals, and are read, recorded, marked
+ * and answered with during an outage the same way, each kind under a record
+ * and a flag of its own (RecordedKind, markedMarket): what is said here of the
+ * decisions is said of either kind's.
  */
 
 /*
- * The decisions in force by collateral: a collateral nobody has decided
- * about, or one decided not deprecated, is not among them.
+ * The decisions of one kind in force by collateral: a collateral nobody has
+ * decided about, or one decided otherwise, is not among them.
  */
-type DeprecatedDecisions = {
-  collaterals: DeprecatedCollateral[],
-  // whether the collateral `token` of the Comet at `comet` on `chainId` is deprecated; addresses lowercase
+type CollateralDecisions = {
+  collaterals: CollateralOfComet[],
+  // whether the decisions name the collateral `token` of the Comet at `comet` on `chainId`; addresses lowercase
   has:         (chainId: number, comet: Address, token: Address) => boolean,
   // what tells two sets of decisions apart
   digest:      string,
 };
 
+type DeprecatedDecisions = CollateralDecisions;
+type HiddenDecisions     = CollateralDecisions;
+
 // the decisions a read marks collaterals with, and whether they came from the record rather than from D1
-type DeprecatedRead = { decisions: DeprecatedDecisions, recorded: boolean };
+type CollateralRead = { decisions: CollateralDecisions, recorded: boolean };
+type DeprecatedRead = CollateralRead;
+type HiddenRead     = CollateralRead;
 
 function keyOf(chainId: number, comet: Address, token: Address): string {
   return `${chainId}:${comet}:${token}`;
@@ -63,7 +75,7 @@ function digestOf(keys: string[]): string {
   return keccak256([ ...keys ].sort().join(',')).slice(0, 16);
 }
 
-function deprecatedDecisionsOf(collaterals: DeprecatedCollateral[]): DeprecatedDecisions {
+function decisionsOf(collaterals: CollateralOfComet[]): CollateralDecisions {
   const keys = collaterals.map(({ chainId, cometAddress, tokenAddress }) => keyOf(chainId, cometAddress, tokenAddress));
   const held = new Set(keys);
   return {
@@ -74,23 +86,24 @@ function deprecatedDecisionsOf(collaterals: DeprecatedCollateral[]): DeprecatedD
 }
 
 /*
- * The record an outage answers with, in the registry's namespace beside the
- * pointer record (cache.ts): every chain's decisions, and when they were
- * recorded. It does not expire. Decisions do not grow old, they change, and
- * every change records them again.
+ * The records an outage answers with, one a kind, in the registry's namespace
+ * beside the pointer record (cache.ts): every chain's decisions, and when
+ * they were recorded. A record does not expire. Decisions do not grow old,
+ * they change, and every change records them again.
  */
 const DEPRECATED_KEY = 'deprecated-collaterals:v1';
+const HIDDEN_KEY     = 'hidden-collaterals:v1';
 
-type DeprecatedRecord = { at: string, collaterals: DeprecatedCollateral[] };
+type CollateralRecord = { at: string, collaterals: CollateralOfComet[] };
 
-function recordOf(value: unknown): DeprecatedCollateral[] | null {
-  const record = value as DeprecatedRecord | null;
+function recordOf(value: unknown): CollateralOfComet[] | null {
+  const record = value as CollateralRecord | null;
   if (record === null || typeof(record) !== 'object' || typeof(record.at) !== 'string' || !Array.isArray(record.collaterals)) {
     return null;
   }
   const collaterals = record.collaterals as unknown[];
   const valid = collaterals.every(entry => {
-    const collateral = entry as Partial<DeprecatedCollateral> | null;
+    const collateral = entry as Partial<CollateralOfComet> | null;
     return collateral !== null && typeof(collateral) === 'object'
       && typeof(collateral.chainId) === 'number' && Number.isSafeInteger(collateral.chainId) && collateral.chainId > 0
       && isAddress(collateral.cometAddress) && isAddress(collateral.tokenAddress);
@@ -105,10 +118,10 @@ function recordOf(value: unknown): DeprecatedCollateral[] | null {
 }
 
 /*
- * What each isolate knows of the record, per namespace: the decisions it last
- * found there or wrote there, or set out to, by their digest; until when the
- * reads of those decisions leave the record alone; and the check under way, if
- * one is.
+ * What each isolate knows of a kind's record, per namespace: the decisions it
+ * last found there or wrote there, or set out to, by their digest; until when
+ * the reads of those decisions leave the record alone; and the check under
+ * way, if one is.
  *
  * KV takes one write a second to a key, and keeps whichever write reaches it
  * last. So a read writes the record only where it does not hold the decisions
@@ -132,7 +145,31 @@ type Known = {
   pending: Promise<void> | null,
 };
 
-const known = new WeakMap<KVNamespace, Known>();
+/*
+ * A kind of decision as its record is kept: the record's key, what a log line
+ * calls the kind, its read of every chain's decisions from D1, and what each
+ * isolate knows of its record, which is the kind's own, as the record is.
+ */
+type RecordedKind = {
+  key:   string,
+  noun:  string,
+  read:  (db: D1Database) => Promise<CollateralOfComet[]>,
+  known: WeakMap<KVNamespace, Known>,
+};
+
+const DEPRECATED: RecordedKind = {
+  key:   DEPRECATED_KEY,
+  noun:  'deprecated collateral',
+  read:  readDeprecatedCollaterals,
+  known: new WeakMap(),
+};
+
+const HIDDEN: RecordedKind = {
+  key:   HIDDEN_KEY,
+  noun:  'hidden collateral',
+  read:  readHiddenCollaterals,
+  known: new WeakMap(),
+};
 
 const CHECK_RECORD_EVERY_MS = 300_000;
 const RETRY_RECORD_AFTER_MS = 60_000;
@@ -142,14 +179,14 @@ function timeOf(deps: CacheDeps): number {
 }
 
 // whether the record holds these decisions; one that cannot be read, or is not a record, does not
-async function recordHolds(deps: CacheDeps, decisions: DeprecatedDecisions): Promise<boolean> {
-  let collaterals: DeprecatedCollateral[] | null;
+async function recordHolds(kind: RecordedKind, deps: CacheDeps, decisions: CollateralDecisions): Promise<boolean> {
+  let collaterals: CollateralOfComet[] | null;
   try {
-    collaterals = recordOf(await deps.kv.get(DEPRECATED_KEY, 'json'));
+    collaterals = recordOf(await deps.kv.get(kind.key, 'json'));
   } catch {
     return false;
   }
-  return collaterals !== null && deprecatedDecisionsOf(collaterals).digest === decisions.digest;
+  return collaterals !== null && decisionsOf(collaterals).digest === decisions.digest;
 }
 
 /*
@@ -157,16 +194,16 @@ async function recordHolds(deps: CacheDeps, decisions: DeprecatedDecisions): Pro
  * and says whether KV refused them. It never fails: the answer, or the
  * command, is already made, and failing to record it must not fail it.
  */
-async function writeRecord(deps: CacheDeps, decisions: DeprecatedDecisions, check: boolean): Promise<boolean> {
+async function writeRecord(kind: RecordedKind, deps: CacheDeps, decisions: CollateralDecisions, check: boolean): Promise<boolean> {
   try {
-    if (check && await recordHolds(deps, decisions)) {
+    if (check && await recordHolds(kind, deps, decisions)) {
       return false;
     }
-    const record: DeprecatedRecord = { at: new Date(timeOf(deps)).toISOString(), collaterals: decisions.collaterals };
-    await deps.kv.put(DEPRECATED_KEY, JSON.stringify(record));
+    const record: CollateralRecord = { at: new Date(timeOf(deps)).toISOString(), collaterals: decisions.collaterals };
+    await deps.kv.put(kind.key, JSON.stringify(record));
     return false;
   } catch (error) {
-    deps.debug.warn(`deprecated collateral record unwritable`, { error });
+    deps.debug.warn(`${kind.noun} record unwritable`, { error });
     return true;
   }
 }
@@ -176,10 +213,10 @@ async function writeRecord(deps: CacheDeps, decisions: DeprecatedDecisions, chec
  * the record say so. A check that a later one replaced meanwhile settles only
  * itself, so what it found never overwrites what the later one finds.
  */
-function record(deps: CacheDeps, decisions: DeprecatedDecisions, check: boolean): Promise<void> {
+function record(kind: RecordedKind, deps: CacheDeps, decisions: CollateralDecisions, check: boolean): Promise<void> {
   const entry: Known = { digest: decisions.digest, due: timeOf(deps) + RETRY_RECORD_AFTER_MS, pending: null };
-  known.set(deps.kv, entry);
-  entry.pending = writeRecord(deps, decisions, check).then(refused => {
+  kind.known.set(deps.kv, entry);
+  entry.pending = writeRecord(kind, deps, decisions, check).then(refused => {
     entry.due     = timeOf(deps) + (refused ? RETRY_RECORD_AFTER_MS : CHECK_RECORD_EVERY_MS);
     entry.pending = null;
   });
@@ -197,15 +234,15 @@ function record(deps: CacheDeps, decisions: DeprecatedDecisions, check: boolean)
  * The answer does not wait for the check: it is handed to the request's
  * waitUntil (`defer`), as the pointer record's write is (cache.ts).
  */
-async function rememberDeprecated(deps: CacheDeps, decisions: DeprecatedDecisions): Promise<void> {
+async function remember(kind: RecordedKind, deps: CacheDeps, decisions: CollateralDecisions): Promise<void> {
   if (deps.staleSeconds <= 0) {
     return;
   }
-  const last = known.get(deps.kv);
+  const last = kind.known.get(deps.kv);
   if (last?.digest === decisions.digest && timeOf(deps) < last.due) {
     return;
   }
-  const checking = record(deps, decisions, true);
+  const checking = record(kind, deps, decisions, true);
   if (deps.defer === undefined) {
     await checking;
   } else {
@@ -229,26 +266,26 @@ async function settlesWithin(work: Promise<void>, milliseconds: number): Promise
  * right after the command answers with its decision.
  *
  * It never fails the command, which has committed already; a record it could
- * not write is written by a later read (rememberDeprecated): of any isolate
- * that last found other decisions there, or of this one a minute later.
+ * not write is written by a later read (remember): of any isolate that last
+ * found other decisions there, or of this one a minute later.
  */
-async function recordDeprecatedCollaterals(deps: CacheDeps): Promise<void> {
+async function recordCollaterals(kind: RecordedKind, deps: CacheDeps): Promise<void> {
   if (deps.staleSeconds <= 0) {
     return;
   }
-  let decisions: DeprecatedDecisions;
+  let decisions: CollateralDecisions;
   try {
-    decisions = deprecatedDecisionsOf(await readDeprecatedCollaterals(deps.db));
+    decisions = decisionsOf(await kind.read(deps.db));
   } catch (error) {
-    deps.debug.warn(`deprecated collateral record not written: the decisions could not be read`, { error });
+    deps.debug.warn(`${kind.noun} record not written: the decisions could not be read`, { error });
     return;
   }
-  const last = known.get(deps.kv);
+  const last = kind.known.get(deps.kv);
   if (last !== undefined && last.digest === decisions.digest && last.pending !== null
     && await settlesWithin(last.pending, last.due - timeOf(deps))) {
     return;
   }
-  await record(deps, decisions, false);
+  await record(kind, deps, decisions, false);
 }
 
 /*
@@ -257,46 +294,47 @@ async function recordDeprecatedCollaterals(deps: CacheDeps): Promise<void> {
  * leaves the read nothing to answer with: the registry is unavailable, as it
  * is past the fallback window.
  */
-async function recordedDeprecated(deps: CacheDeps, cause: unknown): Promise<DeprecatedDecisions> {
-  const unavailable = () => new RegistryUnavailable(`the deprecated collateral decisions could not be read`, cause);
+async function recordedDecisions(kind: RecordedKind, deps: CacheDeps, cause: unknown): Promise<CollateralDecisions> {
+  const unavailable = () => new RegistryUnavailable(`the ${kind.noun} decisions could not be read`, cause);
   let value: unknown;
   try {
-    value = await deps.kv.get(DEPRECATED_KEY, 'json');
+    value = await deps.kv.get(kind.key, 'json');
   } catch (error) {
-    deps.debug.warn(`deprecated collateral record unreadable`, { error });
+    deps.debug.warn(`${kind.noun} record unreadable`, { error });
     throw unavailable();
   }
   const collaterals = recordOf(value);
   if (collaterals === null) {
     throw unavailable();
   }
-  return deprecatedDecisionsOf(collaterals);
+  return decisionsOf(collaterals);
 }
 
 /*
- * When this isolate says it answers with the recorded decisions, per database
- * binding: once a minute, as the cache says it answers from an older version,
- * rather than once a request.
+ * When this isolate says it answers with a kind's recorded decisions, per
+ * database binding: once a minute, as the cache says it answers from an older
+ * version, rather than once a request.
  */
 const fallbackDue = throttleBy<D1Database>(60_000);
 
-function reportFallback(deps: CacheDeps, error: unknown): void {
-  if (!fallbackDue(deps.db, 'fallback', timeOf(deps))) {
+function reportFallback(kind: RecordedKind, deps: CacheDeps, error: unknown): void {
+  if (!fallbackDue(deps.db, kind.key, timeOf(deps))) {
     return;
   }
-  deps.debug.warn(`deprecated collateral decisions unreadable; answering with the ones last recorded`, { error });
+  deps.debug.warn(`${kind.noun} decisions unreadable; answering with the ones last recorded`, { error });
 }
 
 /*
- * The decisions the active reads mark collaterals with: every chain's, from
- * D1, or — when D1 could not be reached, in an environment that answers from
- * the cache at all — the ones last recorded. A database that answered with a
- * fault, such as a release ahead of migration 0007, is raised as it is.
+ * The decisions of a kind the active reads mark collaterals with: every
+ * chain's, from D1, or — when D1 could not be reached, in an environment that
+ * answers from the cache at all — the ones last recorded. A database that
+ * answered with a fault, such as a release ahead of the kind's migration, is
+ * raised as it is.
  */
-async function deprecatedDecisions(deps: CacheDeps): Promise<DeprecatedRead> {
-  let decisions: DeprecatedDecisions;
+async function readDecisions(kind: RecordedKind, deps: CacheDeps): Promise<CollateralRead> {
+  let decisions: CollateralDecisions;
   try {
-    decisions = deprecatedDecisionsOf(await readDeprecatedCollaterals(deps.db));
+    decisions = decisionsOf(await kind.read(deps.db));
   } catch (error) {
     if (!isUnreachable(error)) {
       throw error;
@@ -304,56 +342,85 @@ async function deprecatedDecisions(deps: CacheDeps): Promise<DeprecatedRead> {
     if (deps.staleSeconds <= 0) {
       throw new RegistryUnavailable(`the comet registry could not be read`, error);
     }
-    const last = await recordedDeprecated(deps, error);
-    reportFallback(deps, error);
+    const last = await recordedDecisions(kind, deps, error);
+    reportFallback(kind, deps, error);
     return { decisions: last, recorded: true };
   }
-  await rememberDeprecated(deps, decisions);
+  await remember(kind, deps, decisions);
   return { decisions, recorded: false };
 }
 
 /*
- * A market as the active reads serve it: every collateral says whether it is
- * deprecated in this Comet. The version's own objects are left as they are,
- * since the cache hands one snapshot to every request of an isolate.
+ * Each kind's decisions, as readDecisions reads them, and what a command that
+ * may have changed them does once it has committed (recordCollaterals).
  */
-function markedMarket(chainId: number, market: ServedMarket, deprecated: DeprecatedDecisions): ActiveMarketV1 {
+function deprecatedDecisions(deps: CacheDeps): Promise<DeprecatedRead> {
+  return readDecisions(DEPRECATED, deps);
+}
+
+function recordDeprecatedCollaterals(deps: CacheDeps): Promise<void> {
+  return recordCollaterals(DEPRECATED, deps);
+}
+
+function hiddenDecisions(deps: CacheDeps): Promise<HiddenRead> {
+  return readDecisions(HIDDEN, deps);
+}
+
+function recordHiddenCollaterals(deps: CacheDeps): Promise<void> {
+  return recordCollaterals(HIDDEN, deps);
+}
+
+// the decisions of each kind the active reads mark collaterals with
+type CollateralMarks = { deprecated: DeprecatedDecisions, hidden: HiddenDecisions };
+
+/*
+ * A market as the active reads serve it: every collateral says whether it is
+ * deprecated in this Comet, and whether it is hidden there. The version's own
+ * objects are left as they are, since the cache hands one snapshot to every
+ * request of an isolate.
+ */
+function markedMarket(chainId: number, market: ServedMarket, { deprecated, hidden }: CollateralMarks): ActiveMarketV1 {
   const comet = market.contracts.comet;
   return {
     ...market,
     collateralAssets: market.collateralAssets.map(asset => ({
       ...asset,
       isDeprecated: deprecated.has(chainId, comet, asset.token.address),
+      isHidden:     hidden.has(chainId, comet, asset.token.address),
     })),
   };
 }
 
-function markedNetwork(network: ServedNetwork, deprecated: DeprecatedDecisions): ActiveNetworkV1 {
-  return { ...network, markets: network.markets.map(market => markedMarket(network.chainId, market, deprecated)) };
+function markedNetwork(network: ServedNetwork, marks: CollateralMarks): ActiveNetworkV1 {
+  return { ...network, markets: network.markets.map(market => markedMarket(network.chainId, market, marks)) };
 }
 
 /*
  * The representation an answer that carries the flags is tagged by: its name,
- * and a digest of the collaterals it flags. The version's id and checksum name
- * the rest of it (handlers.ts, etagOf), but the flags change without a new
- * version, so a decision that changes what an answer flags changes its tag. A
- * decision about a collateral the answer does not list leaves both as they
- * are.
+ * and for each flag a digest of the collaterals it flags, the deprecated ones
+ * first. The version's id and checksum name the rest of it (handlers.ts,
+ * etagOf), but the flags change without a new version, so a decision that
+ * changes what an answer flags changes its tag. A decision about a collateral
+ * the answer does not list leaves both as they are.
  */
-function deprecatedRepresentation(name: string, networks: Array<{ chainId: number, markets: ActiveMarketV1[] }>): string {
-  const flagged = networks.flatMap(network => network.markets.flatMap(market => market.collateralAssets
-    .filter(asset => asset.isDeprecated)
+function markedRepresentation(name: string, networks: Array<{ chainId: number, markets: ActiveMarketV1[] }>): string {
+  const flagged = (flag: 'isDeprecated' | 'isHidden') => networks.flatMap(network => network.markets.flatMap(market => market.collateralAssets
+    .filter(asset => asset[flag])
     .map(asset => keyOf(network.chainId, market.contracts.comet, asset.token.address))));
-  return `${name}+deprecated-${digestOf(flagged)}`;
+  return `${name}+deprecated-${digestOf(flagged('isDeprecated'))}+hidden-${digestOf(flagged('isHidden'))}`;
 }
 
-export type { DeprecatedDecisions, DeprecatedRead };
+export type { CollateralDecisions, CollateralMarks, CollateralRead, DeprecatedDecisions, DeprecatedRead, HiddenDecisions, HiddenRead };
 export {
   DEPRECATED_KEY,
+  HIDDEN_KEY,
   deprecatedDecisions,
-  deprecatedDecisionsOf,
-  deprecatedRepresentation,
+  decisionsOf as deprecatedDecisionsOf,
+  hiddenDecisions,
+  decisionsOf as hiddenDecisionsOf,
   markedMarket,
   markedNetwork,
+  markedRepresentation,
   recordDeprecatedCollaterals,
+  recordHiddenCollaterals,
 };

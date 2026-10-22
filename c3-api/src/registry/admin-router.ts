@@ -43,6 +43,14 @@ import {
   postActivation,
   postValidate,
 } from './handlers.js';
+import {
+  getHiddenCollateral,
+  getHiddenCollateralExport,
+  patchHiddenCollateral,
+  postHiddenCollateralApply,
+  postHiddenCollateralReview,
+} from './hidden-collateral-handlers.js';
+import type { ListedDecision as ListedHiddenDecision } from './hidden-collateral-repository.js';
 import { isExplicit } from './importer.js';
 import type { InvocationResult } from './importer.js';
 import type { SyncOutcome } from './rows.js';
@@ -120,6 +128,11 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/deprecated-collaterals$/,                               method: 'GET',  handler: 'exportDeprecatedCollaterals', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/deprecated-collaterals\/review$/,                       method: 'POST', handler: 'reviewDeprecatedCollaterals', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/deprecated-collaterals\/apply$/,                        method: 'POST', handler: 'applyDeprecatedCollaterals',  family: 'policy' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/hidden$/, method: 'GET',   handler: 'hiddenCollateral',    family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/hidden$/, method: 'PATCH', handler: 'setHiddenCollateral', family: 'policy' },
+  { pattern: /^\/registry\/v1\/admin\/hidden-collaterals$/,                                   method: 'GET',  handler: 'exportHiddenCollaterals', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/hidden-collaterals\/review$/,                           method: 'POST', handler: 'reviewHiddenCollaterals', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/hidden-collaterals\/apply$/,                            method: 'POST', handler: 'applyHiddenCollaterals',  family: 'policy' },
 ] as const;
 
 const MAX_REASON = 1000;
@@ -149,10 +162,11 @@ const MAX_OVERLAYS_PER_REQUEST = 100;
 const MAX_OVERLAYS_BODY_BYTES  = 512 * 1024;
 
 /*
- * A list of decisions in one request, of token policies or of deprecated
- * collaterals: every token, or every collateral, of every network of a
- * registry fits, with a reason on each row. The list is written as a handful
- * of statements whatever its length, so the bound is the body, not D1.
+ * A list of decisions in one request, of token policies, of deprecated
+ * collaterals or of hidden ones: every token, or every collateral, of every
+ * network of a registry fits, with a reason on each row. The list is written
+ * as a handful of statements whatever its length, so the bound is the body,
+ * not D1.
  */
 const MAX_DECISIONS_PER_REQUEST = 500;
 const MAX_DECISIONS_BODY_BYTES  = 1024 * 1024;
@@ -164,6 +178,8 @@ const BODY_BYTES: Partial<Record<string, number>> = {
   applyTokenPolicies:          MAX_DECISIONS_BODY_BYTES,
   reviewDeprecatedCollaterals: MAX_DECISIONS_BODY_BYTES,
   applyDeprecatedCollaterals:  MAX_DECISIONS_BODY_BYTES,
+  reviewHiddenCollaterals:     MAX_DECISIONS_BODY_BYTES,
+  applyHiddenCollaterals:      MAX_DECISIONS_BODY_BYTES,
 };
 
 /*
@@ -580,12 +596,34 @@ const DEPRECATED_COLLATERAL_LIST: DecisionListSpec<ListedDeprecatedDecision> = {
   addressesOf: decision => [ decision.cometAddress, decision.tokenAddress ],
 };
 
+// the shape of a deprecated collateral list under its own member, so neither kind's review takes the other's export
+const HIDDEN_COLLATERAL_LIST: DecisionListSpec<ListedHiddenDecision> = {
+  bodyKeys:    [ 'registryVersion', 'reason', 'hiddenCollaterals', 'retained' ],
+  listKey:     'hiddenCollaterals',
+  what:        'hidden collaterals',
+  fields:      [
+    [ 'chainId', 'chainId' ], [ 'cometAddress', 'address' ], [ 'deploymentKey', 'name' ],
+    [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ], [ 'isHidden', 'flag' ],
+  ],
+  decisionOf:  (value, reason) => ({
+    chainId:       value.chainId as number,
+    cometAddress:  normalizeAddress(value.cometAddress as string),
+    deploymentKey: (value.deploymentKey as string | null | undefined) ?? null,
+    tokenAddress:  normalizeAddress(value.tokenAddress as string),
+    symbol:        (value.symbol as string | null | undefined) ?? null,
+    isHidden:      value.isHidden as boolean,
+    reason,
+  }),
+  addressesOf: decision => [ decision.cometAddress, decision.tokenAddress ],
+};
+
 /*
  * The body of a list's review and apply (`POST /token-policies/review` and
- * `/apply`, `POST /deprecated-collaterals/review` and `/apply`): a list as
- * the export answers it, edited. `registryVersion` says where it was exported
- * from and is not checked, since a decision belongs to no version. Every
- * problem of every row is reported at once, so a file is fixed in one pass.
+ * `/apply`, `POST /deprecated-collaterals/review` and `/apply`, `POST
+ * /hidden-collaterals/review` and `/apply`): a list as the export answers it,
+ * edited. `registryVersion` says where it was exported from and is not
+ * checked, since a decision belongs to no version. Every problem of every row
+ * is reported at once, so a file is fixed in one pass.
  */
 function decisionListOf<Listed extends { chainId: number }>(
   body: Record<string, unknown>,
@@ -806,6 +844,29 @@ async function routeAdmin(
       return await postDeprecatedCollateralReview(context, decisionListOf(body, DEPRECATED_COLLATERAL_LIST));
     case 'applyDeprecatedCollaterals':
       return await postDeprecatedCollateralApply(context, decisionListOf(body, DEPRECATED_COLLATERAL_LIST));
+    case 'hiddenCollateral':
+      return await getHiddenCollateral(context, versionId!, second!, third!);
+    case 'setHiddenCollateral': {
+      /*
+       * A hidden decision changes which tokens discovery shows, so it carries
+       * a reason like every other decision, and the audit event stores it
+       * beside the actor.
+       */
+      requireExactKeys(body, [ 'isHidden', 'reason' ]);
+      if (typeof(body.isHidden) !== 'boolean') {
+        throw new ApiError('BAD_REQUEST', `isHidden must be a boolean`);
+      }
+      return await patchHiddenCollateral(context, versionId!, second!, third!, {
+        isHidden: body.isHidden,
+        reason:   requireReason(body),
+      });
+    }
+    case 'exportHiddenCollaterals':
+      return await getHiddenCollateralExport(context);
+    case 'reviewHiddenCollaterals':
+      return await postHiddenCollateralReview(context, decisionListOf(body, HIDDEN_COLLATERAL_LIST));
+    case 'applyHiddenCollaterals':
+      return await postHiddenCollateralApply(context, decisionListOf(body, HIDDEN_COLLATERAL_LIST));
   }
 }
 

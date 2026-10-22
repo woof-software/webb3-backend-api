@@ -507,12 +507,13 @@ const collateralOf  = (entry: Summary, symbol: string) => collateralsOf(entry).f
 /*
  * After what was read of each collateral, the summary answers what the token
  * list says of its token: its name and decimals, whether this market's Comet
- * has it deprecated, and what holds of the token across the whole chain. A
- * collateral whose price reverts keeps its message after its status, a market
- * whose base asset could not be priced answers its collaterals so all the
- * same, and a value of the chain nobody could read is left out. COMP's price
- * reverts in USDC's market only, so its value across the chain is unknown in
- * every market that takes it, USDT's too, where its own price was read.
+ * has it deprecated or hidden, and what holds of the token across the whole
+ * chain. A collateral whose price reverts keeps its message after its status,
+ * a market whose base asset could not be priced answers its collaterals so
+ * all the same, and a value of the chain nobody could read is left out.
+ * COMP's price reverts in USDC's market only, so its value across the chain
+ * is unknown in every market that takes it, USDT's too, where its own price
+ * was read.
  */
 t.test('every collateral answers what the token list says of its token after what was read of it, in every form', async t => {
   consoleLines(t, [ 'warn' ]);
@@ -545,6 +546,8 @@ t.test('every collateral answers what the token list says of its token after wha
     is_deprecated:         false,
     is_network_deprecated: false,
     deprecated_in:         [],
+    is_hidden:             false,
+    hidden_in:             [],
     is_strategic:          false,
     network_roles:         [ 'reward', 'collateral' ],
     total_network_collateral_value_status: 'unavailable',

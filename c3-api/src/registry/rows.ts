@@ -255,9 +255,37 @@ type DeprecatedCollateralEventRow = {
   created_at:             string,
 };
 
+/*
+ * Hidden collaterals, from migrations/0008_hidden_collaterals.sql: which
+ * collaterals of which Comets an administrator has hidden, kept as the
+ * deprecated ones are.
+ */
+type HiddenCollateralRow = {
+  chain_id:      number,
+  comet_address: Address,
+  token_address: Address,
+  is_hidden:     number,
+  updated_at:    string,
+  updated_by:    string,
+};
+
+type HiddenCollateralEventRow = {
+  id:                 string,
+  chain_id:           number,
+  comet_address:      Address,
+  token_address:      Address,
+  previous_is_hidden: number | null,
+  is_hidden:          number,
+  actor:              string,
+  reason:             string,
+  created_at:         string,
+};
+
 export type {
   DeprecatedCollateralEventRow,
   DeprecatedCollateralRow,
+  HiddenCollateralEventRow,
+  HiddenCollateralRow,
   MarketAssetRow,
   MarketContractRow,
   MarketRow,

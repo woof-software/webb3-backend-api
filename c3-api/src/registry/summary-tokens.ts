@@ -7,20 +7,23 @@ import type { Address, TokenVisibilityV1 } from '../../lib/model/comet-registry.
 import type { CacheDeps } from './cache.js';
 import type { Catalog, RegistryComet } from './catalog.js';
 import { nowOf } from './clock.js';
-import { deprecatedDecisions, deprecatedDecisionsOf } from './deprecated-collaterals.js';
-import type { DeprecatedRead } from './deprecated-collaterals.js';
+import { deprecatedDecisions, deprecatedDecisionsOf, hiddenDecisions, hiddenDecisionsOf } from './deprecated-collaterals.js';
+import type { DeprecatedRead, HiddenRead } from './deprecated-collaterals.js';
 import { collateralView, positionsOf } from './token-collateral.js';
 import type { BlockRef, TokenCollateralDeps } from './token-collateral.js';
 import { readStrategicTokensByChain } from './token-policy-repository.js';
-import { tokenList } from './token-visibility.js';
+import { tokenList, visibilityWith } from './token-visibility.js';
 
 /*
  * What /summary says of each collateral beside what it read of the market:
  * every field the token list gives its token (token-handlers.ts), written flat
  * on the collateral. A field about the token across its chain says `network`
  * in its name, since on a market it would read as the market's own: the value
- * is what every enabled market of the chain holds, and `is_visible` is whether
- * discovery shows the token, not whether this market offers it.
+ * is what every enabled market of the chain holds. `is_visible` is whether
+ * discovery shows the token, not whether this market offers it, and is the
+ * market's own: the list's rule, with whether this market's Comet hides the
+ * token and whether it has it deprecated in place of what the chain decides of
+ * either (token-visibility.ts, visibilityWith).
  *
  * The values are the list's own, from the record of the chain's minute
  * (token-collateral.ts): valued at the latest block the summary read, or found
@@ -36,6 +39,7 @@ type StrategicTokens = ReadonlyMap<number, ReadonlySet<Address>>;
 // the decisions of administrators, every chain's, or null where they could not be read
 type SummaryDecisions = {
   deprecated: DeprecatedRead | null,
+  hidden:     HiddenRead | null,
   strategic:  StrategicTokens | null,
 };
 
@@ -66,13 +70,14 @@ const SUMMARY_DEADLINE_MS = 2_000;
 const unreadDue = throttleBy<D1Database>(60_000);
 
 /*
- * The decisions, both read at once. Neither read fails the summary, where the
- * token list answers 503 for it: on the legacy router a database fault would
- * be a 500 of every market's summary. A read that failed leaves out the
+ * The decisions, every kind read at once. No read fails the summary, where
+ * the token list answers 503 for it: on the legacy router a database fault
+ * would be a 500 of every market's summary. A read that failed leaves out the
  * fields it decides on every request, and is logged under the id of the
- * request that found it (unreadDue). The deprecated decisions are read as
- * /registry/v1/active reads them, and come from the record the worker keeps
- * while D1 cannot be reached; the strategic ones have no such record.
+ * request that found it (unreadDue). The deprecated and the hidden decisions
+ * are read as /registry/v1/active reads them, and come from the records the
+ * worker keeps while D1 cannot be reached; the strategic ones have no such
+ * record.
  */
 async function summaryDecisions(deps: CacheDeps, requestId: string): Promise<SummaryDecisions> {
   const unread = (decisions: string) => (error: unknown) => {
@@ -81,11 +86,12 @@ async function summaryDecisions(deps: CacheDeps, requestId: string): Promise<Sum
     }
     return null;
   };
-  const [ deprecated, strategic ] = await Promise.all([
+  const [ deprecated, hidden, strategic ] = await Promise.all([
     deprecatedDecisions(deps).catch(unread('deprecated collateral decisions')),
+    hiddenDecisions(deps).catch(unread('hidden collateral decisions')),
     readStrategicTokensByChain(deps.db).catch(unread('token policies')),
   ]);
-  return { deprecated, strategic };
+  return { deprecated, hidden, strategic };
 }
 
 // the token list's entry of every token of a chain, by address, and the decisions it was made with
@@ -122,6 +128,7 @@ async function chainTokens(
     view,
     strategic:  decisions.strategic?.get(chainId) ?? new Set(),
     deprecated: decisions.deprecated?.decisions ?? deprecatedDecisionsOf([]),
+    hidden:     decisions.hidden?.decisions ?? hiddenDecisionsOf([]),
     now:        deps.now(),
   });
   return { chainId, tokens: new Map(list.tokens.map(token => [ token.address, token ])), decisions };
@@ -129,21 +136,38 @@ async function chainTokens(
 
 /*
  * One collateral's token under the summary's names, after what was read of
- * it: its name and decimals; `is_deprecated`, the decision of this market's
- * Comet, as /registry/v1/active marks its collateral; and the rest as the list
- * says it of the whole chain. A field whose decision could not be read is left
- * out, and so is a value that is not known: never null, as the summary leaves
- * out whatever it cannot give.
+ * it: its name and decimals; `is_deprecated` and `is_hidden`, the decisions of
+ * this market's Comet, as /registry/v1/active marks its collateral; and the
+ * rest as the list says it of the whole chain, but for whether discovery
+ * shows the token (visibilityWith). A field whose decision could not be read
+ * is left out, and so is a value that is not known: never null, as the
+ * summary leaves out whatever it cannot give.
+ *
+ * Whether discovery shows the token is said as soon as the decisions read
+ * decide it, since the rule asks this Comet's hiding first and its
+ * deprecating next: a token this Comet hides, or does not hide but has
+ * deprecated, is said not to be shown here even when the decisions after it
+ * could not be read, as a client that is told nothing shows it. The rest of
+ * the rule takes every kind.
  */
 function collateralFields(token: TokenVisibilityV1, { chainId, decisions }: ChainTokens, comet: Address) {
-  const { deprecated, strategic } = decisions;
+  const { deprecated, hidden, strategic } = decisions;
+  const isHidden     = hidden === null ? null : hidden.decisions.has(chainId, comet, token.address);
+  const isDeprecated = deprecated === null ? null : deprecated.decisions.has(chainId, comet, token.address);
+  const decided      = isHidden === true
+    || (isHidden === false && (isDeprecated === true || (isDeprecated === false && strategic !== null)));
+  const visibility   = decided ? visibilityWith(token, { isHidden: isHidden === true, isDeprecated: isDeprecated === true }) : null;
   return {
     name:     token.name,
     decimals: token.decimals,
-    ...(deprecated === null ? {} : {
-      is_deprecated:         deprecated.decisions.has(chainId, comet, token.address),
+    ...(isDeprecated === null ? {} : {
+      is_deprecated:         isDeprecated,
       is_network_deprecated: token.isDeprecated,
       deprecated_in:         token.deprecatedIn.map(address => checksumAddress(address)),
+    }),
+    ...(isHidden === null ? {} : {
+      is_hidden: isHidden,
+      hidden_in: token.hiddenIn.map(address => checksumAddress(address)),
     }),
     ...(strategic === null ? {} : { is_strategic: token.isStrategic }),
     network_roles: token.roles,
@@ -159,9 +183,9 @@ function collateralFields(token: TokenVisibilityV1, { chainId, decisions }: Chai
       // null where the exception does not expire: that is known, not left out
       expires_at:         exception.expiresAt,
     })),
-    ...(deprecated === null || strategic === null ? {} : {
-      is_visible:        token.isVisible,
-      visibility_reason: token.visibilityReason,
+    ...(visibility === null ? {} : {
+      is_visible:        visibility.isVisible,
+      visibility_reason: visibility.visibilityReason,
     }),
   };
 }

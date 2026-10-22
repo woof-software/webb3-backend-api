@@ -8,8 +8,9 @@ import { registryHeaders } from './version-headers.js';
 /*
  * The decisions an administrator makes about what the registry serves, with
  * the audit of every change to each: token policies
- * (token-policy-repository.ts) and deprecated collaterals
- * (deprecated-collateral-repository.ts). Both are written, read, reviewed and
+ * (token-policy-repository.ts), deprecated collaterals
+ * (deprecated-collateral-repository.ts) and hidden collaterals
+ * (hidden-collateral-repository.ts). All are written, read, reviewed and
  * applied here, the same way: each kind describes itself to the store
  * (DecisionKind), and answers in its own types.
  *
@@ -48,8 +49,12 @@ type DecisionBase = {
 /*
  * A kind of decision, as the store writes, reads, reviews and applies it:
  * `Decision` is what one write records, `Listed` a row of a list. Its
- * statements are its own, kept as they are written: the kinds' tables differ
- * in their columns, and one template would give neither kind's text.
+ * statements name its own tables and no other kind's. Token policies keep
+ * theirs as they are written; the two kinds about a collateral of a Comet
+ * build theirs from one template over their tables' names
+ * (collateral-decision-repository.ts), since those tables differ in nothing
+ * else. A test that picks a statement out by its text therefore picks one
+ * kind's.
  *
  * The store's functions take their types from the kind alone. The decisions
  * handed to them are NoInfer, so a literal is checked against the kind

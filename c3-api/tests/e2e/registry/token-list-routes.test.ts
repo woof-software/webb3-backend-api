@@ -41,7 +41,7 @@ t.test('a chain whose collateral cannot be read is still listed, failing open', 
   const body = await response.json() as TokenListV1;
   t.same(
     { registryVersion: body.registryVersion, chainId: body.chainId, thresholdUsd: body.thresholdUsd, ruleVersion: body.ruleVersion, block: body.block },
-    { registryVersion: { id: versionId, checksum: snapshot.registryVersion.checksum }, chainId: SCROLL, thresholdUsd: '250000', ruleVersion: 2, block: null },
+    { registryVersion: { id: versionId, checksum: snapshot.registryVersion.checksum }, chainId: SCROLL, thresholdUsd: '250000', ruleVersion: 3, block: null },
     'the latest block could not be read',
   );
   t.same(
@@ -105,15 +105,19 @@ t.test('without an active version there is nothing to list', async t => {
 });
 
 /*
- * Without its decisions the list would hide a strategic token below the
- * threshold, so a list that cannot read them is not answered at all.
+ * Without its decisions the list would not show a strategic token below the
+ * threshold, and would show one an administrator hid, so a list that cannot
+ * read them is not answered at all: neither before the token policy
+ * migration nor before the hidden collateral one.
  */
-t.test('a database without the token policy migration says so', async t => {
-  await freshActive(harness, { activate: true, through: '0004' });
+t.test('a database without a migration of the decisions the list reads says so', async t => {
+  for (const [ through, migration ] of [ [ '0004', 'the token policy migration' ], [ '0007', 'the hidden collateral migration' ] ]) {
+    await freshActive(harness, { activate: true, through });
 
-  const response = await server.fetch(tokensPath(SCROLL));
-  t.equal(response.status, 503);
-  const body = await response.json() as ErrorBody;
-  t.equal(body.error.code, 'UPSTREAM_UNAVAILABLE');
-  t.match(body.error.message, /apply the D1 migrations/, 'naming the remedy');
+    const response = await server.fetch(tokensPath(SCROLL));
+    t.equal(response.status, 503, `without ${migration}`);
+    const body = await response.json() as ErrorBody;
+    t.equal(body.error.code, 'UPSTREAM_UNAVAILABLE');
+    t.match(body.error.message, /apply the D1 migrations/, 'naming the remedy');
+  }
 });

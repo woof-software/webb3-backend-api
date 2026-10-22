@@ -65,6 +65,8 @@ const APPLICATION_TABLES = [
   'token_policy_events',
   'deprecated_collaterals',
   'deprecated_collateral_events',
+  'hidden_collaterals',
+  'hidden_collateral_events',
 ];
 
 const NOT_IMPORTING = { message: /registry version is not importing/ };
@@ -141,6 +143,7 @@ t.test('migration 0001 creates strict tables and an empty active pointer', async
   ).all<{ name: string }>();
   t.same((partialIndexes.results ?? []).map(index => index.name), [
     'deprecated_collaterals_marked',
+    'hidden_collaterals_marked',
     'market_assets_collateral_index',
     'market_assets_single_base',
     'market_assets_single_reward',

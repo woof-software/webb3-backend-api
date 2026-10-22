@@ -5,11 +5,13 @@ import { randomUUID } from 'node:crypto';
 import type {
   Address,
   DeprecatedCollateralListV1,
+  HiddenCollateralListV1,
   NetworkV1,
   TokenPoliciesV1,
 } from '../../../lib/model/comet-registry.js';
 import { checksumAddress } from '../../../lib/model/comet-registry.js';
 import { applyDeprecatedCollaterals, setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
+import { applyHiddenCollaterals, setHiddenCollateral } from '../../../src/registry/hidden-collateral-repository.js';
 import { applyTokenPolicies, setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
 import { foreignKeyViolations } from '../../util/d1.js';
@@ -20,18 +22,20 @@ import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 import type { RegistryHarness } from '../../util/registry-harness.js';
 
 /*
- * What token policies and deprecated collaterals do alike. Both are kinds of
- * one store of decisions (src/registry/decision-store.ts) behind routes of
- * one shape, so a decision, a list of them, the races around their writes
- * and the refusals of their routes are tested here once, over a description
- * of each kind (DecisionKindUnderTest): a change to what the kinds share is
- * made, and checked, for both.
+ * What token policies, deprecated collaterals and hidden collaterals do
+ * alike. All are kinds of one store of decisions
+ * (src/registry/decision-store.ts) behind routes of one shape, so a decision,
+ * a list of them, the races around their writes and the refusals of their
+ * routes are tested here once, over a description of each kind
+ * (DecisionKindUnderTest): a change to what the kinds share is made, and
+ * checked, for every one.
  *
  * Each kind runs them from its own files, beside the tests only it has:
- * decisionScenarios from token-policies.test.ts and
- * deprecated-collaterals.test.ts, decisionRouteScenarios from
- * token-policy-routes.test.ts and deprecated-collateral-routes.test.ts. This
- * module is not a test file, and tap does not run it on its own.
+ * decisionScenarios from token-policies.test.ts,
+ * deprecated-collaterals.test.ts and hidden-collaterals.test.ts,
+ * decisionRouteScenarios from token-policy-routes.test.ts,
+ * deprecated-collateral-routes.test.ts and hidden-collateral-routes.test.ts.
+ * This module is not a test file, and tap does not run it on its own.
  */
 
 // what a decision is about, by the names its answers and its list rows give its addresses: a token, or a collateral of a Comet
@@ -90,7 +94,7 @@ type DecisionKindUnderTest = {
   migrations: { through: string[], reads: Array<[ string, string ]> },
 };
 
-// what both kinds answer, by the members they share; a member named after the kind is read through it
+// what every kind answers, by the members they share; a member named after the kind is read through it
 type Decided  = Record<string, unknown> & { changed: boolean, updatedAt: string | null };
 type Detail   = Record<string, unknown> & {
   inActiveVersion: boolean,
@@ -110,7 +114,7 @@ function checksummed(subject: Subject): Record<string, string> {
   return Object.fromEntries(Object.entries(subject).map(([ name, address ]) => [ name, checksumAddress(address) ]));
 }
 
-// values by the columns of both kinds' tables, which name in snake case what their answers name in camel case
+// values by the columns of every kind's tables, which name in snake case what their answers name in camel case
 function columnsOf(values: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(values).map(([ name, value ]) => [ name.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`), value ]));
 }
@@ -506,12 +510,16 @@ function decisionRouteScenarios(harness: RegistryHarness, kind: DecisionKindUnde
    * than answering an internal error only the logs explain.
    */
   t.test(`a database without the ${kind.label} migration says so`, async t => {
+    const list = { [kind.list.key]: [ { chainId: 1, ...kind.subject, ...valid } ] };
     for (const through of kind.migrations.through) {
       await freshActive(harness, { activate: true, through });
 
       const requests: Array<[ string, () => Promise<Answer<Refused>> ]> = [
-        [ 'the export', () => admin.read(kind.list.export) ],
-        [ 'a change',   () => admin.patch(kind.path(1, kind.subject), valid) ],
+        [ `a read of one ${kind.noun}`, () => admin.read(kind.path(1, kind.subject)) ],
+        [ 'the export',                 () => admin.read(kind.list.export) ],
+        [ 'a change',                   () => admin.patch(kind.path(1, kind.subject), valid) ],
+        [ 'a review',                   () => admin.post(kind.list.review, list) ],
+        [ 'an apply',                   () => admin.post(kind.list.apply, list) ],
         ...kind.migrations.reads.map(([ name, path ]): [ string, () => Promise<Answer<Refused>> ] => [ name, () => admin.read(path, {}) ]),
       ];
       for (const [ name, request ] of requests) {
@@ -785,5 +793,122 @@ const DEPRECATED_COLLATERALS: DecisionKindUnderTest = {
   },
 };
 
+// a row of a hidden collateral list, which the malformed rows are made from
+const HIDDEN_ROW = { chainId: 1, cometAddress: USDT_COMET, tokenAddress: METH, isHidden: true };
+
+/*
+ * A hidden collateral is decided about as a deprecated one is, the same
+ * collaterals of the same Comets, under its own tables, routes and flag, and
+ * its list under a member of its own, so that a deprecated export is refused
+ * by its review.
+ */
+const HIDDEN_COLLATERALS: DecisionKindUnderTest = {
+  noun:     'collateral',
+  label:    'hidden collateral',
+  flag:     'isHidden',
+  previous: 'previousIsHidden',
+  tables:   { rows: 'hidden_collaterals', events: 'hidden_collateral_events' },
+  left:     { code: 'COLLATERAL_LEFT_REGISTRY', message: /left the collateral of/ },
+  path:     (chainId, { cometAddress, tokenAddress }) =>
+    `/registry/v1/admin/networks/${chainId}/markets/${cometAddress}/collaterals/${tokenAddress}/hidden`,
+  list:     {
+    export: '/registry/v1/admin/hidden-collaterals',
+    review: '/registry/v1/admin/hidden-collaterals/review',
+    apply:  '/registry/v1/admin/hidden-collaterals/apply',
+    key:    'hiddenCollaterals',
+    what:   'hidden collaterals',
+    other:  'collaterals',
+  },
+  reads:    () => [],
+  subject:  { cometAddress: USDT_COMET, tokenAddress: METH },
+  other:    { cometAddress: USDT_COMET, tokenAddress: WEETH },
+  without:  withoutCollateral(METH),
+  set:      (db, { subject, flag, actor, reason }) => setHiddenCollateral(db, {
+    chainId: 1, cometAddress: subject.cometAddress, tokenAddress: subject.tokenAddress, isHidden: flag, actor, reason,
+  }),
+  apply:    (db, list, actor) => applyHiddenCollaterals(db, {
+    reason:    list.reason,
+    decisions: list.rows.map(([ { cometAddress, tokenAddress }, isHidden, reason ]) => ({
+      chainId: 1, cometAddress, deploymentKey: null, tokenAddress, symbol: null, isHidden, reason,
+    })),
+  }, actor),
+  // the export, which keeps the decisions for collaterals the version does not hold in their Comet
+  listing:  async admin => {
+    const { body } = await admin.read<HiddenCollateralListV1>('/registry/v1/admin/hidden-collaterals');
+    return {
+      versionId:  body.registryVersion?.id,
+      decisionOf: subject => body.hiddenCollaterals.find(row =>
+        row.chainId === 1 && row.cometAddress === subject.cometAddress && row.tokenAddress === subject.tokenAddress)?.isHidden,
+      retained:   body.retained,
+    };
+  },
+  retained: (subject, updatedAt) => ({ chainId: 1, ...subject, isHidden: true, updatedAt, updatedBy: ADMIN_ACTOR }),
+  // a missing chain, a missing Comet, a token that Comet does not take, a market and a symbol that are another's, and a change without a reason
+  problems: {
+    list: {
+      reason:            null,
+      hiddenCollaterals: [
+        { chainId: 1,  cometAddress: USDT_COMET, deploymentKey: 'usdt', tokenAddress: METH, symbol: 'mETH', isHidden: true, reason: 'not listed' },
+        { chainId: 10, cometAddress: USDT_COMET, tokenAddress: METH, isHidden: true, reason: 'not listed' },
+        { chainId: 1,  cometAddress: NOWHERE, tokenAddress: METH, isHidden: true, reason: 'not listed' },
+        { chainId: 1,  cometAddress: USDC_COMET, tokenAddress: METH, isHidden: true, reason: 'not listed' },
+        { chainId: 1,  cometAddress: USDC_COMET, deploymentKey: 'usdt', tokenAddress: WEETH, isHidden: true, reason: 'not listed' },
+        { chainId: 1,  cometAddress: WETH_COMET, tokenAddress: WEETH, symbol: 'eETH', isHidden: true, reason: 'not listed' },
+        { chainId: 1,  cometAddress: USDT_COMET, tokenAddress: WEETH, isHidden: true },
+      ],
+    },
+    named: [
+      [ 1, null ],
+      [ 2, 'chain 10 is not part of the active registry' ],
+      [ 3, `${NOWHERE} is not a market of the active registry on chain 1` ],
+      [ 4, `${METH} is not a collateral of ${USDC_COMET} in the active registry on chain 1` ],
+      [ 5, `the list names ${USDC_COMET} usdt, which the active registry calls usdc` ],
+      [ 6, `the list names ${WEETH} eETH, which the active registry calls weETH` ],
+      [ 7, `${WEETH} (weETH of usdt) changes, and needs a reason: its own or the list's` ],
+    ],
+  },
+  unheld:   DEPRECATED_COLLATERALS.unheld,
+  // `retained` is what an export keeps for collaterals the version does not hold, and a list does not read it
+  malformed: {
+    list: {
+      reason:            '\u0000not listed',
+      retained:          [ { anything: 'is not read' } ],
+      hiddenCollaterals: [
+        'mETH',
+        { ...HIDDEN_ROW, note: 'x' },
+        { chainId: '1', cometAddress: 'usdt', tokenAddress: '0x12', deploymentKey: 5, symbol: 5, isHidden: 'yes', reason: ' ' },
+        { ...HIDDEN_ROW, reason: 'x'.repeat(1001) },
+        HIDDEN_ROW,
+        // the same addresses in another case, which name the same collateral
+        { ...HIDDEN_ROW, cometAddress: USDT_COMET.toUpperCase().replace('0X', '0x'), tokenAddress: METH.toUpperCase().replace('0X', '0x') },
+      ],
+    },
+    problems: [
+      'reason cannot contain a NUL character',
+      'row 1 must be an object',
+      'row 2 has unexpected properties: note',
+      'row 3: chainId must be a positive integer',
+      'row 3: cometAddress must be an address',
+      'row 3: deploymentKey must be null or a string',
+      'row 3: tokenAddress must be an address',
+      'row 3: symbol must be null or a string',
+      'row 3: isHidden must be a boolean',
+      'row 3: reason must be null or a non-empty string of at most 1000 characters',
+      'row 4: reason must be null or a non-empty string of at most 1000 characters',
+      `row 6 repeats row 5 (chain 1, ${USDT_COMET}, ${METH})`,
+    ],
+  },
+  /*
+   * The active reads mark collaterals hidden as they mark them deprecated,
+   * and the token list reads both kinds, so the reads that need the
+   * deprecated tables need these too. A database migrated through 0007 holds
+   * every table but these.
+   */
+  migrations: {
+    through: [ '0007' ],
+    reads:   DEPRECATED_COLLATERALS.migrations.reads,
+  },
+};
+
 export type { DecisionKindUnderTest };
-export { DEPRECATED_COLLATERALS, TOKEN_POLICIES, decisionRouteScenarios, decisionScenarios };
+export { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, TOKEN_POLICIES, decisionRouteScenarios, decisionScenarios };
