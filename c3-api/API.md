@@ -680,15 +680,16 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
 
 Aggregate of all governance proposals across Governors alpha and bravo.
 
-Each action is described against the contracts this API knows by name. One
-the static constants cannot fully name — a target only the active registry
-version knows, an action bridged to another chain, a call that configures a
-market — is described again with the version's markets, every token they
-name and every price feed they read: a cap or an amount of a token is
-written there at the decimals the version read for it, under the constants'
-name where they know the token too. When the registry cannot be read, an
-action bridged or configuring a market is described again against the
-constants alone. `addAsset` writes the new asset's cap at the decimals its
+Each action of the page is described against the contracts this API knows
+by name, with the markets of the active registry version merged in, every
+token they name and every price feed they read, and the disabled markets it
+holds: a market is named by its contract name, or its label where it has
+none, and linked at its checksummed address, and a cap or an amount of a
+token is written at the decimals the version read for it, under the
+constants' name where they know the token too. A Comet the version does not
+hold reads as its address. When the registry cannot be read, every action is
+described against the constants alone, and every market in it reads as its
+address. `addAsset` writes the new asset's cap at the decimals its
 configuration states. `updateAssetSupplyCap` states none, so the cap of an
 asset neither the constants nor the version know — one added to the market
 since the version was imported — is written at 18 decimals until a version
@@ -1218,8 +1219,7 @@ worth trying again.
 
 Every `CONFLICT` names in `details.code` the conflict it met, which is what a
 script matches; the message says the same to a person, and may change. An
-overlay write below is any of `PUT …/overlay`, `PUT …/overlays` and
-`POST …/proposal/apply`:
+overlay write below is any of `PUT …/overlay` and `PUT …/overlays`:
 
 | `details.code` | Answered by | Means |
 |---|---|---|
@@ -1234,8 +1234,6 @@ overlay write below is any of `PUT …/overlay`, `PUT …/overlays` and
 | `SLUG_TAKEN` | an overlay write | another market of the network keeps the slug a market's document names |
 | `DEFAULT_TAKEN` | an overlay write | a market's document says `isDefault: true` while another market of the version is the default |
 | `REWARD_FEED_WITHOUT_REWARD` | an overlay write | a market's document names a `rewardPriceFeed`, and its rewards contract names no reward token |
-| `PROPOSAL_CLOSED` | the proposal routes | a version of the registry has been activated |
-| `PROPOSAL_CHANGED` | `POST …/proposal/apply` | the proposal no longer has the digest sent; `details.digest` is the one it has |
 | `TOKEN_LEFT_REGISTRY` | `PATCH …/policy`, `POST …/token-policies/apply` | a version without the token, or without a token of the list, was activated while it was being written |
 | `COLLATERAL_LEFT_REGISTRY` | `PATCH …/deprecated`, `POST …/deprecated-collaterals/apply`, `PATCH …/hidden`, `POST …/hidden-collaterals/apply` | a version whose market does not take the collateral, or a collateral of the list, was activated while it was being written |
 | `DECISION_CHANGED` | `POST …/token-policies/apply`, `POST …/deprecated-collaterals/apply`, `POST …/hidden-collaterals/apply` | someone else changed a decision of the list while it was being applied |
@@ -2314,15 +2312,15 @@ and `digest: null`.
 
 Many overlays in one request: the way a new environment is reviewed, where
 every network and market the first import wrote needs its decisions at once.
-`GET /versions/{version_id}/proposal` answers with exactly this body under
-`bundle`.
+A first bring-up sends the checked-in seed,
+[`c3-api/registry/seed/production.json`](./registry/seed/README.md), as this
+body ([REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md#3-send-the-seed)).
 
 Network overlays are keyed by chain id and market overlays by
 `chainId/deploymentKey`, the chain id written as a path writes it (`1`, never
-`01`), which is how the proposal's bundle writes it; each is the same
-complete document the one-scope routes take, decided the same way, and
-`reason` is stored with every audit event the request records. Up to 100
-overlays, in a body of up to 512 KiB.
+`01`); each is the same complete document the one-scope routes take, decided
+the same way, and `reason` is stored with every audit event the request
+records. Up to 100 overlays, in a body of up to 512 KiB.
 
 The request is applied all at once or not at all. Every document is parsed
 and every network and market it names is found before anything is written,
@@ -2338,7 +2336,7 @@ against what it read.
 
 ```json
 {
-  "reason": "bootstrap: derived from the static constants against Compound-Foundation/comet@a34d9b571c83",
+  "reason": "first registry version: c3-api/registry/seed/production.json",
   "networks": { "1": { "displayName": "Ethereum", "assetDisplayOverrides": [], "unwrappedCollateralAssets": [], "priceExceptions": [] } },
   "markets":  { "1/usdc": { "displayName": "USDC", "contractName": "cUSDCv3", "...": "..." } }
 }
@@ -2373,7 +2371,12 @@ The answer says what each document changed — the networks first, by chain
 id, then the markets in the order the request named them — and what the
 candidate still has unreviewed. A document identical to
 what is stored changes nothing and records no event, so sending the same
-directory again is safe.
+directory again is safe. A body with `expectedDigests` is not repeatable:
+once a request has written a document, its scope holds that document's digest
+rather than the one the request expected, so the same body sent again is
+refused with `409`, naming each such scope in `details.current`. That is what
+the seed's `null` for every document is for: it reviews a first draft once,
+and is refused by a draft somebody has reviewed.
 
 ```json
 {
@@ -2388,50 +2391,6 @@ directory again is safe.
   "unreviewed": { "networks": [], "markets": [] }
 }
 ```
-
-## `GET /registry/v1/admin/versions/{version_id}/proposal`
-### `GET /registry/v1/admin/versions/{version_id}/proposal/review`
-### description:
-
-What the release serving the request proposes as the first review of a
-version: for every market the version imported that the static constants
-describe, the decisions the API already acts on, and for every network, its
-name, presentation and price exceptions. A market the constants do not
-describe is not proposed; it is listed under `needsDecision`, and stays
-switched off until it is described with the market overlay route.
-
-The proposal is for an environment's first version only. Once any version
-has been activated, the decisions live in the registry and every draft
-inherits them, so applying the constants' values over a draft would undo
-what was reviewed since: the proposal routes, `apply` included, answer
-`409` with `PROPOSAL_CLOSED` from then on, and a draft is reviewed with the
-overlay routes.
-
-`/proposal` answers with the proposal as data: its `digest`, what it leaves
-undecided, and under `bundle` the body `PUT /versions/{version_id}/overlays`
-takes. `/proposal/review` answers with the same proposal as a document to read
-(`text/markdown`), naming the digest to apply it by. Neither changes anything.
-
-```json
-{
-  "versionId": "d9698ddd-ab86-46bc-a412-c71df7d20414",
-  "digest": "3f9a1c0e7b2d4a61",
-  "needsDecision": [],
-  "bundle": { "reason": "bootstrap: derived from the static constants against Compound-Foundation/comet@a34d9b571c83", "networks": { "...": "..." }, "markets": { "...": "..." } }
-}
-```
-
-## `POST /registry/v1/admin/versions/{version_id}/proposal/apply`
-### description:
-
-Applies the proposal by its digest: `{"reason": "...", "digest": "<16 hex>"}`.
-The proposal is built again and written only if it still has that digest, so
-what is applied is exactly what was read; one that changed since — another
-release, another version — answers `409` with `PROPOSAL_CHANGED`, and its
-current digest in `details.digest`. The write is the one
-`PUT /versions/{version_id}/overlays` makes, all of it or none, and answers
-the same way, with the `digest` beside it. Only an importing version is
-writable.
 
 ## `GET /registry/v1/admin/versions/{version_id}/changes`
 ### description:

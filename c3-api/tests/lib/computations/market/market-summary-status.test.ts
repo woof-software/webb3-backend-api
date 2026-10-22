@@ -449,14 +449,14 @@ t.test('a price is read at the scale the version states for its feed', async t =
 });
 
 /*
- * The price exceptions the registry seeded (bootstrap.ts) name the feeds
- * wUSDM and pumpBTC had before governance delisted them, moving both onto a
- * "Constant price feed" that answers 1 at 8 decimals (TOK-0 audit §6, trap
- * 1). A summary prices a collateral with the feed its Comet reads at the
- * block summarized, so a day before the move applies the exceptions —
- * wUSDM at zero, pumpBTC at its feed's last answer, 1.02447384 BTC — without
- * reading either feed; the latest block reads the constant feed, at 10^-8,
- * like any other, and applies nothing.
+ * The price exceptions the registry seeded (registry/seed/production.json)
+ * name the feeds wUSDM and pumpBTC had before governance delisted them,
+ * moving both onto a "Constant price feed" that answers 1 at 8 decimals
+ * (TOK-0 audit §6, trap 1). A summary prices a collateral with the feed its
+ * Comet reads at the block summarized, so a day before the move applies
+ * the exceptions — wUSDM at zero, pumpBTC at its feed's last answer,
+ * 1.02447384 BTC — without reading either feed; the latest block reads the
+ * constant feed, at 10^-8, like any other, and applies nothing.
  */
 t.test('the seeded exceptions price wUSDM and pumpBTC where their Comet still reads the feed they name', async t => {
   const CONSTANT     = '0x7badab7109afbbf48ecd8d6498caacd2630b45b9';

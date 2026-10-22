@@ -120,9 +120,6 @@ type ConflictCode = (
   | 'SLUG_TAKEN'
   | 'DEFAULT_TAKEN'
   | 'REWARD_FEED_WITHOUT_REWARD'
-  // the proposal
-  | 'PROPOSAL_CLOSED'
-  | 'PROPOSAL_CHANGED'
   // cancelling a sync run
   | 'SYNC_RUN_HELD'
   | 'SYNC_RUN_ENDED'
