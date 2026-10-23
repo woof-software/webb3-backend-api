@@ -2887,6 +2887,12 @@ body is a list as the export answers it, edited, of 1 to 500 rows and at most
   what the active version does not hold, and are not read: a decision belongs
   to no version.
 
+A first bring-up sends the collaterals the app hid by a list of its own,
+checked in as
+[`c3-api/registry/seed/production.deprecated-collaterals.json`](./registry/seed/README.md#the-deprecated-collaterals),
+as this body once its first version is active, then applies what it changes
+([REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md#7-mark-the-initial-deprecated-collaterals)).
+
 A malformed body answers `400` with every problem of every row in
 `details.problems`. A well-formed one answers `200`, with each row's
 `problem` in place of refusing:
@@ -2971,10 +2977,6 @@ $ curl -X POST 'localhost:8787/registry/v1/admin/deprecated-collaterals/apply' \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
     --data @deprecated-collaterals.json
 ```
-
-The list the app kept of its own, which calls these collaterals legacy, is
-applied once in each environment from the document in
-[REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md).
 
 Every deprecated collateral route answers `503 UPSTREAM_UNAVAILABLE` naming
 the D1 migrations when the environment's database does not have migration

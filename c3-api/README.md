@@ -614,9 +614,13 @@ runbook does
 
 The frontend's list is not seeded by a migration: a migration cannot know
 which version an environment has on, and a decision is only made about a
-collateral of one. The runbook holds it as a document applied once per
-environment, with every Comet and token address the repository's registry
-data resolves, and the steps for the rest
+collateral of one. It is checked in beside the registry seed, as
+[`registry/seed/production.deprecated-collaterals.json`](./registry/seed/README.md#the-deprecated-collaterals):
+20 collaterals of five Ethereum markets, with every Comet and token address,
+in a list the review and apply routes take as it is. A first bring-up
+reviews it and applies what it changes once its first version is on
+([REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md#7-mark-the-initial-deprecated-collaterals)),
+and the runbook says where each address comes from
 ([The initial list of deprecated collaterals](./REGISTRY_RUNBOOK.md#the-initial-list-of-deprecated-collaterals)).
 
 # Hidden Collaterals

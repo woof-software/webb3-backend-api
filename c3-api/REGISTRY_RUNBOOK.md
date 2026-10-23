@@ -79,7 +79,7 @@ then the headers, then the body. To use them:
 >    how long the window will be.
 > 2. Announce the window beforehand — when it opens and how long it lasts —
 >    to the frontend developer and to whoever answers users.
-> 3. Deploy, and run steps 1 to 6 below straight away, one after another.
+> 3. Deploy, and run steps 1 to 7 below straight away, one after another.
 >
 > Once a version is active, a client that pages transaction history with a
 > cursor it was given before is told to start over, once
@@ -183,7 +183,7 @@ proxy, in `../node-provider-proxy/.dev.vars`, the keys of providers that keep
 archive state, and add `-c wrangler.local-proxy.toml` to both commands.
 
 **Bring it up.** In another terminal, from the root of the checkout, with
-`export API=http://localhost:8787` and your token in `TOKEN`, run steps 1 to 6
+`export API=http://localhost:8787` and your token in `TOKEN`, run steps 1 to 7
 of [the first bring-up](#bringing-an-environment-up-for-the-first-time), and
 time them.
 
@@ -193,15 +193,18 @@ its second column. Step 3 answers `"changed": true`, with nothing unreviewed
 but those; to check the file it asks the node 10 `eth_blockNumber`, 58
 `eth_getCode` at past blocks — each Comet at its creation block and at the
 block before — and the decimals of up to 19 feeds. Step 4 answers
-`validated`, and step 6 serves every market, none in `error`. Then compare
-`GET $API/registry/v1/active` with develop's
+`validated`, step 6 serves every market, none in `error`, and step 7's
+review finds no problem: the version holds every collateral of the initial
+list, which the tests cannot check for the wstETH and USDS markets.
+Then compare `GET $API/registry/v1/active` with develop's
 `GET /market/all-networks/all-contracts/summary`: every market develop serves
 but its test markets, under the same display name, base asset name, slug, and
 default and institutional flags.
 
 **If not.** What step 3 refuses, its table explains. Where the file is at
 fault, it needs a change ([its README](./registry/seed/README.md#changing-it))
-before any environment is brought up with it. A `503` there with
+before any environment is brought up with it, and so does the list of step 7
+for a row its review finds a problem in. A `503` there with
 `details.code` `CHAIN_REQUEST_FAILED` and
 "the node provider did not serve the code of 0x…", naming a Comet, is a
 provider that did not serve the Comet's code at a past block — most often one
@@ -603,6 +606,64 @@ One error is no market's: `Too many subrequests` in that log line says the
 request ran out of the subrequests an invocation has
 ([README.md](./README.md#workers-plan)). Switch nothing off or back for it;
 show it to a developer.
+
+### 7. Mark the initial deprecated collaterals
+
+```sh
+curl -s -X POST "$API/registry/v1/admin/deprecated-collaterals/review" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data-binary @c3-api/registry/seed/production.deprecated-collaterals.json > review.json
+jq 'if .error then .error else .summary, (.collaterals[] | select(.problem != null)) end' review.json
+```
+
+Postman:
+
+```http
+POST {{API}}/registry/v1/admin/deprecated-collaterals/review
+Authorization: Bearer {{TOKEN}}
+Content-Type: application/json
+
+<the file c3-api/registry/seed/production.deprecated-collaterals.json>
+```
+
+Send the file as it is: **Body → binary**, and select it. Set the
+`Content-Type: application/json` header yourself.
+
+**Why.** Until the registry served them, the app left 20 collaterals of five
+Ethereum markets out by a list of its own. The file is that list, in the
+form the review and apply routes take
+([The initial list of deprecated collaterals](#the-initial-list-of-deprecated-collaterals)).
+A collateral can be marked only while a version that holds it is on, so the
+list goes in once step 5 has switched one on, and until it is applied, the
+reads mark none of the 20 deprecated. The review writes nothing: it holds
+every row against the version that is on, and says what applying the list
+would change.
+
+**You should see** `"change": 20`, `"unchanged": 0` and `"problems": 0`, and
+nothing after them. Then apply what it changes, right after the review,
+with the command of step 3 of
+[A reviewed list of deprecated collaterals](#a-reviewed-list-of-deprecated-collaterals):
+it reads this `review.json`, and answers `"changed": 20`. In Postman, when
+the review shows `"change": 20`, every row of the file changes, so send the
+file to `…/deprecated-collaterals/apply` as it went to the review; otherwise
+write the body as that step says.
+
+In an environment where the list was applied before, the review shows
+`"change": 0` and `"unchanged": 20`: there is nothing to apply, and the
+command of step 3 says so and sends nothing. Where only part of it was, the
+review counts that part as `unchanged`, and apply writes the rest.
+
+**If not.** A row printed after the summary has a `problem`: the version
+that is on does not hold that collateral of that Comet, or names its market
+or its token otherwise than the row does. Do not apply the file, and do not
+edit it to get past the problem; the command of step 3 sends nothing while
+the review has one. Tell a developer which row it is: the app's list was
+written against what these markets took, so a market that no longer takes
+one of them is the frontend's question, and the file changes by a pull
+request ([its README](./registry/seed/README.md#the-deprecated-collaterals)).
+`503` `REGISTRY_NOT_ACTIVE` means nothing is on yet: step 5 first. Any other
+`error` in place of the summary is in
+[When something goes wrong](#when-something-goes-wrong).
 
 ## When the source changes
 
@@ -1647,45 +1708,22 @@ Applying `reviewed.json` again changes nothing.
 Until the registry served them, the app left these collaterals out by a list
 of its own, which calls them legacy collateral (Linear COM-18): 20
 collaterals of five Ethereum markets — the list is also how it keeps wUSDM
-out of the USDT market, which its row `usdt`/`wUSDM` below now decides as
-`isDeprecated`. Apply it once in each environment, as the document below: it
-has the address of every Comet and every token, and holds 12 of the 20. The
-other 8 are taken from the environment itself, in the next step. Once they
-are applied, token discovery no longer shows a token that an enabled market
-takes and that they leave deprecated in every one that does.
+out of the USDT market, which its row `usdt`/`wUSDM` now decides as
+`isDeprecated`. The list is checked in beside the seed, as
+[`c3-api/registry/seed/production.deprecated-collaterals.json`](./registry/seed/README.md#the-deprecated-collaterals),
+in the form `GET /registry/v1/admin/deprecated-collaterals` exports and the
+review and apply routes take: every row with the address of its Comet and
+of its token, the market's key and the token's symbol. Step 7 of
+[the first bring-up](#7-mark-the-initial-deprecated-collaterals) sends it
+once the environment's first version is on. Once it is applied, token
+discovery no longer shows a token that an enabled market takes and that it
+leaves deprecated in every one that does.
 
-Save it as `deprecated-collaterals-initial.json`:
-
-```json
-{
-  "reason": "Deprecated collateral the app hid by its own list until the registry served it (Linear COM-18)",
-  "collaterals": [
-    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa", "symbol": "mETH", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee", "symbol": "weETH", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x5c5b196abe0d54485975d1ec29617d42d9198326", "symbol": "sdeUSD", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x57f5e098cad7a3d1eed53991d4d66c45c9af7812", "symbol": "wUSDM", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x15700b564ca08d9439c58ca5053166e8317aa138", "symbol": "deUSD", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0x3afdc9bca9213a35503b077a6072f3d0d5ab0840", "deploymentKey": "usdt", "tokenAddress": "0x4c9edd5852cd905f086c759e8383e09bff1e68b3", "symbol": "USDe", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "tokenAddress": "0xa1290d69c65a6fe4df752f95823fae25cb99e5a7", "symbol": "rsETH", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "tokenAddress": "0x4c9edd5852cd905f086c759e8383e09bff1e68b3", "symbol": "USDe", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "tokenAddress": "0x15700b564ca08d9439c58ca5053166e8317aa138", "symbol": "deUSD", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "tokenAddress": "0x5c5b196abe0d54485975d1ec29617d42d9198326", "symbol": "sdeUSD", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0xe85dc543813b8c2cfeaac371517b925a166a9293", "deploymentKey": "wbtc", "tokenAddress": "0x8236a87084f8b84306f72007f36f2618a5634494", "symbol": "LBTC", "isDeprecated": true },
-    { "chainId": 1, "cometAddress": "0xe85dc543813b8c2cfeaac371517b925a166a9293", "deploymentKey": "wbtc", "tokenAddress": "0xf469fbd2abcd6b9de8e169d128226c0fc90a012e", "symbol": "pumpBTC", "isDeprecated": true }
-  ]
-}
-```
-
-Review it as step 2 above, with `--data @deprecated-collaterals-initial.json`,
-and apply what it changes as step 3. **You should see** `"change": 12` and
-`"problems": 0` from the review, and `"changed": 12` from apply. In an
-environment where it was applied before, the review shows `"change": 0` and
-`"unchanged": 12`: there is nothing to apply, and step 3 says so.
-
-Where the addresses come from: each is what the registry's own data in the
-repository holds for that market and that symbol — the registry's test
-fixture (`tests/fixtures/registry/registry-snapshot-v1.json`), imported from
-the Comet repository and read on chain — and in it each token is exactly one
+Where the addresses come from: for the USDT, USDC and WBTC markets, each is
+what the registry's own data in the repository holds for that market and
+that symbol — the registry's test fixture
+(`tests/fixtures/registry/registry-snapshot-v1.json`), imported from the
+Comet repository and read on chain — and in it each token is exactly one
 collateral of its Comet:
 
 | App's key | Market | Comet | Collaterals |
@@ -1698,10 +1736,8 @@ The app's key `1:USDC` also names the institutional USDC market (ciUSDCv3,
 `0x207158a267cbd2598bb3d611d8cbdee2709f2f8c`, its root in the source
 fixtures). The version that is on lists its collateral as WETH, wstETH,
 cbBTC and WBTC (`GET /registry/v1/networks/1/markets`), none of the four, so
-the document names the USDC market alone; review shows it, since a token
-that is no collateral of a Comet is a problem there.
-
-#### The 8 collaterals taken from the environment
+the file names the USDC market alone; review shows it, since a token that is
+no collateral of a Comet is a problem there.
 
 The app's list also names 3 collaterals of the wstETH market and 5 of the
 USDS market:
@@ -1717,37 +1753,18 @@ USDS market:
 | | | weETH | `0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee` |
 | | | deUSD | `0x15700b564ca08d9439c58ca5053166e8317aa138` |
 
-They are not in the document because nothing in the repository says which
-tokens these two Comets take as collateral. The registry's test fixture holds
-four Ethereum markets — USDC, WETH, USDT and WBTC — the source fixtures hold
-the roots of the USDC and institutional USDC markets only, and the seed names
-both Comets (`production.comets.json`) but no Comet's collateral. Every
-symbol has a known token address, but not that it is exactly one collateral
-of that Comet, and that is not guessed: the version that is on knows, so the
-rows are taken from its export.
-
-```sh
-curl -s "$API/registry/v1/admin/deprecated-collaterals" -H "Authorization: Bearer $TOKEN" \
-  | jq '{
-      reason: "Deprecated collateral the app hid by its own list until the registry served it (Linear COM-18)",
-      collaterals: [ .collaterals[]
-        | select(.chainId == 1)
-        | select(
-            (.deploymentKey == "wsteth" and (.symbol | ascii_downcase | IN("rseth", "ezeth", "weeth")))
-            or (.deploymentKey == "usds" and (.symbol | ascii_downcase | IN("usde", "sdeusd", "tbtc", "weeth", "deusd"))))
-        | .isDeprecated = true ] }' > deprecated-collaterals-wsteth-usds.json
-jq -r '.collaterals[] | "\(.deploymentKey) \(.symbol) \(.tokenAddress)"' deprecated-collaterals-wsteth-usds.json
-```
-
-**You should see** 8 lines, one for each collateral of the table, with the
-token address the table has. Fewer means the version that is on does not hold
-one of the two markets, or one of them does not take that symbol as
-collateral; more means one market has two collaterals of one symbol. Either
-way, do not apply the file: tell the frontend developer which collateral it
-is, since the app's list was written against what these markets took then.
-With the 8 lines as the table has them, review the file as step 2 above, with
-`--data @deprecated-collaterals-wsteth-usds.json`, and apply what it changes
-as step 3.
+Nothing in the repository says which tokens these two Comets take as
+collateral. The registry's test fixture holds four Ethereum markets — USDC,
+WETH, USDT and WBTC — the source fixtures hold the roots of the USDC and
+institutional USDC markets only, and the seed names both Comets
+(`production.comets.json`) but no Comet's collateral. Each token address is
+the one the fixture's Ethereum markets hold under that symbol. That each is
+a collateral of its Comet is what the version that was on said: on
+2026-10-22, the export of develop's active version (`2b27157d…`) listed each
+of the 8 exactly once, as a collateral of its Comet, with the address and
+the symbol the table has. Step 7's review checks every row of the file
+again, against the version that is on where it is sent, before anything is
+written.
 
 ## Hiding a collateral
 
