@@ -1,7 +1,7 @@
 import { BigFixnum } from '../../bigfixnum.js';
 import * as Compute  from '../../symbolic/computation.js';
 
-import type { Address, PriceExceptionV1, RegistryAnnotation, RegistryComet } from '../../model/comet-registry.js';
+import type { Address, PriceExceptionV1, PriceFeedV1, RegistryAnnotation, RegistryComet } from '../../model/comet-registry.js';
 
 import type { AssetInfo } from './asset-info.js';
 import { reportRevert, type GetPrice, type PriceRead } from './get-price.js';
@@ -30,6 +30,34 @@ type AssetPrice = Compute.Spec<{
 function exceptionFor(annotation: RegistryAnnotation, priceFeed: Address): PriceExceptionV1 | null {
   const address = priceFeed.toLowerCase();
   return annotation.priceExceptions.find(exception => exception.priceFeedAddress === address) ?? null;
+}
+
+/*
+ * How the version prices one feed. Decision D1 of the TOK-0 audit: a zero or
+ * fixed price stated by the registry replaces the read altogether, since the
+ * feed it describes is known not to answer; a remap reads the feed it names
+ * instead, and falls back on the feed it replaces, which still answers at a
+ * block before the replacement was deployed. Whether that answer is one to
+ * use is the reader's to decide.
+ */
+type PricePlan = (
+  | { fixed: BigFixnum, exception: PriceExceptionV1 }
+  | { read: PriceFeedV1, fallback: PriceFeedV1 | null, exception: PriceExceptionV1 | null }
+);
+
+function pricePlanOf(annotation: RegistryAnnotation, feed: PriceFeedV1): PricePlan {
+  const exception = exceptionFor(annotation, feed.address);
+  if (exception === null) {
+    return { read: feed, fallback: null, exception };
+  }
+  switch (exception.kind) {
+    case 'zero_price':
+      return { fixed: BigFixnum.from({ decimals: feed.decimals, value: 0 }), exception };
+    case 'fixed_price':
+      return { fixed: BigFixnum.from({ decimals: exception.price.decimals, value: exception.price.value }), exception };
+    case 'deprecated_price_remap':
+      return { read: exception.replacementPriceFeed, fallback: feed, exception };
+  }
 }
 
 /*
@@ -63,56 +91,41 @@ const assetPrice = implement({
     { assetInfo: { apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network } },
     ({ priceFeed }) => {
       const annotation = contract.registry;
-      const exception  = exceptionFor(annotation, priceFeed);
-      const own        = { address: priceFeed, decimals: decimalsOf(annotation, priceFeed) };
-
-      if (exception !== null) {
-        switch (exception.kind) {
-          case 'zero_price':
-            return { status: 'success', price: BigFixnum.from({ decimals: own.decimals, value: 0 }) };
-          case 'fixed_price':
-            return { status: 'success', price: BigFixnum.from({ decimals: exception.price.decimals, value: exception.price.value }) };
-          case 'deprecated_price_remap': {
-            /*
-             * A remap reads its replacement. At a block before the replacement
-             * was deployed — a day of history older than it — the replacement
-             * reverts, and the feed the Comet named at that block is read
-             * instead. A revert there is expected, so the replacement is
-             * reported only when neither answers. At the latest block the
-             * replacement answers, and nothing more is read.
-             */
-            const read        = { apiHost, nodeHost, nodeKey, network, contract, blockNumber, unreported: true } as const;
-            const replacement = exception.replacementPriceFeed;
-            return pipe1([
-              { getPrice: { ...read, priceFeed: replacement } },
-              replaced => replaced.status === 'success' ? replaced : pipe1([
-                { getPrice: { ...read, priceFeed: own } },
-                (fallback): PriceRead => {
-                  if (fallback.status === 'success') {
-                    return fallback;
-                  }
-                  reportRevert(replaced.message, replacement.address, contract.address, network, blockNumber);
-                  return replaced;
-                },
-              ]),
-            ]);
-          }
-        }
+      const plan       = pricePlanOf(annotation, { address: priceFeed, decimals: decimalsOf(annotation, priceFeed) });
+      if ('fixed' in plan) {
+        return { status: 'success', price: plan.fixed };
       }
 
-      return pull1({
-        getPrice: {
-          apiHost,
-          nodeHost,
-          nodeKey,
-          network,
-          contract,
-          blockNumber,
-          priceFeed: own,
-        },
-      });
+      const frame = { apiHost, nodeHost, nodeKey, network, contract, blockNumber };
+      const { read, fallback } = plan;
+      if (fallback === null) {
+        return pull1({ getPrice: { ...frame, priceFeed: read } });
+      }
+      /*
+       * A remap reads its replacement. At a block before the replacement was
+       * deployed — a day of history older than it — the replacement reverts,
+       * and the feed the Comet named at that block is read instead. A revert
+       * there is expected, so the replacement is reported only when neither
+       * answers. At the latest block the replacement answers, and nothing
+       * more is read.
+       */
+      const unreported = { ...frame, unreported: true } as const;
+      return pipe1([
+        { getPrice: { ...unreported, priceFeed: read } },
+        replaced => replaced.status === 'success' ? replaced : pipe1([
+          { getPrice: { ...unreported, priceFeed: fallback } },
+          (own): PriceRead => {
+            if (own.status === 'success') {
+              return own;
+            }
+            reportRevert(replaced.message, read.address, contract.address, network, blockNumber);
+            return replaced;
+          },
+        ]),
+      ]);
     },
   ]),
 });
 
-export { AssetPrice, assetPrice, exceptionFor };
+export type { PricePlan };
+export { AssetPrice, assetPrice, decimalsOf, exceptionFor, pricePlanOf };

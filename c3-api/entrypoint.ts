@@ -76,6 +76,12 @@ interface Env extends Flags.Env, ServiceBindings {
   COMET_SYNC_LEASE_SECONDS: string,
   REGISTRY_SNAPSHOT_CACHE_TTL_S: string,
   REGISTRY_STALE_FALLBACK_MAX_S: string,
+  /*
+   * how many minutes back the token list may take a collateral value it could
+   * not read now: a whole number from 0 to 30, and anything else, unset
+   * included, is 15
+   */
+  TOKEN_COLLATERAL_MAX_STALE_MINUTES?: string,
   // the operator identity recorded in audit rows, never taken from a request
   COMET_REGISTRY_ADMIN_ACTOR?: string,
   // comet registry secrets, never set in wrangler.toml
@@ -126,12 +132,14 @@ function secured(response: Response, cors: Record<string, string> = {}): Respons
 }
 
 /*
- * What a request is answered with, whichever router answers it: its context,
+ * What a request is evaluated with, whichever router answers it: its context,
  * the id it is answered under, what it may spend, and every computation the
- * legacy router's evaluators evaluate. The registry router is handed the
- * context and the id alone.
+ * evaluators of either router evaluate. Each router is handed evaluators of
+ * these typed by the scope its own handlers read.
+ *
+ * It takes the request's waitUntil, so no call can drop it by leaving it out.
  */
-function prepare(env: Env) {
+function prepare(env: Env, waitUntil: (work: Promise<unknown>) => void) {
   /*
    * What one request may spend before the counting fetch and the
    * computation cache refuse it themselves. No environment sets either
@@ -150,7 +158,12 @@ function prepare(env: Env) {
   fetch.resetCount();
   const debug = Debug.MakeLogger([]).configure(env);
   const flags = Flags.parse(env);
-  const context: Evaluator.Context = { env, debug, flags };
+  const context: Evaluator.Context = {
+    env,
+    debug,
+    flags,
+    waitUntil,
+  };
   return {
     context,
     /*
@@ -178,33 +191,58 @@ function prepare(env: Env) {
   };
 }
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const { pathname } = new URL(request.url);
-    /*
-     * The path decides which router answers, here and nowhere else. The
-     * registry answers everything under its prefix, its preflight, its errors
-     * and its CORS headers included — none on an administrative route, whose
-     * authenticated writes no script on any origin may read.
-     */
-    if (isRegistryPath(pathname)) {
-      const { context, requestId } = prepare(env);
-      return secured(await routeRegistry(request, { ...context, requestId }));
-    }
-    /*
-     * Every other path is a legacy route's. Its preflight reads nothing, so
-     * it is answered before anything is set up for it.
-     */
-    if (request.method === 'OPTIONS') {
-      return secured(new Response(null, { status: 204 }), corsHeaders('legacy', { preflight: true }));
-    }
-    const { context, requestId, quota, computations } = prepare(env);
-    const response = await route(
+async function answer(request: Request, env: Env, waitUntil: (work: Promise<unknown>) => void): Promise<Response> {
+  const { pathname } = new URL(request.url);
+  /*
+   * The path decides which router answers, here and nowhere else. The
+   * registry answers everything under its prefix, its preflight, its errors
+   * and its CORS headers included — none on an administrative route, whose
+   * authenticated writes no script on any origin may read.
+   */
+  if (isRegistryPath(pathname)) {
+    const { context, requestId, quota, computations } = prepare(env, waitUntil);
+    return secured(await routeRegistry(
       request,
       { ...context, requestId },
       Evaluator.preInstantiate(quota, context, computations),
-    );
-    return secured(response, corsHeaders('legacy'));
+    ));
+  }
+  /*
+   * Every other path is a legacy route's. Its preflight reads nothing, so
+   * it is answered before anything is set up for it.
+   */
+  if (request.method === 'OPTIONS') {
+    return secured(new Response(null, { status: 204 }), corsHeaders('legacy', { preflight: true }));
+  }
+  const { context, requestId, quota, computations } = prepare(env, waitUntil);
+  const response = await route(
+    request,
+    { ...context, requestId },
+    Evaluator.preInstantiate(quota, context, computations),
+  );
+  return secured(response, corsHeaders('legacy'));
+}
+
+export default {
+  /*
+   * The runtime always gives an execution context. A call without one, as a
+   * test makes, is answered once everything the request handed to waitUntil
+   * has finished, so what a request writes past its answer is there for the
+   * request after it. A test that holds such work back passes its own context
+   * (tests/util/execution-context.ts).
+   */
+  async fetch(request: Request, env: Env, executionContext?: ExecutionContext): Promise<Response> {
+    const handed: Array<Promise<unknown>> = [];
+    // the context's method in a closure: called on its own, it throws
+    const waitUntil = executionContext === undefined
+      ? (work: Promise<unknown>) => { handed.push(work); }
+      : (work: Promise<unknown>) => executionContext.waitUntil(work);
+    const response = await answer(request, env, waitUntil);
+    // until nothing is left: a valuation handed over hands over its minute's record once it is done
+    while (handed.length > 0) {
+      await Promise.allSettled(handed.splice(0));
+    }
+    return response;
   },
 
   /*
@@ -238,9 +276,6 @@ export default {
      * metrics and past events show it, rather than a success that only the
      * log contradicts. A market that failed fails only its root.
      */
-    const result = await runRegistrySync(env);
-    if (result.kind === 'failed') {
-      throw new Error(`registry sync failed: ${result.reason}`);
-    }
+    await runRegistrySync(env);
   },
 };

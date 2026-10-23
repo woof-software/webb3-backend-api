@@ -56,17 +56,21 @@ function withUnservedMarkets(
 
 /*
  * Describes every action of the page again, against the constants with the
- * markets of the active version merged in: those it serves, with their base
- * and reward tokens, and those it holds without serving them
- * (Catalog.unservedMarkets). The constants name no market, and an action
- * can name one anywhere — as its target, as an argument, or in what it
- * bridges to another chain — so none is singled out: telling whether one
- * does costs about what describing it does. A Comet the version does not
- * hold reads as its address.
+ * markets of the active version merged in: those it serves, with every
+ * token they name and every feed they read, and those it holds without
+ * serving them (Catalog.unservedMarkets). The constants name no market, and
+ * an action can name one anywhere — as its target, as an argument, or in
+ * what it bridges to another chain — so none is singled out: telling
+ * whether one does costs about what describing it does. A Comet the version
+ * does not hold reads as its address.
  *
  * A page with no action never reads the registry. If the registry cannot be
- * loaded, the actions keep the description they already have rather than
- * failing the whole proposal list.
+ * loaded, every action is described again against the constants alone,
+ * which name no market, rather than failing the whole proposal list. Either
+ * way this build describes every action: the proposal list caches each
+ * description as the build that computed it gave it, and is not computed
+ * again when a description changes, since that would read every governor's
+ * logs again from its creation.
  */
 async function describeRegistryTargets(
   proposals: governanceModel.proposal.Proposal[],
@@ -82,13 +86,15 @@ async function describeRegistryTargets(
     catalog = await registry.load();
   } catch (error) {
     debug?.error(`proposal actions not described from the registry`, { error });
-    return;
+    catalog = null;
   }
 
-  const contracts = withUnservedMarkets(
-    withRegistryContracts(Eth.wellKnownContractsByNetwork, catalog.markets()),
-    catalog.unservedMarkets(),
-  );
+  const contracts = catalog === null
+    ? Eth.wellKnownContractsByNetwork
+    : withUnservedMarkets(
+      withRegistryContracts(Eth.wellKnownContractsByNetwork, catalog.markets()),
+      catalog.unservedMarkets(),
+    );
   for (const proposal of proposals) {
     for (const action of proposal.actions) {
       const redescribed = describeContractCallForHumans(

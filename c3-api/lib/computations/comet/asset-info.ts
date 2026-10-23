@@ -32,4 +32,4 @@ const assetInfo = implement({
   parser: ([{ asset, priceFeed, scale }]) => ({ asset, priceFeed, scale }),
 });
 
-export { AssetInfo, assetInfo };
+export { AssetInfo, AssetInfoStructAbi, assetInfo };

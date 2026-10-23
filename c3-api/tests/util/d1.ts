@@ -47,24 +47,32 @@ async function applyMigrations(
  * database an earlier migration left behind.
  */
 async function applyMigration(db: D1Database, file: string, directory: string = MIGRATIONS_DIR): Promise<void> {
-  const statements = unstable_splitSqlQuery(readFileSync(join(directory, file), 'utf8'));
+  await applySql(db, readFileSync(join(directory, file), 'utf8'));
+}
+
+// statements written as a migration is, applied as one is: split by Wrangler's splitter and sent as one batch
+async function applySql(db: D1Database, sql: string): Promise<void> {
+  const statements = unstable_splitSqlQuery(sql);
   await db.batch(statements.map(statement => db.prepare(statement)));
 }
 
+type Verb = 'INSERT' | 'INSERT OR REPLACE';
+
 /*
- * Prepares an INSERT of one row. Table and column names come from test code,
- * values are always bound.
+ * Prepares an INSERT of one row, or with `verb` the INSERT OR REPLACE a test
+ * of a guard against replacing rows sends. Table and column names come from
+ * test code, values are always bound.
  */
-function insertStatement(db: D1Database, table: string, row: Row): D1PreparedStatement {
+function insertStatement(db: D1Database, table: string, row: Row, verb: Verb = 'INSERT'): D1PreparedStatement {
   const columns = Object.keys(row);
   const placeholders = columns.map((_, index) => `?${index + 1}`);
   return db
-    .prepare(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`)
+    .prepare(`${verb} INTO ${table} (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`)
     .bind(...Object.values(row));
 }
 
-async function insertRow(db: D1Database, table: string, row: Row): Promise<D1Result> {
-  return insertStatement(db, table, row).run();
+async function insertRow(db: D1Database, table: string, row: Row, verb: Verb = 'INSERT'): Promise<D1Result> {
+  return insertStatement(db, table, row, verb).run();
 }
 
 /*
@@ -85,6 +93,7 @@ export {
   SqlValue,
   applyMigration,
   applyMigrations,
+  applySql,
   changedRows,
   foreignKeyViolations,
   insertRow,

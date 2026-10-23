@@ -1,13 +1,7 @@
-import t from 'tap';
+import t, { Test } from 'tap';
 
-import * as Debug    from '../../lib/debug-log.js';
-import * as Flags    from '../../lib/flags.js';
-import { BigNumber } from '../../lib/bignumber.js';
+import * as Flags from '../../lib/flags.js';
 import { BigFixnum } from '../../lib/bigfixnum.js';
-
-import * as Compute    from '../../lib/symbolic/computation.js';
-import * as Evaluator  from '../../lib/symbolic/evaluator.js';
-import { MemoryCache } from '../../lib/symbolic/cache.js';
 
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
@@ -20,11 +14,15 @@ import {
   AllNetworks,
   type AccountRouteData,
   type Context,
+  type MarketContext,
   type MarketRouteData,
 } from '../../src/router.js';
 
+import { consoleLines } from '../util/console.js';
+import { evaluatorOver, stub } from '../util/evaluator.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../util/registry-fixture.js';
 import { REGISTRY_KEYS } from '../util/summary-registry-fields.js';
+import { summaryTokens } from '../util/token-collateral.js';
 
 import '../../shim/node-self.js';
 
@@ -34,7 +32,6 @@ import '../../shim/node-self.js';
  * identifies it — and a node that fails still fails the request.
  */
 const flags = Flags.parseWithDefaults(process.env);
-const debug = Debug.MakeLogger([]).configure(process.env);
 
 const catalog = fixtureCatalog();
 
@@ -42,7 +39,6 @@ const MAINNET = 'ethereum-mainnet' as const;
 const USDC    = '0xc3d688b66703497daa19211eedff47f25384cdc3';
 const WBTC    = '0xe85dc543813b8c2cfeaac371517b925a166a9293';
 const AERO    = '0x784efeb622244d2348d4f2522f8860b96fbece89';
-const COMP    = '0xc00e94cb662c3520282e6f5717214004a7f26888';
 const WETH    = '0xa17581a9e3356d9a858b789d68b4d866e593ae94';
 const ACCOUNT = '0x1111111111111111111111111111111111111111';
 
@@ -67,12 +63,13 @@ const COMPUTATIONS = [
 ] as const;
 
 function evaluatorOf(answer: Answer, overrides: Flags.SomeFlags = {}) {
-  const computations = Object.fromEntries(COMPUTATIONS.map(name => [
-    name, Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(name, context) }),
-  ]));
-  const cache     = new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]);
+  const computations = Object.fromEntries(COMPUTATIONS.map(name => [ name, stub(context => answer(name, context)) ]));
+  // on what the handler asks for, and otherwise on what the environment sets
   const evaluator = Object.assign(
-    Evaluator.instantiate<any>(computations as any, { cache, debug, flags: { ...flags, ...overrides } }),
+    evaluatorOver(computations, {
+      algorithm: overrides.evaluatorAlgorithm ?? flags.evaluatorAlgorithm,
+      batching:  overrides.batchingEnabled ?? flags.batchingEnabled,
+    }),
     { evaluations: 0 },
   );
   // a handler takes evaluate off the evaluator, so the count is put where it reads it
@@ -90,8 +87,9 @@ function answers(reverting: string[]) {
     if (name === 'ethGetBlock') {
       return LATEST;
     }
+    // each rewards contract pays the token the version describes for its market
     if (name === 'getRewardConfigsSleuth') {
-      return context.cometMarkets.map(() => ({ rewardConfig: { rewardToken: COMP } }));
+      return context.cometMarkets.map((market: any) => ({ rewardConfig: { rewardToken: market.rewards.asset.address } }));
     }
     const comet = { address: context.contract.address };
     if (reverting.includes(comet.address.toLowerCase())) {
@@ -115,12 +113,26 @@ function routeData(network: MarketRouteData['network'], contract: MarketRouteDat
   return { apiHost: '', nodeHost: '', nodeKey: '', network, contract, catalog, queryParams: new URLSearchParams() };
 }
 
+/*
+ * What values the collateral of the summary's chains: a computation of its
+ * own, every position worth a dollar, since no node answers here. The
+ * summaries the computations above answer have no collaterals to add it to.
+ */
+const valuedAtADollar = () => evaluatorOver({
+  assetCollateralValue: stub(() => ({ status: 'success', valueUsd: BigFixnum.from({ value: 1 }) })),
+});
+
 // as the router hands a market handler the evaluator it made, with the route's flags
 function uninstantiated(answer: Answer) {
   const evaluator = evaluatorOf(answer, Flags.ROUTE_EVALUATOR_FLAGS);
-  // a local run, whose history samples one day
-  const context = { flags: { ...flags, environment: 'local' }, evaluator, evaluations: () => evaluator.evaluations };
-  return context as unknown as Context & { evaluations(): number };
+  const context = {
+    // a local run, whose history samples one day
+    flags: { ...flags, environment: 'local' },
+    evaluator,
+    tokens: summaryTokens({ evaluator: valuedAtADollar }),
+    evaluations: () => evaluator.evaluations,
+  };
+  return context as unknown as MarketContext & { evaluations(): number };
 }
 
 // as the router hands a handler an evaluator it made: with the request's flags, and those it sets for the route
@@ -256,8 +268,8 @@ t.test('the rewards summary reads the reward feed its version states', async t =
   t.equal(asked.length, 1, 'one summary is asked for');
   t.equal(asked[0].rewardsTokenPriceFeed, feed, 'of the feed the version states');
   t.equal(
-    await rewards.rewardsSummary.key('rewardsSummary-v3', asked[0]),
-    `rewardsSummary-v3:(block:${asked[0].block.number};contract:${usdc.key()};network:${MAINNET};`
+    await rewards.rewardsSummary.key('rewardsSummary-v5', asked[0]),
+    `rewardsSummary-v5:(block:${asked[0].block.number};contract:${usdc.key()};network:${MAINNET};`
       + `rewardsTokenPriceFeed:(address:${feed.address};decimals:${feed.decimals}))`,
     'and kept under that feed',
   );
@@ -324,10 +336,8 @@ function createdAt(block: number, comets: string[]) {
 }
 
 // the warning a market the chain has not reached is logged with, kept out of the test's output
-function quiet(test: { teardown(fn: () => void): unknown }): void {
-  const warn = console.warn;
-  console.warn = () => {};
-  test.teardown(() => { console.warn = warn; });
+function quiet(t: Test): void {
+  consoleLines(t, [ 'warn' ]);
 }
 
 /*

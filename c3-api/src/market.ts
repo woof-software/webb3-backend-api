@@ -10,22 +10,26 @@ import * as market  from '../lib/computations/market.js';
 import * as rewards from '../lib/computations/rewards.js';
 
 import { snakeifyCamelObject } from '../lib/camel-snake.js';
+import { throttle }            from '../lib/throttle.js';
 
 import { checksumAddress, type RegistryComet } from '../lib/model/comet-registry.js';
 import type { MarketIdentity } from '../lib/computations/market/market-summary.js';
 
 import { ApiError } from './http/errors.js';
 import type { Catalog } from './registry/catalog.js';
+import { chainTokens, summaryHeaders, withTokenFields } from './registry/summary-tokens.js';
 
 import {
   AllNetworks,
   AllContracts,
   type MarketRouteData,
   type Context as RouterContext,
+  type MarketContext,
 } from './router.js';
 
 type Dependencies = (
   | evm.Evm
+  | market.AssetCollateralValue
   | market.MarketDaySummary
   | market.HistoricalMarketDaySummaries
   | market.MarketRewards
@@ -78,24 +82,18 @@ function unreachedMarket(contract: RegistryComet, latestBlock: Pick<Eth.Block, '
 }
 
 /*
- * When this isolate last reported each market the chain has not reached, by
+ * When this isolate reports each market the chain has not reached, by
  * network and Comet. Every route that lists the market answers it on every
  * request, and a line for each would bury everything else in the log: one a
  * minute per market names it for as long as it lasts, as a feed that reverts
  * is named (get-price.ts).
  */
-const reported = new Map<string, number>();
-
-const REPORT_EVERY_MS = 60_000;
+const due = throttle(60_000);
 
 function reportUnreached(contract: RegistryComet, message: string): void {
-  const key  = `${contract.network}:${contract.address.toLowerCase()}`;
-  const at   = Date.now();
-  const last = reported.get(key);
-  if (last !== undefined && at - last < REPORT_EVERY_MS) {
+  if (!due(`${contract.network}:${contract.address.toLowerCase()}`)) {
     return;
   }
-  reported.set(key, at);
   console.warn(`creation block not reached: ${contract.address} on ${contract.network}: ${message}`);
 }
 
@@ -138,11 +136,13 @@ function described<Summary extends MarketIdentity>({ chainId, comet, ...summary 
 
 async function latestSummary(
   { apiHost, nodeHost, nodeKey, network, contract, catalog }: MarketRouteData,
-  context: RouterContext,
+  context: MarketContext,
 ): Promise<Response> {
   const selectedNetworks = networksOf(network);
+  // once for every network, while their latest blocks are read
+  const decisions = context.tokens.decisions();
 
-  const { evaluate, pipe1, split, value } = context.evaluator;
+  const { evaluate, pipe1, pull1, split, value } = context.evaluator;
 
   const summary = await Promise.all(
     selectedNetworks.map(async (network) => {
@@ -156,34 +156,36 @@ async function latestSummary(
       }
 
       /*
-       * One evaluation per network, not per market. Its markets share the
-       * latest block, read once, and every round of their reads reaches the
-       * node as one batch: four calls to the node provider proxy per network,
-       * whatever its market count. An evaluation per market made four for
-       * every market, and all networks at once took 116 — each call a round
-       * trip of its own, and a subrequest, of which an invocation has 10,000
-       * on the Workers Paid plan stage and production run on, and 50 on the
-       * Free plan (README, "Workers Plan").
+       * One evaluation per network for its markets, not one per market. They
+       * share the latest block, read once, and every round of their reads
+       * reaches the node as one batch: four calls to the node provider proxy
+       * per network, whatever its market count. An evaluation per market made
+       * four for every market, and all networks at once took 116 — each call
+       * a round trip of its own, and a subrequest, of which an invocation has
+       * 10,000 on the Workers Paid plan stage and production run on, and 50
+       * on the Free plan (README, "Workers Plan").
        *
        * Networks stay separate evaluations: within one, the batches of
-       * different networks would go to the node one after another.
+       * different networks would go to the node one after another. The
+       * token list's values of the network's collateral are read at the same
+       * block, beside the markets: one call more in a minute nobody has
+       * valued (summary-tokens.ts).
        */
-      const summary = await evaluate(
-        pipe1([
-          { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: "latest", network } },
-          (latestBlock) => split(selectedContracts.map((contract) => {
-            const origin = { apiHost, nodeHost, nodeKey, network, contract, block: latestBlock };
-            if (!market.marketMinutelySummary.index.covers(origin)) {
-              return value(described(unreachedMarket(contract, latestBlock), contract));
-            }
-            const projected = Fallible.must(market.marketMinutelySummary.index.project(origin));
-            projected.block.timestamp = latestBlock.timestamp;
-            return pipe1([ { marketMinutelySummary: projected }, computed => described(computed, contract) ]);
-          })),
-        ])
-      );
+      const latestBlock = await evaluate(pull1({ ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: "latest", network } }));
+      const [ entries, tokens ] = await Promise.all([
+        evaluate(split(selectedContracts.map((contract) => {
+          const origin = { apiHost, nodeHost, nodeKey, network, contract, block: latestBlock };
+          if (!market.marketMinutelySummary.index.covers(origin)) {
+            return value(described(unreachedMarket(contract, latestBlock), contract));
+          }
+          const projected = Fallible.must(market.marketMinutelySummary.index.project(origin));
+          projected.block.timestamp = latestBlock.timestamp;
+          return pipe1([ { marketMinutelySummary: projected }, computed => described(computed, contract) ]);
+        }))),
+        chainTokens(context.tokens.collateral, catalog, network, selectedContracts[0]!.registry.chainId, latestBlock, decisions),
+      ]);
 
-      return summary.map(snakeifyCamelObject);
+      return entries.map((entry, index) => withTokenFields(snakeifyCamelObject(entry), selectedContracts[index]!, tokens));
     })
   );
 
@@ -193,7 +195,8 @@ async function latestSummary(
    * would change its shape with an activation.
    */
   const flattedSummary = summary.flat();
-  return new Response(JSON.stringify(flattedSummary));
+  const headers = summaryHeaders(await decisions);
+  return new Response(JSON.stringify(flattedSummary), { headers });
 }
 
 async function latestRewardsSummary(

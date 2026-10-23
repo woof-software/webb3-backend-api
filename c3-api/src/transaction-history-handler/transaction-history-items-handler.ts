@@ -2,7 +2,6 @@ import * as Eth      from '../../lib/eth-constants.js';
 import * as Flags    from '../../lib/flags.js';
 import * as Debug    from '../../lib/debug-log.js';
 import * as Fallible from '../../lib/fallible/fallible.js';
-import { sha256    } from '../../lib/hash.js';
 import { BigNumber } from '../../lib/bignumber.js';
 import { BigFixnum } from '../../lib/bigfixnum.js';
 
@@ -42,6 +41,18 @@ import { Env } from '../../entrypoint.js';
 
 import type { TransactionHistoryRouteData } from '../router.js';
 
+import {
+  contractsOf,
+  cursorStore,
+  isCursorId,
+  keepCursor,
+  openCursor,
+  resumeCursor,
+  streamEventsOf,
+  streamKeyOf,
+} from './cursor.js';
+import type { CursorPayload, StoredCursor } from './cursor.js';
+
 // Default max items setting for transaction history query
 const MAX_ITEMS_LIMIT = 15;
 // The maximum number of transaction history items to process and enrich
@@ -54,79 +65,6 @@ const MAX_ENRICH_TRANSACTION_HISTORY_ITEMS = 50;
 
 // Parallel batch size for parallel enriching process
 const PARALLEL_BATCH_SIZE = 10;
-
-/*
- * One log stream: the markets whose events are read together, and the rewards
- * contract whose claim events belong with them. Markets are grouped by their
- * rewards contract, because a stream is read as one range of logs and the
- * rewards contract is part of that range.
- */
-type StreamEvent = {
-  network: KnownNetwork.Name; // Will change to chain-id later
-  marketContractAddresses: Eth.Address[];
-  rewardsContractAddress: Eth.Address;
-};
-
-function streamKeyOf({ network, rewardsContractAddress }: StreamEvent): string {
-  return `${network}|${rewardsContractAddress.toLowerCase()}`;
-}
-
-/*
- * The streams a cursor reads, as one value two lists of streams can be
- * compared by: each stream with every market it reads, in no particular
- * order.
- */
-function streamsOf(streams: StreamEvent[]): string {
-  return streams
-    .map(stream => `${streamKeyOf(stream)}:${stream.marketContractAddresses.map(address => address.toLowerCase()).sort().join(',')}`)
-    .sort()
-    .join(';');
-}
-
-interface Cursor {
-  network: KnownNetwork.Name;
-  blockNumber: number;
-  marketContractAddresses: Eth.Address[];
-  rewardsContractAddress: Eth.Address;
-  transactionHash: Eth.TransactionHash;
-};
-
-type CursorPayload = {
-  /*
-   * The registry version this page was read against. A cursor is meaningful
-   * for as long as the version that answers reads the same streams, which
-   * are what the version's markets define.
-   */
-  registryVersionId: string;
-  profilesByAddress: { [key: Eth.Address]: governanceModel.Profile };
-  filter: {
-    markets: string[];
-    actions: string[];
-    initiatedBy: string[];
-
-    // Parsed from markets input, which will be used to filter out events
-    contractAddresses: string[];
-    networks: string[];
-  };
-  streamEvents: StreamEvent[];
-  // keyed by stream, not by network: one network can have several streams
-  cursors: { [key: string]: Cursor };
-};
-
-/*
- * A cursor as KV holds it. KV keeps cursors without an expiry, and a client
- * may keep one across visits, so a cursor issued before the registry, which
- * carries no version, can still be sent.
- */
-type StoredCursor = Omit<CursorPayload, 'registryVersionId'> & { registryVersionId?: string };
-
-/*
- * What a cursor is named by: the hex SHA-256 of what it holds, the only form
- * the history has handed out. A value of any other form names no cursor and
- * is not looked up, since KV refuses some keys outright, such as '', '.' and
- * '..', and the request would fail with that.
- */
-const CURSOR_ID = /^[0-9a-f]{64}$/;
 
 interface Context {
   env: Env;
@@ -160,64 +98,6 @@ function Api({ env, debug, flags = {} }: Context) {
   });
 }
 
-/*
- * The log streams of one registry version.
- *
- * A market is readable here when the version says its transaction history is
- * served, and markets that share a rewards contract are read as one stream.
- * Before the registry this list was written out by hand, which meant a market
- * missing from it had no reachable history at all — indistinguishable from a
- * market with no activity — while the `markets[]` query parameter could only
- * filter what these streams had already fetched.
- */
-function streamEventsOf(catalog: Catalog): StreamEvent[] {
-  const streams = new Map<string, StreamEvent>();
-
-  for (const entry of catalog.markets()) {
-    const comet   = entry.market.contracts.comet;
-    const rewards = entry.market.contracts.rewards;
-    if (!entry.market.capabilities.transactionHistory || rewards === null) {
-      continue;
-    }
-    const stream = { network: entry.network, marketContractAddresses: [ comet ], rewardsContractAddress: rewards };
-    const key    = streamKeyOf(stream);
-    const known  = streams.get(key);
-    if (known === undefined) {
-      streams.set(key, stream);
-    } else {
-      known.marketContractAddresses.push(comet);
-    }
-  }
-
-  return [ ...streams.values() ];
-}
-
-/*
- * The contracts of a stream, as the pinned version materializes them. Every
- * address in a stream came from this same catalog, so a market that the
- * version does not describe cannot appear here.
- */
-function contractsOf(catalog: Catalog, stream: StreamEvent): {
-  marketContracts: Eth.Contract[],
-  rewardsContract: Eth.Contract,
-} {
-  const markets = stream.marketContractAddresses
-    .map(address => catalog.marketAt(stream.network, address))
-    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-  if (markets.length === 0) {
-    throw new Error(`stream ${streamKeyOf(stream)} has no market in the active registry`);
-  }
-  // every market of a stream shares one rewards contract, by construction
-  const rewards = markets[0]!.comet.rewards;
-  if (rewards === undefined) {
-    throw new Error(`invariant violated: stream ${streamKeyOf(stream)} reads a market without its rewards contract`);
-  }
-  return {
-    marketContracts: markets.map(entry => entry.comet),
-    rewardsContract: rewards.contract,
-  };
-}
-
 function GetAllMigratorsAddresses(): Eth.Address[] {
   const migrators: Eth.Address[] = [];
   migrators.push(Eth.wellKnownContractsByNetwork['ethereum-mainnet']['CompoundMigrator']['V1'].address);
@@ -230,14 +110,6 @@ function getDefiSaverProxyRegistryContract(): { [key: string]: Eth.Contract }{
   const proxyRegistryContract: { [key: string]: Eth.Contract } = {};
   proxyRegistryContract['ethereum-mainnet'] = Eth.wellKnownContractsByNetwork['ethereum-mainnet']['DFSProxyRegistry']['default'];
   return proxyRegistryContract;
-}
-
-/*
- * Whether a cursor's positions still mean what they meant against the
- * streams a version reads: the version reads the same streams.
- */
-function readsSameStreams(payload: StoredCursor, streams: StreamEvent[]): boolean {
-  return streamsOf(payload.streamEvents) === streamsOf(streams);
 }
 
 // Filter to apply before history items get enriched, if filter it before we can save some API calls in enrichment
@@ -311,37 +183,10 @@ async function getTransactionHistory(
 ): Promise<Response> {
   // ****************** HELPER FUNCTIONS ******************
   const { evaluate, pull1 } = Api(context);
-  /*
-   * Cursors are kept in the namespace history is cached in, but they are not
-   * a cache: a value KV cannot read or keep is computed again, and a cursor
-   * cannot be. So a cursor KV cannot read or keep fails the request, as it
-   * always has, rather than being answered as invalid, or handed out without
-   * being kept.
-   */
-  const cursorStore = new WorkersKvCache(context.env[`kv_mainnet`], [
-    BigNumber.JsonReviver,
-    BigFixnum.JsonReviver,
-  ], context.debug);
-
-  /*
-   * A cursor's id is the digest of what it holds, which names no account: the
-   * same page asked twice, or the first pages of two accounts without history
-   * at one block, keep one cursor under one id. KV refuses the second write of
-   * a key within a second with 429: what it refuses then is the same cursor,
-   * written a moment before, and the page is answered with it.
-   */
-  async function keepCursor(id: string, payload: CursorPayload): Promise<void> {
-    try {
-      await cursorStore.write(id, payload);
-    } catch (error) {
-      if (!(error instanceof Error && /^KV PUT failed: 429\b/.test(error.message))) {
-        throw error;
-      }
-      context.debug.warn(`history cursor written twice in a second: ${error.message}: ${id}`);
-    }
-  }
+  const store = cursorStore(context.env[`kv_mainnet`], context.debug);
 
   async function getRawTransactionHistoryItems(
+    catalog: Catalog,
     accountAddress: Eth.Address,
     proxyAddresses: Eth.Address[],
     startBlockNumber: Eth.BlockNumber,
@@ -367,6 +212,7 @@ async function getTransactionHistory(
   }
 
   async function enrichRawTransactionHistoryItem(
+    catalog: Catalog,
     accountAddress: Eth.Address,
     network: KnownNetwork.Name,
     rawItem: RawTransactionHistoryItem,
@@ -385,6 +231,7 @@ async function getTransactionHistory(
   }
 
   async function loadTransactionHistoryItems(
+    catalog: Catalog,
     accountAddress: Eth.Address,
     cursorPayload: CursorPayload,
     itemsLimit: number,
@@ -462,6 +309,7 @@ async function getTransactionHistory(
       rawItemsLoadingBatch[streamId].push(
         Promise.all([latestBlockNumber, defiSaverProxies[network]]).then(([latestBlockNum, proxies]) => {
           return getRawTransactionHistoryItems(
+            catalog,
             accountAddress,
             proxies,
             latestBlockNum,
@@ -541,6 +389,7 @@ async function getTransactionHistory(
               const newPrecedingBlockNumber = Fallible.unwrap(newPrecedingBlockResult).blockNumber;
               blockNumberAnchor[streamId].push(newPrecedingBlockNumber);
               rawItemsLoadingBatch[streamId].push(getRawTransactionHistoryItems(
+                catalog,
                 accountAddress,
                 [ ...await defiSaverProxies[network] ],
                 newPrecedingBlockNumber,
@@ -579,7 +428,7 @@ async function getTransactionHistory(
               const rawItem = rawItemsQueue[streamId].pop()!;
               if (filterRawTransactionHistoryItem(networks, contractAddresses, rawItem)) {
                 enrichingBatch[streamId].push(
-                  enrichRawTransactionHistoryItem(accountAddress, network, rawItem)
+                  enrichRawTransactionHistoryItem(catalog, accountAddress, network, rawItem)
                 );
               }
             }
@@ -663,8 +512,7 @@ async function getTransactionHistory(
     }
 
     // Upsert cursor info before return
-    const cursorHash = await sha256(JSON.stringify(cursorPayload));
-    await keepCursor(cursorHash, cursorPayload);
+    const cursorHash = await keepCursor(store, context.debug, cursorPayload);
 
     let transactionHistoryResponse: TransactionHistoryResponse = {
       done,
@@ -763,8 +611,8 @@ async function getTransactionHistory(
     }
     namedMarkets.push({ network: networkAlias, address });
   }
-  // a cursor of another form than the history hands out names none (CURSOR_ID), and is refused the same way
-  if (cursor !== null && !CURSOR_ID.test(cursor)) {
+  // a cursor of another form than the history hands out names none (isCursorId), and is refused the same way
+  if (cursor !== null && !isCursorId(cursor)) {
     return new Response('Cursor is invalid', { status: 400 });
   }
 
@@ -820,40 +668,24 @@ async function getTransactionHistory(
   }
 
   if (cursor === null || cursor === undefined) {
-    let profilesByAddress: { [_ in Eth.Address]: governanceModel.Profile } = {};
     // No cursor provided, use provided filters
-    // Iterate over all markets and get transaction history items
-    // Initializing cursor
-    const cursorPayload: CursorPayload = {
-      registryVersionId: catalog.versionId,
-      profilesByAddress,
-      filter: {
-        markets: markets,
-        actions: actions ?? [],
-        initiatedBy: initiatedBy ?? [],
-        contractAddresses,
-        networks
-      },
-      streamEvents: streamEvents,
-      cursors: {},
-    };
-
-    // Populate cursor info
-    const latestBlocks: {[key: string]: Promise<Eth.Block>} = {};
-    streamEvents.map((m) => {
-      cursorPayload.cursors[streamKeyOf(m)] = {
-        network: m.network,
-        marketContractAddresses: m.marketContractAddresses,
-        rewardsContractAddress: m.rewardsContractAddress,
-        transactionHash: '0x0',
-        blockNumber: 0,
-      };
-      // one latest block per network, however many streams it has
-      latestBlocks[m.network] ??= evaluate(pull1({ ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: 'latest', network: m.network } }));
+    const cursorPayload = openCursor(catalog, streamEvents, {
+      markets,
+      actions,
+      initiatedBy,
+      contractAddresses,
+      networks,
     });
+
+    // one latest block per network, however many streams it has
+    const latestBlocks: {[key: string]: Promise<Eth.Block>} = {};
+    for (const stream of streamEvents) {
+      latestBlocks[stream.network] ??= evaluate(pull1({ ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: 'latest', network: stream.network } }));
+    }
 
     const [ transactionHistoryResponse, defiSaverProxies ] = await (
       loadTransactionHistoryItems(
+        catalog,
         accountAddress,
         cursorPayload,
         itemsLimit,
@@ -864,80 +696,36 @@ async function getTransactionHistory(
       formatTransactionHistoryResponse(
         transactionHistoryResponse,
         populateDefiSaverProxyProfiles(
-          profilesByAddress,
+          cursorPayload.profilesByAddress,
           defiSaverProxies
         )
       )
     ), { status: 200 });
   } else {
-    const storedPayload = await cursorStore.read<StoredCursor>(cursor);
+    const storedPayload = await store.read<StoredCursor>(cursor);
     if (storedPayload === null) {
       return new Response('Cursor is invalid', { status: 400 });
     } else {
-      /*
-       * A cursor holds a position in each stream it reads: a block and a
-       * transaction in the logs of those contracts. The positions stay true
-       * for as long as the version that answers reads the same streams, so a
-       * rollback, a re-import of the same markets, or a new label on one
-       * leaves pagination going; what each page says about its items is the
-       * version that answered that page, which the headers name. A version
-       * that reads other streams leaves the positions meaning nothing, and
-       * the client is told to start over.
-       *
-       * A cursor issued before the registry names no version, and keeps its
-       * positions by network rather than by stream. It is ended as one of
-       * another version is, whatever it reads, and the client starts over.
-       */
-      const cursorPayload: CursorPayload | null = typeof storedPayload.registryVersionId === 'string'
-        && (storedPayload.registryVersionId === catalog.versionId || readsSameStreams(storedPayload, streamEvents))
-        ? { ...storedPayload, registryVersionId: catalog.versionId }
-        : null;
-
-      if (cursorPayload === null) {
+      const resumed = resumeCursor(storedPayload, catalog, streamEvents, { markets, actions, initiatedBy });
+      if (resumed.kind === 'version-changed') {
         throw new ApiError(
           'REGISTRY_VERSION_CHANGED',
           'the markets of the registry changed; restart pagination without a cursor',
           {
-            cursorRegistryVersionId: storedPayload.registryVersionId ?? null,
+            cursorRegistryVersionId: resumed.cursorRegistryVersionId,
             registryVersionId:       catalog.versionId,
           },
         );
       }
-
-      // Validate cursor and match if the provided filters are the same
-      if (cursorPayload.filter.markets.length !== markets.length) {
-        return new Response('Cursor is having different markets filter', { status: 400 });
-      } else {
-        for (const m of cursorPayload.filter.markets) {
-          if (!markets.includes(m)) {
-            return new Response('Cursor is having different markets filter', { status: 400 });
-          }
-        }
+      if (resumed.kind === 'filter-changed') {
+        return new Response(`Cursor is having different ${resumed.filter} filter`, { status: 400 });
       }
-
-      if (cursorPayload.filter.actions.length !== (actions?.length ?? 0)) {
-        return new Response('Cursor is having different actions filter', { status: 400 });
-      } else {
-        for (const a of cursorPayload.filter.actions) {
-          if (!actions?.includes(a)) {
-            return new Response('Cursor is having different actions filter', { status: 400 });
-          }
-        }
-      }
-
-      if (cursorPayload.filter.initiatedBy.length !== (initiatedBy?.length ?? 0)) {
-        return new Response('Cursor is having different initiated by filter', { status: 400 });
-      } else {
-        for (const i of cursorPayload.filter.initiatedBy) {
-          if (!initiatedBy?.includes(i)) {
-            return new Response('Cursor is having different initiated by filter', { status: 400 });
-          }
-        }
-      }
+      const cursorPayload = resumed.payload;
 
       // every stream of a cursor resumes from its own position
       const [ transactionHistoryResponse, defiSaverProxies ] = await (
         loadTransactionHistoryItems(
+          catalog,
           accountAddress,
           cursorPayload,
           itemsLimit,
@@ -960,13 +748,9 @@ async function getTransactionHistory(
 
 export type {
   Context,
-  CursorPayload,
   Dependencies,
-  StreamEvent,
 };
 
 export {
   getTransactionHistory,
-  streamEventsOf,
-  streamKeyOf,
 };

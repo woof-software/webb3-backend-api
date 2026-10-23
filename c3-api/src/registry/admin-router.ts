@@ -1,14 +1,15 @@
 import type { Env } from '../../entrypoint.js';
 
-import { SyncOutcome, parseMarketKey } from '../../lib/model/comet-registry.js';
+import { Address, isAddress, normalizeAddress, parseMarketKey } from '../../lib/model/comet-registry.js';
 
 import { authenticateAdmin } from '../http/bearer-auth.js';
 import { clientOf } from '../http/client-address.js';
 import { ApiError, methodNotAllowed } from '../http/errors.js';
 import { MAX_BODY_BYTES, jsonResponse, readJsonObject } from '../http/json.js';
 
-import { cacheDepsOf } from './cache.js';
+import { cacheDepsOf, isUnreachable } from './cache.js';
 import { readCreationBlocks, readFeeds } from './enrichment.js';
+import { isRegistryError, isTransportFailure } from './errors.js';
 import { registryStatus } from './status.js';
 import {
   CreationReader,
@@ -18,6 +19,17 @@ import {
   replaceNetworkOverlay,
   replaceOverlays,
 } from './admin.js';
+import {
+  getCollateral,
+  getCollateralExport,
+  patchCollateral,
+  postCollateralApply,
+  postCollateralReview,
+} from './collateral-decision-handlers.js';
+import type { CollateralDecisionKind, ListedCollateralDecision } from './collateral-decision-repository.js';
+import { DEPRECATED_COLLATERAL_KIND, HIDDEN_COLLATERAL_KIND, member } from './collateral-decision-repository.js';
+import type { RecordedKind } from './collateral-decisions.js';
+import { DEPRECATED_RECORD, HIDDEN_RECORD } from './collateral-decisions.js';
 import {
   RegistryContext,
   cancelSyncRun,
@@ -33,7 +45,17 @@ import {
 } from './handlers.js';
 import { isExplicit } from './importer.js';
 import type { InvocationResult } from './importer.js';
+import type { SyncOutcome } from './rows.js';
 import { runRegistrySync, transportFor } from './scheduled.js';
+import {
+  getTokenPolicies,
+  getTokenPolicy,
+  getTokenPolicyExport,
+  patchTokenPolicy,
+  postTokenPolicyApply,
+  postTokenPolicyReview,
+} from './token-handlers.js';
+import type { ListedDecision } from './token-policy-repository.js';
 
 /*
  * Reads the decimals of the feeds an overlay introduces, through the same
@@ -51,6 +73,42 @@ function feedReader(env: Env): FeedReader {
 function creationReader(env: Env): CreationReader {
   const transport = transportFor(env);
   return (network, markets) => readCreationBlocks(transport(network), markets, network);
+}
+
+/*
+ * The routes of a kind of decision about a collateral: one collateral's
+ * decision, read and set, under the kind's own last segment, and the list of
+ * every collateral's, exported, reviewed and applied, under the kind's own
+ * path, each path's verbs in the order a 405 names them. Each route answers
+ * for the kind it was made for (`collateral`), so one case of routeAdmin
+ * answers it for either kind, and a command keeps that kind's record
+ * (`record`).
+ */
+function collateralRoutes<Flag extends string, Column extends string, Rows extends string>(
+  kind: CollateralDecisionKind<Flag, Column, Rows>,
+  record: RecordedKind,
+) {
+  const one  = new RegExp(`^/registry/v1/admin/networks/([^/]+)/markets/([^/]+)/collaterals/([^/]+)/${kind.segment}$`);
+  const list = `^/registry/v1/admin/${kind.listPath}`;
+  const spec = collateralListSpec(kind);
+  const collateral = {
+    // the member of a command's body that holds the decision
+    flag:   kind.flag,
+    read:   (context: RegistryContext, chainId: string, cometAddress: string, tokenAddress: string) =>
+      getCollateral(context, kind, chainId, cometAddress, tokenAddress),
+    set:    (context: RegistryContext, chainId: string, cometAddress: string, tokenAddress: string, decision: { flag: boolean, reason: string }) =>
+      patchCollateral(context, kind, record, chainId, cometAddress, tokenAddress, decision),
+    export: (context: RegistryContext) => getCollateralExport(context, kind),
+    review: (context: RegistryContext, body: Record<string, unknown>) => postCollateralReview(context, kind, decisionListOf(body, spec)),
+    apply:  (context: RegistryContext, body: Record<string, unknown>) => postCollateralApply(context, kind, record, decisionListOf(body, spec)),
+  };
+  return [
+    { pattern: one,                           method: 'GET',   handler: 'collateral',        family: 'read',   collateral },
+    { pattern: one,                           method: 'PATCH', handler: 'setCollateral',     family: 'policy', collateral },
+    { pattern: new RegExp(`${list}$`),        method: 'GET',   handler: 'exportCollaterals', family: 'read',   collateral },
+    { pattern: new RegExp(`${list}/review$`), method: 'POST',  handler: 'reviewCollaterals', family: 'read',   collateral },
+    { pattern: new RegExp(`${list}/apply$`),  method: 'POST',  handler: 'applyCollaterals',  family: 'policy', collateral },
+  ] as const;
 }
 
 /*
@@ -84,6 +142,14 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/markets\/([^/]+)\/([^/]+)\/overlay$/, method: 'PUT',  handler: 'marketOverlay',  family: 'overlay' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/markets\/([^/]+)\/([^/]+)\/overlay$/, method: 'GET',  handler: 'readMarketOverlay', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/overlays$/,                            method: 'PUT',  handler: 'overlays',       family: 'overlay' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens$/,                             method: 'GET',  handler: 'tokenPolicies',  family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens\/([^/]+)\/policy$/,            method: 'GET',  handler: 'tokenPolicy',    family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens\/([^/]+)\/policy$/,            method: 'PATCH', handler: 'setTokenPolicy', family: 'policy' },
+  { pattern: /^\/registry\/v1\/admin\/token-policies$/,                                       method: 'GET',  handler: 'exportTokenPolicies', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/token-policies\/review$/,                               method: 'POST', handler: 'reviewTokenPolicies', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/token-policies\/apply$/,                                method: 'POST', handler: 'applyTokenPolicies',  family: 'policy' },
+  ...collateralRoutes(DEPRECATED_COLLATERAL_KIND, DEPRECATED_RECORD),
+  ...collateralRoutes(HIDDEN_COLLATERAL_KIND, HIDDEN_RECORD),
 ] as const;
 
 const MAX_REASON = 1000;
@@ -113,16 +179,74 @@ const MAX_OVERLAYS_PER_REQUEST = 100;
 const MAX_OVERLAYS_BODY_BYTES  = 512 * 1024;
 
 /*
+ * A list of decisions in one request, of token policies, of deprecated
+ * collaterals or of hidden ones: every token, or every collateral, of every
+ * network of a registry fits, with a reason on each row. The list is written
+ * as a handful of statements whatever its length, so the bound is the body,
+ * not D1.
+ */
+const MAX_DECISIONS_PER_REQUEST = 500;
+const MAX_DECISIONS_BODY_BYTES  = 1024 * 1024;
+
+// the bodies larger than an ordinary command, by the handler of the route that takes them
+const BODY_BYTES: Partial<Record<typeof ROUTES[number]['handler'], number>> = {
+  overlays:            MAX_OVERLAYS_BODY_BYTES,
+  reviewTokenPolicies: MAX_DECISIONS_BODY_BYTES,
+  applyTokenPolicies:  MAX_DECISIONS_BODY_BYTES,
+  reviewCollaterals:   MAX_DECISIONS_BODY_BYTES,
+  applyCollaterals:    MAX_DECISIONS_BODY_BYTES,
+};
+
+/*
+ * A value as a reason, trimmed, or what keeps it from being one. A command
+ * and a list are held to this one rule, so they take the same reasons.
+ */
+function reasonOf(value: unknown): { reason: string } | { problem: 'malformed' | 'nul' } {
+  if (typeof(value) !== 'string' || value.trim().length === 0 || value.length > MAX_REASON) {
+    return { problem: 'malformed' };
+  }
+  /*
+   * SQLite's text functions stop at a NUL, so the audit tables' checks would
+   * read a reason that starts with one as empty and refuse it with a database
+   * error, and one that only contains one would be stored cut short.
+   */
+  return value.includes('\u0000') ? { problem: 'nul' } : { reason: value.trim() };
+}
+
+/*
  * A reason is required wherever an operator changes what the registry serves,
  * because the audit row that records the change is only as useful as the
  * reason stored with it.
  */
 function requireReason(body: Record<string, unknown>): string {
-  const reason = body.reason;
-  if (typeof(reason) !== 'string' || reason.trim().length === 0 || reason.length > MAX_REASON) {
-    throw new ApiError('BAD_REQUEST', `a non-empty reason of at most ${MAX_REASON} characters is required`);
+  const checked = reasonOf(body.reason);
+  if ('problem' in checked) {
+    throw new ApiError('BAD_REQUEST', {
+      malformed: `a non-empty reason of at most ${MAX_REASON} characters is required`,
+      nul:       `a reason cannot contain a NUL character`,
+    }[checked.problem]);
   }
-  return reason.trim();
+  return checked.reason;
+}
+
+/*
+ * An optional reason: absent or null, or a reason as requireReason accepts
+ * one. A problem is collected rather than thrown, so a list reports every
+ * problem of every row at once.
+ */
+function optionalReason(value: unknown, where: string, problems: string[]): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const checked = reasonOf(value);
+  if ('problem' in checked) {
+    problems.push({
+      malformed: `${where} must be null or a non-empty string of at most ${MAX_REASON} characters`,
+      nul:       `${where} cannot contain a NUL character`,
+    }[checked.problem]);
+    return null;
+  }
+  return checked.reason;
 }
 
 function requireExactKeys(body: Record<string, unknown>, allowed: string[]): void {
@@ -218,28 +342,16 @@ async function limit(env: Env, fingerprint: string, family: string): Promise<voi
   }
 }
 
-type SyncFailure = Extract<InvocationResult, { kind: 'invalid' | 'failed' }>;
-
 /*
- * The error an administrative sync answers with when the invocation failed.
- *
- * A registry error is answered as the routes answer it everywhere: a request
- * the registry has to refuse, such as a commit the tracked ref cannot reach,
- * is the client's to fix. A candidate that failed its checks would fail the
- * same way again, so it is refused with the ids to inspect it by rather than
- * offered as something to retry. A database or a source that did not answer
- * is a 503; a fault never reaches here — it is raised, and answered 500.
+ * The error an administrative sync answers with when its candidate failed its
+ * checks. It would fail the same way again, so it is refused with the ids to
+ * inspect it by rather than offered as something to retry.
  */
-function syncFailure(result: SyncFailure): Error {
-  switch (result.kind) {
-    case 'invalid':
-      return new ApiError('UNPROCESSABLE', result.reason, {
-        syncRunId:         result.runId,
-        registryVersionId: result.versionId,
-      });
-    case 'failed':
-      return result.error ?? new ApiError('UPSTREAM_UNAVAILABLE', result.reason);
-  }
+function syncFailure(result: Extract<InvocationResult, { kind: 'invalid' }>): ApiError {
+  return new ApiError('UNPROCESSABLE', result.reason, {
+    syncRunId:         result.runId,
+    registryVersionId: result.versionId,
+  });
 }
 
 /*
@@ -248,7 +360,7 @@ function syncFailure(result: SyncFailure): Error {
  * candidate completed its import as one that validated did, and says that it
  * is held, and how many of its checks failed.
  */
-function syncAnswer(result: Exclude<InvocationResult, SyncFailure>): {
+function syncAnswer(result: Exclude<InvocationResult, { kind: 'invalid' }>): {
   status:        'idle' | 'running' | 'completed',
   outcome:       SyncOutcome | null,
   heldForReview: boolean,
@@ -326,9 +438,22 @@ async function postSync(
     env,
     isExplicit(request) ? { ...request, reason: requireReason(body) } : request,
     { requestId },
-  );
+  ).catch((error: unknown) => {
+    /*
+     * A registry error is answered as the routes answer it everywhere: a
+     * request the registry has to refuse, such as a commit the tracked ref
+     * cannot reach, is the client's to fix. A database or a source that did
+     * not answer, with no registry error to say so, is worth trying again
+     * whatever it said: a 503, whose cause the line runRegistrySync logged
+     * names. A fault is raised as it is, and answered 500.
+     */
+    if (!isRegistryError(error) && (isTransportFailure(error) || isUnreachable(error))) {
+      throw new ApiError('UPSTREAM_UNAVAILABLE', `the import was interrupted by a service that did not answer`);
+    }
+    throw error;
+  });
 
-  if (result.kind === 'invalid' || result.kind === 'failed') {
+  if (result.kind === 'invalid') {
     throw syncFailure(result);
   }
   const { status, outcome, heldForReview, checksFailed } = syncAnswer(result);
@@ -428,6 +553,137 @@ function overlayDocuments(body: Record<string, unknown>, versionId: string, acto
   return { versionId, actor, reason, networks, markets };
 }
 
+const DECISION_FIELDS = {
+  chainId: { must: 'must be a positive integer', valid: (value: unknown) => typeof(value) === 'number' && Number.isSafeInteger(value) && value > 0 },
+  address: { must: 'must be an address',         valid: (value: unknown) => isAddress(value) },
+  name:    { must: 'must be null or a string',   valid: (value: unknown) => value === undefined || value === null || typeof(value) === 'string' },
+  flag:    { must: 'must be a boolean',          valid: (value: unknown) => typeof(value) === 'boolean' },
+};
+
+/*
+ * A kind of decision list, as its review and apply take it: the members of
+ * the body, the one that holds the rows, what the list is called, a row's
+ * fields in the order they are checked, and the decision a valid row is. Two
+ * rows about the same addresses on one chain are one decision.
+ */
+type DecisionListSpec<Listed extends { chainId: number }> = {
+  bodyKeys:    string[],
+  listKey:     string,
+  what:        string,
+  fields:      Array<[ string, keyof typeof DECISION_FIELDS ]>,
+  decisionOf:  (value: Record<string, unknown>, reason: string | null) => Listed,
+  addressesOf: (decision: Listed) => Address[],
+};
+
+const TOKEN_POLICY_LIST: DecisionListSpec<ListedDecision> = {
+  bodyKeys:    [ 'registryVersion', 'reason', 'policies' ],
+  listKey:     'policies',
+  what:        'token policies',
+  fields:      [ [ 'chainId', 'chainId' ], [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ], [ 'isStrategic', 'flag' ] ],
+  decisionOf:  (value, reason) => ({
+    chainId:      value.chainId as number,
+    tokenAddress: normalizeAddress(value.tokenAddress as string),
+    symbol:       (value.symbol as string | null | undefined) ?? null,
+    isStrategic:  value.isStrategic as boolean,
+    reason,
+  }),
+  addressesOf: decision => [ decision.tokenAddress ],
+};
+
+/*
+ * A list of a kind of decision about a collateral, its rows under the kind's
+ * own member, so neither kind's review takes the other's export. `retained`
+ * names the decisions the active version does not hold, and is not read.
+ */
+function collateralListSpec<Flag extends string, Column extends string, Rows extends string>(
+  kind: CollateralDecisionKind<Flag, Column, Rows>,
+): DecisionListSpec<ListedCollateralDecision<Flag>> {
+  return {
+    bodyKeys:    [ 'registryVersion', 'reason', kind.listKey, 'retained' ],
+    listKey:     kind.listKey,
+    what:        kind.listOf,
+    fields:      [
+      [ 'chainId', 'chainId' ], [ 'cometAddress', 'address' ], [ 'deploymentKey', 'name' ],
+      [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ], [ kind.flag, 'flag' ],
+    ],
+    decisionOf:  (value, reason) => ({
+      chainId:       value.chainId as number,
+      cometAddress:  normalizeAddress(value.cometAddress as string),
+      deploymentKey: (value.deploymentKey as string | null | undefined) ?? null,
+      tokenAddress:  normalizeAddress(value.tokenAddress as string),
+      symbol:        (value.symbol as string | null | undefined) ?? null,
+      ...member(kind.flag, value[kind.flag] as boolean),
+      reason,
+    }),
+    addressesOf: decision => [ decision.cometAddress, decision.tokenAddress ],
+  };
+}
+
+/*
+ * The body of a list's review and apply (`POST /token-policies/review` and
+ * `/apply`, `POST /deprecated-collaterals/review` and `/apply`, `POST
+ * /hidden-collaterals/review` and `/apply`): a list as the export answers it,
+ * edited. `registryVersion` says where it was exported from and is not
+ * checked, since a decision belongs to no version. Every problem of every row
+ * is reported at once, so a file is fixed in one pass.
+ */
+function decisionListOf<Listed extends { chainId: number }>(
+  body: Record<string, unknown>,
+  spec: DecisionListSpec<Listed>,
+): { reason: string | null, decisions: Listed[] } {
+  requireExactKeys(body, spec.bodyKeys);
+  const problems: string[] = [];
+  const reason = optionalReason(body.reason, 'reason', problems);
+
+  const rows = body[spec.listKey];
+  if (!Array.isArray(rows) || rows.length === 0 || rows.length > MAX_DECISIONS_PER_REQUEST) {
+    throw new ApiError('BAD_REQUEST', `${spec.listKey} must be a list of 1 to ${MAX_DECISIONS_PER_REQUEST} decisions`);
+  }
+
+  const keys = [ ...spec.fields.map(([ name ]) => name), 'reason' ];
+  const seen = new Map<string, number>();
+  const decisions: Listed[] = [];
+  rows.forEach((entry: unknown, index: number) => {
+    const row = `row ${index + 1}`;
+    if (typeof(entry) !== 'object' || entry === null || Array.isArray(entry)) {
+      problems.push(`${row} must be an object`);
+      return;
+    }
+    const value  = entry as Record<string, unknown>;
+    const before = problems.length;
+
+    const unexpected = Object.keys(value).filter(key => !keys.includes(key));
+    if (unexpected.length > 0) {
+      problems.push(`${row} has unexpected properties: ${unexpected.sort().join(', ')}`);
+    }
+    for (const [ name, field ] of spec.fields) {
+      if (!DECISION_FIELDS[field].valid(value[name])) {
+        problems.push(`${row}: ${name} ${DECISION_FIELDS[field].must}`);
+      }
+    }
+    const rowReason = optionalReason(value.reason, `${row}: reason`, problems);
+    if (problems.length > before) {
+      return;
+    }
+
+    const decision  = spec.decisionOf(value, rowReason);
+    const addresses = spec.addressesOf(decision);
+    const key       = `${decision.chainId}:${addresses.join(':')}`;
+    const first     = seen.get(key);
+    if (first !== undefined) {
+      problems.push(`${row} repeats row ${first} (chain ${decision.chainId}, ${addresses.join(', ')})`);
+      return;
+    }
+    seen.set(key, index + 1);
+    decisions.push(decision);
+  });
+
+  if (problems.length > 0) {
+    throw new ApiError('BAD_REQUEST', `the list of ${spec.what} is invalid`, { problems });
+  }
+  return { reason, decisions };
+}
+
 async function routeAdmin(
   request: Request,
   env: Env,
@@ -463,7 +719,7 @@ async function routeAdmin(
   const [ , versionId, second, third ] = route.match!;
   const body = route.method === 'GET'
     ? {}
-    : await readJsonObject(request, { maxBytes: route.handler === 'overlays' ? MAX_OVERLAYS_BODY_BYTES : MAX_BODY_BYTES });
+    : await readJsonObject(request, { maxBytes: BODY_BYTES[route.handler] ?? MAX_BODY_BYTES });
 
   switch (route.handler) {
     case 'status':
@@ -528,7 +784,57 @@ async function routeAdmin(
       }, feedReader(env), creationReader(env)));
     case 'overlays':
       return jsonResponse(await replaceOverlays(context.db, overlayDocuments(body, versionId!, context.actor), feedReader(env), creationReader(env)));
+    case 'tokenPolicies':
+      // the first capture of a network route is a chain id, not a version id
+      return await getTokenPolicies(context, versionId!);
+    case 'tokenPolicy':
+      return await getTokenPolicy(context, versionId!, second!);
+    case 'setTokenPolicy': {
+      /*
+       * A strategic decision changes which tokens the API offers for
+       * discovery, so it carries a reason like every other decision, and the
+       * audit event stores it beside the actor.
+       */
+      requireExactKeys(body, [ 'isStrategic', 'reason' ]);
+      if (typeof(body.isStrategic) !== 'boolean') {
+        throw new ApiError('BAD_REQUEST', `isStrategic must be a boolean`);
+      }
+      return await patchTokenPolicy(context, versionId!, second!, {
+        isStrategic: body.isStrategic,
+        reason:      requireReason(body),
+      });
+    }
+    case 'exportTokenPolicies':
+      return await getTokenPolicyExport(context);
+    case 'reviewTokenPolicies':
+      return await postTokenPolicyReview(context, decisionListOf(body, TOKEN_POLICY_LIST));
+    case 'applyTokenPolicies':
+      return await postTokenPolicyApply(context, decisionListOf(body, TOKEN_POLICY_LIST));
+    case 'collateral':
+      // a chain id, the Comet and the token, as on the token routes
+      return await route.collateral.read(context, versionId!, second!, third!);
+    case 'setCollateral': {
+      /*
+       * A decision about a collateral changes which tokens discovery shows,
+       * and a deprecated one which collaterals the frontend offers, so it
+       * carries a reason like every other decision, and the audit event
+       * stores it beside the actor.
+       */
+      const { flag } = route.collateral;
+      requireExactKeys(body, [ flag, 'reason' ]);
+      const value = body[flag];
+      if (typeof(value) !== 'boolean') {
+        throw new ApiError('BAD_REQUEST', `${flag} must be a boolean`);
+      }
+      return await route.collateral.set(context, versionId!, second!, third!, { flag: value, reason: requireReason(body) });
+    }
+    case 'exportCollaterals':
+      return await route.collateral.export(context);
+    case 'reviewCollaterals':
+      return await route.collateral.review(context, body);
+    case 'applyCollaterals':
+      return await route.collateral.apply(context, body);
   }
 }
 
-export { overlayDocuments, routeAdmin, syncAnswer, syncFailure };
+export { overlayDocuments, routeAdmin, syncAnswer };

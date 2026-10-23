@@ -1,8 +1,10 @@
 /*
- * Types shared by the Comet registry: the rows of the APP_DB tables created
- * in migrations/0001_comet_registry.sql, the records parsed from the pinned
- * Comet source, and the RegistrySnapshotV1 wire contract frozen in
- * tests/fixtures/registry/registry-snapshot-v1.json.
+ * Types shared by the Comet registry: the records parsed from the pinned
+ * Comet source, the RegistrySnapshotV1 wire contract frozen in
+ * tests/fixtures/registry/registry-snapshot-v1.json and the other answers of
+ * the registry routes, and the Comet a computation takes. The rows of the
+ * APP_DB tables are in src/registry/rows.ts, beside the only modules that
+ * read them.
  *
  * Addresses are stored and compared lowercase. The registry validates them
  * with the anchored validator below rather than Eth.parseAddress, whose
@@ -21,18 +23,26 @@ type Address = `0x${string}`;
  * array, so the type and the runtime list validation uses cannot drift apart,
  * and the values are exactly what D1 stores and the wire contract carries.
  */
-const CONTRACT_ROLES   = [ 'comet', 'configurator', 'rewards', 'bulker', 'fauceteer', 'bridge_receiver' ] as const;
-const ASSET_ROLES      = [ 'base', 'reward', 'collateral' ] as const;
-const PRICE_QUOTES     = [ 'usd', 'base' ] as const;
-const MARKET_STATUSES  = [ 'enabled', 'deprecated', 'disabled' ] as const;
-const VERSION_STATUSES = [ 'importing', 'invalid', 'validated' ] as const;
-const EXCEPTION_KINDS  = [ 'zero_price', 'fixed_price', 'deprecated_price_remap' ] as const;
+const CONTRACT_ROLES  = [ 'comet', 'configurator', 'rewards', 'bulker', 'fauceteer', 'bridge_receiver' ] as const;
+const ASSET_ROLES     = [ 'base', 'reward', 'collateral' ] as const;
+const PRICE_QUOTES    = [ 'usd', 'base' ] as const;
+const MARKET_STATUSES = [ 'enabled', 'deprecated', 'disabled' ] as const;
+const EXCEPTION_KINDS = [ 'zero_price', 'fixed_price', 'deprecated_price_remap' ] as const;
 
 const ACTIVATION_ACTIONS = [ 'activate', 'rollback' ] as const;
-const SYNC_TRIGGER_KINDS = [ 'scheduled', 'manual' ] as const;
-const SYNC_RUN_STATUSES  = [ 'running', 'failed', 'completed' ] as const;
-const SYNC_OUTCOMES      = [ 'imported', 'no_change' ] as const;
-const SYNC_ITEM_STATUSES = [ 'pending', 'processing', 'completed', 'failed' ] as const;
+
+/*
+ * How the token list valued a token, and why discovery shows it or not.
+ * `partial` is a value read from only some of a token's positions that
+ * already reaches the threshold (decision D7 of the TOK-0 audit). `hidden`
+ * and `deprecated` each name a token that an enabled market takes and none of
+ * them leaves to discovery, offering it without hiding it: `hidden` where an
+ * administrator hid it in one of them, and `deprecated` where every one of
+ * them has it deprecated and none hides it. Discovery shows neither, whatever
+ * else holds.
+ */
+const COLLATERAL_VALUE_STATUSES = [ 'fresh', 'exception', 'partial', 'stale', 'unavailable' ] as const;
+const VISIBILITY_REASONS        = [ 'hidden', 'deprecated', 'strategic', 'collateral_threshold', 'below_threshold', 'data_unavailable' ] as const;
 
 type ContractRole  = (typeof CONTRACT_ROLES)[number];
 
@@ -55,14 +65,9 @@ type ContractRoleKey = (typeof CONTRACT_ROLE_KEYS)[ContractRole];
 type AssetRole     = (typeof ASSET_ROLES)[number];
 type PriceQuote    = (typeof PRICE_QUOTES)[number];
 type MarketStatus  = (typeof MARKET_STATUSES)[number];
-type VersionStatus = (typeof VERSION_STATUSES)[number];
 type ExceptionKind = (typeof EXCEPTION_KINDS)[number];
 
 type ActivationAction = (typeof ACTIVATION_ACTIONS)[number];
-type SyncTriggerKind  = (typeof SYNC_TRIGGER_KINDS)[number];
-type SyncRunStatus   = (typeof SYNC_RUN_STATUSES)[number];
-type SyncOutcome     = (typeof SYNC_OUTCOMES)[number];
-type SyncItemStatus  = (typeof SYNC_ITEM_STATUSES)[number];
 
 /*
  * Anchored address validation. Accepts any casing, because upstream roots
@@ -148,183 +153,6 @@ type ParsedRoot = DeploymentPath & {
   contracts:    Partial<Record<ContractRole, Address>>,
   otherRoots:   Record<string, Address>,
   checksum:     string,
-};
-
-/*
- * D1 rows. Booleans are INTEGER 0 or 1 and every nullable column is
- * explicitly nullable, matching the migrations.
- *
- * `reviewed` says whether someone made the decisions a network or market row
- * carries (0002). The column defaults to 1, which SQLite needs to add it to a
- * table that has rows, so a row inserted without it would claim a review
- * nobody made; the row types require it, and so every write states it.
- */
-type RegistryVersionRow = {
-  id:                string,
-  source_repository: string,
-  source_commit_sha: string,
-  source_checksum:   string,
-  snapshot_checksum: string | null,
-  attempt:           number,
-  status:            VersionStatus,
-  created_at:        string,
-  validated_at:      string | null,
-  created_by:        string,
-};
-
-type RegistryNetworkRow = {
-  id:                   string,
-  registry_version_id:  string,
-  chain_id:             number,
-  upstream_network_key: string,
-  canonical_name:       string,
-  display_name:         string,
-  is_testnet:           number,
-  metadata:             string,
-  reviewed:             number,
-};
-
-type MarketRow = {
-  id:                          string,
-  registry_version_id:         string,
-  network_id:                  string,
-  deployment_key:              string,
-  display_name:                string,
-  slug:                        string | null,
-  contract_name:               string | null,
-  creation_block:              number,
-  status:                      MarketStatus,
-  is_default:                  number,
-  is_institutional:            number,
-  rewards_enabled:             number,
-  account_rewards_enabled:     number,
-  transaction_history_enabled: number,
-  collateral_value_quote:      PriceQuote,
-  reviewed:                    number,
-};
-
-type TokenRow = {
-  id:                  string,
-  registry_version_id: string,
-  network_id:          string,
-  address:             Address,
-  symbol:              string,
-  name:                string,
-  decimals:            number,
-};
-
-type MarketContractRow = {
-  id?:       number,
-  market_id: string,
-  role:      ContractRole,
-  address:   Address,
-};
-
-type MarketAssetRow = {
-  id?:                     number,
-  registry_version_id:     string,
-  network_id:              string,
-  market_id:               string,
-  token_id:                string,
-  role:                    AssetRole,
-  asset_index:             number | null,
-  price_feed_address:      Address | null,
-  price_feed_decimals:     number | null,
-  price_feed_quote:        PriceQuote | null,
-  usd_price_feed_address:  Address | null,
-  usd_price_feed_decimals: number | null,
-  display_name:            string | null,
-  is_wrapped_native:       number | null,
-};
-
-type NetworkPriceExceptionRow = {
-  id?:                             number,
-  registry_version_id:             string,
-  network_id:                      string,
-  price_feed_address:              Address,
-  kind:                            ExceptionKind,
-  fixed_price_value:               string | null,
-  fixed_price_decimals:            number | null,
-  replacement_price_feed_address:  Address | null,
-  replacement_price_feed_decimals: number | null,
-  provenance:                      string,
-  expires_at:                      string | null,
-};
-
-type ValidationResultRow = {
-  id?:                 number,
-  registry_version_id: string,
-  validation_attempt:  number,
-  check_name:          string,
-  scope:               string,
-  passed:              number,
-  details:             string,
-  created_at:          string,
-};
-
-type RegistryOverlayEventRow = {
-  id:                  string,
-  registry_version_id: string,
-  scope_type:          'network' | 'market',
-  scope_key:           string,
-  previous_digest:     string | null,
-  new_digest:          string,
-  actor:               string,
-  reason:              string,
-  created_at:          string,
-};
-
-type SyncRunRow = {
-  id:                  string,
-  source_commit_sha:   string,
-  tracked_ref:         string | null,
-  registry_version_id: string | null,
-  trigger_kind:        SyncTriggerKind,
-  requested_by:        string | null,
-  reason:              string | null,
-  status:              SyncRunStatus,
-  outcome:             SyncOutcome | null,
-  lease_owner:         string | null,
-  lease_expires_at:    string | null,
-  expected_count:      number,
-  completed_count:     number,
-  failed_count:        number,
-  last_error:          string | null,
-  started_at:          string,
-  completed_at:        string | null,
-  hold_for_review:     number,
-};
-
-type SyncRunItemRow = {
-  id:                   string,
-  sync_run_id:          string,
-  root_path:            string,
-  source_blob_sha:      string,
-  upstream_network_key: string,
-  deployment_key:       string,
-  status:               SyncItemStatus,
-  attempts:             number,
-  claim_owner:          string | null,
-  claimed_at:           string | null,
-  completed_at:         string | null,
-  last_error:           string | null,
-  created_at:           string,
-  updated_at:           string,
-};
-
-/*
- * The tables the registry writes row by row, with the row each one takes, so
- * a write names its table and is checked against that table's columns.
- */
-type RegistryTables = {
-  registry_versions:        RegistryVersionRow,
-  registry_networks:        RegistryNetworkRow,
-  network_price_exceptions: NetworkPriceExceptionRow,
-  markets:                  MarketRow,
-  tokens:                   TokenRow,
-  market_contracts:         MarketContractRow,
-  market_assets:            MarketAssetRow,
-  registry_overlay_events:  RegistryOverlayEventRow,
 };
 
 /*
@@ -458,6 +286,31 @@ type RegistrySnapshotV1 = {
 };
 
 /*
+ * A market the API serves: one that is not disabled, with its Comet, which
+ * is what it is addressed and keyed by (isServed, src/registry/catalog.ts).
+ * Validation refuses a market that does not declare its Comet
+ * (comet-contract-declared), so of a validated version only the disabled
+ * markets are left out. A network the API serves lists only the markets it
+ * serves.
+ */
+type ServedMarket  = MarketV1 & { contracts: MarketV1['contracts'] & { comet: Address } };
+type ServedNetwork = Omit<NetworkV1, 'markets'> & { markets: ServedMarket[] };
+
+/*
+ * The active version as the active reads serve it — /active and the market
+ * reads — beside RegistrySnapshotV1, which stays the version as imported:
+ * every collateral also says whether an administrator marked it deprecated in
+ * its Comet (migrations/0007_deprecated_collaterals.sql), and whether one hid
+ * it there (migrations/0008_hidden_collaterals.sql). A flag is a decision
+ * about the market, not part of the version, so it takes no part in the
+ * version's checksum and is read anew for every answer.
+ */
+type ActiveCollateralAssetV1 = CollateralAssetV1 & { isDeprecated: boolean, isHidden: boolean };
+type ActiveMarketV1          = Omit<ServedMarket, 'collateralAssets'> & { collateralAssets: ActiveCollateralAssetV1[] };
+type ActiveNetworkV1         = Omit<NetworkV1, 'markets'> & { markets: ActiveMarketV1[] };
+type ActiveSnapshotV1        = Omit<RegistrySnapshotV1, 'networks'> & { networks: ActiveNetworkV1[] };
+
+/*
  * How a response that resolved a version identifies it. It is deliberately
  * smaller than the snapshot's own reference: a convenience read states which
  * version answered, not where it came from.
@@ -506,6 +359,351 @@ type ValidationSummaryV1 = {
 };
 
 /*
+ * The decision in force for a token. A token nobody has decided about is not
+ * strategic, and has no time or author to name.
+ */
+type TokenPolicyV1 = {
+  isStrategic: boolean,
+  updatedAt:   string | null,
+  updatedBy:   string | null,
+};
+
+type TokenPolicyEventV1 = {
+  id:                  string,
+  // null where the token had no decision yet, which is not strategic
+  previousIsStrategic: boolean | null,
+  isStrategic:         boolean,
+  actor:               string,
+  reason:              string,
+  createdAt:           string,
+};
+
+/*
+ * Every token of one network of the active version, with the decision in
+ * force for each, and the decisions kept for tokens of the chain the active
+ * version does not hold: each applies again if a version brings its token
+ * back and serves a market that names it. `inActiveVersion` is false for a
+ * chain the active version does not hold at all, which has no tokens to list
+ * but may still have decisions kept.
+ */
+type TokenPoliciesV1 = {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  inActiveVersion: boolean,
+  tokens:          Array<TokenV1 & TokenPolicyV1>,
+  retained:        Array<TokenPolicyV1 & { address: Address }>,
+};
+
+/*
+ * One token's decision, and the changes that led to it, newest committed
+ * first. `inActiveVersion` is false for a decision kept while the active
+ * version does not hold the token, which applies again once one does and
+ * serves a market that names it.
+ */
+type TokenPolicyDetailV1 = TokenPolicyV1 & {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  tokenAddress:    Address,
+  inActiveVersion: boolean,
+  events:          TokenPolicyEventV1[],
+};
+
+/*
+ * The answer to a policy change. `changed` is false when the decision asked
+ * for was already in force, which writes nothing; `updatedAt` is when the
+ * decision in force was made, and null for a token nobody has decided about.
+ */
+type TokenPolicyResultV1 = {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  tokenAddress:    Address,
+  isStrategic:     boolean,
+  changed:         boolean,
+  updatedAt:       string | null,
+};
+
+/*
+ * A list of decisions: what the export answers, and what review and apply
+ * take, so a list is exported, edited and sent back as one file.
+ *
+ * A row that changes a decision needs a reason: its own, or the list's. A row
+ * that leaves its token as it is needs none. `symbol` is there for the person
+ * editing the file; the address decides, and a symbol that is not the token's
+ * is refused as the mistake it usually is. `registryVersion` says where the
+ * list was exported from, and is not checked: a decision belongs to no version.
+ */
+type TokenPolicyDecisionV1 = {
+  chainId:      number,
+  tokenAddress: Address,
+  symbol?:      string | null,
+  isStrategic:  boolean,
+  reason?:      string | null,
+};
+
+type TokenPolicyListV1 = {
+  registryVersion?: VersionRefV1,
+  reason:           string | null,
+  policies:         TokenPolicyDecisionV1[],
+};
+
+// what applying a list would change, row by row, without writing anything
+type TokenPolicyReviewV1 = {
+  registryVersion: VersionRefV1,
+  summary:         { change: number, unchanged: number, problems: number },
+  policies:        Array<{
+    row:          number,
+    chainId:      number,
+    tokenAddress: Address,
+    symbol:       string | null,
+    current:      boolean,
+    requested:    boolean,
+    action:       'change' | 'unchanged',
+    reason:       string | null,
+    problem:      string | null,
+  }>,
+};
+
+// what applying a list wrote: every row, as the transaction that wrote it left it
+type TokenPolicyApplyV1 = {
+  registryVersion: VersionRefV1,
+  summary:         { changed: number, unchanged: number },
+  policies:        Array<{
+    row:          number,
+    chainId:      number,
+    tokenAddress: Address,
+    symbol:       string,
+    isStrategic:  boolean,
+    changed:      boolean,
+    updatedAt:    string | null,
+  }>,
+};
+
+/*
+ * The decisions an administrator makes about a collateral of a Comet, a flag
+ * a kind: whether the collateral is deprecated in that Comet
+ * (`isDeprecated`), and whether it is hidden there from discovery
+ * (`isHidden`). Every kind answers in the types below under its own flag, and
+ * a list of a kind's decisions holds its rows under the kind's own member
+ * (`Rows`), so that neither kind's review takes the other's file. Each kind's
+ * own names for those types follow them.
+ *
+ * The decision in force for a collateral of a Comet. A collateral nobody has
+ * decided about has the flag unset, and has no time or author to name.
+ */
+type CollateralDecisionV1<Flag extends string> = Record<Flag, boolean> & {
+  updatedAt: string | null,
+  updatedBy: string | null,
+};
+
+// the flag before the change is null where the collateral had no decision yet, which has the flag unset
+type CollateralDecisionEventV1<Flag extends string> = {
+  id:        string,
+} & Record<`previous${Capitalize<Flag>}`, boolean | null> & Record<Flag, boolean> & {
+  actor:     string,
+  reason:    string,
+  createdAt: string,
+};
+
+/*
+ * One collateral's decision, and the changes that led to it, newest committed
+ * first. `inActiveVersion` is false for a decision kept while the active
+ * version does not hold the collateral in that Comet, which applies again once
+ * one does and serves the market.
+ */
+type CollateralDecisionDetailV1<Flag extends string> = CollateralDecisionV1<Flag> & {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  cometAddress:    Address,
+  tokenAddress:    Address,
+  inActiveVersion: boolean,
+  events:          Array<CollateralDecisionEventV1<Flag>>,
+};
+
+/*
+ * The answer to a decision about one collateral. `changed` is false when the
+ * decision asked for was already in force, which writes nothing; `updatedAt`
+ * is when the decision in force was made, and null where nobody has decided.
+ */
+type CollateralDecisionResultV1<Flag extends string> = {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  cometAddress:    Address,
+  tokenAddress:    Address,
+} & Record<Flag, boolean> & {
+  changed:         boolean,
+  updatedAt:       string | null,
+};
+
+/*
+ * A row of a list of decisions about collaterals. A list is what the export
+ * answers, and what review and apply take, so a list is exported, edited and
+ * sent back as one file, as a list of token policies is.
+ *
+ * A row that changes a decision needs a reason: its own, or the list's.
+ * `deploymentKey` and `symbol` are there for the person editing the file; the
+ * addresses decide, and a market or a symbol that is not the one the active
+ * version names is refused as the mistake it usually is.
+ */
+type ListedCollateralDecisionV1<Flag extends string> = {
+  chainId:        number,
+  cometAddress:   Address,
+  deploymentKey?: string | null,
+  tokenAddress:   Address,
+  symbol?:        string | null,
+} & Record<Flag, boolean> & {
+  reason?:        string | null,
+};
+
+// a decision kept for a collateral the active version does not hold in that Comet
+type RetainedCollateralDecisionV1<Flag extends string> = CollateralDecisionV1<Flag> & {
+  chainId:      number,
+  cometAddress: Address,
+  tokenAddress: Address,
+};
+
+/*
+ * `registryVersion` and `retained` say where the list was exported from and
+ * which decisions the active version does not hold, and are not read.
+ */
+type CollateralDecisionListV1<Flag extends string, Rows extends string> = {
+  registryVersion?: VersionRefV1,
+  reason:           string | null,
+} & Record<Rows, Array<ListedCollateralDecisionV1<Flag>>> & {
+  retained?:        Array<RetainedCollateralDecisionV1<Flag>>,
+};
+
+// what applying a list would change, row by row, without writing anything
+type CollateralDecisionReviewV1<Rows extends string> = {
+  registryVersion: VersionRefV1,
+  summary:         { change: number, unchanged: number, problems: number },
+} & Record<Rows, Array<{
+  row:           number,
+  chainId:       number,
+  cometAddress:  Address,
+  deploymentKey: string | null,
+  tokenAddress:  Address,
+  symbol:        string | null,
+  current:       boolean,
+  requested:     boolean,
+  action:        'change' | 'unchanged',
+  reason:        string | null,
+  problem:       string | null,
+}>>;
+
+// what applying a list wrote: every row, as the transaction that wrote it left it
+type CollateralDecisionApplyV1<Flag extends string, Rows extends string> = {
+  registryVersion: VersionRefV1,
+  summary:         { changed: number, unchanged: number },
+} & Record<Rows, Array<{
+  row:           number,
+  chainId:       number,
+  cometAddress:  Address,
+  deploymentKey: string,
+  tokenAddress:  Address,
+  symbol:        string,
+} & Record<Flag, boolean> & {
+  changed:       boolean,
+  updatedAt:     string | null,
+}>>;
+
+type DeprecatedCollateralV1         = CollateralDecisionV1<'isDeprecated'>;
+type DeprecatedCollateralEventV1    = CollateralDecisionEventV1<'isDeprecated'>;
+type DeprecatedCollateralDetailV1   = CollateralDecisionDetailV1<'isDeprecated'>;
+type DeprecatedCollateralResultV1   = CollateralDecisionResultV1<'isDeprecated'>;
+type DeprecatedCollateralDecisionV1 = ListedCollateralDecisionV1<'isDeprecated'>;
+type RetainedDeprecatedCollateralV1 = RetainedCollateralDecisionV1<'isDeprecated'>;
+type DeprecatedCollateralListV1     = CollateralDecisionListV1<'isDeprecated', 'collaterals'>;
+type DeprecatedCollateralReviewV1   = CollateralDecisionReviewV1<'collaterals'>;
+type DeprecatedCollateralApplyV1    = CollateralDecisionApplyV1<'isDeprecated', 'collaterals'>;
+
+type HiddenCollateralV1         = CollateralDecisionV1<'isHidden'>;
+type HiddenCollateralEventV1    = CollateralDecisionEventV1<'isHidden'>;
+type HiddenCollateralDetailV1   = CollateralDecisionDetailV1<'isHidden'>;
+type HiddenCollateralResultV1   = CollateralDecisionResultV1<'isHidden'>;
+type HiddenCollateralDecisionV1 = ListedCollateralDecisionV1<'isHidden'>;
+type RetainedHiddenCollateralV1 = RetainedCollateralDecisionV1<'isHidden'>;
+type HiddenCollateralListV1     = CollateralDecisionListV1<'isHidden', 'hiddenCollaterals'>;
+type HiddenCollateralReviewV1   = CollateralDecisionReviewV1<'hiddenCollaterals'>;
+type HiddenCollateralApplyV1    = CollateralDecisionApplyV1<'isHidden', 'hiddenCollaterals'>;
+
+/*
+ * The token list: every token the active version serves on one chain, with
+ * its strategic decision, its collateral value in USD across the chain's
+ * enabled markets, and whether discovery shows it.
+ *
+ * Values are decimal strings, never numbers: a value is exact, and a client
+ * that compares or formats it must not lose a digit doing so. Each token says
+ * when its value was read, which may be an earlier minute than the list's own
+ * `block` when the latest could not be read.
+ */
+type CollateralValueStatusV1 = (typeof COLLATERAL_VALUE_STATUSES)[number];
+type VisibilityReasonV1      = (typeof VISIBILITY_REASONS)[number];
+
+type NotShownV1 = 'hidden' | 'deprecated' | 'below_threshold';
+
+/*
+ * Whether discovery shows a token follows from its reason, so a client given
+ * both may read either. /summary can say the first without the second, where
+ * the decisions it read settle only that (summary-tokens.ts).
+ */
+type VisibilityV1 = (
+  | { isVisible: true,  visibilityReason: Exclude<VisibilityReasonV1, NotShownV1> }
+  | { isVisible: false, visibilityReason: Extract<VisibilityReasonV1, NotShownV1> }
+);
+
+type BlockRefV1 = { number: number, timestamp: number };
+
+// a price exception the value applied: what the registry stated in place of reading a feed
+type AppliedPriceExceptionV1 = {
+  kind:             ExceptionKind,
+  priceFeedAddress: Address,
+  provenance:       string,
+  expiresAt:        string | null,
+};
+
+/*
+ * `deprecatedIn` names the Comets of the chain's served markets that take the
+ * token as a collateral an administrator marked deprecated, sorted.
+ * `isDeprecated` says it is deprecated in every enabled market that takes it,
+ * of which there is at least one: none of them offers it any longer, and
+ * discovery does not show it, whatever else holds. A token deprecated in some
+ * of them only is left to the others, which offer it: it is not shown where
+ * every one of them hides it, and is otherwise decided by its strategic mark
+ * and its value.
+ *
+ * `hiddenIn` names, the same way, the Comets that take the token as a
+ * collateral an administrator hid. The decisions keep a token out of
+ * discovery, before anything else is asked, where an enabled market takes it
+ * and none of them leaves it to discovery, offering it without hiding it: as
+ * `hidden` where one of them hides it, which only the reason says, the list
+ * having no flag of its own for it, and otherwise as `deprecated`, which
+ * `isDeprecated` says as well (src/registry/token-visibility.ts).
+ */
+type TokenVisibilityV1 = TokenV1 & {
+  roles:                 AssetRole[],
+  isStrategic:           boolean,
+  isDeprecated:          boolean,
+  deprecatedIn:          Address[],
+  hiddenIn:              Address[],
+  collateralValueUsd:    string | null,
+  collateralValueStatus: CollateralValueStatusV1,
+  valueAt:               string | null,
+  valueBlock:            BlockRefV1 | null,
+  staleAgeSeconds:       number | null,
+  exceptions:            AppliedPriceExceptionV1[],
+} & VisibilityV1;
+
+type TokenListV1 = {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  thresholdUsd:    string,
+  ruleVersion:     number,
+  computedAt:      string,
+  block:           BlockRefV1 | null,
+  tokens:          TokenVisibilityV1[],
+};
+
+/*
  * What a Comet contract carries when it was materialized from the registry:
  * the version that described it, the market as that version describes it, and
  * the exceptions of its network.
@@ -544,66 +742,94 @@ export type {
   ActivationAction,
   ActivationRecordV1,
   ActivationResultV1,
+  ActiveCollateralAssetV1,
+  ActiveMarketV1,
+  ActiveNetworkV1,
+  ActiveSnapshotV1,
   Address,
   AssetDisplayOverrideV1,
+  AppliedPriceExceptionV1,
   AssetRole,
   BaseAssetV1,
+  BlockRefV1,
+  CollateralValueStatusV1,
   CollateralAssetV1,
+  CollateralDecisionApplyV1,
+  CollateralDecisionDetailV1,
+  CollateralDecisionEventV1,
+  CollateralDecisionListV1,
+  CollateralDecisionResultV1,
+  CollateralDecisionReviewV1,
+  CollateralDecisionV1,
   ContractRole,
   ContractRoleKey,
   DeploymentPath,
+  DeprecatedCollateralApplyV1,
+  DeprecatedCollateralDecisionV1,
+  DeprecatedCollateralDetailV1,
+  DeprecatedCollateralEventV1,
+  DeprecatedCollateralListV1,
+  DeprecatedCollateralResultV1,
+  DeprecatedCollateralReviewV1,
+  DeprecatedCollateralV1,
   ExceptionKind,
-  MarketAssetRow,
-  MarketContractRow,
-  MarketRow,
+  HiddenCollateralApplyV1,
+  HiddenCollateralDecisionV1,
+  HiddenCollateralDetailV1,
+  HiddenCollateralEventV1,
+  HiddenCollateralListV1,
+  HiddenCollateralResultV1,
+  HiddenCollateralReviewV1,
+  HiddenCollateralV1,
+  ListedCollateralDecisionV1,
   MarketStatus,
   MarketV1,
   NetworkPresentationV1,
-  NetworkPriceExceptionRow,
   NetworkV1,
   ParsedRoot,
   PriceExceptionV1,
   PriceFeedV1,
   PriceQuote,
-  RegistryNetworkRow,
-  RegistryOverlayEventRow,
   RegistrySnapshotV1,
-  RegistryTables,
   RegistryVersionRefV1,
   RegistryAnnotation,
   RegistryComet,
-  RegistryVersionRow,
+  RetainedCollateralDecisionV1,
+  RetainedDeprecatedCollateralV1,
+  RetainedHiddenCollateralV1,
   RewardAssetV1,
-  SyncItemStatus,
-  SyncOutcome,
-  SyncRunItemRow,
-  SyncRunRow,
-  SyncRunStatus,
-  SyncTriggerKind,
-  TokenRow,
+  ServedMarket,
+  ServedNetwork,
+  TokenPoliciesV1,
+  TokenListV1,
+  TokenPolicyApplyV1,
+  TokenPolicyDecisionV1,
+  TokenPolicyDetailV1,
+  TokenPolicyEventV1,
+  TokenPolicyListV1,
+  TokenPolicyResultV1,
+  TokenPolicyReviewV1,
+  TokenPolicyV1,
   TokenV1,
   UnwrappedCollateralAssetV1,
   ValidationCheckV1,
-  ValidationResultRow,
   ValidationSummaryV1,
   VersionRefV1,
-  VersionStatus,
+  VisibilityReasonV1,
+  VisibilityV1,
+  TokenVisibilityV1,
 };
 
 export {
   checksumAddress,
-  ACTIVATION_ACTIONS,
   ASSET_ROLES,
+  COLLATERAL_VALUE_STATUSES,
+  VISIBILITY_REASONS,
   CONTRACT_ROLES,
   CONTRACT_ROLE_KEYS,
   EXCEPTION_KINDS,
   MARKET_STATUSES,
   PRICE_QUOTES,
-  SYNC_ITEM_STATUSES,
-  SYNC_OUTCOMES,
-  SYNC_RUN_STATUSES,
-  SYNC_TRIGGER_KINDS,
-  VERSION_STATUSES,
   isAddress,
   isCommitSha,
   MARKET_KEY_SEPARATOR,

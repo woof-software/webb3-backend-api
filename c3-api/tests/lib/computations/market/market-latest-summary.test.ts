@@ -1,14 +1,8 @@
 import t from 'tap';
 
-import * as Debug    from '../../../../lib/debug-log.js';
-import * as Flags    from '../../../../lib/flags.js';
 import * as Eth      from '../../../../lib/eth-constants.js';
 import { BigNumber } from '../../../../lib/bignumber.js';
 import { BigFixnum } from '../../../../lib/bigfixnum.js';
-
-import * as Compute    from '../../../../lib/symbolic/computation.js';
-import * as Evaluator  from '../../../../lib/symbolic/evaluator.js';
-import { MemoryCache } from '../../../../lib/symbolic/cache.js';
 
 import * as market from '../../../../lib/computations/market.js';
 
@@ -18,6 +12,7 @@ import type { Collateral } from '../../../../lib/computations/market/collaterals
 import type { RegistryComet } from '../../../../lib/model/comet-registry.js';
 import { checksumAddress } from '../../../../lib/model/comet-registry.js';
 
+import { evaluatorOver, stub } from '../../../util/evaluator.js';
 import { fixtureCatalog } from '../../../util/registry-fixture.js';
 
 import '../../../../shim/node-self.js';
@@ -27,9 +22,6 @@ import '../../../../shim/node-self.js';
  * it: the computation runs on the real evaluator, over reads that answer
  * from a table instead of a node.
  */
-const flags = Flags.parseWithDefaults(process.env);
-const debug = Debug.MakeLogger([]).configure(process.env);
-
 const network = 'ethereum-mainnet' as const;
 const block   = { number: 50_000_000, timestamp: 1_790_000_000 };
 
@@ -44,16 +36,6 @@ const WETH = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
 const at8      = (value: number | string) => BigFixnum.from({ decimals: 8, value });
 const read     = (price: BigFixnum) => ({ status: 'success' as const, price });
 const reverted = (message = 'execution reverted') => ({ status: 'error' as const, message });
-
-function stub(answer: (context: any) => unknown) {
-  return Compute.Functor<any>({}).implement({ version: 0, compute: context => answer(context) });
-}
-
-// on the working set, which the summary route evaluates on
-function evaluator(computations: Record<string, unknown>) {
-  const cache = new MemoryCache({}, [ BigFixnum.JsonReviver, BigNumber.JsonReviver ]);
-  return Evaluator.instantiate<any>(computations as any, { cache, debug, flags: { ...flags, evaluatorAlgorithm: 'workingset', batchingEnabled: true } });
-}
 
 /*
  * What the summary of USDT's market reads but its collateral, as the Comet
@@ -83,15 +65,15 @@ function contextOf(contract: RegistryComet) {
 }
 
 function summaryOf(reads: Reads): Promise<any> {
-  const { evaluate, pull1 } = evaluator({
+  const { evaluate, pull1 } = evaluatorOver({
     marketLatestSummary: market.marketLatestSummary,
     ...readsOf(reads),
-    versionedCollaterals: stub(() => reads.collaterals),
+    collaterals:         stub(() => reads.collaterals),
   });
   return evaluate(pull1({ marketLatestSummary: contextOf(reads.contract ?? usdt) }));
 }
 
-// a collateral of the summary's market as versionedCollaterals reports it: `held` whole tokens of eighteen decimals at `price`
+// a collateral of the summary's market as collaterals reports it: `held` whole tokens of eighteen decimals at `price`
 function collateral(asset: string, symbol: string, held: number, price: PriceRead): Collateral {
   return {
     asset:           asset as Eth.Address,
@@ -111,15 +93,19 @@ t.test('a market whose every price reads reports every field, in the order the A
     chainId: 1,
     comet:   { address: usdt.address },
     status:  'success',
-    borrowApr:              '0.05',
-    supplyApr:              '0.03',
-    totalBorrowValue:       '998.90608',
-    totalSupplyValue:       '1997.81216',
-    totalCollateralValue:   '5154.99578686',
-    utilization:            '500000000000000000',
-    baseUsdPrice:           '0.99890608',
-    basePrice:              '0.99890608',
-    collateralAssetSymbols: [ 'COMP', 'WETH' ],
+    borrowApr:               '0.05',
+    supplyApr:               '0.03',
+    totalBorrowValue:        '998.90608',
+    totalSupplyValue:        '1997.81216',
+    totalCollateralValue:    '5154.99578686',
+    // USDT's market is quoted in USD, so its totals in USD are the quoted ones
+    totalBorrowValueUsd:     '998.90608',
+    totalSupplyValueUsd:     '1997.81216',
+    totalCollateralValueUsd: '5154.99578686',
+    utilization:             '500000000000000000',
+    baseUsdPrice:            '0.99890608',
+    basePrice:               '0.99890608',
+    collateralAssetSymbols:  [ 'COMP', 'WETH' ],
     collaterals: [
       { address: COMP, symbol: 'COMP', status: 'success' },
       { address: WETH, symbol: 'WETH', status: 'success' },
@@ -144,12 +130,11 @@ t.test('a market reports what marketSummary reports of it, as it reports it', as
     },
   ];
   for (const { status, ...reads } of answers) {
-    const { evaluate, pull1, split } = evaluator({
+    const { evaluate, pull1, split } = evaluatorOver({
       marketSummary:       market.marketSummary,
       marketLatestSummary: market.marketLatestSummary,
       ...readsOf(reads),
       collaterals:         stub(() => reads.collaterals),
-      versionedCollaterals: stub(() => reads.collaterals),
     });
     const context = contextOf(reads.contract);
     const [ before, { basePrice, ...latest } ] = await evaluate(split([
@@ -167,18 +152,23 @@ t.test('a market reports what marketSummary reports of it, as it reports it', as
 
 /*
  * On a market quoted in USD, the base price and the base asset's USD price
- * read the same feed, unless the Comet moved off the feed the version names
- * (drift.ts): either can fail alone. Each field needs only its own reads.
+ * are one read, with one fallback: of the base feed the version names, or,
+ * where that reverts, of the feed the Comet names. They fail together, where
+ * neither answers (base-price.test.ts). Where one fails alone below, it shows
+ * only that each field needs its own reads: a total in USD is the total
+ * itself there, and needs what the total needs.
  */
 t.test('a market quoted in USD whose base price reverts reports every field it can', async t => {
-  const BASE = reverted('execution reverted: the feed the Comet names');
-  const USD  = reverted('execution reverted: the feed the version names');
-  const common = [ 'totalCollateralValue', 'utilization' ];
-  const after  = [ 'collateralAssetSymbols', 'collaterals' ];
+  const BASE = reverted('execution reverted: read as the base price');
+  const USD  = reverted('execution reverted: read as the USD price');
+  // the fields up to the utilization, without the totals of the base price and with them
+  const unpriced = [ 'totalCollateralValue', 'totalCollateralValueUsd', 'utilization' ];
+  const priced   = [ 'totalBorrowValue', 'totalSupplyValue', 'totalCollateralValue', 'totalBorrowValueUsd', 'totalSupplyValueUsd', 'totalCollateralValueUsd', 'utilization' ];
+  const after    = [ 'collateralAssetSymbols', 'collaterals' ];
   const cases = [
-    { reads: { basePrice: BASE, baseUsdPrice: USD }, message: BASE.message, keys: [ ...common, ...after ], name: 'both revert' },
-    { reads: { baseUsdPrice: USD },                  message: USD.message,  keys: [ 'totalBorrowValue', 'totalSupplyValue', ...common, 'basePrice', ...after ], name: 'its USD price reverts' },
-    { reads: { basePrice: BASE },                    message: BASE.message, keys: [ ...common, 'baseUsdPrice', ...after ], name: 'its base price reverts' },
+    { reads: { basePrice: BASE, baseUsdPrice: USD }, message: BASE.message, keys: [ ...unpriced, ...after ], name: 'both revert' },
+    { reads: { baseUsdPrice: USD },                  message: USD.message,  keys: [ ...priced, 'basePrice', ...after ], name: 'its USD price reverts' },
+    { reads: { basePrice: BASE },                    message: BASE.message, keys: [ ...unpriced, 'baseUsdPrice', ...after ], name: 'its base price reverts' },
   ];
   for (const { reads, message, keys, name } of cases) {
     const summary = await summaryOf({ basePrice: READS.basePrice, baseUsdPrice: READS.baseUsdPrice, ...reads, collaterals: [ usdtComp(), usdtWeth() ] });
@@ -190,6 +180,38 @@ t.test('a market quoted in USD whose base price reverts reports every field it c
     'the totals at the base price that was read');
   const usd = await summaryOf({ basePrice: BASE, collaterals: [ usdtComp(), usdtWeth() ] });
   t.equal(usd.baseUsdPrice, '0.99890608', 'and the USD price that was read');
+});
+
+/*
+ * On a market quoted in its base asset, the totals and the collateral are in
+ * that asset, ETH for a WETH market, and only the base asset's USD price
+ * turns them into USD.
+ */
+t.test('a market quoted in its base asset whose base prices revert reports every field it can', async t => {
+  const BASE = reverted('execution reverted: WETH / ETH');
+  const USD  = reverted('execution reverted: ETH / USD');
+  const [ cbETH, wstETH, rETH ] = weth.registry.market.collateralAssets.map(asset => checksumAddress(asset.token.address));
+  const collaterals = [
+    collateral(cbETH!,  'cbETH',  4, read(at8(105_000_000))),
+    collateral(wstETH!, 'wstETH', 5, read(at8(0))),
+    collateral(rETH!,   'rETH',   6, reverted()),
+  ];
+
+  const unconverted = await summaryOf({ contract: weth, basePrice: read(at8(100_000_000)), baseUsdPrice: USD, collaterals });
+  t.match(unconverted, {
+    status:               'error',
+    message:              USD.message,
+    totalBorrowValue:     '1000.0',
+    totalSupplyValue:     '2000.0',
+    totalCollateralValue: '4.2',
+    basePrice:            '1.0',
+  }, 'its USD price reverts: an error with its message, the totals in ETH, and the base price');
+  t.notOk('baseUsdPrice' in unconverted, 'without the USD price that reverted');
+  t.strictSame(unconverted.collaterals.map((each: any) => each.status), [ 'success', 'success', 'error' ], 'each collateral as its price read');
+
+  const unpriced = await summaryOf({ contract: weth, basePrice: BASE, baseUsdPrice: USD, collaterals });
+  t.match(unpriced, { status: 'error', message: BASE.message, totalCollateralValue: '4.2' }, 'both revert: the message of the base price');
+  t.notOk('totalBorrowValue' in unpriced || 'totalSupplyValue' in unpriced || 'basePrice' in unpriced || 'baseUsdPrice' in unpriced, 'and no totals of the base asset, nor either price');
 });
 
 /*
@@ -213,26 +235,23 @@ t.test('the WBTC market\'s base price is WBTC in BTC, which values its total', a
 /*
  * While a registry version no longer describes its market — the Comet listed
  * a collateral after the import, and holds another asset at an index the
- * version describes — the summary of the latest block lists the collateral
- * of the version, and the history that of the chain. The two differ on
- * purpose: the chain drift check raises it, and a new import ends it.
+ * version describes — the summary of the latest block and the history both
+ * list the collateral of the version, by the same rules (collaterals.ts). The
+ * chain drift check raises the difference, and a
+ * new import ends it.
  */
-t.test('while the version and the chain differ, the summary follows the version and the history the chain', async t => {
+t.test('while the version and the chain differ, the summary and the history both follow the version', async t => {
   const STRANGER  = '0x1111111111111111111111111111111111111111';
   const NEWCOMER  = '0x2222222222222222222222222222222222222222';
   const versioned = usdt.registry.market.collateralAssets;
   t.equal(versioned.length, 16, 'the version describes sixteen collaterals of USDT\'s market');
 
-  // the asset the Comet holds at each of its seventeen indices, and what its token answers to symbol()
-  const assetAt  = (assetNumber: number) => assetNumber === 3 ? STRANGER : assetNumber === 16 ? NEWCOMER : versioned[assetNumber]!.token.address;
-  const symbolOf = (address: string) => (
-    { [STRANGER]: 'STR', [NEWCOMER]: 'NEW' }[address.toLowerCase()] ?? versioned.find(asset => asset.token.address === address.toLowerCase())!.token.symbol
-  );
-  const { evaluate, pull1, split } = evaluator({
+  // the asset the Comet holds at each of its seventeen indices
+  const assetAt = (assetNumber: number) => assetNumber === 3 ? STRANGER : assetNumber === 16 ? NEWCOMER : versioned[assetNumber]!.token.address;
+  const { evaluate, pull1, split } = evaluatorOver({
     marketSummary:        market.marketSummary,
     marketLatestSummary:  market.marketLatestSummary,
     collaterals:          market.collaterals,
-    versionedCollaterals: market.versionedCollaterals,
     ...readsOf({ collaterals: [] }),
     numAssets:            stub(() => 17),
     assetInfo:            stub(({ assetNumber }) => ({
@@ -242,7 +261,6 @@ t.test('while the version and the chain differ, the summary follows the version 
     })),
     assetTotalCollateral: stub(({ assetNumber }) => BigFixnum.from({ value: assetNumber + 1 })),
     assetPrice:           stub(() => read(BigFixnum.from({ value: 2 }))),
-    symbol:               stub(({ contract }) => symbolOf(contract.address)),
   });
   const context = contextOf(usdt);
   const [ history, latest ] = await evaluate(split([
@@ -250,22 +268,55 @@ t.test('while the version and the chain differ, the summary follows the version 
     pull1({ marketLatestSummary: context }),
   ])) as [ any, any ];
 
-  t.equal(latest.status, 'partially', 'the summary: partial');
-  t.strictSame(latest.collateralAssetSymbols, versioned.map(asset => asset.token.symbol), 'with the sixteen collaterals of the version');
-  t.strictSame(latest.collaterals.map((each: any) => each.status), versioned.map((_, assetNumber) => assetNumber === 3 ? 'error' : 'success'),
-    'each priced but one');
-  t.strictSame(latest.collaterals[3], {
-    address: checksumAddress(versioned[3]!.token.address),
-    symbol:  'UNI',
-    status:  'error',
-    message: `asset 3 of the Comet is ${STRANGER}, not the UNI the registry version describes`,
-  }, 'the one at whose index the Comet holds another asset as an error');
-  t.equal(latest.totalCollateralValue, String(2 * (136 - 4)), 'and the total leaves it and the seventeenth out: indices 1 to 16 but 4, at two each');
+  for (const [ name, summary ] of [ [ 'the summary', latest ], [ 'the history', history ] ]) {
+    t.equal(summary.status, 'partially', `${name}: partial`);
+    t.strictSame(summary.collateralAssetSymbols, versioned.map(asset => asset.token.symbol), `${name}: with the sixteen collaterals of the version`);
+    t.strictSame(summary.collaterals.map((each: any) => each.status), versioned.map((_, assetNumber) => assetNumber === 3 ? 'error' : 'success'),
+      `${name}: each priced but one`);
+    t.strictSame(summary.collaterals[3], {
+      address: checksumAddress(versioned[3]!.token.address),
+      symbol:  'UNI',
+      status:  'error',
+      message: `asset 3 of the Comet is ${STRANGER}, not the UNI the registry version describes`,
+    }, `${name}: the one at whose index the Comet holds another asset as an error`);
+    t.equal(summary.totalCollateralValue, String(2 * (136 - 4)),
+      `${name}: and the total leaves it and the seventeenth out: indices 1 to 16 but 4, at two each`);
+  }
+});
 
-  const symbols = versioned.map(asset => asset.token.symbol);
-  t.equal(history.status, 'success', 'the history: a success');
-  t.strictSame(history.collateralAssetSymbols, [ ...symbols.slice(0, 3), 'STR', ...symbols.slice(4), 'NEW' ],
-    'with the seventeen the chain lists, named by their tokens');
-  t.strictSame(history.collaterals.map((each: any) => each.status), Array(17).fill('success'), 'each priced');
-  t.equal(history.totalCollateralValue, String(2 * 153), 'and every one in the total: indices 1 to 17, at two each');
+/*
+ * Each total is given in USD beside it, as marketSummary gives it: the same
+ * total on a market quoted in USD, and converted at the base asset's USD
+ * price on one quoted in its base asset. A total in USD is there where the
+ * total is and what converts it was read, in an error as anywhere else.
+ */
+t.test('a total in USD is reported where the total and what converts it were read', async t => {
+  // the totals in USD a summary reports
+  const inUsdOf = (summary: any) => Object.fromEntries(Object.entries(summary).filter(([ key ]) => /^total\w+Usd$/.test(key)));
+
+  const usdQuoted = await summaryOf({ collaterals: [ usdtComp(), usdtWeth(reverted()) ] });
+  t.match(usdQuoted, { status: 'partially', totalBorrowValue: '998.90608', totalSupplyValue: '1997.81216', totalCollateralValue: '126.51' });
+  t.strictSame(inUsdOf(usdQuoted), { totalBorrowValueUsd: '998.90608', totalSupplyValueUsd: '1997.81216', totalCollateralValueUsd: '126.51' },
+    'a market quoted in USD: the same totals, leaving out the collateral that could not be priced');
+  const unpriced = await summaryOf({ basePrice: reverted(), baseUsdPrice: reverted(), collaterals: [ usdtComp(), usdtWeth(reverted()) ] });
+  t.strictSame(inUsdOf(unpriced), { totalCollateralValueUsd: '126.51' }, 'and without its base price, the total of its collateral, which needs none');
+
+  // WETH's market is quoted in ETH: its base asset at 1.0 ETH, and 2500 USD per ETH
+  const [ cbETH, wstETH ] = weth.registry.market.collateralAssets.map(asset => checksumAddress(asset.token.address));
+  const collaterals = [
+    collateral(cbETH!,  'cbETH',  4, read(at8(105_000_000))),
+    collateral(wstETH!, 'wstETH', 5, reverted()),
+  ];
+  const ETH     = read(at8(100_000_000));
+  const ETH_USD = read(at8(250_000_000_000));
+  const inEth   = (basePrice: PriceRead, baseUsdPrice: PriceRead) => summaryOf({ contract: weth, basePrice, baseUsdPrice, collaterals });
+
+  const converted = await inEth(ETH, ETH_USD);
+  t.match(converted, { status: 'partially', totalBorrowValue: '1000.0', totalSupplyValue: '2000.0', totalCollateralValue: '4.2' });
+  t.strictSame(inUsdOf(converted), { totalBorrowValueUsd: '2500000.0', totalSupplyValueUsd: '5000000.0', totalCollateralValueUsd: '10500.0' },
+    'a market quoted in ETH: each total at 2500 USD per ETH');
+  t.strictSame(inUsdOf(await inEth(reverted(), ETH_USD)), { totalCollateralValueUsd: '10500.0' },
+    'its base price reverts: the total of its collateral alone, which needs no base price');
+  t.strictSame(inUsdOf(await inEth(ETH, reverted())), {}, 'its USD price reverts: none, since nothing converts them');
+  t.strictSame(inUsdOf(await inEth(reverted(), reverted())), {}, 'both revert: none');
 });

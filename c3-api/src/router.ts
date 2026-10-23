@@ -1,6 +1,6 @@
 import * as Eth      from '../lib/eth-constants.js';
 import * as Fallible from '../lib/fallible/fallible.js';
-import * as jsonRpc  from '../lib/json-rpc.js';
+
 import { ROUTE_EVALUATOR_FLAGS } from '../lib/flags.js';
 
 import * as KnownNetwork  from '../lib/well-known/networks/network.js';
@@ -15,18 +15,18 @@ import * as transactionHistoryHandler from './transaction-history-handler/transa
 import type { Contract } from '../lib/well-known/contracts/types.js';
 import type { RegistryComet } from '../lib/model/comet-registry.js';
 
-import { ApiError, failureResponse, isApiError, nodeUnavailable } from './http/errors.js';
+import { ApiError, failureResponse } from './http/errors.js';
+import { knownFailure } from './http/failures.js';
 import { refuseTestnet, refuseTestnetsParameter } from './testnets.js';
+import { cacheDepsOf } from './registry/cache.js';
 import type { Catalog } from './registry/catalog.js';
-import {
-  RequestCatalog,
-  catalogHeadersOf,
-  isRegistryUnavailable,
-  requestCatalog,
-  unavailableError,
-} from './registry/request-catalog.js';
+import { RequestCatalog, catalogHeadersOf, requestCatalog } from './registry/request-catalog.js';
+import { tokenCollateralDeps } from './registry/router.js';
+import { SUMMARY_DEADLINE_MS, summaryDecisions } from './registry/summary-tokens.js';
+import type { SummaryTokens } from './registry/summary-tokens.js';
+import type * as TokenCollateral from './registry/token-collateral.js';
 
-import type * as Evaluator from './evaluator.js';
+import * as Evaluator from './evaluator.js';
 
 /*
  * Handlers must declare the sets of computations upon which they depend.
@@ -48,7 +48,16 @@ type Scope = (
 interface Context extends Evaluator.Context {
   evaluator: Evaluator.Implementation<Scope>;
   // the id the entrypoint gave the request, which its error answer and the log line about it carry
-  requestId?: string;
+  requestId: string;
+}
+
+/*
+ * What the router hands a market handler: the evaluator it made for the
+ * route, and what the summary adds to each collateral from the token list
+ * (summary-tokens.ts).
+ */
+interface MarketContext extends Context {
+  tokens: SummaryTokens;
 }
 
 /*
@@ -172,31 +181,21 @@ async function route(
    * first handler that needs it, and every response whose content depended on
    * it says which version answered.
    */
-  const registry  = requestCatalog(context.env, context.debug);
-  // a caller that made no id, such as a test calling the router directly, gets one here
-  const requestId = context.requestId ?? crypto.randomUUID();
+  const registry = requestCatalog({ ...cacheDepsOf(context.env, context.debug), defer: context.waitUntil });
+  const { requestId } = context;
   const answer = async (): Promise<Response> => {
     try {
-      return await unsafeRoute(request, { ...context, requestId }, instantiateEvaluator, registry);
+      return await unsafeRoute(request, context, instantiateEvaluator, registry);
     } catch (e: unknown) {
       context.debug.clearDanglingGroups();
       /*
        * A failure is answered in the envelope every route answers with, under
-       * this request's id. What a handler raised to say something — a market
-       * without rewards, a cursor of another version — says it; a route that
-       * needs the registry cannot be answered from anywhere else, since after
-       * the cutover there is no static market list to fall back to, so it
-       * fails with 503 while the rest of the API keeps working. So does a
-       * node provider that did not serve the request, which a client may ask
-       * again; a call the contract reverted is its answer, not the node's
-       * failure. Anything else is a 500 that tells the client nothing but the
-       * id, while the log gets the whole of it.
+       * this request's id, as what it means to a client (knownFailure): a
+       * route that needs the registry fails with 503 while the rest of the
+       * API keeps working. Anything else is a 500 that tells the client
+       * nothing but the id, while the log gets the whole of it.
        */
-      const said = isApiError(e) ? e
-        : isRegistryUnavailable(e) ? unavailableError(e)
-        : jsonRpc.isNotServed(e) ? nodeUnavailable(e)
-        : null;
-      return failureResponse(said, e, {
+      return failureResponse(knownFailure(e), e, {
         requestId,
         pathname: new URL(request.url).pathname,
         debug:    context.debug,
@@ -215,8 +214,7 @@ async function route(
 
 async function unsafeRoute(
   request: Request,
-  // by now with the request's id: the entrypoint's, or one route() made
-  context: Omit<Context, 'evaluator'> & { requestId: string },
+  context: Omit<Context, 'evaluator'>,
   instantiateEvaluator: Evaluator.InstantiateFn<Scope>,
   registry: RequestCatalog,
 ): Promise<Response> {
@@ -446,7 +444,7 @@ async function unsafeRoute(
      */
     const evaluator = instantiateEvaluator('mainnet', { flags: { ...context.flags, ...ROUTE_EVALUATOR_FLAGS } });
     const handler   = handlerMappings[resourceApi][strippedEndpointSuffix];
-    return handler(data, { ...context, evaluator });
+    return handler(data, { ...context, evaluator, tokens: summaryTokensOf(context, instantiateEvaluator) });
   }
 
   const maybeWellKnownContract = (() => {
@@ -489,6 +487,19 @@ async function unsafeRoute(
   return new Response(`Error: Not a valid governance API endpoint`, { status: 400 });
 }
 
+/*
+ * How the summary values a chain's collateral, as the token list does, and
+ * where it reads the decisions: from D1, and the deprecated and the hidden
+ * ones from the records the worker keeps of them while D1 cannot be reached,
+ * as the active reads do. Nothing is read until the summary asks.
+ */
+function summaryTokensOf(context: Omit<Context, 'evaluator'>, instantiateEvaluator: Evaluator.InstantiateFn<Scope>): SummaryTokens {
+  return {
+    collateral: tokenCollateralDeps(context, Evaluator.narrowed<Scope, TokenCollateral.Dependencies>(instantiateEvaluator), SUMMARY_DEADLINE_MS),
+    decisions:  () => summaryDecisions({ ...cacheDepsOf(context.env, context.debug), defer: context.waitUntil }, context.requestId),
+  };
+}
+
 function isValidResourceAPI(apiRoute: string): apiRoute is ResourceAPI {
   return Object.keys(handlerMappings).includes(apiRoute);
 }
@@ -510,6 +521,7 @@ export {
 
 export type {
   Context,
+  MarketContext,
   // route data types
   V2RouteData,
   MarketRouteData,

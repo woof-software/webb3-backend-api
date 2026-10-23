@@ -22,6 +22,13 @@ interface Context {
   flags: Flags.SomeFlags;
   // a custom cache may be passed in, but typically should not be.
   cache?: Cache.Cache;
+  /*
+   * Keeps work alive past the response, which the runtime otherwise cancels
+   * once the request has answered. Every request has one: without an
+   * execution context, as a test calls the worker, the entrypoint answers
+   * only once that work is done.
+   */
+  waitUntil: (work: Promise<unknown>) => void;
 }
 
 /*
@@ -109,6 +116,16 @@ function preInstantiate<Scope extends Compute.Spec>(
   }
 }
 
+/*
+ * The evaluators of a scope, typed by a scope within it: an evaluator
+ * evaluates every computation of its scope, those of a smaller one among them,
+ * but the types of the redexes it builds name its whole scope, so the compiler
+ * cannot take it for an evaluator of the smaller one.
+ */
+function narrowed<Scope extends Compute.Spec, Within extends Scope>(instantiate: InstantiateFn<Scope>): InstantiateFn<Within> {
+  return instantiate as unknown as InstantiateFn<Within>;
+}
+
 /* FIXME: this is a gnarly hack for namespace conflicts in test.
  * Mapping of keys (network + seed) to some memory caches.
  */
@@ -130,6 +147,7 @@ function getOrCreateMemoryCache(
 }
 
 export {
+  narrowed,
   preInstantiate,
   type Context,
   type Implementation,

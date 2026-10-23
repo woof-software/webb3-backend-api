@@ -30,8 +30,8 @@ const { implement, pipe1 } = Compute.Functor<MarketDaySummary>({});
  * summary at that block the same way.
  */
 const marketDaySummary = implement({
-  // 6: summaries report the status of their price reads
-  version: 6,
+  // 8: where the base feed the version names reverts, a summary prices the base asset through the one the Comet names
+  version: 8,
   index: Index.DailyBlockIndex,
   /*
    * Key the computation by the materialized `date' of the block,

@@ -1,4 +1,3 @@
-import * as Fallible     from '../../lib/fallible/fallible.js';
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
 import { canonicalJson } from '../../lib/canonical-json.js';
@@ -8,8 +7,6 @@ import { keccak256 } from '../../lib/hash.js';
 import {
   Comet,
   Contract,
-  ERC20,
-  PriceFeed,
   StandaloneContract,
   UntypedContract,
 } from '../../lib/well-known/contracts/types.js';
@@ -20,13 +17,14 @@ import {
   MarketV1,
   NetworkV1,
   PriceExceptionV1,
-  PriceFeedV1,
   RegistryAnnotation,
   RegistryComet,
   RegistrySnapshotV1,
+  ServedMarket,
   TokenV1,
   checksumAddress,
 } from '../../lib/model/comet-registry.js';
+import { feedContract, tokenContract } from '../../lib/model/registry-contracts.js';
 
 /*
  * The request catalog: one activated snapshot, materialized into the contract
@@ -41,20 +39,17 @@ import {
  * versions can describe the same address with different metadata.
  */
 
-/*
- * A market the API serves: one that is not disabled, with its Comet, which
- * is what it is addressed and keyed by. Validation refuses a market that does
- * not declare its Comet (comet-contract-declared), so of a validated version
- * only the disabled markets are left out.
- */
-type ServedMarket = MarketV1 & { contracts: MarketV1['contracts'] & { comet: Address } };
-
 type CatalogMarket = {
   chainId:       number,
   network:       KnownNetwork.Name,
   deploymentKey: string,
   market:        ServedMarket,
   comet:         RegistryComet,
+};
+
+type CatalogNetwork = {
+  name:    KnownNetwork.Name,
+  network: NetworkV1,
 };
 
 type Catalog = {
@@ -89,8 +84,12 @@ type Catalog = {
    * resolve one.
    */
   markets(): CatalogMarket[],
-  // the networks the API serves: those with a market it may resolve
-  networks(): NetworkV1[],
+  /*
+   * The network the API serves on a chain, and the name it serves it under,
+   * or null where it serves none. A network is served while it has a market
+   * the API may resolve.
+   */
+  networkOn(chainId: number): CatalogNetwork | null,
   marketAt(network: KnownNetwork.Name, cometAddress: Address): CatalogMarket | null,
   marketsOn(network: KnownNetwork.Name): CatalogMarket[],
   /*
@@ -117,52 +116,18 @@ type Catalog = {
 };
 
 function networkName(network: NetworkV1): KnownNetwork.Name | null {
-  const known = KnownNetwork.lookup({ name: network.key });
-  return Fallible.isFailure(known) ? null : (network.key as KnownNetwork.Name);
+  return KnownNetwork.castName(network.key) ? network.key : null;
 }
 
 /*
  * An address as a contract carries it, and so as every response echoes it:
  * checksummed, the form the API answered with before the registry. The
  * registry stores addresses lowercased, and every lookup and cache key keeps
- * comparing that form.
+ * comparing that form. Tokens and feeds are materialized the same way
+ * (registry-contracts.ts).
  */
 function shown(address: Address): Address {
   return checksumAddress(address) as Address;
-}
-
-/*
- * A token as the contract shapes carry it. The registry's `name` goes into
- * `description`, which is where the static constants put the human name of a
- * token ("USD Coin" beside the symbol "USDC") and where the market rewards
- * computation reads it from. `displayName` stays unset, so a token still
- * reads as its symbol wherever a contract is named.
- */
-function erc20(
-  network: KnownNetwork.Name,
-  token: TokenV1,
-  creationBlock: number,
-): Contract<StandaloneContract<ERC20>> {
-  return ERC20(token.symbol, {
-    network,
-    address:     shown(token.address),
-    decimals:    token.decimals,
-    description: token.name,
-    block:       { number: creationBlock },
-  }) as unknown as Contract<StandaloneContract<ERC20>>;
-}
-
-function priceFeed(
-  network: KnownNetwork.Name,
-  feed: PriceFeedV1,
-  creationBlock: number,
-): Contract<StandaloneContract<PriceFeed>> {
-  return PriceFeed({
-    network,
-    address:  shown(feed.address),
-    decimals: feed.decimals,
-    block:    { number: creationBlock },
-  }) as unknown as Contract<StandaloneContract<PriceFeed>>;
 }
 
 /*
@@ -251,11 +216,11 @@ function cometOf(
 ): RegistryComet {
   const block = market.creationBlock;
   const base  = {
-    asset:     erc20(network, market.baseAsset.token, block),
-    priceFeed: priceFeed(network, market.baseAsset.priceFeed, block),
+    asset:     tokenContract(network, market.baseAsset.token, block),
+    priceFeed: feedContract(network, market.baseAsset.priceFeed, block),
     ...(market.baseAsset.usdPriceFeed === null
       ? {}
-      : { usdPriceFeed: priceFeed(network, market.baseAsset.usdPriceFeed, block) }),
+      : { usdPriceFeed: feedContract(network, market.baseAsset.usdPriceFeed, block) }),
   };
 
   const rewardsContract = market.contracts.rewards;
@@ -266,8 +231,8 @@ function cometOf(
       address: shown(rewardsContract),
       block:   { number: block },
     }),
-    ...(market.rewardAsset === null ? {} : { asset: erc20(network, market.rewardAsset.token, block) }),
-    ...(rewardFeed === null ? {} : { priceFeed: priceFeed(network, rewardFeed, block) }),
+    ...(market.rewardAsset === null ? {} : { asset: tokenContract(network, market.rewardAsset.token, block) }),
+    ...(rewardFeed === null ? {} : { priceFeed: feedContract(network, rewardFeed, block) }),
   };
 
   const address = market.contracts.comet;
@@ -366,8 +331,8 @@ function historyKeyOf(network: NetworkV1, served: ServedMarket[]): string {
  */
 function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalog {
   const asOf = now.getTime();
-  const markets: CatalogMarket[] = [];
-  const networks: NetworkV1[]    = [];
+  const markets: CatalogMarket[]   = [];
+  const networks: CatalogNetwork[] = [];
   // every token of the version, by network and lowercased address
   const tokens = new Map<string, TokenV1>();
   const bases  = new Map<string, TokenV1>();
@@ -389,7 +354,7 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
       // a network this API cannot name is not one it can serve
       continue;
     }
-    networks.push(network);
+    networks.push({ name, network });
     historyKeys.set(name, historyKeyOf(network, served));
     const exceptions = applicableExceptions(network.priceExceptions, asOf);
     expiries.push(...exceptions.map(expiryOf).filter((expiry): expiry is number => expiry !== null));
@@ -418,7 +383,7 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
     }
   }
 
-  const renamed = new Map<string, string>(networks.flatMap(network => renamesOf(network)
+  const renamed = new Map<string, string>(networks.flatMap(({ network }) => renamesOf(network)
     .map(override => [ `${network.key}:${override.tokenAddress}`, override.symbol ] as const)));
 
   /*
@@ -444,7 +409,7 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
     key:           () => `registry:${snapshot.registryVersion.checksum.slice(0, 16)}`,
     historyKeyFor: network => `registry:${network}:${historyKeys.get(network) ?? 'none'}`,
     markets:       () => markets,
-    networks:      () => networks,
+    networkOn:     chainId => networks.find(entry => entry.network.chainId === chainId) ?? null,
     tokenAt:     (network, address) => tokens.get(`${network}:${address.toLowerCase()}`) ?? null,
     baseTokenAt: (network, address) => bases.get(`${network}:${address.toLowerCase()}`) ?? null,
     renamedSymbolAt: (network, address) => renamed.get(`${network}:${address.toLowerCase()}`) ?? null,
@@ -454,5 +419,5 @@ function catalogOf(snapshot: RegistrySnapshotV1, now: Date = new Date()): Catalo
   };
 }
 
-export type { Catalog, CatalogMarket, RegistryComet, ServedMarket };
+export type { Catalog, CatalogMarket, CatalogNetwork, RegistryComet, ServedMarket };
 export { catalogOf, isServed, servedNetworks };
