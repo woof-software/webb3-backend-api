@@ -1,5 +1,5 @@
 import { checksumAddress } from '../../lib/model/comet-registry.js';
-import type { TokenVisibilityV1 } from '../../lib/model/comet-registry.js';
+import type { TokenVisibilityV1, VisibilityReasonV1 } from '../../lib/model/comet-registry.js';
 
 // what a collateral of /summary answers, in the order it writes it, where every decision was read and every value is known
 const COLLATERAL_KEYS = [
@@ -10,23 +10,59 @@ const COLLATERAL_KEYS = [
   'is_visible', 'visibility_reason',
 ] as const;
 
+// the token list's threshold, in whole USD
+const THRESHOLD_USD = 250_000n;
+
+/*
+ * Whether discovery shows a token in one market, and why, as a collateral of
+ * /summary says it, stated apart from the rule's code, which asks the rule
+ * every way a decision that could not be read might have gone: from whether
+ * the market's Comet hides the token and whether it has it deprecated,
+ * whether the token is strategic on its chain, each null where that kind of
+ * decision could not be read, and the value the list writes of the token,
+ * null where it is not known. The token is not shown where the Comet hides it
+ * or has it deprecated, or where it is not strategic and is worth less than
+ * the threshold, whatever the other decisions are; it is shown where the
+ * Comet neither hides nor deprecates it and it is strategic, worth at least
+ * the threshold, or of a value that cannot be read. Either is said wherever
+ * it holds. Why is said only where every kind of decision the rule asks, up to
+ * the one that decides, was read: the hiding, then the deprecating, then the
+ * strategic mark.
+ */
+function visibilityOnSummary(
+  { isHidden, isDeprecated, isStrategic }: { isHidden: boolean | null, isDeprecated: boolean | null, isStrategic: boolean | null },
+  valueUsd: string | null,
+): { is_visible?: boolean, visibility_reason?: VisibilityReasonV1 } {
+  // the list writes every digit and no exponent, so the whole part tells a value short of a whole threshold
+  const below    = valueUsd !== null && BigInt(valueUsd.split('.')[0]) < THRESHOLD_USD;
+  const notShown = isHidden === true || isDeprecated === true || (isStrategic === false && below);
+  const shown    = isHidden === false && isDeprecated === false && (isStrategic === true || !below);
+  const reason: VisibilityReasonV1 | null = (
+      isHidden === true                               ? 'hidden'
+    : isHidden === null                               ? null
+    : isDeprecated === true                           ? 'deprecated'
+    : isDeprecated === null || isStrategic === null   ? null
+    : isStrategic                                     ? 'strategic'
+    : valueUsd === null                               ? 'data_unavailable'
+    : below                                           ? 'below_threshold'
+    : 'collateral_threshold'
+  );
+  return {
+    ...(shown || notShown ? { is_visible: shown } : {}),
+    ...(reason === null ? {} : { visibility_reason: reason }),
+  };
+}
+
 /*
  * What a collateral of /summary says of its token as the token list says it:
  * every field of the list's token, under the summary's names, each address
  * checksummed, and a value that is not known left out. `is_deprecated` and
  * `is_hidden` are the market's own, and the list has no such fields. So is
- * whether discovery shows the token: not where the market's Comet hides it or
- * has it deprecated (`here`), and elsewhere as the list says. That holds of
- * every token the list does not call hidden or deprecated, and is refused for
- * any other: a market that neither hides nor deprecates a token the list calls
- * so decides it by the rest of the rule, which a test of one states for
- * itself.
+ * whether discovery shows the token: by the market's Comet's decisions
+ * (`here`), and by the token's strategic mark and value as the list has them
+ * (visibilityOnSummary), every decision read.
  */
 function onSummary(token: TokenVisibilityV1, here: { isHidden: boolean, isDeprecated: boolean }) {
-  const decidedHere = here.isHidden || here.isDeprecated;
-  if (!decidedHere && (token.visibilityReason === 'hidden' || token.visibilityReason === 'deprecated')) {
-    throw new Error(`the list calls ${token.symbol} ${token.visibilityReason}, so a market that neither hides nor deprecates it answers by the rest of the rule, which onSummary does not say`);
-  }
   return {
     name:                  token.name,
     decimals:              token.decimals,
@@ -46,9 +82,8 @@ function onSummary(token: TokenVisibilityV1, here: { isHidden: boolean, isDeprec
       provenance,
       expires_at:         expiresAt,
     })),
-    is_visible:        decidedHere ? false : token.isVisible,
-    visibility_reason: here.isHidden ? 'hidden' : here.isDeprecated ? 'deprecated' : token.visibilityReason,
+    ...visibilityOnSummary({ ...here, isStrategic: token.isStrategic }, token.collateralValueUsd),
   };
 }
 
-export { COLLATERAL_KEYS, onSummary };
+export { COLLATERAL_KEYS, onSummary, visibilityOnSummary };

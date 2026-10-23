@@ -228,60 +228,42 @@ type TokenPolicyEventRow = {
 };
 
 /*
- * Deprecated collaterals, from migrations/0006_legacy_collaterals.sql under
- * the names 0007_deprecated_collaterals.sql gave them: which collaterals of
- * which Comets an administrator has marked deprecated, kept by chain id, Comet
+ * The decisions about a collateral of a Comet, a table a kind, which differ in
+ * the name of the flag alone (`Flag`): deprecated collaterals, from
+ * migrations/0006_legacy_collaterals.sql under the names
+ * 0007_deprecated_collaterals.sql gave them, and hidden collaterals, from
+ * migrations/0008_hidden_collaterals.sql. They are kept by chain id, Comet
  * address and token address rather than on a versioned row, so that they
  * outlive every activation as token policies do.
  */
-type DeprecatedCollateralRow = {
+type CollateralDecisionRow<Flag extends string> = {
   chain_id:      number,
   comet_address: Address,
   token_address: Address,
-  is_deprecated: number,
+} & Record<Flag, number> & {
   updated_at:    string,
   updated_by:    string,
 };
 
-type DeprecatedCollateralEventRow = {
-  id:                     string,
-  chain_id:               number,
-  comet_address:          Address,
-  token_address:          Address,
-  previous_is_deprecated: number | null,
-  is_deprecated:          number,
-  actor:                  string,
-  reason:                 string,
-  created_at:             string,
-};
-
-/*
- * Hidden collaterals, from migrations/0008_hidden_collaterals.sql: which
- * collaterals of which Comets an administrator has hidden, kept as the
- * deprecated ones are.
- */
-type HiddenCollateralRow = {
+type CollateralDecisionEventRow<Flag extends string> = {
+  id:            string,
   chain_id:      number,
   comet_address: Address,
   token_address: Address,
-  is_hidden:     number,
-  updated_at:    string,
-  updated_by:    string,
+} & Record<`previous_${Flag}`, number | null> & Record<Flag, number> & {
+  actor:         string,
+  reason:        string,
+  created_at:    string,
 };
 
-type HiddenCollateralEventRow = {
-  id:                 string,
-  chain_id:           number,
-  comet_address:      Address,
-  token_address:      Address,
-  previous_is_hidden: number | null,
-  is_hidden:          number,
-  actor:              string,
-  reason:             string,
-  created_at:         string,
-};
+type DeprecatedCollateralRow      = CollateralDecisionRow<'is_deprecated'>;
+type DeprecatedCollateralEventRow = CollateralDecisionEventRow<'is_deprecated'>;
+type HiddenCollateralRow          = CollateralDecisionRow<'is_hidden'>;
+type HiddenCollateralEventRow     = CollateralDecisionEventRow<'is_hidden'>;
 
 export type {
+  CollateralDecisionEventRow,
+  CollateralDecisionRow,
   DeprecatedCollateralEventRow,
   DeprecatedCollateralRow,
   HiddenCollateralEventRow,

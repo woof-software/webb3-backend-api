@@ -2,12 +2,10 @@ import t, { Test } from 'tap';
 
 import C3Api, { Env } from '../../../entrypoint.js';
 
-import type { RegistrySnapshotV1, TokenListV1, TokenVisibilityV1 } from '../../../lib/model/comet-registry.js';
+import type { Address, RegistrySnapshotV1, TokenListV1, TokenVisibilityV1 } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
-import { setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
-import { HIDDEN_KEY } from '../../../src/registry/deprecated-collaterals.js';
-import { setHiddenCollateral } from '../../../src/registry/hidden-collateral-repository.js';
+import { DEPRECATED_KEY, HIDDEN_KEY } from '../../../src/registry/collateral-decisions.js';
 import { DEADLINE_MS, positionSetOf, positionsOf, recordKey } from '../../../src/registry/token-collateral.js';
 import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
@@ -18,6 +16,9 @@ import { MemoryKv } from '../../util/kv.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 import { failingStatements, makeTestEnv } from '../../util/test-env.js';
+
+import type { DecisionKindUnderTest } from './decision-scenarios.js';
+import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, TOKEN_POLICIES, statementsOf } from './decision-scenarios.js';
 
 import '../../../shim/node-self.js';
 
@@ -233,7 +234,7 @@ t.test('a request without an execution context waits for what its work hands ove
   const held  = heldMinuteRecords(store);
 
   const answer = C3Api.fetch(new Request(`https://api.test.local/registry/v1/networks/${BASE}/tokens`),
-    { ...env, APP_DB: failingStatements(registry.db, /FROM token_policies WHERE chain_id/), kv_mainnet: held.kv });
+    { ...env, APP_DB: failingStatements(registry.db, statementsOf(TOKEN_POLICIES)), kv_mainnet: held.kv });
   t.notOk(await settledWithin(answer, 300), 'the refusal waits while the record its valuation handed over is held');
 
   held.release();
@@ -274,7 +275,7 @@ t.test('policies the database cannot give are a 503, and are logged', async t =>
   const { registry, get } = await workerOf(t, BASE_NODE);
   const errors = captureErrors(t);
 
-  const response = await get(`/registry/v1/networks/${BASE}/tokens`, failingStatements(registry.db, /FROM token_policies WHERE chain_id/));
+  const response = await get(`/registry/v1/networks/${BASE}/tokens`, failingStatements(registry.db, statementsOf(TOKEN_POLICIES)));
   t.equal(response.status, 503);
   const body = await response.json() as ErrorBody;
   t.same([ body.error.code, body.error.message ], [ 'UPSTREAM_UNAVAILABLE', 'the token policies could not be read' ]);
@@ -285,181 +286,155 @@ t.test('policies the database cannot give are a 503, and are logged', async t =>
 
 const MAINNET_MARKETS = fixture.networks.find(network => network.chainId === 1)!.markets;
 
-// marks one collateral of one mainnet market deprecated, by the market's deployment key and the token's symbol
-const markDeprecated = (db: D1Database, key: string, symbol: string, isDeprecated: boolean = true) => {
+// a kind of decision about a collateral, as the token list answers for it
+type ListedKind = {
+  decisions:  DecisionKindUnderTest,
+  // the record the active reads keep of the kind's decisions
+  key:        string,
+  // the fields a token says the kind's decisions in, as they are for the Comets that decided, and for every enabled market that takes it
+  fields:     Array<keyof TokenVisibilityV1>,
+  marks:      (comets: Address[], everywhere: boolean) => Partial<TokenVisibilityV1>,
+  // the reason a token decided about across the chain is given
+  reason:     string,
+  // in the names of the tests: once a token is not shown, what a market's decision does to it, and why the list cannot answer without them
+  everywhere: string,
+  does:       string,
+  unread:     string,
+};
+
+const DEPRECATED_LISTED: ListedKind = {
+  decisions:  DEPRECATED_COLLATERALS,
+  key:        DEPRECATED_KEY,
+  fields:     [ 'isDeprecated', 'deprecatedIn' ],
+  marks:      (comets, everywhere) => ({ isDeprecated: everywhere, deprecatedIn: comets }),
+  reason:     'deprecated',
+  everywhere: 'an enabled market takes it and every one that does has it deprecated',
+  does:       'has it deprecated',
+  unread:     'without them the list would call a deprecated collateral current, and show a token discovery does not',
+};
+
+// a token the list does not show for its hidden decisions says so only by its reason: it has no flag of its own for them
+const HIDDEN_LISTED: ListedKind = {
+  decisions:  HIDDEN_COLLATERALS,
+  key:        HIDDEN_KEY,
+  fields:     [ 'hiddenIn' ],
+  marks:      comets => ({ hiddenIn: comets }),
+  reason:     'hidden',
+  everywhere: 'an enabled market that takes it hides it, and every other one hides it or has it deprecated',
+  does:       'hides it',
+  unread:     'without them the list would show a token an administrator hid',
+};
+
+const LISTED_KINDS = [ [ DEPRECATED_LISTED, HIDDEN_LISTED ], [ HIDDEN_LISTED, DEPRECATED_LISTED ] ] as const;
+
+// a decision about one collateral of one mainnet market, by the market's deployment key and the token's symbol
+const mark = (db: D1Database, listed: ListedKind, key: string, symbol: string, flag: boolean = true) => {
   const market = MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!;
-  return setDeprecatedCollateral(db, {
-    chainId:      1,
-    cometAddress: market.contracts.comet!,
-    tokenAddress: assetOf(market, symbol).token.address,
-    isDeprecated,
-    actor:        'test',
-    reason:       'decided for a token list test',
+  return listed.decisions.set(db, {
+    subject: { cometAddress: market.contracts.comet!, tokenAddress: assetOf(market, symbol).token.address },
+    flag,
+    actor:   'test',
+    reason:  'decided for a token list test',
   });
 };
 
+const fieldsOf = (listed: ListedKind, token: TokenVisibilityV1) => Object.fromEntries(listed.fields.map(field => [ field, token[field] ]));
+
 /*
- * Deprecated collateral (migrations 0006 and 0007): weETH is a collateral of
- * the USDC, WETH and USDT markets of the fixture's mainnet, and mETH of the
- * USDT market alone. Both are strategic here, so discovery shows them whatever
+ * Deprecated and hidden collateral (migrations 0006 to 0008), each kind
+ * decided about alone and beside the other: weETH is a collateral of the
+ * USDC, WETH and USDT markets of the fixture's mainnet, and mETH of the USDT
+ * market alone. Both are strategic here, so discovery shows them whatever
  * they are worth, until a token is deprecated in every enabled market that
- * takes it. A decision is read on every request, and changes nothing but the
- * fields that say where a token is deprecated and, for such a token, whether
- * it is shown.
+ * takes it, or an enabled market that takes it hides it and every other one
+ * hides it or has it deprecated; either is asked before whether it is
+ * strategic. A decision is read on every request, and changes nothing but
+ * the fields that say where a token is decided about and, for a token
+ * decided about across the chain, whether it is shown.
  */
-t.test('a token says where it is a deprecated collateral, and is not shown once it is one in every enabled market that takes it', async t => {
-  const { registry, get } = await workerOf(t);
-  const comet   = (key: string) => MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!.contracts.comet!;
-  const token   = (key: string, symbol: string) => assetOf(MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!, symbol).token.address;
-  const list    = async () => bySymbol(await listOf(await get('/registry/v1/networks/1/tokens')));
-  const visible = async () => (await listOf(await get('/registry/v1/networks/1/tokens?visibleOnly=true'))).tokens.map(entry => entry.symbol);
-  const stateOf = (tokens: Map<string, TokenVisibilityV1>, symbol: string) => {
-    const { isDeprecated, deprecatedIn, isVisible, visibilityReason } = tokens.get(symbol)!;
-    return { isDeprecated, deprecatedIn, isVisible, visibilityReason };
-  };
+for (const [ listed, other ] of LISTED_KINDS) {
+  const { adjective } = listed.decisions;
+  t.test(`a token says where it is a ${adjective} collateral, and is not shown once ${listed.everywhere}`, async t => {
+    const { registry, get } = await workerOf(t);
+    const comet   = (key: string) => MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!.contracts.comet!;
+    const token   = (key: string, symbol: string) => assetOf(MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!, symbol).token.address;
+    const list    = async () => bySymbol(await listOf(await get('/registry/v1/networks/1/tokens')));
+    const visible = async () => (await listOf(await get('/registry/v1/networks/1/tokens?visibleOnly=true'))).tokens.map(entry => entry.symbol);
+    const stateOf = (tokens: Map<string, TokenVisibilityV1>, symbol: string) => {
+      const entry = tokens.get(symbol)!;
+      return { ...fieldsOf(listed, entry), isVisible: entry.isVisible, visibilityReason: entry.visibilityReason };
+    };
 
-  await decide(registry.db, 1, token('usdt', 'mETH'), true);
-  await decide(registry.db, 1, token('usdt', 'weETH'), true);
-  const before = await list();
-  t.ok([ ...before.values() ].every(entry => entry.isDeprecated === false && entry.deprecatedIn.length === 0), 'nothing is deprecated at first');
-  t.same(await visible(), [ 'mETH', 'weETH' ], 'and discovery shows the two strategic tokens');
+    await decide(registry.db, 1, token('usdt', 'mETH'), true);
+    await decide(registry.db, 1, token('usdt', 'weETH'), true);
+    const before = await list();
+    t.same([ ...before.values() ].map(entry => fieldsOf(listed, entry)), [ ...before.values() ].map(() => listed.marks([], false)),
+      `nothing is ${adjective} at first`);
+    t.same(await visible(), [ 'mETH', 'weETH' ], 'and discovery shows the two strategic tokens');
 
-  await markDeprecated(registry.db, 'usdc', 'weETH');
-  await markDeprecated(registry.db, 'usdt', 'weETH');
-  await markDeprecated(registry.db, 'usdt', 'mETH');
-  const partly = await list();
-  t.same(stateOf(partly, 'weETH'), { isDeprecated: false, deprecatedIn: [ comet('usdc'), comet('usdt') ].sort(), isVisible: true, visibilityReason: 'strategic' },
-    'a token deprecated in two of the three enabled markets that take it names the two, and is shown as before');
-  t.same(stateOf(partly, 'mETH'), { isDeprecated: true, deprecatedIn: [ comet('usdt') ], isVisible: false, visibilityReason: 'deprecated' },
-    'one deprecated in the one market that takes it is not shown, strategic as it is');
-  t.same(await visible(), [ 'weETH' ], 'and visibleOnly leaves it out');
+    await mark(registry.db, listed, 'usdc', 'weETH');
+    await mark(registry.db, listed, 'usdt', 'weETH');
+    await mark(registry.db, listed, 'usdt', 'mETH');
+    const partly = await list();
+    t.same(stateOf(partly, 'weETH'), { ...listed.marks([ comet('usdc'), comet('usdt') ].sort(), false), isVisible: true, visibilityReason: 'strategic' },
+      `a token ${adjective} in two of the three enabled markets that take it names the two, and is shown as before`);
+    t.same(stateOf(partly, 'mETH'), { ...listed.marks([ comet('usdt') ], true), isVisible: false, visibilityReason: listed.reason },
+      `one ${adjective} in the one market that takes it is not shown, strategic as it is`);
+    t.same(await visible(), [ 'weETH' ], 'and visibleOnly leaves it out');
 
-  await markDeprecated(registry.db, 'weth', 'weETH');
-  const after = await list();
-  t.same(stateOf(after, 'weETH'), { isDeprecated: true, deprecatedIn: [ comet('usdc'), comet('usdt'), comet('weth') ].sort(), isVisible: false, visibilityReason: 'deprecated' },
-    'a token deprecated in every enabled market that takes it is not shown, the next request says');
-  t.same(await visible(), [], 'which leaves discovery nothing to show');
+    await mark(registry.db, other, 'weth', 'weETH');
+    const mixed = (await list()).get('weETH')!;
+    t.same(
+      { ...fieldsOf(listed, mixed), ...fieldsOf(other, mixed), isVisible: mixed.isVisible, visibilityReason: mixed.visibilityReason },
+      { ...listed.marks([ comet('usdc'), comet('usdt') ].sort(), false), ...other.marks([ comet('weth') ], false), isVisible: false, visibilityReason: 'hidden' },
+      `weETH, ${adjective} in two of them, is not shown once the third ${other.does}, though not deprecated in every one: none of them offers it and leaves it to discovery`,
+    );
+    await mark(registry.db, other, 'weth', 'weETH', false);
 
-  const decided = [ 'mETH', 'weETH' ];
-  const shown = (tokens: Map<string, TokenVisibilityV1>) => [ ...tokens.values() ]
-    .filter(entry => !decided.includes(entry.symbol))
-    .map(entry => [ entry.symbol, entry.isVisible, entry.visibilityReason ]);
-  t.same(shown(after), shown(before), 'every other token is shown or not as it was');
-  const rest = (tokens: Map<string, TokenVisibilityV1>) => [ ...tokens.values() ].map(({
-    isDeprecated: _isDeprecated, deprecatedIn: _deprecatedIn, isVisible: _isVisible, visibilityReason: _visibilityReason, ...entry
-  }) => entry);
-  t.same(rest(after), rest(before), 'and every other field of every token is what it was, its value included');
+    await mark(registry.db, listed, 'weth', 'weETH');
+    const after = await list();
+    t.same(stateOf(after, 'weETH'),
+      { ...listed.marks([ comet('usdc'), comet('usdt'), comet('weth') ].sort(), true), isVisible: false, visibilityReason: listed.reason },
+      `a token ${adjective} in every enabled market that takes it is not shown, the next request says`);
+    t.same(await visible(), [], 'which leaves discovery nothing to show');
 
-  await markDeprecated(registry.db, 'weth', 'weETH', false);
-  t.same(await visible(), [ 'weETH' ], 'a decision taken back shows the token again');
-});
+    const decided = [ 'mETH', 'weETH' ];
+    const shown = (tokens: Map<string, TokenVisibilityV1>) => [ ...tokens.values() ]
+      .filter(entry => !decided.includes(entry.symbol))
+      .map(entry => [ entry.symbol, entry.isVisible, entry.visibilityReason ]);
+    t.same(shown(after), shown(before), 'every other token is shown or not as it was');
+    const ruled = new Set<string>([ ...listed.fields, 'isVisible', 'visibilityReason' ]);
+    const rest  = (tokens: Map<string, TokenVisibilityV1>) => [ ...tokens.values() ]
+      .map(entry => Object.fromEntries(Object.entries(entry).filter(([ field ]) => !ruled.has(field))));
+    t.same(rest(after), rest(before),
+      `and every other field of every token is what it was, its value and its ${other.decisions.adjective} decisions included`);
 
-// hides one collateral of one mainnet market, by the market's deployment key and the token's symbol
-const hide = (db: D1Database, key: string, symbol: string, isHidden: boolean = true) => {
-  const market = MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!;
-  return setHiddenCollateral(db, {
-    chainId:      1,
-    cometAddress: market.contracts.comet!,
-    tokenAddress: assetOf(market, symbol).token.address,
-    isHidden,
-    actor:        'test',
-    reason:       'decided for a token list test',
+    await mark(registry.db, listed, 'weth', 'weETH', false);
+    t.same(await visible(), [ 'weETH' ], 'a decision taken back shows the token again');
   });
-};
+}
 
 /*
- * Hidden collateral (migration 0008), decided as a deprecated one is, of the
- * same tokens: strategic again, so discovery shows them until an enabled
- * market that takes a token hides it and every other one hides it or has it
- * deprecated, which is asked before it is strategic. A decision is read on
- * every request, and changes nothing but the Comets a token is named hidden
- * in and, for a token hidden across the chain, whether it is shown.
+ * The list reads each kind's decisions from the database on every request,
+ * and does not answer from the record the active reads keep of them.
  */
-t.test('a token says where it is a hidden collateral, and is not shown once every enabled market that takes it hides it or has it deprecated', async t => {
-  const { registry, get } = await workerOf(t);
-  const comet   = (key: string) => MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!.contracts.comet!;
-  const token   = (key: string, symbol: string) => assetOf(MAINNET_MARKETS.find(entry => entry.deploymentKey === key)!, symbol).token.address;
-  const list    = async () => bySymbol(await listOf(await get('/registry/v1/networks/1/tokens')));
-  const visible = async () => (await listOf(await get('/registry/v1/networks/1/tokens?visibleOnly=true'))).tokens.map(entry => entry.symbol);
-  const stateOf = (tokens: Map<string, TokenVisibilityV1>, symbol: string) => {
-    const { hiddenIn, isVisible, visibilityReason } = tokens.get(symbol)!;
-    return { hiddenIn, isVisible, visibilityReason };
-  };
+for (const [ listed ] of LISTED_KINDS) {
+  const { adjective, label } = listed.decisions;
+  t.test(`${label} decisions the database cannot give are a 503, and are logged`, async t => {
+    const { registry, env, get } = await workerOf(t, BASE_NODE);
+    const errors = captureErrors(t);
+    t.equal((await get('/registry/v1/active')).status, 200, 'a read of the active version');
+    t.not(await env.kv_registry.get(listed.key), null, `records the ${adjective} decisions`);
 
-  await decide(registry.db, 1, token('usdt', 'mETH'), true);
-  await decide(registry.db, 1, token('usdt', 'weETH'), true);
-  const before = await list();
-  t.ok([ ...before.values() ].every(entry => entry.hiddenIn.length === 0), 'nothing is hidden at first');
-  t.same(await visible(), [ 'mETH', 'weETH' ], 'and discovery shows the two strategic tokens');
-
-  await hide(registry.db, 'usdc', 'weETH');
-  await hide(registry.db, 'usdt', 'weETH');
-  await hide(registry.db, 'usdt', 'mETH');
-  const partly = await list();
-  t.same(stateOf(partly, 'weETH'), { hiddenIn: [ comet('usdc'), comet('usdt') ].sort(), isVisible: true, visibilityReason: 'strategic' },
-    'a token hidden in two of the three enabled markets that take it names the two, and is shown as before');
-  t.same(stateOf(partly, 'mETH'), { hiddenIn: [ comet('usdt') ], isVisible: false, visibilityReason: 'hidden' },
-    'one hidden in the one market that takes it is not shown, strategic as it is');
-  t.same(await visible(), [ 'weETH' ], 'and visibleOnly leaves it out');
-
-  await markDeprecated(registry.db, 'weth', 'weETH');
-  const mixed = (await list()).get('weETH')!;
-  t.same([ mixed.isDeprecated, mixed.deprecatedIn, mixed.hiddenIn, mixed.isVisible, mixed.visibilityReason ],
-    [ false, [ comet('weth') ], [ comet('usdc'), comet('usdt') ].sort(), false, 'hidden' ],
-    'weETH, hidden in two of them, is not shown once the third has it deprecated, though not deprecated in every one: none of them offers it and leaves it to discovery');
-  await markDeprecated(registry.db, 'weth', 'weETH', false);
-
-  await hide(registry.db, 'weth', 'weETH');
-  const after = await list();
-  t.same(stateOf(after, 'weETH'), { hiddenIn: [ comet('usdc'), comet('usdt'), comet('weth') ].sort(), isVisible: false, visibilityReason: 'hidden' },
-    'a token hidden in every enabled market that takes it is not shown, the next request says');
-  t.same(await visible(), [], 'which leaves discovery nothing to show');
-
-  const decided = [ 'mETH', 'weETH' ];
-  const shown = (tokens: Map<string, TokenVisibilityV1>) => [ ...tokens.values() ]
-    .filter(entry => !decided.includes(entry.symbol))
-    .map(entry => [ entry.symbol, entry.isVisible, entry.visibilityReason ]);
-  t.same(shown(after), shown(before), 'every other token is shown or not as it was');
-  const rest = (tokens: Map<string, TokenVisibilityV1>) => [ ...tokens.values() ].map(({
-    hiddenIn: _hiddenIn, isVisible: _isVisible, visibilityReason: _visibilityReason, ...entry
-  }) => entry);
-  t.same(rest(after), rest(before), 'and every other field of every token is what it was, its value and its deprecated decisions included');
-
-  await hide(registry.db, 'weth', 'weETH', false);
-  t.same(await visible(), [ 'weETH' ], 'a decision taken back shows the token again');
-});
-
-t.test('deprecated collateral decisions the database cannot give are a 503, and are logged', async t => {
-  const { registry, get } = await workerOf(t, BASE_NODE);
-  const errors = captureErrors(t);
-
-  const response = await get(`/registry/v1/networks/${BASE}/tokens`, failingStatements(registry.db, /FROM deprecated_collaterals\s+WHERE is_deprecated/));
-  t.equal(response.status, 503, 'without them the list would call a deprecated collateral current, and show a token discovery does not');
-  const body = await response.json() as ErrorBody;
-  t.same([ body.error.code, body.error.message ], [ 'UPSTREAM_UNAVAILABLE', 'the deprecated collateral decisions could not be read' ]);
-  t.ok(errors.some(line => line.includes('the token list could not read the deprecated collateral decisions')), 'the outage is logged');
-  t.ok(errors.some(line => line.includes('Network connection lost') && line.includes(body.error.requestId)),
-    'with its cause, under the id the answer names');
-});
-
-/*
- * The hidden decisions are read as the deprecated ones are, and the list does
- * not answer from the record the active reads keep of them either.
- */
-t.test('hidden collateral decisions the database cannot give are a 503, and are logged', async t => {
-  const { registry, env, get } = await workerOf(t, BASE_NODE);
-  const errors = captureErrors(t);
-  t.equal((await get('/registry/v1/active')).status, 200, 'a read of the active version');
-  t.not(await env.kv_registry.get(HIDDEN_KEY), null, 'records the hidden decisions');
-
-  const response = await get(`/registry/v1/networks/${BASE}/tokens`, failingStatements(registry.db, /FROM hidden_collaterals\s+WHERE is_hidden/));
-  t.equal(response.status, 503, 'without them the list would show a token an administrator hid');
-  const body = await response.json() as ErrorBody;
-  t.same([ body.error.code, body.error.message ], [ 'UPSTREAM_UNAVAILABLE', 'the hidden collateral decisions could not be read' ]);
-  t.ok(errors.some(line => line.includes('the token list could not read the hidden collateral decisions')), 'the outage is logged');
-  t.ok(errors.some(line => line.includes('Network connection lost') && line.includes(body.error.requestId)),
-    'with its cause, under the id the answer names');
-});
+    const response = await get(`/registry/v1/networks/${BASE}/tokens`, failingStatements(registry.db, statementsOf(listed.decisions)));
+    t.equal(response.status, 503, listed.unread);
+    const body = await response.json() as ErrorBody;
+    t.same([ body.error.code, body.error.message ], [ 'UPSTREAM_UNAVAILABLE', `the ${label} decisions could not be read` ]);
+    t.ok(errors.some(line => line.includes(`the token list could not read the ${label} decisions`)), 'the outage is logged');
+    t.ok(errors.some(line => line.includes('Network connection lost') && line.includes(body.error.requestId)),
+      'with its cause, under the id the answer names');
+  });
+}
 
 /*
  * When D1 cannot be reached, the registry answers from the version it last
@@ -518,13 +493,13 @@ t.test('every answer of the token list names the version it read, and only that'
     'a list names the version it was made from, and is kept briefly');
   t.same(await answer('GET', '10/tokens'), { status: 404, headers: { ...readable, ...json, ...version } },
     'a chain the version does not hold is refused under that version');
-  t.same(await answer('GET', tokens, failingStatements(registry.db, /FROM token_policies WHERE chain_id/)),
+  t.same(await answer('GET', tokens, failingStatements(registry.db, statementsOf(TOKEN_POLICIES))),
     { status: 503, headers: { ...readable, ...json, ...version } },
     'and so is a list whose policies could not be read after the version was');
-  t.same(await answer('GET', tokens, failingStatements(registry.db, /FROM deprecated_collaterals\s+WHERE is_deprecated/)),
+  t.same(await answer('GET', tokens, failingStatements(registry.db, statementsOf(DEPRECATED_COLLATERALS))),
     { status: 503, headers: { ...readable, ...json, ...version } },
     'or whose deprecated collateral decisions could not be');
-  t.same(await answer('GET', tokens, failingStatements(registry.db, /FROM hidden_collaterals\s+WHERE is_hidden/)),
+  t.same(await answer('GET', tokens, failingStatements(registry.db, statementsOf(HIDDEN_COLLATERALS))),
     { status: 503, headers: { ...readable, ...json, ...version } },
     'or whose hidden collateral decisions could not be');
   t.same(await answer('GET', `${tokens}?visibleOnly=yes`), { status: 400, headers: { ...readable, ...json } },
@@ -539,7 +514,7 @@ t.test('every answer of the token list names the version it read, and only that'
     },
   }, 'and its preflight is the public registry preflight');
 
-  const stale = await answer('GET', tokens, failingStatements(registry.db, /FROM registry_state|FROM token_policies WHERE chain_id/));
+  const stale = await answer('GET', tokens, failingStatements(failingStatements(registry.db, /FROM registry_state/), statementsOf(TOKEN_POLICIES)));
   const { 'x-registry-stale': age, ...rest } = stale.headers;
   t.match(age, /^[0-9]+$/, 'a refusal under a version the database could not confirm says how old it is');
   t.same({ status: stale.status, headers: rest }, { status: 503, headers: { ...readable, ...json, ...version, 'cache-control': 'no-store' } },

@@ -1,9 +1,6 @@
 import t from 'tap';
 
-import { randomUUID } from 'node:crypto';
-
 import type {
-  ActiveMarketV1,
   DeprecatedCollateralListV1,
   HiddenCollateralApplyV1,
   HiddenCollateralListV1,
@@ -22,11 +19,11 @@ import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, decisionScenarios } from '.
  * every kind of decision does is in decision-scenarios.ts, run here for
  * hidden collaterals: a decision and its audit, idempotency under a race,
  * survival across activations, the database guard against an activation that
- * races a write, and a list refused for its problems or for a race. Beside
- * them, the tests of hidden collaterals alone: the market reads that flag
- * them, and a list exported, edited, reviewed and applied through the
- * hidden-collaterals routes, apart from the deprecated decisions about the
- * same collaterals.
+ * races a write, a list refused for its problems or for a race, and the
+ * market reads that flag a hidden collateral. Beside them, the test of hidden
+ * collaterals alone: a list exported, edited, reviewed and applied through
+ * the hidden-collaterals routes, apart from the deprecated decisions about
+ * the same collaterals.
  *
  * Refusals of malformed requests are in hidden-collateral-routes.test.ts, and
  * what the active reads answer, and the record the commands keep for an
@@ -55,37 +52,6 @@ const WEETH = collateral('usdt', 'weETH');
 const REVIEW = HIDDEN_COLLATERALS.list.review;
 const APPLY  = HIDDEN_COLLATERALS.list.apply;
 
-// the collaterals a public market read flags hidden, by symbol
-async function hiddenIn(market: string): Promise<string[]> {
-  const { body } = await admin.read<{ market: ActiveMarketV1 }>(`/registry/v1/networks/1/markets/${market}`, {});
-  return body.market.collateralAssets.filter(asset => asset.isHidden).map(asset => asset.token.symbol);
-}
-
-/*
- * What a decision changes for every client: the market reads flag a
- * collateral from the moment it is hidden until the decision is reversed,
- * and only in a version whose Comet takes it.
- */
-t.test('the market reads flag a collateral while it is hidden', async t => {
-  const db    = await harness.freshDatabase();
-  const first = await seedValidated(db);
-  await admin.switchTo(first);
-  const path = HIDDEN_COLLATERALS.path(1, { cometAddress: USDT, tokenAddress: METH });
-
-  t.same(await hiddenIn(USDT), [], 'nothing is flagged before anybody decides');
-  await admin.patch(path, { isHidden: true, reason: 'not for discovery' });
-  t.same(await hiddenIn(USDT), [ 'mETH' ], 'the market reads flag the collateral at once');
-  await admin.patch(path, { isHidden: false, reason: 'shown again' });
-  t.same(await hiddenIn(USDT), [], 'and stop flagging it once the decision is reversed');
-
-  await admin.patch(path, { isHidden: true, reason: 'not for discovery, again' });
-  await admin.switchTo(await seedValidated(db, { networks: HIDDEN_COLLATERALS.without, versionId: randomUUID() }));
-  t.same(await hiddenIn(USDT), [], 'a version whose Comet does not take the collateral has nothing of it to flag');
-  await admin.switchTo(first, 'rollback');
-  t.same(await hiddenIn(USDT), [ 'mETH' ], 'and a version that brings it back flags it again');
-});
-
-// the collaterals of a list whose decision `flagged` finds set, as `market/symbol`, in the list's order
 function marked<Row extends { deploymentKey?: string | null, symbol?: string | null }>(rows: Row[], flagged: (row: Row) => boolean): string[] {
   return rows.filter(flagged).map(row => `${row.deploymentKey}/${row.symbol}`);
 }

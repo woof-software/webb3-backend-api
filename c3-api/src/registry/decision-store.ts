@@ -8,11 +8,11 @@ import { registryHeaders } from './version-headers.js';
 /*
  * The decisions an administrator makes about what the registry serves, with
  * the audit of every change to each: token policies
- * (token-policy-repository.ts), deprecated collaterals
- * (deprecated-collateral-repository.ts) and hidden collaterals
- * (hidden-collateral-repository.ts). All are written, read, reviewed and
- * applied here, the same way: each kind describes itself to the store
- * (DecisionKind), and answers in its own types.
+ * (token-policy-repository.ts), and the deprecated and the hidden collaterals
+ * of Comets (collateral-decision-repository.ts, which describes both kinds).
+ * All are written, read, reviewed and applied here, the same way: each kind
+ * describes itself to the store (DecisionKind), and its module answers in the
+ * types lib/model/comet-registry.ts gives it.
  *
  * One decision and a whole list of them are written alike, by one batch
  * whose statements take the decisions as one JSON parameter: a list of any
@@ -38,38 +38,41 @@ type StateRow = {
   written_id: string | null,
 };
 
-// what every kind's decision says beside what it is about
-type DecisionBase = {
+// what every kind's decision is about: a token, of a chain or of a Comet
+type SubjectBase = {
   // lowercase, as the registry stores every address
   tokenAddress: Address,
+};
+
+// what every kind's decision says beside what it is about
+type DecisionBase = {
   // null for a row that leaves what it is about as it is, and so needs no reason
-  reason:       string | null,
+  reason: string | null,
 };
 
 /*
  * A kind of decision, as the store writes, reads, reviews and applies it:
- * `Decision` is what one write records, `Listed` a row of a list. Its
- * statements name its own tables and no other kind's. Token policies keep
- * theirs as they are written; the two kinds about a collateral of a Comet
- * build theirs from one template over their tables' names
- * (collateral-decision-repository.ts), since those tables differ in nothing
- * else. A test that picks a statement out by its text therefore picks one
- * kind's.
+ * `Subject` is what a decision is about, and all a read asks for, `Decision`
+ * what one write records, `Listed` a row of a list. Its statements name its
+ * own tables and no other kind's. Token policies keep theirs as they are
+ * written; the two kinds about a collateral of a Comet build theirs from one
+ * template over their tables' names (collateral-decision-repository.ts), since
+ * those tables differ in nothing else.
  *
- * The store's functions take their types from the kind alone. The decisions
- * handed to them are NoInfer, so a literal is checked against the kind
- * rather than taken for a kind of its own.
+ * The store's functions take their types from the kind alone. The subjects
+ * and decisions handed to them are NoInfer, so a literal is checked against
+ * the kind rather than taken for a kind of its own.
  */
-type DecisionKind<Decision extends DecisionBase, Listed extends Decision, State extends StateRow> = {
+type DecisionKind<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow> = {
   // names the kind's writes in a defect: 'token policy', 'deprecated collateral'
   label:       string,
   // name a list and what its rows are about in a defect: 'token policies' and 'token'
   listOf:      string,
   subject:     string,
   // what a decision is about, as the kind's statements read it from the JSON parameter
-  identity:    (decision: Decision) => Record<string, string | number>,
+  identity:    (subject: Subject) => Record<string, string | number>,
   // what makes two rows of a list one decision
-  keyOf:       (decision: Decision) => string,
+  keyOf:       (subject: Subject) => string,
   flagOf:      (decision: Decision) => boolean,
   // the decision stored, as its column holds it: 1, 0, or null where nothing is stored
   storedOf:    (state: State) => number | null,
@@ -78,12 +81,12 @@ type DecisionKind<Decision extends DecisionBase, Listed extends Decision, State 
   writes:      { events: string, rows: string, expectations: string },
   // what the kind's triggers abort with when the active version does not hold what a decision is about
   leftAbort:   string,
-  // why the active version cannot take a decision, or null where it can
-  missingFrom: (state: State, decision: Decision) => string | null,
+  // why the active version cannot take a decision about the subject, or null where it can
+  missingFrom: (state: State, subject: Subject) => string | null,
   // what a row names that the active version names otherwise, or null
   misnamed:    (decision: Listed, state: State) => string | null,
   // what a row is about, as a problem names it
-  named:       (state: State, decision: Decision) => string,
+  named:       (state: State, subject: Subject) => string,
 };
 
 type DecisionList<Listed> = { reason: string | null, decisions: Listed[] };
@@ -129,8 +132,8 @@ function refusal(
  * the decision is about, `s` the decision as 0 or 1, and `r` the reason or
  * null.
  */
-function keyed<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
-  kind: DecisionKind<Decision, Listed, State>,
+function keyed<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
+  kind: DecisionKind<Subject, Decision, Listed, State>,
   decisions: Array<NoInfer<Decision>>,
 ): string {
   return JSON.stringify(decisions.map(decision => ({
@@ -142,17 +145,29 @@ function keyed<Decision extends DecisionBase, Listed extends Decision, State ext
 }
 
 /*
+ * The parameter of a read about one subject. The states statement reads a
+ * write's parameter too, so a read hands it one of the same form, for the
+ * decision not taken: `s` 0 and `r` null, which the statement does not read.
+ */
+function keyedSubject<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
+  kind: DecisionKind<Subject, Decision, Listed, State>,
+  subject: NoInfer<Subject>,
+): string {
+  return JSON.stringify([ { i: crypto.randomUUID(), ...kind.identity(subject), s: 0, r: null } ]);
+}
+
+/*
  * The version a request about one decision resolves against, refusing what
  * that version does not hold. A decision is about something the registry
  * serves; one about anything else would be a decision nobody could check.
  */
-function requireActive<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
-  kind: DecisionKind<Decision, Listed, State>,
+function requireActive<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
+  kind: DecisionKind<Subject, Decision, Listed, State>,
   state: State | undefined,
-  decision: NoInfer<Decision>,
+  subject: NoInfer<Subject>,
 ): VersionRefV1 {
   const registryVersion = activeVersionOf(state);
-  const missing = kind.missingFrom(state!, decision);
+  const missing = kind.missingFrom(state!, subject);
   if (missing !== null) {
     throw refusal('NOT_FOUND', missing, registryVersion);
   }
@@ -180,9 +195,9 @@ function requireActive<Decision extends DecisionBase, Listed extends Decision, S
  * (`left`), or a decision someone else changed meanwhile for a row that
  * states no reason and so was not written (`changed`).
  */
-async function writeDecisions<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
+async function writeDecisions<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
   db: D1Database,
-  kind: DecisionKind<Decision, Listed, State>,
+  kind: DecisionKind<Subject, Decision, Listed, State>,
   payload: string,
   actor: string,
   conflicts: { left: () => ApiError, changed: () => ApiError },
@@ -229,9 +244,9 @@ async function writeDecisions<Decision extends DecisionBase, Listed extends Deci
  * written wherever it differs, and only a version activated in between
  * (`left`) aborts it.
  */
-async function setDecision<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
+async function setDecision<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
   db: D1Database,
-  kind: DecisionKind<Decision, Listed, State>,
+  kind: DecisionKind<Subject, Decision, Listed, State>,
   change: NoInfer<Decision> & { actor: string },
   left: () => ApiError,
 ): Promise<State> {
@@ -242,31 +257,31 @@ async function setDecision<Decision extends DecisionBase, Listed extends Decisio
 }
 
 /*
- * One decision and the changes that led to it, as `events` lists them, read
- * in one batch so that the history and the decision it explains are the same
- * moment's.
+ * The decision about one subject and the changes that led to it, as `events`
+ * lists them, read in one batch so that the history and the decision it
+ * explains are the same moment's.
  *
- * A decision outlives a version that drops what it is about, and applies
- * again when a later version brings it back, so it stays readable meanwhile.
+ * A decision outlives a version that drops what it is about, and comes back
+ * with a later version that brings it back, so it stays readable meanwhile.
  * Only what the active version does not hold and nobody ever decided about is
  * not found.
  */
-async function readDecision<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
+async function readDecision<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
   db: D1Database,
-  kind: DecisionKind<Decision, Listed, State>,
-  decision: NoInfer<Decision>,
+  kind: DecisionKind<Subject, Decision, Listed, State>,
+  subject: NoInfer<Subject>,
   events: () => D1PreparedStatement,
 ): Promise<{ registryVersion: VersionRefV1, state: State, events: D1Result }> {
-  const [ head, history ] = await db.batch([ kind.states(db, keyed(kind, [ decision ])), events() ]);
+  const [ head, history ] = await db.batch([ kind.states(db, keyedSubject(kind, subject)), events() ]);
 
-  const [ state ] = rowsOf<State>(head);
-  const decided   = (state !== undefined && kind.storedOf(state) !== null) || rowsOf(history).length > 0;
-  const registryVersion = decided ? activeVersionOf(state) : requireActive(kind, state, decision);
+  const [ state ]   = rowsOf<State>(head);
+  const everDecided = (state !== undefined && kind.storedOf(state) !== null) || rowsOf(history).length > 0;
+  const registryVersion = everDecided ? activeVersionOf(state) : requireActive(kind, state, subject);
   return { registryVersion, state: state!, events: history };
 }
 
-function decisionsOf<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
-  kind: DecisionKind<Decision, Listed, State>,
+function decisionsOf<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
+  kind: DecisionKind<Subject, Decision, Listed, State>,
   list: DecisionList<NoInfer<Listed>>,
 ): Listed[] {
   const decisions = list.decisions.map(decision => ({ ...decision, reason: decision.reason ?? list.reason }));
@@ -278,9 +293,9 @@ function decisionsOf<Decision extends DecisionBase, Listed extends Decision, Sta
   return decisions;
 }
 
-async function planDecisions<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
+async function planDecisions<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
   db: D1Database,
-  kind: DecisionKind<Decision, Listed, State>,
+  kind: DecisionKind<Subject, Decision, Listed, State>,
   list: DecisionList<NoInfer<Listed>>,
 ): Promise<{ registryVersion: VersionRefV1, planned: Array<Planned<Listed, State>> }> {
   const decisions = decisionsOf(kind, list);
@@ -301,9 +316,9 @@ async function planDecisions<Decision extends DecisionBase, Listed extends Decis
   return { registryVersion, planned };
 }
 
-async function reviewDecisions<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
+async function reviewDecisions<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
   db: D1Database,
-  kind: DecisionKind<Decision, Listed, State>,
+  kind: DecisionKind<Subject, Decision, Listed, State>,
   list: DecisionList<NoInfer<Listed>>,
 ): Promise<{
   registryVersion: VersionRefV1,
@@ -328,9 +343,9 @@ async function reviewDecisions<Decision extends DecisionBase, Listed extends Dec
  * row to hold what the list says once it is done. A list that met a
  * concurrent activation or change writes nothing.
  */
-async function writeDecisionList<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
+async function writeDecisionList<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
   db: D1Database,
-  kind: DecisionKind<Decision, Listed, State>,
+  kind: DecisionKind<Subject, Decision, Listed, State>,
   list: DecisionList<NoInfer<Listed>>,
   actor: string,
   conflicts: { left: () => ApiError, changed: () => ApiError },
@@ -349,9 +364,9 @@ async function writeDecisionList<Decision extends DecisionBase, Listed extends D
  * it rather than writing it: a decision someone makes on such a row between
  * the comparison and the write aborts the list instead of being reverted.
  */
-async function applyDecisions<Decision extends DecisionBase, Listed extends Decision, State extends StateRow>(
+async function applyDecisions<Subject extends SubjectBase, Decision extends Subject & DecisionBase, Listed extends Decision, State extends StateRow>(
   db: D1Database,
-  kind: DecisionKind<Decision, Listed, State>,
+  kind: DecisionKind<Subject, Decision, Listed, State>,
   list: DecisionList<NoInfer<Listed>>,
   actor: string,
   { problemOf, conflicts }: {

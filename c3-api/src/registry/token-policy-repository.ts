@@ -42,14 +42,18 @@ import { rowsOf } from './sql-condition.js';
 // how many changes one policy read lists, newest first; a token's decision changes rarely
 const MAX_POLICY_EVENTS = 100;
 
-// what one write records for a token: a command's decision, or one row of a list
-type Decision = {
+// a token of a chain, as a policy names it
+type TokenOfChain = {
   chainId:      number,
   // lowercase, as the registry stores every address
   tokenAddress: Address,
-  isStrategic:  boolean,
+};
+
+// what one write records for a token: a command's decision, or one row of a list
+type Decision = TokenOfChain & {
+  isStrategic: boolean,
   // null for a row that leaves its token as it is, and so needs no reason
-  reason:       string | null,
+  reason:      string | null,
 };
 
 // the administrative command for one token
@@ -85,12 +89,12 @@ function statesStatement(db: D1Database, tokens: string): D1PreparedStatement {
   ).bind(tokens);
 }
 
-function missingFrom(state: TokenState, decision: { chainId: number, tokenAddress: Address }): string | null {
+function missingFrom(state: TokenState, token: TokenOfChain): string | null {
   if (state.network_id === null) {
-    return `chain ${decision.chainId} is not part of the active registry`;
+    return `chain ${token.chainId} is not part of the active registry`;
   }
   if (state.token_id === null) {
-    return `${decision.tokenAddress} is not a token of the active registry on chain ${decision.chainId}`;
+    return `${token.tokenAddress} is not a token of the active registry on chain ${token.chainId}`;
   }
   return null;
 }
@@ -133,12 +137,12 @@ const EXPECT_DECISIONS = `
  * token the registry serves; one about an address the active version does
  * not describe would be a decision nobody could check.
  */
-const TOKEN_POLICY_KIND: DecisionKind<Decision, ListedDecision, TokenState> = {
+const TOKEN_POLICY_KIND: DecisionKind<TokenOfChain, Decision, ListedDecision, TokenState> = {
   label:       'token policy',
   listOf:      'token policies',
   subject:     'token',
-  identity:    decision => ({ c: decision.chainId, t: decision.tokenAddress }),
-  keyOf:       decision => `${decision.chainId}:${decision.tokenAddress}`,
+  identity:    token => ({ c: token.chainId, t: token.tokenAddress }),
+  keyOf:       token => `${token.chainId}:${token.tokenAddress}`,
   flagOf:      decision => decision.isStrategic,
   storedOf:    state => state.is_strategic,
   states:      statesStatement,
@@ -148,7 +152,7 @@ const TOKEN_POLICY_KIND: DecisionKind<Decision, ListedDecision, TokenState> = {
   misnamed:    (decision, state) => decision.symbol !== null && state.symbol !== decision.symbol
     ? `the list names ${decision.tokenAddress} ${decision.symbol}, which the active registry calls ${state.symbol}`
     : null,
-  named:       (state, decision) => state.symbol ?? decision.tokenAddress,
+  named:       (state, token) => state.symbol ?? token.tokenAddress,
 };
 
 async function setTokenPolicy(db: D1Database, change: PolicyChange): Promise<TokenPolicyResultV1> {
@@ -168,7 +172,9 @@ async function setTokenPolicy(db: D1Database, change: PolicyChange): Promise<Tok
 
 /*
  * One token's decision and the changes that led to it (readDecision).
- * `inActiveVersion` says whether the decision applies now.
+ * `inActiveVersion` says whether the active version holds the token, in a
+ * market of any status: a token only disabled markets name is held, and its
+ * mark shows once a market that names it is served.
  *
  * The changes are listed in the order they were committed, newest first,
  * which is rowid order (migrations/0005_token_policies.sql says why), so the
@@ -178,7 +184,7 @@ async function readTokenPolicy(db: D1Database, chainId: number, tokenAddress: Ad
   const { registryVersion, state, events } = await readDecision(
     db,
     TOKEN_POLICY_KIND,
-    { chainId, tokenAddress, isStrategic: false, reason: null },
+    { chainId, tokenAddress },
     () => db.prepare(
       `SELECT * FROM token_policy_events
        WHERE chain_id = ?1 AND token_address = ?2
@@ -234,10 +240,10 @@ async function readStrategicTokensByChain(db: D1Database): Promise<Map<number, S
  * Every token one network of the active version holds, with the decision in
  * force for each, and beside them the decisions kept for tokens of the chain
  * that the active version does not hold, each of which applies again if a
- * version brings its token back. A chain the active version dropped entirely
- * still answers with what is kept for it; only a chain with neither tokens nor
- * decisions is not found. One batch, so the version it names is the version
- * it lists.
+ * version brings its token back and serves a market that names it. A chain
+ * the active version dropped entirely still answers with what is kept for it;
+ * only a chain with neither tokens nor decisions is not found. One batch, so
+ * the version it names is the version it lists.
  */
 async function readTokenPolicies(db: D1Database, chainId: number): Promise<TokenPoliciesV1> {
   const [ listed, kept ] = await db.batch([

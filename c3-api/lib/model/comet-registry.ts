@@ -34,11 +34,12 @@ const ACTIVATION_ACTIONS = [ 'activate', 'rollback' ] as const;
 /*
  * How the token list valued a token, and why discovery shows it or not.
  * `partial` is a value read from only some of a token's positions that
- * already reaches the threshold (decision D7 of the TOK-0 audit). `hidden` is
- * a token an administrator hid in an enabled market that takes it, which
- * every other such market hides or has deprecated, and `deprecated` one
- * deprecated in every such market: discovery shows neither, whatever else
- * holds.
+ * already reaches the threshold (decision D7 of the TOK-0 audit). `hidden`
+ * and `deprecated` each name a token that an enabled market takes and none of
+ * them leaves to discovery, offering it without hiding it: `hidden` where an
+ * administrator hid it in one of them, and `deprecated` where every one of
+ * them has it deprecated and none hides it. Discovery shows neither, whatever
+ * else holds.
  */
 const COLLATERAL_VALUE_STATUSES = [ 'fresh', 'exception', 'partial', 'stale', 'unavailable' ] as const;
 const VISIBILITY_REASONS        = [ 'hidden', 'deprecated', 'strategic', 'collateral_threshold', 'below_threshold', 'data_unavailable' ] as const;
@@ -380,9 +381,10 @@ type TokenPolicyEventV1 = {
 /*
  * Every token of one network of the active version, with the decision in
  * force for each, and the decisions kept for tokens of the chain the active
- * version does not hold: each applies again if a version brings its token back.
- * `inActiveVersion` is false for a chain the active version does not hold at
- * all, which has no tokens to list but may still have decisions kept.
+ * version does not hold: each applies again if a version brings its token
+ * back and serves a market that names it. `inActiveVersion` is false for a
+ * chain the active version does not hold at all, which has no tokens to list
+ * but may still have decisions kept.
  */
 type TokenPoliciesV1 = {
   registryVersion: VersionRefV1,
@@ -395,7 +397,8 @@ type TokenPoliciesV1 = {
 /*
  * One token's decision, and the changes that led to it, newest committed
  * first. `inActiveVersion` is false for a decision kept while the active
- * version does not hold the token, which applies again once one does.
+ * version does not hold the token, which applies again once one does and
+ * serves a market that names it.
  */
 type TokenPolicyDetailV1 = TokenPolicyV1 & {
   registryVersion: VersionRefV1,
@@ -476,38 +479,44 @@ type TokenPolicyApplyV1 = {
 };
 
 /*
+ * The decisions an administrator makes about a collateral of a Comet, a flag
+ * a kind: whether the collateral is deprecated in that Comet
+ * (`isDeprecated`), and whether it is hidden there from discovery
+ * (`isHidden`). Every kind answers in the types below under its own flag, and
+ * a list of a kind's decisions holds its rows under the kind's own member
+ * (`Rows`), so that neither kind's review takes the other's file. Each kind's
+ * own names for those types follow them.
+ *
  * The decision in force for a collateral of a Comet. A collateral nobody has
- * decided about is not deprecated, and has no time or author to name.
+ * decided about has the flag unset, and has no time or author to name.
  */
-type DeprecatedCollateralV1 = {
-  isDeprecated: boolean,
-  updatedAt:    string | null,
-  updatedBy:    string | null,
+type CollateralDecisionV1<Flag extends string> = Record<Flag, boolean> & {
+  updatedAt: string | null,
+  updatedBy: string | null,
 };
 
-type DeprecatedCollateralEventV1 = {
-  id:                   string,
-  // null where the collateral had no decision yet, which is not deprecated
-  previousIsDeprecated: boolean | null,
-  isDeprecated:         boolean,
-  actor:                string,
-  reason:               string,
-  createdAt:            string,
+// the flag before the change is null where the collateral had no decision yet, which has the flag unset
+type CollateralDecisionEventV1<Flag extends string> = {
+  id:        string,
+} & Record<`previous${Capitalize<Flag>}`, boolean | null> & Record<Flag, boolean> & {
+  actor:     string,
+  reason:    string,
+  createdAt: string,
 };
 
 /*
  * One collateral's decision, and the changes that led to it, newest committed
  * first. `inActiveVersion` is false for a decision kept while the active
  * version does not hold the collateral in that Comet, which applies again once
- * one does.
+ * one does and serves the market.
  */
-type DeprecatedCollateralDetailV1 = DeprecatedCollateralV1 & {
+type CollateralDecisionDetailV1<Flag extends string> = CollateralDecisionV1<Flag> & {
   registryVersion: VersionRefV1,
   chainId:         number,
   cometAddress:    Address,
   tokenAddress:    Address,
   inActiveVersion: boolean,
-  events:          DeprecatedCollateralEventV1[],
+  events:          Array<CollateralDecisionEventV1<Flag>>,
 };
 
 /*
@@ -515,194 +524,107 @@ type DeprecatedCollateralDetailV1 = DeprecatedCollateralV1 & {
  * decision asked for was already in force, which writes nothing; `updatedAt`
  * is when the decision in force was made, and null where nobody has decided.
  */
-type DeprecatedCollateralResultV1 = {
+type CollateralDecisionResultV1<Flag extends string> = {
   registryVersion: VersionRefV1,
   chainId:         number,
   cometAddress:    Address,
   tokenAddress:    Address,
-  isDeprecated:    boolean,
+} & Record<Flag, boolean> & {
   changed:         boolean,
   updatedAt:       string | null,
 };
 
 /*
- * A list of decisions about collaterals: what the export answers, and what
- * review and apply take, so a list is exported, edited and sent back as one
- * file, as a list of token policies is.
+ * A row of a list of decisions about collaterals. A list is what the export
+ * answers, and what review and apply take, so a list is exported, edited and
+ * sent back as one file, as a list of token policies is.
  *
  * A row that changes a decision needs a reason: its own, or the list's.
  * `deploymentKey` and `symbol` are there for the person editing the file; the
  * addresses decide, and a market or a symbol that is not the one the active
- * version names is refused as the mistake it usually is. `registryVersion`
- * and `retained` say where the list was exported from and which decisions
- * the active version does not hold, and are not read.
+ * version names is refused as the mistake it usually is.
  */
-type DeprecatedCollateralDecisionV1 = {
+type ListedCollateralDecisionV1<Flag extends string> = {
   chainId:        number,
   cometAddress:   Address,
   deploymentKey?: string | null,
   tokenAddress:   Address,
   symbol?:        string | null,
-  isDeprecated:   boolean,
+} & Record<Flag, boolean> & {
   reason?:        string | null,
 };
 
 // a decision kept for a collateral the active version does not hold in that Comet
-type RetainedDeprecatedCollateralV1 = DeprecatedCollateralV1 & {
+type RetainedCollateralDecisionV1<Flag extends string> = CollateralDecisionV1<Flag> & {
   chainId:      number,
   cometAddress: Address,
   tokenAddress: Address,
 };
 
-type DeprecatedCollateralListV1 = {
+/*
+ * `registryVersion` and `retained` say where the list was exported from and
+ * which decisions the active version does not hold, and are not read.
+ */
+type CollateralDecisionListV1<Flag extends string, Rows extends string> = {
   registryVersion?: VersionRefV1,
   reason:           string | null,
-  collaterals:      DeprecatedCollateralDecisionV1[],
-  retained?:        RetainedDeprecatedCollateralV1[],
+} & Record<Rows, Array<ListedCollateralDecisionV1<Flag>>> & {
+  retained?:        Array<RetainedCollateralDecisionV1<Flag>>,
 };
 
 // what applying a list would change, row by row, without writing anything
-type DeprecatedCollateralReviewV1 = {
+type CollateralDecisionReviewV1<Rows extends string> = {
   registryVersion: VersionRefV1,
   summary:         { change: number, unchanged: number, problems: number },
-  collaterals:     Array<{
-    row:           number,
-    chainId:       number,
-    cometAddress:  Address,
-    deploymentKey: string | null,
-    tokenAddress:  Address,
-    symbol:        string | null,
-    current:       boolean,
-    requested:     boolean,
-    action:        'change' | 'unchanged',
-    reason:        string | null,
-    problem:       string | null,
-  }>,
-};
+} & Record<Rows, Array<{
+  row:           number,
+  chainId:       number,
+  cometAddress:  Address,
+  deploymentKey: string | null,
+  tokenAddress:  Address,
+  symbol:        string | null,
+  current:       boolean,
+  requested:     boolean,
+  action:        'change' | 'unchanged',
+  reason:        string | null,
+  problem:       string | null,
+}>>;
 
 // what applying a list wrote: every row, as the transaction that wrote it left it
-type DeprecatedCollateralApplyV1 = {
+type CollateralDecisionApplyV1<Flag extends string, Rows extends string> = {
   registryVersion: VersionRefV1,
   summary:         { changed: number, unchanged: number },
-  collaterals:     Array<{
-    row:           number,
-    chainId:       number,
-    cometAddress:  Address,
-    deploymentKey: string,
-    tokenAddress:  Address,
-    symbol:        string,
-    isDeprecated:  boolean,
-    changed:       boolean,
-    updatedAt:     string | null,
-  }>,
-};
+} & Record<Rows, Array<{
+  row:           number,
+  chainId:       number,
+  cometAddress:  Address,
+  deploymentKey: string,
+  tokenAddress:  Address,
+  symbol:        string,
+} & Record<Flag, boolean> & {
+  changed:       boolean,
+  updatedAt:     string | null,
+}>>;
 
-/*
- * The decision in force for a collateral of a Comet an administrator may hide
- * from discovery, answered as a deprecated collateral's is. A collateral
- * nobody has decided about is not hidden, and has no time or author to name.
- */
-type HiddenCollateralV1 = {
-  isHidden:  boolean,
-  updatedAt: string | null,
-  updatedBy: string | null,
-};
+type DeprecatedCollateralV1         = CollateralDecisionV1<'isDeprecated'>;
+type DeprecatedCollateralEventV1    = CollateralDecisionEventV1<'isDeprecated'>;
+type DeprecatedCollateralDetailV1   = CollateralDecisionDetailV1<'isDeprecated'>;
+type DeprecatedCollateralResultV1   = CollateralDecisionResultV1<'isDeprecated'>;
+type DeprecatedCollateralDecisionV1 = ListedCollateralDecisionV1<'isDeprecated'>;
+type RetainedDeprecatedCollateralV1 = RetainedCollateralDecisionV1<'isDeprecated'>;
+type DeprecatedCollateralListV1     = CollateralDecisionListV1<'isDeprecated', 'collaterals'>;
+type DeprecatedCollateralReviewV1   = CollateralDecisionReviewV1<'collaterals'>;
+type DeprecatedCollateralApplyV1    = CollateralDecisionApplyV1<'isDeprecated', 'collaterals'>;
 
-type HiddenCollateralEventV1 = {
-  id:               string,
-  // null where the collateral had no decision yet, which is not hidden
-  previousIsHidden: boolean | null,
-  isHidden:         boolean,
-  actor:            string,
-  reason:           string,
-  createdAt:        string,
-};
-
-// one collateral's decision, and the changes that led to it, newest committed first
-type HiddenCollateralDetailV1 = HiddenCollateralV1 & {
-  registryVersion: VersionRefV1,
-  chainId:         number,
-  cometAddress:    Address,
-  tokenAddress:    Address,
-  inActiveVersion: boolean,
-  events:          HiddenCollateralEventV1[],
-};
-
-// the answer to a decision about one collateral
-type HiddenCollateralResultV1 = {
-  registryVersion: VersionRefV1,
-  chainId:         number,
-  cometAddress:    Address,
-  tokenAddress:    Address,
-  isHidden:        boolean,
-  changed:         boolean,
-  updatedAt:       string | null,
-};
-
-/*
- * A list of decisions about collaterals, exported, edited and sent back as a
- * list of deprecated collaterals is, with its rows under `hiddenCollaterals`,
- * so that neither kind's review takes the other's file.
- */
-type HiddenCollateralDecisionV1 = {
-  chainId:        number,
-  cometAddress:   Address,
-  deploymentKey?: string | null,
-  tokenAddress:   Address,
-  symbol?:        string | null,
-  isHidden:       boolean,
-  reason?:        string | null,
-};
-
-// a decision kept for a collateral the active version does not hold in that Comet
-type RetainedHiddenCollateralV1 = HiddenCollateralV1 & {
-  chainId:      number,
-  cometAddress: Address,
-  tokenAddress: Address,
-};
-
-type HiddenCollateralListV1 = {
-  registryVersion?:  VersionRefV1,
-  reason:            string | null,
-  hiddenCollaterals: HiddenCollateralDecisionV1[],
-  retained?:         RetainedHiddenCollateralV1[],
-};
-
-// what applying a list would change, row by row, without writing anything
-type HiddenCollateralReviewV1 = {
-  registryVersion:   VersionRefV1,
-  summary:           { change: number, unchanged: number, problems: number },
-  hiddenCollaterals: Array<{
-    row:           number,
-    chainId:       number,
-    cometAddress:  Address,
-    deploymentKey: string | null,
-    tokenAddress:  Address,
-    symbol:        string | null,
-    current:       boolean,
-    requested:     boolean,
-    action:        'change' | 'unchanged',
-    reason:        string | null,
-    problem:       string | null,
-  }>,
-};
-
-// what applying a list wrote: every row, as the transaction that wrote it left it
-type HiddenCollateralApplyV1 = {
-  registryVersion:   VersionRefV1,
-  summary:           { changed: number, unchanged: number },
-  hiddenCollaterals: Array<{
-    row:           number,
-    chainId:       number,
-    cometAddress:  Address,
-    deploymentKey: string,
-    tokenAddress:  Address,
-    symbol:        string,
-    isHidden:      boolean,
-    changed:       boolean,
-    updatedAt:     string | null,
-  }>,
-};
+type HiddenCollateralV1         = CollateralDecisionV1<'isHidden'>;
+type HiddenCollateralEventV1    = CollateralDecisionEventV1<'isHidden'>;
+type HiddenCollateralDetailV1   = CollateralDecisionDetailV1<'isHidden'>;
+type HiddenCollateralResultV1   = CollateralDecisionResultV1<'isHidden'>;
+type HiddenCollateralDecisionV1 = ListedCollateralDecisionV1<'isHidden'>;
+type RetainedHiddenCollateralV1 = RetainedCollateralDecisionV1<'isHidden'>;
+type HiddenCollateralListV1     = CollateralDecisionListV1<'isHidden', 'hiddenCollaterals'>;
+type HiddenCollateralReviewV1   = CollateralDecisionReviewV1<'hiddenCollaterals'>;
+type HiddenCollateralApplyV1    = CollateralDecisionApplyV1<'isHidden', 'hiddenCollaterals'>;
 
 /*
  * The token list: every token the active version serves on one chain, with
@@ -716,6 +638,18 @@ type HiddenCollateralApplyV1 = {
  */
 type CollateralValueStatusV1 = (typeof COLLATERAL_VALUE_STATUSES)[number];
 type VisibilityReasonV1      = (typeof VISIBILITY_REASONS)[number];
+
+type NotShownV1 = 'hidden' | 'deprecated' | 'below_threshold';
+
+/*
+ * Whether discovery shows a token follows from its reason, so a client given
+ * both may read either. /summary can say the first without the second, where
+ * the decisions it read settle only that (summary-tokens.ts).
+ */
+type VisibilityV1 = (
+  | { isVisible: true,  visibilityReason: Exclude<VisibilityReasonV1, NotShownV1> }
+  | { isVisible: false, visibilityReason: Extract<VisibilityReasonV1, NotShownV1> }
+);
 
 type BlockRefV1 = { number: number, timestamp: number };
 
@@ -731,15 +665,19 @@ type AppliedPriceExceptionV1 = {
  * `deprecatedIn` names the Comets of the chain's served markets that take the
  * token as a collateral an administrator marked deprecated, sorted.
  * `isDeprecated` says it is deprecated in every enabled market that takes it,
- * of which there is at least one, and then discovery does not show it,
- * whatever else holds. A token deprecated in some of them only is shown or
- * not by the rest of the rule.
+ * of which there is at least one: none of them offers it any longer, and
+ * discovery does not show it, whatever else holds. A token deprecated in some
+ * of them only is left to the others, which offer it: it is not shown where
+ * every one of them hides it, and is otherwise decided by its strategic mark
+ * and its value.
  *
  * `hiddenIn` names, the same way, the Comets that take the token as a
- * collateral an administrator hid. A token that an enabled market taking it
- * hides, and every other one hides or has deprecated, is not shown, before
- * anything else is asked, and only its reason says so: the list has no flag
- * of its own for it.
+ * collateral an administrator hid. The decisions keep a token out of
+ * discovery, before anything else is asked, where an enabled market takes it
+ * and none of them leaves it to discovery, offering it without hiding it: as
+ * `hidden` where one of them hides it, which only the reason says, the list
+ * having no flag of its own for it, and otherwise as `deprecated`, which
+ * `isDeprecated` says as well (src/registry/token-visibility.ts).
  */
 type TokenVisibilityV1 = TokenV1 & {
   roles:                 AssetRole[],
@@ -753,9 +691,7 @@ type TokenVisibilityV1 = TokenV1 & {
   valueBlock:            BlockRefV1 | null,
   staleAgeSeconds:       number | null,
   exceptions:            AppliedPriceExceptionV1[],
-  isVisible:             boolean,
-  visibilityReason:      VisibilityReasonV1,
-};
+} & VisibilityV1;
 
 type TokenListV1 = {
   registryVersion: VersionRefV1,
@@ -818,6 +754,13 @@ export type {
   BlockRefV1,
   CollateralValueStatusV1,
   CollateralAssetV1,
+  CollateralDecisionApplyV1,
+  CollateralDecisionDetailV1,
+  CollateralDecisionEventV1,
+  CollateralDecisionListV1,
+  CollateralDecisionResultV1,
+  CollateralDecisionReviewV1,
+  CollateralDecisionV1,
   ContractRole,
   ContractRoleKey,
   DeploymentPath,
@@ -838,6 +781,7 @@ export type {
   HiddenCollateralResultV1,
   HiddenCollateralReviewV1,
   HiddenCollateralV1,
+  ListedCollateralDecisionV1,
   MarketStatus,
   MarketV1,
   NetworkPresentationV1,
@@ -850,6 +794,7 @@ export type {
   RegistryVersionRefV1,
   RegistryAnnotation,
   RegistryComet,
+  RetainedCollateralDecisionV1,
   RetainedDeprecatedCollateralV1,
   RetainedHiddenCollateralV1,
   RewardAssetV1,
@@ -871,6 +816,7 @@ export type {
   ValidationSummaryV1,
   VersionRefV1,
   VisibilityReasonV1,
+  VisibilityV1,
   TokenVisibilityV1,
 };
 

@@ -16,8 +16,9 @@ import { jsonResponse } from '../http/json.js';
 import type { Log } from '../log.js';
 
 import type { CachedSnapshot, PinnedVersion } from './cache.js';
-import type { CollateralMarks, DeprecatedRead, HiddenRead } from './deprecated-collaterals.js';
-import { markedMarket, markedNetwork, markedRepresentation } from './deprecated-collaterals.js';
+import type { CollateralOfComet } from './collateral-decision-repository.js';
+import type { CollateralMarks, RecordedKind } from './collateral-decisions.js';
+import { markedMarket, markedNetwork, markedRepresentation } from './collateral-decisions.js';
 import { conflict } from './errors.js';
 import type { RequestCatalog } from './request-catalog.js';
 import type { TokenCollateralDeps } from './token-collateral.js';
@@ -90,17 +91,14 @@ type RegistryContext = {
    */
   warm: (versionId: string) => Promise<void>,
   /*
-   * The deprecated decisions of every chain, and the hidden ones, which the
-   * active reads mark the collaterals of the active version with
-   * (deprecated-collaterals.ts): read from D1, or during an outage from the
-   * record the Worker keeps of each kind. `recordDeprecated` and
-   * `recordHidden` keep those records, after a command that may have changed
-   * them; neither fails the command.
+   * The decisions of every kind and every chain that the active reads mark
+   * the collaterals of the active version with (collateral-decisions.ts):
+   * read from D1, or during an outage from the record the Worker keeps of
+   * each kind. `record` keeps a kind's record after a command that may have
+   * changed it, and never fails the command.
    */
-  deprecated:       () => Promise<DeprecatedRead>,
-  hidden:           () => Promise<HiddenRead>,
-  recordDeprecated: () => Promise<void>,
-  recordHidden:     () => Promise<void>,
+  marks:  () => Promise<{ marks: CollateralMarks, recorded: boolean }>,
+  record: (kind: RecordedKind) => Promise<void>,
   /*
    * The registry version of the request as the market routes load it, so the
    * token list values a chain's markets from the same catalog they use.
@@ -215,44 +213,36 @@ async function activeSnapshot(context: RegistryContext): Promise<CachedSnapshot>
 }
 
 /*
- * The active snapshot and the decisions its collaterals are marked with, the
- * deprecated and the hidden ones, read side by side. The version decides
- * first: one that could not be read fails the request, whatever the decisions
- * did, and the decisions are taken (`decided`) only once the version has
- * selected what they mark, so a request the version refuses — a chain id that
- * is not one, a chain it does not hold, a market it does not serve — is
- * refused as it always has been. Only a request the version answers fails for
- * want of the decisions, of either kind.
+ * The active snapshot and the decisions its collaterals are marked with, read
+ * side by side. The version decides first: one that could not be read fails
+ * the request, whatever the decisions did, and the decisions are taken
+ * (`marking`) only once the version has selected what they mark, so a request
+ * the version refuses — a chain id that is not one, a chain it does not hold,
+ * a market it does not serve — is refused as it always has been. Only a
+ * request the version answers fails for want of the decisions.
  *
  * Decisions that came from a record rather than from D1 are not confirmed
  * either, so the answer says so as one from an older version does: as that
  * version's age, or as 0 seconds old when the version itself was read now.
- * One kind from its record is enough.
  */
 async function activeWithDecisions(context: RegistryContext): Promise<{
   snapshot: RegistrySnapshotV1,
-  // the decisions, and how stale an answer marked with them is; it throws what reading either kind failed with
-  decided:  () => { marks: CollateralMarks, staleFor: number | null },
+  // the decisions, and how stale an answer marked with them is; it throws what reading them failed with
+  marking:  () => { marks: CollateralMarks, staleFor: number | null },
 }> {
-  const [ active, deprecated, hidden ] = await Promise.allSettled([ activeSnapshot(context), context.deprecated(), context.hidden() ]);
+  const [ active, decisions ] = await Promise.allSettled([ activeSnapshot(context), context.marks() ]);
   if (active.status === 'rejected') {
     throw active.reason;
   }
   const { snapshot, staleFor } = active.value;
   return {
     snapshot,
-    decided: () => {
-      if (deprecated.status === 'rejected') {
-        throw deprecated.reason;
+    marking: () => {
+      if (decisions.status === 'rejected') {
+        throw decisions.reason;
       }
-      if (hidden.status === 'rejected') {
-        throw hidden.reason;
-      }
-      const recorded = deprecated.value.recorded || hidden.value.recorded;
-      return {
-        marks:    { deprecated: deprecated.value.decisions, hidden: hidden.value.decisions },
-        staleFor: staleFor ?? (recorded ? 0 : null),
-      };
+      const { marks, recorded } = decisions.value;
+      return { marks, staleFor: staleFor ?? (recorded ? 0 : null) };
     },
   };
 }
@@ -294,6 +284,10 @@ function addressOf(value: string): Address {
   return normalizeAddress(value);
 }
 
+function collateralOf(chainId: string, cometAddress: string, tokenAddress: string): CollateralOfComet {
+  return { chainId: chainIdOf(chainId), cometAddress: addressOf(cometAddress), tokenAddress: addressOf(tokenAddress) };
+}
+
 /*
  * A market is addressed by its Comet address. A disabled market is not
  * selectable, so it answers 404 even though it stays in the snapshot for
@@ -321,8 +315,8 @@ function marketOf(network: NetworkV1, address: string): ServedMarket {
  * none.
  */
 async function getActive(request: Request, context: RegistryContext, maxAge: number): Promise<Response> {
-  const { snapshot, decided } = await activeWithDecisions(context);
-  const { marks, staleFor } = decided();
+  const { snapshot, marking } = await activeWithDecisions(context);
+  const { marks, staleFor } = marking();
   const served   = selectable(snapshot);
   const networks = served.networks.map(network => markedNetwork(network, marks));
   return snapshotResponse(request, versionRef(snapshot), markedRepresentation('snapshot', networks), () => ({
@@ -341,10 +335,10 @@ async function getNetworks(request: Request, context: RegistryContext, maxAge: n
 }
 
 async function getMarkets(request: Request, context: RegistryContext, chainId: string, maxAge: number): Promise<Response> {
-  const { snapshot, decided } = await activeWithDecisions(context);
+  const { snapshot, marking } = await activeWithDecisions(context);
   // the same selectability rule the market route and the catalog apply
   const selected = networkOf(selectable(snapshot), chainIdOf(chainId));
-  const { marks, staleFor } = decided();
+  const { marks, staleFor } = marking();
   const network  = markedNetwork(selected, marks);
   const tagged   = markedRepresentation(`markets:${network.chainId}`, [ network ]);
   return snapshotResponse(request, versionRef(snapshot), tagged, () => ({
@@ -361,10 +355,10 @@ async function getMarket(
   cometAddress: string,
   maxAge: number,
 ): Promise<Response> {
-  const { snapshot, decided } = await activeWithDecisions(context);
+  const { snapshot, marking } = await activeWithDecisions(context);
   const network  = networkOf(snapshot, chainIdOf(chainId));
   const selected = marketOf(network, cometAddress);
-  const { marks, staleFor } = decided();
+  const { marks, staleFor } = marking();
   const market   = markedMarket(network.chainId, selected, marks);
   const tagged   = markedRepresentation(`market:${network.chainId}:${market.contracts.comet}`, [
     { chainId: network.chainId, markets: [ market ] },
@@ -707,6 +701,7 @@ export {
   addressOf,
   cancelSyncRun,
   chainIdOf,
+  collateralOf,
   getActive,
   getChanges,
   getMarket,

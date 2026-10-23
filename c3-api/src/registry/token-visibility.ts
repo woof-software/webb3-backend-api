@@ -12,10 +12,10 @@ import {
   TokenV1,
   TokenVisibilityV1,
   VersionRefV1,
+  VisibilityV1,
 } from '../../lib/model/comet-registry.js';
 
 import type { Catalog, CatalogMarket } from './catalog.js';
-import type { DeprecatedDecisions, HiddenDecisions } from './deprecated-collaterals.js';
 import type { CollateralView, Position } from './token-collateral.js';
 import { TokenValue, tokenValue } from './token-value.js';
 
@@ -29,31 +29,40 @@ import { TokenValue, tokenValue } from './token-value.js';
  * and showing it is the safe answer to not knowing. A strategic token is shown
  * whatever its value says.
  *
- * A token deprecated in every enabled market that takes it is not shown,
- * whatever else holds, strategic or worth the threshold: no market offers it
- * as collateral any longer, so discovery does not either. Its holders lose
- * nothing by it, since the app keeps showing a deprecated collateral to a user
- * who still holds some, so that it can be withdrawn.
+ * Before any of that is asked, the decisions about a collateral of a Comet
+ * may keep a token out of discovery, whatever else holds, strategic or worth
+ * the threshold (Exclusion). An enabled market that takes the token offers it
+ * unless it has it deprecated, and leaves it to discovery where it offers it
+ * and does not hide it (migrations/0008_hidden_collaterals.sql). A token that
+ * an enabled market takes, and that none of them leaves to discovery, is
+ * kept out across the chain: as `hidden` where one of them hides it, since
+ * hiding a collateral is a decision about discovery alone and so is asked
+ * first; otherwise as `deprecated`, every one of them having it deprecated,
+ * as no market offers it as collateral any longer. A market whose status is
+ * `deprecated` offers the token no longer: its decisions are named, and take
+ * no part in what the chain decides. In one market, its Comet's own decisions
+ * keep the token out the same way, its hiding first, as /summary says of each
+ * collateral (summary-tokens.ts).
  *
- * Nor is a token an administrator hid (migrations/0008_hidden_collaterals.sql)
- * in an enabled market that takes it, where every other one hides it or has
- * it deprecated: no enabled market offers it as a current collateral and
- * leaves it to discovery. That is asked first, before whether it is
- * deprecated or strategic, since hiding a collateral is a decision about
- * discovery alone. The markets still take the token as collateral, and the
- * app keeps showing it to a user who holds some, as it does a deprecated one.
+ * The markets still take a token kept out as collateral, and the app keeps
+ * showing it to a user who holds some, so that it can be withdrawn.
  */
 const THRESHOLD_USD  = BigFixnum.from({ value: 250000 });
 const THRESHOLD_TEXT = '250000';
 
 /*
- * The rule a list decides by, which the list names: 2 since a token
- * deprecated in every enabled market that takes it is not shown, 3 since one
- * that such a market hides, and every other hides or has deprecated, is not
- * either, whatever else holds. It reads the values the records hold
- * (token-collateral.ts), and no record depends on it.
+ * The rule a list decides by, which the list names: 2 since the deprecated
+ * decisions may keep a token out of discovery, 3 since the hidden ones may as
+ * well. It reads the values the records hold (token-collateral.ts), and no
+ * record depends on it.
  */
 const RULE_VERSION = 3;
+
+// what keeps a token out of discovery, if anything; not null, which /summary gives a decision it could not read
+type Exclusion = 'hidden' | 'deprecated' | 'none';
+
+// a kind of decision as the rule asks it (collateral-decisions.ts): whether it names a collateral, its addresses lowercase
+type Decisions = { has: (collateral: { chainId: number, cometAddress: Address, tokenAddress: Address }) => boolean };
 
 /*
  * Every token the active version serves on a chain, with every role it plays
@@ -78,71 +87,44 @@ function tokensOf(catalog: Catalog, network: KnownNetwork.Name): Array<{ token: 
   return [ ...found.values() ].map(({ token, roles }) => ({ token, roles: ASSET_ROLES.filter(role => roles.has(role)) }));
 }
 
-/*
- * Where a token is a deprecated collateral: the Comets of the chain's served
- * markets that take it as collateral and whose decision marks it deprecated,
- * sorted, and whether it is deprecated in every enabled market that takes it,
- * of which there is at least one. The decision of a market whose status is
- * `deprecated` is named, but takes no part in `isDeprecated`, which says that
- * no enabled market offers the token as a current collateral any longer: a
- * token still current in one of them is offered there, and discovery decides
- * it as any other.
- */
-function deprecatedOf(
-  chainId: number,
-  token: Address,
-  markets: CatalogMarket[],
-  deprecated: DeprecatedDecisions,
-): { isDeprecated: boolean, deprecatedIn: Address[] } {
-  const taking  = markets.filter(({ market }) => market.collateralAssets.some(asset => asset.token.address === token));
-  const marked  = taking.filter(({ market }) => deprecated.has(chainId, market.contracts.comet, token));
-  const enabled = taking.filter(({ market }) => market.status === 'enabled');
-  return {
-    isDeprecated: enabled.length > 0 && enabled.every(entry => marked.includes(entry)),
-    deprecatedIn: marked.map(({ market }) => market.contracts.comet).sort(),
-  };
+function exclusionHere({ isHidden, isDeprecated }: { isHidden: boolean, isDeprecated: boolean }): Exclusion {
+  return isHidden ? 'hidden' : isDeprecated ? 'deprecated' : 'none';
 }
 
 /*
- * Where an administrator hid a token as a collateral: the Comets of the
- * chain's served markets that take it as collateral and hide it, sorted, as
- * deprecatedOf names where it is deprecated. And whether it is hidden across
- * the chain: an enabled market that takes it hides it, and every other one
- * hides it or has it deprecated, so that none of them offers it as a current
- * collateral and leaves it to discovery. A token deprecated in every one of
- * them and hidden in none is deprecated instead, and one that an enabled
- * market takes with neither decision is offered there, and decided by the
- * rest of the rule. A market whose status is `deprecated` offers the token no
- * longer: its decisions are named, and take no part.
+ * What the decisions of a chain's served markets make of a token they take as
+ * collateral: the Comets that have it deprecated, and those that hide it,
+ * sorted; whether it is deprecated in every enabled market that takes it, of
+ * which there is at least one, which the list says even where one of them
+ * hides it as well; and what keeps it out of discovery across the chain.
  */
-function hiddenOf(
+function exclusionOnChain(
   chainId: number,
   token: Address,
   markets: CatalogMarket[],
-  { deprecated, hidden }: { deprecated: DeprecatedDecisions, hidden: HiddenDecisions },
-): { isHidden: boolean, hiddenIn: Address[] } {
-  const taking  = markets.filter(({ market }) => market.collateralAssets.some(asset => asset.token.address === token));
-  const hiding  = taking.filter(({ market }) => hidden.has(chainId, market.contracts.comet, token));
-  const enabled = taking.filter(({ market }) => market.status === 'enabled');
+  { deprecated, hidden }: { deprecated: Decisions, hidden: Decisions },
+): { exclusion: Exclusion, isDeprecated: boolean, deprecatedIn: Address[], hiddenIn: Address[] } {
+  const taking = markets
+    .filter(({ market }) => market.collateralAssets.some(asset => asset.token.address === token))
+    .map(({ market }) => {
+      const collateral = { chainId, cometAddress: market.contracts.comet, tokenAddress: token };
+      return { market, isHidden: hidden.has(collateral), isDeprecated: deprecated.has(collateral) };
+    });
+  const enabled  = taking.filter(({ market }) => market.status === 'enabled');
+  const byMarket = enabled.map(exclusionHere);
+  const keptOut  = byMarket.length > 0 && !byMarket.includes('none');
   return {
-    isHidden: enabled.some(entry => hiding.includes(entry))
-      && enabled.every(entry => hiding.includes(entry) || deprecated.has(chainId, entry.market.contracts.comet, token)),
-    hiddenIn: hiding.map(({ market }) => market.contracts.comet).sort(),
+    exclusion:    !keptOut ? 'none' : byMarket.includes('hidden') ? 'hidden' : 'deprecated',
+    isDeprecated: enabled.length > 0 && enabled.every(entry => entry.isDeprecated),
+    deprecatedIn: taking.filter(entry => entry.isDeprecated).map(({ market }) => market.contracts.comet).sort(),
+    hiddenIn:     taking.filter(entry => entry.isHidden).map(({ market }) => market.contracts.comet).sort(),
   };
 }
-
-type Visibility = Pick<TokenVisibilityV1, 'isVisible' | 'visibilityReason'>;
 
 // of a value, the rule reads only whether it is known and what it is worth
-function visibilityOf(
-  { isHidden, isDeprecated, isStrategic }: { isHidden: boolean, isDeprecated: boolean, isStrategic: boolean },
-  value: Pick<TokenValue, 'valueUsd'>,
-): Visibility {
-  if (isHidden) {
-    return { isVisible: false, visibilityReason: 'hidden' };
-  }
-  if (isDeprecated) {
-    return { isVisible: false, visibilityReason: 'deprecated' };
+function visibilityOf(exclusion: Exclusion, isStrategic: boolean, value: Pick<TokenValue, 'valueUsd'>): VisibilityV1 {
+  if (exclusion !== 'none') {
+    return { isVisible: false, visibilityReason: exclusion };
   }
   if (isStrategic) {
     return { isVisible: true, visibilityReason: 'strategic' };
@@ -153,6 +135,29 @@ function visibilityOf(
   return value.valueUsd.gte(THRESHOLD_USD)
     ? { isVisible: true,  visibilityReason: 'collateral_threshold' }
     : { isVisible: false, visibilityReason: 'below_threshold' };
+}
+
+/*
+ * What discovery says of a token in one market, by its Comet's decisions about
+ * the collateral and the chain's strategic marks, where a kind of them may not
+ * have been read (null): what the rule answers whichever way an unread
+ * decision went. Where every answer gives the same reason, that answer is
+ * said, the reason saying whether the token is shown; where they agree only on
+ * whether it is shown, that alone is said, a key being left out only where an
+ * unread decision could change it; elsewhere nothing is.
+ */
+function visibilityHere(
+  { isHidden, isDeprecated, isStrategic }: { isHidden: boolean | null, isDeprecated: boolean | null, isStrategic: boolean | null },
+  value: Pick<TokenValue, 'valueUsd'>,
+): Partial<VisibilityV1> {
+  const either     = (decision: boolean | null) => decision === null ? [ true, false ] : [ decision ];
+  const exclusions = either(isHidden).flatMap(hiding => either(isDeprecated).map(deprecating => (
+    exclusionHere({ isHidden: hiding, isDeprecated: deprecating })
+  )));
+  const answers    = exclusions.flatMap(exclusion => either(isStrategic).map(strategic => visibilityOf(exclusion, strategic, value)));
+  const [ first ]  = answers;
+  const agreed     = (part: keyof VisibilityV1) => answers.every(answer => answer[part] === first[part]);
+  return agreed('visibilityReason') ? first : agreed('isVisible') ? { isVisible: first.isVisible } : {};
 }
 
 /*
@@ -172,27 +177,6 @@ function decimalString(value: BigFixnum): string {
   return `${negative ? '-' : ''}${fraction === '' ? whole : `${whole}.${fraction}`}`;
 }
 
-// a value as decimalString writes it, read back: every digit is written, so it is the value itself
-function fixnumOf(text: string): BigFixnum {
-  const [ whole, fraction = '' ] = text.split('.');
-  return BigFixnum.from({ value: `${whole}${fraction}`, decimals: fraction.length });
-}
-
-/*
- * What discovery says of a token of the list where one market's decisions are
- * what count: the rule, with whether this market hides the token and whether
- * it has it deprecated in place of what the chain decides of either (hiddenOf,
- * deprecatedOf), and every other input as the list has it, its value read back
- * from the digits the list writes. The summary asks it of each collateral with
- * the decisions of the collateral's own Comet (summary-tokens.ts).
- */
-function visibilityWith(token: TokenVisibilityV1, here: { isHidden: boolean, isDeprecated: boolean }): Visibility {
-  return visibilityOf(
-    { isHidden: here.isHidden, isDeprecated: here.isDeprecated, isStrategic: token.isStrategic },
-    { valueUsd: token.collateralValueUsd === null ? null : fixnumOf(token.collateralValueUsd) },
-  );
-}
-
 function appliedOf(exception: PriceExceptionV1): AppliedPriceExceptionV1 {
   return {
     kind:             exception.kind,
@@ -209,43 +193,59 @@ function bySymbol(left: TokenVisibilityV1, right: TokenVisibilityV1): number {
   return a < b ? -1 : a > b ? 1 : left.address < right.address ? -1 : left.address > right.address ? 1 : 0;
 }
 
-function tokenList(input: {
-  registryVersion: VersionRefV1,
-  chainId:         number,
-  catalog:         Catalog,
-  network:         KnownNetwork.Name,
-  positions:       Position[],
-  view:            CollateralView,
-  strategic:       ReadonlySet<Address>,
-  deprecated:      DeprecatedDecisions,
-  hidden:          HiddenDecisions,
-  now:             Date,
-}): TokenListV1 {
+type ListInput = {
+  chainId:    number,
+  catalog:    Catalog,
+  network:    KnownNetwork.Name,
+  positions:  Position[],
+  view:       CollateralView,
+  strategic:  ReadonlySet<Address>,
+  deprecated: Decisions,
+  hidden:     Decisions,
+  now:        Date,
+};
+
+// a token as the list writes it, and the value the rule read of it, of which the list writes the digits
+type ListedToken = { token: TokenVisibilityV1, valueUsd: BigFixnum | null };
+
+/*
+ * Every token of a chain as the list writes it, in no particular order, with
+ * the value it was decided by, which /summary decides each collateral by in
+ * its own market (summary-tokens.ts).
+ */
+function listedTokens(input: ListInput): ListedToken[] {
   const markets = input.catalog.marketsOn(input.network);
-  const tokens  = tokensOf(input.catalog, input.network).map(({ token, roles }): TokenVisibilityV1 => {
+  return tokensOf(input.catalog, input.network).map(({ token, roles }): ListedToken => {
     const value       = tokenValue(token.address, input.view, input.positions, THRESHOLD_USD, input.now);
     const isStrategic = input.strategic.has(token.address);
-    const deprecated  = deprecatedOf(input.chainId, token.address, markets, input.deprecated);
-    // the list names where the token is hidden, and says that it is hidden across the chain by its reason alone
-    const { isHidden, hiddenIn } = hiddenOf(input.chainId, token.address, markets, { deprecated: input.deprecated, hidden: input.hidden });
+    // the list names where the token is hidden, and says what keeps it out of discovery by its reason alone
+    const chain       = exclusionOnChain(input.chainId, token.address, markets, input);
     return {
-      address:               token.address,
-      symbol:                token.symbol,
-      name:                  token.name,
-      decimals:              token.decimals,
-      roles,
-      isStrategic,
-      ...deprecated,
-      hiddenIn,
-      collateralValueUsd:    value.valueUsd === null ? null : decimalString(value.valueUsd),
-      collateralValueStatus: value.status,
-      valueAt:               value.block === null ? null : new Date(value.block.timestamp * 1000).toISOString(),
-      valueBlock:            value.block,
-      staleAgeSeconds:       value.staleAgeSeconds,
-      exceptions:            value.exceptions.map(appliedOf),
-      ...visibilityOf({ isHidden, isDeprecated: deprecated.isDeprecated, isStrategic }, value),
+      token: {
+        address:               token.address,
+        symbol:                token.symbol,
+        name:                  token.name,
+        decimals:              token.decimals,
+        roles,
+        isStrategic,
+        isDeprecated:          chain.isDeprecated,
+        deprecatedIn:          chain.deprecatedIn,
+        hiddenIn:              chain.hiddenIn,
+        collateralValueUsd:    value.valueUsd === null ? null : decimalString(value.valueUsd),
+        collateralValueStatus: value.status,
+        valueAt:               value.block === null ? null : new Date(value.block.timestamp * 1000).toISOString(),
+        valueBlock:            value.block,
+        staleAgeSeconds:       value.staleAgeSeconds,
+        exceptions:            value.exceptions.map(appliedOf),
+        ...visibilityOf(chain.exclusion, isStrategic, value),
+      },
+      valueUsd: value.valueUsd,
     };
   });
+}
+
+function tokenList(input: ListInput & { registryVersion: VersionRefV1 }): TokenListV1 {
+  const tokens = listedTokens(input).map(({ token }) => token);
   return {
     registryVersion: input.registryVersion,
     chainId:         input.chainId,
@@ -257,4 +257,5 @@ function tokenList(input: {
   };
 }
 
-export { RULE_VERSION, THRESHOLD_USD, decimalString, deprecatedOf, hiddenOf, tokenList, tokensOf, visibilityOf, visibilityWith };
+export type { Exclusion, ListedToken };
+export { RULE_VERSION, decimalString, listedTokens, tokenList, tokensOf, visibilityHere, visibilityOf };

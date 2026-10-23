@@ -9,7 +9,7 @@ import type * as Evaluator from '../evaluator.js';
 import { routeAdmin } from './admin-router.js';
 import type { CachedSnapshot } from './cache.js';
 import { activeSnapshot, cacheDepsOf, isUnreachable, versionSnapshot, warmSnapshot } from './cache.js';
-import { deprecatedDecisions, hiddenDecisions, recordDeprecatedCollaterals, recordHiddenCollaterals } from './deprecated-collaterals.js';
+import { readMarks, recordCollaterals } from './collateral-decisions.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
@@ -228,10 +228,8 @@ async function routeRegistry(
         debug.warn(`registry snapshot not warmed`, { versionId, error });
       }
     },
-    deprecated:       () => deprecatedDecisions(deps),
-    hidden:           () => hiddenDecisions(deps),
-    recordDeprecated: () => recordDeprecatedCollaterals(deps),
-    recordHidden:     () => recordHiddenCollaterals(deps),
+    marks:   () => readMarks(deps),
+    record:  kind => recordCollaterals(kind, deps),
     catalog: registry,
     tokens:  tokenCollateralDeps({ env, debug, flags, waitUntil }, instantiateEvaluator, DEADLINE_MS),
   };

@@ -20,13 +20,16 @@ import {
   replaceOverlays,
 } from './admin.js';
 import {
-  getDeprecatedCollateral,
-  getDeprecatedCollateralExport,
-  patchDeprecatedCollateral,
-  postDeprecatedCollateralApply,
-  postDeprecatedCollateralReview,
-} from './deprecated-collateral-handlers.js';
-import type { ListedDecision as ListedDeprecatedDecision } from './deprecated-collateral-repository.js';
+  getCollateral,
+  getCollateralExport,
+  patchCollateral,
+  postCollateralApply,
+  postCollateralReview,
+} from './collateral-decision-handlers.js';
+import type { CollateralDecisionKind, ListedCollateralDecision } from './collateral-decision-repository.js';
+import { DEPRECATED_COLLATERAL_KIND, HIDDEN_COLLATERAL_KIND, member } from './collateral-decision-repository.js';
+import type { RecordedKind } from './collateral-decisions.js';
+import { DEPRECATED_RECORD, HIDDEN_RECORD } from './collateral-decisions.js';
 import {
   RegistryContext,
   cancelSyncRun,
@@ -40,14 +43,6 @@ import {
   postActivation,
   postValidate,
 } from './handlers.js';
-import {
-  getHiddenCollateral,
-  getHiddenCollateralExport,
-  patchHiddenCollateral,
-  postHiddenCollateralApply,
-  postHiddenCollateralReview,
-} from './hidden-collateral-handlers.js';
-import type { ListedDecision as ListedHiddenDecision } from './hidden-collateral-repository.js';
 import { isExplicit } from './importer.js';
 import type { InvocationResult } from './importer.js';
 import type { SyncOutcome } from './rows.js';
@@ -78,6 +73,42 @@ function feedReader(env: Env): FeedReader {
 function creationReader(env: Env): CreationReader {
   const transport = transportFor(env);
   return (network, markets) => readCreationBlocks(transport(network), markets, network);
+}
+
+/*
+ * The routes of a kind of decision about a collateral: one collateral's
+ * decision, read and set, under the kind's own last segment, and the list of
+ * every collateral's, exported, reviewed and applied, under the kind's own
+ * path, each path's verbs in the order a 405 names them. Each route answers
+ * for the kind it was made for (`collateral`), so one case of routeAdmin
+ * answers it for either kind, and a command keeps that kind's record
+ * (`record`).
+ */
+function collateralRoutes<Flag extends string, Column extends string, Rows extends string>(
+  kind: CollateralDecisionKind<Flag, Column, Rows>,
+  record: RecordedKind,
+) {
+  const one  = new RegExp(`^/registry/v1/admin/networks/([^/]+)/markets/([^/]+)/collaterals/([^/]+)/${kind.segment}$`);
+  const list = `^/registry/v1/admin/${kind.listPath}`;
+  const spec = collateralListSpec(kind);
+  const collateral = {
+    // the member of a command's body that holds the decision
+    flag:   kind.flag,
+    read:   (context: RegistryContext, chainId: string, cometAddress: string, tokenAddress: string) =>
+      getCollateral(context, kind, chainId, cometAddress, tokenAddress),
+    set:    (context: RegistryContext, chainId: string, cometAddress: string, tokenAddress: string, decision: { flag: boolean, reason: string }) =>
+      patchCollateral(context, kind, record, chainId, cometAddress, tokenAddress, decision),
+    export: (context: RegistryContext) => getCollateralExport(context, kind),
+    review: (context: RegistryContext, body: Record<string, unknown>) => postCollateralReview(context, kind, decisionListOf(body, spec)),
+    apply:  (context: RegistryContext, body: Record<string, unknown>) => postCollateralApply(context, kind, record, decisionListOf(body, spec)),
+  };
+  return [
+    { pattern: one,                           method: 'GET',   handler: 'collateral',        family: 'read',   collateral },
+    { pattern: one,                           method: 'PATCH', handler: 'setCollateral',     family: 'policy', collateral },
+    { pattern: new RegExp(`${list}$`),        method: 'GET',   handler: 'exportCollaterals', family: 'read',   collateral },
+    { pattern: new RegExp(`${list}/review$`), method: 'POST',  handler: 'reviewCollaterals', family: 'read',   collateral },
+    { pattern: new RegExp(`${list}/apply$`),  method: 'POST',  handler: 'applyCollaterals',  family: 'policy', collateral },
+  ] as const;
 }
 
 /*
@@ -117,16 +148,8 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/token-policies$/,                                       method: 'GET',  handler: 'exportTokenPolicies', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/token-policies\/review$/,                               method: 'POST', handler: 'reviewTokenPolicies', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/token-policies\/apply$/,                                method: 'POST', handler: 'applyTokenPolicies',  family: 'policy' },
-  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/deprecated$/, method: 'GET',   handler: 'deprecatedCollateral',    family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/deprecated$/, method: 'PATCH', handler: 'setDeprecatedCollateral', family: 'policy' },
-  { pattern: /^\/registry\/v1\/admin\/deprecated-collaterals$/,                               method: 'GET',  handler: 'exportDeprecatedCollaterals', family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/deprecated-collaterals\/review$/,                       method: 'POST', handler: 'reviewDeprecatedCollaterals', family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/deprecated-collaterals\/apply$/,                        method: 'POST', handler: 'applyDeprecatedCollaterals',  family: 'policy' },
-  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/hidden$/, method: 'GET',   handler: 'hiddenCollateral',    family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/collaterals\/([^/]+)\/hidden$/, method: 'PATCH', handler: 'setHiddenCollateral', family: 'policy' },
-  { pattern: /^\/registry\/v1\/admin\/hidden-collaterals$/,                                   method: 'GET',  handler: 'exportHiddenCollaterals', family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/hidden-collaterals\/review$/,                           method: 'POST', handler: 'reviewHiddenCollaterals', family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/hidden-collaterals\/apply$/,                            method: 'POST', handler: 'applyHiddenCollaterals',  family: 'policy' },
+  ...collateralRoutes(DEPRECATED_COLLATERAL_KIND, DEPRECATED_RECORD),
+  ...collateralRoutes(HIDDEN_COLLATERAL_KIND, HIDDEN_RECORD),
 ] as const;
 
 const MAX_REASON = 1000;
@@ -165,15 +188,13 @@ const MAX_OVERLAYS_BODY_BYTES  = 512 * 1024;
 const MAX_DECISIONS_PER_REQUEST = 500;
 const MAX_DECISIONS_BODY_BYTES  = 1024 * 1024;
 
-// the bodies larger than an ordinary command, by the route that takes them
-const BODY_BYTES: Partial<Record<string, number>> = {
-  overlays:                    MAX_OVERLAYS_BODY_BYTES,
-  reviewTokenPolicies:         MAX_DECISIONS_BODY_BYTES,
-  applyTokenPolicies:          MAX_DECISIONS_BODY_BYTES,
-  reviewDeprecatedCollaterals: MAX_DECISIONS_BODY_BYTES,
-  applyDeprecatedCollaterals:  MAX_DECISIONS_BODY_BYTES,
-  reviewHiddenCollaterals:     MAX_DECISIONS_BODY_BYTES,
-  applyHiddenCollaterals:      MAX_DECISIONS_BODY_BYTES,
+// the bodies larger than an ordinary command, by the handler of the route that takes them
+const BODY_BYTES: Partial<Record<typeof ROUTES[number]['handler'], number>> = {
+  overlays:            MAX_OVERLAYS_BODY_BYTES,
+  reviewTokenPolicies: MAX_DECISIONS_BODY_BYTES,
+  applyTokenPolicies:  MAX_DECISIONS_BODY_BYTES,
+  reviewCollaterals:   MAX_DECISIONS_BODY_BYTES,
+  applyCollaterals:    MAX_DECISIONS_BODY_BYTES,
 };
 
 /*
@@ -569,47 +590,34 @@ const TOKEN_POLICY_LIST: DecisionListSpec<ListedDecision> = {
   addressesOf: decision => [ decision.tokenAddress ],
 };
 
-// `retained` names the decisions the active version does not hold, and is not read
-const DEPRECATED_COLLATERAL_LIST: DecisionListSpec<ListedDeprecatedDecision> = {
-  bodyKeys:    [ 'registryVersion', 'reason', 'collaterals', 'retained' ],
-  listKey:     'collaterals',
-  what:        'deprecated collaterals',
-  fields:      [
-    [ 'chainId', 'chainId' ], [ 'cometAddress', 'address' ], [ 'deploymentKey', 'name' ],
-    [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ], [ 'isDeprecated', 'flag' ],
-  ],
-  decisionOf:  (value, reason) => ({
-    chainId:       value.chainId as number,
-    cometAddress:  normalizeAddress(value.cometAddress as string),
-    deploymentKey: (value.deploymentKey as string | null | undefined) ?? null,
-    tokenAddress:  normalizeAddress(value.tokenAddress as string),
-    symbol:        (value.symbol as string | null | undefined) ?? null,
-    isDeprecated:  value.isDeprecated as boolean,
-    reason,
-  }),
-  addressesOf: decision => [ decision.cometAddress, decision.tokenAddress ],
-};
-
-// the shape of a deprecated collateral list under its own member, so neither kind's review takes the other's export
-const HIDDEN_COLLATERAL_LIST: DecisionListSpec<ListedHiddenDecision> = {
-  bodyKeys:    [ 'registryVersion', 'reason', 'hiddenCollaterals', 'retained' ],
-  listKey:     'hiddenCollaterals',
-  what:        'hidden collaterals',
-  fields:      [
-    [ 'chainId', 'chainId' ], [ 'cometAddress', 'address' ], [ 'deploymentKey', 'name' ],
-    [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ], [ 'isHidden', 'flag' ],
-  ],
-  decisionOf:  (value, reason) => ({
-    chainId:       value.chainId as number,
-    cometAddress:  normalizeAddress(value.cometAddress as string),
-    deploymentKey: (value.deploymentKey as string | null | undefined) ?? null,
-    tokenAddress:  normalizeAddress(value.tokenAddress as string),
-    symbol:        (value.symbol as string | null | undefined) ?? null,
-    isHidden:      value.isHidden as boolean,
-    reason,
-  }),
-  addressesOf: decision => [ decision.cometAddress, decision.tokenAddress ],
-};
+/*
+ * A list of a kind of decision about a collateral, its rows under the kind's
+ * own member, so neither kind's review takes the other's export. `retained`
+ * names the decisions the active version does not hold, and is not read.
+ */
+function collateralListSpec<Flag extends string, Column extends string, Rows extends string>(
+  kind: CollateralDecisionKind<Flag, Column, Rows>,
+): DecisionListSpec<ListedCollateralDecision<Flag>> {
+  return {
+    bodyKeys:    [ 'registryVersion', 'reason', kind.listKey, 'retained' ],
+    listKey:     kind.listKey,
+    what:        kind.listOf,
+    fields:      [
+      [ 'chainId', 'chainId' ], [ 'cometAddress', 'address' ], [ 'deploymentKey', 'name' ],
+      [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ], [ kind.flag, 'flag' ],
+    ],
+    decisionOf:  (value, reason) => ({
+      chainId:       value.chainId as number,
+      cometAddress:  normalizeAddress(value.cometAddress as string),
+      deploymentKey: (value.deploymentKey as string | null | undefined) ?? null,
+      tokenAddress:  normalizeAddress(value.tokenAddress as string),
+      symbol:        (value.symbol as string | null | undefined) ?? null,
+      ...member(kind.flag, value[kind.flag] as boolean),
+      reason,
+    }),
+    addressesOf: decision => [ decision.cometAddress, decision.tokenAddress ],
+  };
+}
 
 /*
  * The body of a list's review and apply (`POST /token-policies/review` and
@@ -802,53 +810,30 @@ async function routeAdmin(
       return await postTokenPolicyReview(context, decisionListOf(body, TOKEN_POLICY_LIST));
     case 'applyTokenPolicies':
       return await postTokenPolicyApply(context, decisionListOf(body, TOKEN_POLICY_LIST));
-    case 'deprecatedCollateral':
+    case 'collateral':
       // a chain id, the Comet and the token, as on the token routes
-      return await getDeprecatedCollateral(context, versionId!, second!, third!);
-    case 'setDeprecatedCollateral': {
+      return await route.collateral.read(context, versionId!, second!, third!);
+    case 'setCollateral': {
       /*
-       * A deprecated decision changes which collaterals the frontend offers,
-       * and which tokens discovery shows, so it carries a reason like every
-       * other decision, and the audit event stores it beside the actor.
+       * A decision about a collateral changes which tokens discovery shows,
+       * and a deprecated one which collaterals the frontend offers, so it
+       * carries a reason like every other decision, and the audit event
+       * stores it beside the actor.
        */
-      requireExactKeys(body, [ 'isDeprecated', 'reason' ]);
-      if (typeof(body.isDeprecated) !== 'boolean') {
-        throw new ApiError('BAD_REQUEST', `isDeprecated must be a boolean`);
+      const { flag } = route.collateral;
+      requireExactKeys(body, [ flag, 'reason' ]);
+      const value = body[flag];
+      if (typeof(value) !== 'boolean') {
+        throw new ApiError('BAD_REQUEST', `${flag} must be a boolean`);
       }
-      return await patchDeprecatedCollateral(context, versionId!, second!, third!, {
-        isDeprecated: body.isDeprecated,
-        reason:       requireReason(body),
-      });
+      return await route.collateral.set(context, versionId!, second!, third!, { flag: value, reason: requireReason(body) });
     }
-    case 'exportDeprecatedCollaterals':
-      return await getDeprecatedCollateralExport(context);
-    case 'reviewDeprecatedCollaterals':
-      return await postDeprecatedCollateralReview(context, decisionListOf(body, DEPRECATED_COLLATERAL_LIST));
-    case 'applyDeprecatedCollaterals':
-      return await postDeprecatedCollateralApply(context, decisionListOf(body, DEPRECATED_COLLATERAL_LIST));
-    case 'hiddenCollateral':
-      return await getHiddenCollateral(context, versionId!, second!, third!);
-    case 'setHiddenCollateral': {
-      /*
-       * A hidden decision changes which tokens discovery shows, so it carries
-       * a reason like every other decision, and the audit event stores it
-       * beside the actor.
-       */
-      requireExactKeys(body, [ 'isHidden', 'reason' ]);
-      if (typeof(body.isHidden) !== 'boolean') {
-        throw new ApiError('BAD_REQUEST', `isHidden must be a boolean`);
-      }
-      return await patchHiddenCollateral(context, versionId!, second!, third!, {
-        isHidden: body.isHidden,
-        reason:   requireReason(body),
-      });
-    }
-    case 'exportHiddenCollaterals':
-      return await getHiddenCollateralExport(context);
-    case 'reviewHiddenCollaterals':
-      return await postHiddenCollateralReview(context, decisionListOf(body, HIDDEN_COLLATERAL_LIST));
-    case 'applyHiddenCollaterals':
-      return await postHiddenCollateralApply(context, decisionListOf(body, HIDDEN_COLLATERAL_LIST));
+    case 'exportCollaterals':
+      return await route.collateral.export(context);
+    case 'reviewCollaterals':
+      return await route.collateral.review(context, body);
+    case 'applyCollaterals':
+      return await route.collateral.apply(context, body);
   }
 }
 

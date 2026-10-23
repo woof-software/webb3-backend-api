@@ -1,6 +1,5 @@
 import t from 'tap';
 
-import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 import type {
@@ -22,10 +21,10 @@ import { DEPRECATED_COLLATERALS, decisionScenarios } from './decision-scenarios.
  * What every kind of decision does is in decision-scenarios.ts, run here for
  * deprecated collaterals: a decision and its audit, idempotency under a race,
  * survival across activations, the database guard against an activation
- * that races a write, and a list refused for its problems or for a race.
- * Beside them, the tests of deprecated collaterals alone: the market reads
- * that flag them, and the seed document of the runbook, reviewed, applied and
- * exported through the deprecated-collaterals routes.
+ * that races a write, a list refused for its problems or for a race, and the
+ * market reads that flag a deprecated collateral. Beside them, the test of
+ * deprecated collaterals alone: the seed document of the runbook, reviewed,
+ * applied and exported through the deprecated-collaterals routes.
  *
  * Refusals of malformed requests are in deprecated-collateral-routes.test.ts,
  * and what the active reads answer in deprecated-collateral-reads.test.ts.
@@ -46,7 +45,6 @@ const collateral = (key: string, symbol: string) => mainnet.markets.find(market 
 const USDT = comet('usdt');
 const USDC = comet('usdc');
 const WETH = comet('weth');
-// collateral of the USDT market alone, so a version without it in that market holds no mETH at all
 const METH = collateral('usdt', 'mETH');
 
 // the collaterals a public market read flags deprecated, by symbol
@@ -54,30 +52,6 @@ async function flagged(market: string): Promise<string[]> {
   const { body } = await admin.read<{ market: ActiveMarketV1 }>(`/registry/v1/networks/1/markets/${market}`, {});
   return body.market.collateralAssets.filter(asset => asset.isDeprecated).map(asset => asset.token.symbol);
 }
-
-/*
- * What a decision changes for every client: the market reads flag a
- * collateral from the moment it is deprecated until the decision is
- * reversed, and only in a version whose Comet takes it.
- */
-t.test('the market reads flag a collateral while it is deprecated', async t => {
-  const db    = await harness.freshDatabase();
-  const first = await seedValidated(db);
-  await admin.switchTo(first);
-  const path = DEPRECATED_COLLATERALS.path(1, { cometAddress: USDT, tokenAddress: METH });
-
-  t.same(await flagged(USDT), [], 'nothing is flagged before anybody decides');
-  await admin.patch(path, { isDeprecated: true, reason: 'Linear COM-18' });
-  t.same(await flagged(USDT), [ 'mETH' ], 'the market reads flag the collateral at once');
-  await admin.patch(path, { isDeprecated: false, reason: 'listed again' });
-  t.same(await flagged(USDT), [], 'and stop flagging it once the decision is reversed');
-
-  await admin.patch(path, { isDeprecated: true, reason: 'Linear COM-18, again' });
-  await admin.switchTo(await seedValidated(db, { networks: DEPRECATED_COLLATERALS.without, versionId: randomUUID() }));
-  t.same(await flagged(USDT), [], 'a version whose Comet does not take the collateral has nothing of it to flag');
-  await admin.switchTo(first, 'rollback');
-  t.same(await flagged(USDT), [ 'mETH' ], 'and a version that brings it back flags it again');
-});
 
 const REVIEW = DEPRECATED_COLLATERALS.list.review;
 const APPLY  = DEPRECATED_COLLATERALS.list.apply;

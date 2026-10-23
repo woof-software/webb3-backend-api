@@ -1,317 +1,59 @@
-import t, { Test } from 'tap';
+import t from 'tap';
 
-import C3Api, { Env } from '../../../entrypoint.js';
-import type { ActiveMarketV1, ActiveSnapshotV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
-import { setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
-import { DEPRECATED_KEY, deprecatedDecisions, recordDeprecatedCollaterals } from '../../../src/registry/deprecated-collaterals.js';
+import { keccak256 } from '../../../lib/hash.js';
+import {
+  DEPRECATED_KEY,
+  DEPRECATED_RECORD,
+  collateralDecisionsOf,
+  markedDecisions,
+  recordCollaterals,
+} from '../../../src/registry/collateral-decisions.js';
 
-import { consoleLines } from '../../util/console.js';
-import { executionContext, settledWithin } from '../../util/execution-context.js';
+import { settledWithin } from '../../util/execution-context.js';
 import { MemoryKv } from '../../util/kv.js';
 import { quietLog } from '../../util/quiet-log.js';
-import { activeRegistryDatabase } from '../../util/registry-database.js';
-import { ADMIN_TOKEN, adminTestEnv, failingStatements } from '../../util/test-env.js';
+
+import { DEPRECATED_READS, HIDDEN_READS, bindingOf, decisionReadScenarios, envOf, fixture, get } from './collateral-read-scenarios.js';
+import { DEPRECATED_COLLATERALS, statementsOf } from './decision-scenarios.js';
 
 import '../../../shim/node-self.js';
 
 /*
  * What the active reads answer about deprecated collaterals, through the
- * worker's own entry point: the flag on every collateral of /active and the
- * market reads, by the decisions in force when they answer; ETags that change
- * with the flags they name, and only then; when the database cannot be
- * reached, the decisions the Worker last recorded, said to be unconfirmed; and
- * how the reads keep that record, which some of the tests below drive
- * directly.
- *
- * Decisions are made through the repository, or through the command where
- * what it records is the point, so nothing here spends the limiter's budget.
+ * worker's own entry point: what they answer for every kind of decision
+ * about a collateral is in collateral-read-scenarios.ts, run here for
+ * deprecated collaterals. Beside it, the form of the digest a tag names each
+ * kind's flags by, and how the reads keep the record an outage answers with
+ * in step under load and races, which the tests below drive through the
+ * deprecated kind's record: the two kinds keep their records by the same code.
  */
-let seed = 0;
-
-type Envelope = { error: { code: string, message: string } };
-
-// matches no statement, so that a database fails only while it is down
-const NO_STATEMENT = /^$/;
-
-function envOf(db: D1Database, kv: KVNamespace, overrides: Partial<Env> = {}): Promise<Env> {
-  return adminTestEnv({
-    APP_DB:            db,
-    kv_registry:       kv,
-    MEMORY_CACHE_SEED: `deprecated-collateral-reads-${seed++}`,
-    ...overrides,
-  });
-}
+decisionReadScenarios(DEPRECATED_READS);
 
 /*
- * Without an execution context, so the request writes the records an outage
- * reads before it answers, not past the answer: what a request records is
- * there for the request after it.
+ * The copies clients hold were tagged by these digests, and a record is
+ * checked by the same digest of its decisions. The other tests read only the
+ * digest's shape, so its form is held here, written out.
  */
-async function get(env: Env, path: string, headers: Record<string, string> = {}): Promise<Response> {
-  return C3Api.fetch(new Request(`https://api.test.local${path}`, { headers }), env);
-}
-
-async function json<T>(env: Env, path: string): Promise<T> {
-  const response = await get(env, path);
-  if (response.status !== 200) {
-    throw new Error(`${path} answered ${response.status}: ${await response.text()}`);
-  }
-  return await response.json() as T;
-}
-
-// what the worker logged, for the length of a test, each line after its level
-function captureLogs(t: Test): string[] {
-  return consoleLines(t, [ 'error', 'warn' ], { prefixed: true });
-}
-
-async function fixture(t: Test) {
-  const registry = await activeRegistryDatabase();
-  t.teardown(() => registry.dispose());
-  const mainnet = registry.snapshot.networks.find(network => network.chainId === 1)!;
-  const market  = (key: string) => mainnet.markets.find(entry => entry.deploymentKey === key)!;
-  const token   = (key: string, symbol: string) => market(key).collateralAssets.find(asset => asset.token.symbol === symbol)!.token.address;
-  const decide  = (key: string, symbol: string, isDeprecated: boolean) => setDeprecatedCollateral(registry.db, {
-    chainId:      1,
-    cometAddress: market(key).contracts.comet!,
-    tokenAddress: token(key, symbol),
-    isDeprecated,
-    actor:        'test',
-    reason:       'decided for a deprecated collateral read test',
-  });
-  return { registry, market, decide, USDT: market('usdt').contracts.comet!, USDC: market('usdc').contracts.comet! };
-}
-
-// the collaterals an answer flags deprecated, as `market/symbol`
-function flaggedIn(networks: Array<{ markets: ActiveMarketV1[] }>): string[] {
-  return networks.flatMap(network => network.markets.flatMap(market => market.collateralAssets
-    .filter(asset => asset.isDeprecated)
-    .map(asset => `${market.deploymentKey}/${asset.token.symbol}`)));
-}
-
-t.test('the active reads mark every collateral by the decisions in force, and the version read by id marks none', async t => {
-  const { registry, decide, USDT } = await fixture(t);
+t.test('a tag names each kind\'s flags by a digest of their collaterals, as the decisions of the kind are named', async t => {
+  const { registry, collateral, decide } = await fixture(t);
   const env = await envOf(registry.db, MemoryKv({}));
+  const [ mEth, weEth, lBtc ] = [ collateral('usdt', 'mETH'), collateral('usdc', 'weETH'), collateral('wbtc', 'LBTC') ];
+  await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
+  await decide(DEPRECATED_READS, 'usdc', 'weETH', true);
+  await decide(HIDDEN_READS, 'wbtc', 'LBTC', true);
 
-  const before = await json<ActiveSnapshotV1>(env, '/registry/v1/active');
-  const assets = before.networks.flatMap(network => network.markets.flatMap(market => market.collateralAssets));
-  t.ok(assets.length > 0 && assets.every(asset => asset.isDeprecated === false), 'every collateral is current while nobody has decided');
-  t.same(Object.keys(assets[0]!), [ 'assetIndex', 'token', 'priceFeed', 'isDeprecated', 'isHidden' ],
-    'the flag stands beside what the version says, before the hidden one (hidden-collateral-reads.test.ts)');
+  // keys given in their sorted order
+  const digestOf   = (...keys: string[]) => keccak256(keys.join(',')).slice(0, 16);
+  const deprecated = digestOf(`1:${mEth.cometAddress}:${mEth.tokenAddress}`, `1:${weEth.cometAddress}:${weEth.tokenAddress}`);
+  const hidden     = digestOf(`1:${lBtc.cometAddress}:${lBtc.tokenAddress}`);
+  t.equal((await get(env, '/registry/v1/active')).headers.get('etag'),
+    `"v1-r5-snapshot+deprecated-${deprecated}+hidden-${hidden}-${registry.versionId}-${registry.snapshot.registryVersion.checksum}"`,
+    'the active snapshot names the collaterals it flags deprecated, and those it flags hidden, each by the digest of their keys');
   t.same(
-    before.networks.map(network => ({ ...network, markets: network.markets.map(market => ({
-      ...market,
-      collateralAssets: market.collateralAssets.map(({ isDeprecated: _isDeprecated, isHidden: _isHidden, ...asset }) => asset),
-    })) })),
-    registry.snapshot.networks,
-    'and everything else is the version as it was stored',
-  );
-
-  await decide('usdt', 'mETH', true);
-  await decide('usdc', 'weETH', true);
-  const after = await json<ActiveSnapshotV1>(env, '/registry/v1/active');
-  t.same(flaggedIn(after.networks), [ 'usdc/weETH', 'usdt/mETH' ], 'the next answer flags each decided collateral in its own market');
-
-  const markets = await json<{ markets: ActiveMarketV1[] }>(env, '/registry/v1/networks/1/markets');
-  t.same(flaggedIn([ markets ]), [ 'usdc/weETH', 'usdt/mETH' ], 'and so does the chain\'s market list');
-  const usdt = await json<{ market: ActiveMarketV1 }>(env, `/registry/v1/networks/1/markets/${USDT}`);
-  t.same(flaggedIn([ { markets: [ usdt.market ] } ]), [ 'usdt/mETH' ], 'and the market itself, its own decisions only');
-  t.same(flaggedIn([ await json<{ markets: ActiveMarketV1[] }>(env, '/registry/v1/networks/8453/markets') ]), [],
-    'while another chain flags nothing');
-
-  const pinned = await json<RegistrySnapshotV1>(env, `/registry/v1/versions/${registry.versionId}`);
-  t.same(pinned.networks, registry.snapshot.networks, 'the version read by id is the version as it was imported, without a flag');
+    [ collateralDecisionsOf([ weEth, mEth ]).digest, collateralDecisionsOf([ lBtc ]).digest ],
+    [ deprecated, hidden ],
+    'and so are the decisions of each kind, in whatever order they were listed');
 });
-
-t.test('a decision changes the tag of every answer whose flags it changes, and of no other', async t => {
-  const { registry, decide, USDT, USDC } = await fixture(t);
-  const env  = await envOf(registry.db, MemoryKv({}));
-  const tag  = async (path: string) => (await get(env, path)).headers.get('etag')!;
-  const paths = [
-    '/registry/v1/active',
-    '/registry/v1/networks/1/markets',
-    `/registry/v1/networks/1/markets/${USDT}`,
-    `/registry/v1/networks/1/markets/${USDC}`,
-    '/registry/v1/networks/8453/markets',
-    `/registry/v1/versions/${registry.versionId}`,
-    '/registry/v1/networks',
-  ];
-  const first = Object.fromEntries(await Promise.all(paths.map(async path => [ path, await tag(path) ] as const)));
-  t.match(first['/registry/v1/active'], new RegExp(`^"v1-r5-snapshot\\+deprecated-[0-9a-f]{16}\\+hidden-[0-9a-f]{16}-${registry.versionId}-[0-9a-f]{64}"$`),
-    'the bootstrap tag names the flags it carries beside the version');
-  t.equal(first[`/registry/v1/versions/${registry.versionId}`], `"v1-r5-snapshot-${registry.versionId}-${registry.snapshot.registryVersion.checksum}"`,
-    'and the version read by id, which carries none, is another representation');
-
-  await decide('usdt', 'mETH', true);
-  const answered = async (path: string, etag: string) => (await get(env, path, { 'If-None-Match': etag })).status;
-  for (const path of paths.slice(0, 3)) {
-    t.equal(await answered(path, first[path]!), 200, `${path} sends the body again to a client holding a copy without the flag`);
-    const next = await tag(path);
-    t.not(next, first[path], 'under a new tag');
-    t.equal(await answered(path, next), 304, 'which it then confirms');
-    t.equal(await answered(path, `W/${next}`), 304, 'weak or strong');
-  }
-  for (const path of paths.slice(3)) {
-    t.equal(await answered(path, first[path]!), 304, `${path}, which flags nothing the decision changed, still confirms its copy`);
-  }
-
-  await decide('usdt', 'mETH', false);
-  t.equal(await tag('/registry/v1/active'), first['/registry/v1/active'], 'taking the decision back is the first answer again, under its tag');
-  t.equal(await answered('/registry/v1/active', first['/registry/v1/active']!), 304, 'which confirms the copy made before it');
-});
-
-/*
- * The fallback (cache.ts) answers with the version D1 last named; the flags it
- * marks are the decisions the Worker last recorded, which a read records where
- * the record does not hold them.
- */
-t.test('during an outage the active reads answer with the decisions last recorded', async t => {
-  const { registry, market, decide, USDT } = await fixture(t);
-  const logs = captureLogs(t);
-  let down = false;
-  const kv  = MemoryKv({});
-  const env = await envOf(failingStatements(registry.db, NO_STATEMENT, { down: () => down }), kv);
-
-  await decide('usdt', 'mETH', true);
-  t.equal((await get(env, '/registry/v1/active')).status, 200, 'a read while the database answers caches the version');
-  const mEth = market('usdt').collateralAssets.find(asset => asset.token.symbol === 'mETH')!.token.address;
-  const recorded = await kv.get(DEPRECATED_KEY, 'json') as { at: string, collaterals: unknown[] };
-  t.same(recorded.collaterals, [ { chainId: 1, cometAddress: USDT, tokenAddress: mEth } ], 'and records the decisions it read');
-
-  down = true;
-  for (const path of [ '/registry/v1/active', '/registry/v1/networks/1/markets', `/registry/v1/networks/1/markets/${USDT}` ]) {
-    const response = await get(env, path);
-    t.equal(response.status, 200, `${path} answers from the cache`);
-    t.match(response.headers.get('x-registry-stale'), /^[0-9]+$/, 'saying how old its answer is');
-    t.equal(response.headers.get('cache-control'), 'no-store', 'and that nothing may keep it');
-    const body = await response.json() as { networks?: Array<{ markets: ActiveMarketV1[] }>, markets?: ActiveMarketV1[], market?: ActiveMarketV1 };
-    const networks = body.networks ?? [ { markets: body.markets ?? [ body.market! ] } ];
-    t.same(flaggedIn(networks), [ 'usdt/mETH' ], 'with the decisions last recorded');
-    t.equal((await get(env, path, { 'If-None-Match': response.headers.get('etag')! })).status, 200, 'and confirms nothing');
-  }
-  t.ok(logs.some(line => line === 'warn: deprecated collateral decisions unreadable; answering with the ones last recorded'),
-    'the log says where the flags came from');
-  t.equal(logs.filter(line => line.includes('deprecated collateral decisions unreadable')).length, 1, 'once a minute, not once a request');
-});
-
-t.test('a decision a command makes is recorded at once, for an outage to answer with', async t => {
-  const { registry, market } = await fixture(t);
-  captureLogs(t);
-  let down = false;
-  const env = await envOf(failingStatements(registry.db, NO_STATEMENT, { down: () => down }), MemoryKv({}));
-  t.same(flaggedIn((await json<ActiveSnapshotV1>(env, '/registry/v1/active')).networks), [], 'nothing is deprecated at first');
-
-  const usdc  = market('usdc');
-  const weEth = usdc.collateralAssets.find(asset => asset.token.symbol === 'weETH')!.token.address;
-  const command = await C3Api.fetch(new Request(
-    `https://api.test.local/registry/v1/admin/networks/1/markets/${usdc.contracts.comet}/collaterals/${weEth}/deprecated`,
-    {
-      method:  'PATCH',
-      headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ isDeprecated: true, reason: 'Linear COM-18' }),
-    },
-  ), env);
-  t.equal(command.status, 200, 'the command commits');
-
-  down = true;
-  const response = await get(env, '/registry/v1/active');
-  t.equal(response.status, 200);
-  t.same(flaggedIn((await response.json() as ActiveSnapshotV1).networks), [ 'usdc/weETH' ],
-    'and an outage right after it, before any read, answers with its decision');
-});
-
-t.test('decisions the database does not give are answered from the record, and said to be unconfirmed', async t => {
-  const { registry, decide } = await fixture(t);
-  const logs = captureLogs(t);
-  const kv = MemoryKv({});
-  await decide('wbtc', 'LBTC', true);
-  await json(await envOf(registry.db, kv), '/registry/v1/active');
-
-  const env = await envOf(failingStatements(registry.db, /FROM deprecated_collaterals/), kv);
-  const response = await get(env, '/registry/v1/active');
-  t.equal(response.status, 200, 'a version the database confirms is answered');
-  t.equal(response.headers.get('x-registry-version'), registry.versionId);
-  t.equal(response.headers.get('x-registry-stale'), '0', 'as no older than now, since the version is the one on');
-  t.equal(response.headers.get('cache-control'), 'no-store', 'but not to be kept, since its flags are as last recorded');
-  t.same(flaggedIn((await response.json() as ActiveSnapshotV1).networks), [ 'wbtc/LBTC' ], 'which they are');
-  t.equal((await get(env, '/registry/v1/active', { 'If-None-Match': response.headers.get('etag')! })).status, 200,
-    'and such an answer confirms no copy');
-  t.ok(logs.some(line => line.includes('deprecated collateral decisions unreadable; answering with the ones last recorded')));
-});
-
-t.test('without a record to answer with, decisions the database does not give are a 503', async t => {
-  const { registry, decide } = await fixture(t);
-  captureLogs(t);
-  await decide('wbtc', 'LBTC', true);
-  const failing = /FROM deprecated_collaterals/;
-
-  const fresh = await envOf(failingStatements(registry.db, failing), MemoryKv({}));
-  const unrecorded = await get(fresh, '/registry/v1/active');
-  t.equal(unrecorded.status, 503, 'nothing recorded is nothing to answer with');
-  t.equal((await unrecorded.json() as Envelope).error.code, 'UPSTREAM_UNAVAILABLE');
-
-  const garbled = MemoryKv({ seed: { [DEPRECATED_KEY]: { collaterals: 'not a list' } } });
-  t.equal((await get(await envOf(failingStatements(registry.db, failing), garbled), '/registry/v1/active')).status, 503,
-    'nor is a record that is not one');
-
-  /*
-   * An environment that would rather fail than answer from the cache has no
-   * fallback window, so nothing records the decisions and nothing answers
-   * with them.
-   */
-  const kv = MemoryKv({});
-  const windowless = { REGISTRY_STALE_FALLBACK_MAX_S: '0' };
-  await json(await envOf(registry.db, kv, windowless), '/registry/v1/active');
-  t.equal(await kv.get(DEPRECATED_KEY), null, 'without a window, a read records nothing');
-  t.equal((await get(await envOf(failingStatements(registry.db, failing), kv, windowless), '/registry/v1/active')).status, 503,
-    'and decisions the database does not give are a 503 there');
-});
-
-/*
- * The version selects what a market read asks for before the decisions mark
- * it, so a request the version refuses is refused as it always was, even
- * while the decisions cannot be read and nothing is recorded to answer with:
- * only a request the version answers waits for them.
- */
-t.test('a market read the version refuses is refused as before, whatever the decisions did', async t => {
-  const { registry } = await fixture(t);
-  captureLogs(t);
-  const failing = /FROM deprecated_collaterals/;
-  const refused = [
-    [ '/registry/v1/networks/01/markets',                                              400, 'BAD_REQUEST' ],
-    [ '/registry/v1/networks/999/markets',                                             404, 'NOT_FOUND' ],
-    [ '/registry/v1/networks/11155111/markets',                                        404, 'NOT_FOUND' ],
-    [ '/registry/v1/networks/1/markets/not-an-address',                                400, 'BAD_REQUEST' ],
-    [ '/registry/v1/networks/1/markets/0x0000000000000000000000000000000000000001',   404, 'NOT_FOUND' ],
-    [ '/registry/v1/networks/0x1/markets/0x0000000000000000000000000000000000000001', 400, 'BAD_REQUEST' ],
-  ] as const;
-  for (const [ setting, overrides ] of [ [ 'nothing recorded', {} ], [ 'no fallback window', { REGISTRY_STALE_FALLBACK_MAX_S: '0' } ] ] as const) {
-    const env = await envOf(failingStatements(registry.db, failing), MemoryKv({}), overrides);
-    for (const [ path, status, code ] of refused) {
-      const response = await get(env, path);
-      t.same([ response.status, (await response.json() as Envelope).error.code ], [ status, code ], `${setting}: ${path} is refused`);
-    }
-    const answered = await get(env, '/registry/v1/networks/1/markets');
-    t.same([ answered.status, (await answered.json() as Envelope).error.code ], [ 503, 'UPSTREAM_UNAVAILABLE' ],
-      `${setting}: while a read the version answers needs the decisions`);
-  }
-});
-
-/*
- * Another binding of a namespace: what another isolate reads and writes the
- * same store through, since an isolate knows the record by its own binding.
- * `put` stands in for its writes, given the write itself to make.
- */
-function bindingOf(store: KVNamespace, { put }: { put?: (parameters: unknown[], write: () => Promise<void>) => Promise<void> } = {}): KVNamespace {
-  return new Proxy(store, {
-    get(target, property) {
-      const value = Reflect.get(target, property) as unknown;
-      if (property === 'put' && put !== undefined) {
-        return (...parameters: unknown[]) => put(parameters, () => (value as (...parameters: unknown[]) => Promise<void>).apply(target, parameters));
-      }
-      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
-    },
-  }) as KVNamespace;
-}
 
 // waits for a condition, for five seconds at most: one never met fails the assertions after it, not the run
 async function until(condition: () => boolean): Promise<void> {
@@ -328,6 +70,7 @@ async function until(condition: () => boolean): Promise<void> {
  * timer sees the count.
  */
 function counting(db: D1Database): { db: D1Database, answered: () => number } {
+  const reads  = statementsOf(DEPRECATED_COLLATERALS);
   let answered = 0;
   const wrapped = new Proxy(db, {
     get(target, property) {
@@ -337,7 +80,7 @@ function counting(db: D1Database): { db: D1Database, answered: () => number } {
       }
       return (sql: string) => {
         const statement = (value as D1Database['prepare']).call(target, sql);
-        if (!/FROM deprecated_collaterals/.test(sql)) {
+        if (!reads.test(sql)) {
           return statement;
         }
         return new Proxy(statement, {
@@ -401,28 +144,29 @@ t.test('the reads of an isolate check the record once between them, and write it
 
   const deps  = depsOf(counted(held));
   let settled = 0;
-  const burst = Array.from({ length: 8 }, () => deprecatedDecisions(deps).then(read => { settled += 1; return read; }));
+  const burst = Array.from({ length: 8 }, () => markedDecisions(DEPRECATED_RECORD, deps).then(read => { settled += 1; return read; }));
   await until(() => settled >= 7);
   t.equal(gets, 1, 'eight reads arriving together check the record once, the other seven leaving it to that check');
-  const command = recordDeprecatedCollaterals(deps);
+  const command = recordCollaterals(DEPRECATED_RECORD, deps);
   await until(() => answered() === 9);
+  t.equal(answered(), 9, 'the command reads the decisions, as each of the eight reads did, while the check is held');
   release();
   await Promise.all([ ...burst, command ]);
   t.same([ gets, puts, warnings ], [ 1, 1, [] ],
     'and the one check writes what it did not find, once, as does a command that decided nothing meanwhile');
 
   const started = depsOf(counted(Promise.resolve()));
-  await Promise.all(Array.from({ length: 8 }, () => deprecatedDecisions(started)));
+  await Promise.all(Array.from({ length: 8 }, () => markedDecisions(DEPRECATED_RECORD, started)));
   t.same([ gets, puts ], [ 2, 1 ], 'an isolate starting after it finds the record right, and writes nothing');
 
-  await decide('usdt', 'mETH', true);
-  await deprecatedDecisions(started);
+  await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
+  await markedDecisions(DEPRECATED_RECORD, started);
   t.same([ gets, puts ], [ 3, 2 ], 'until the decisions change, when its next read finds the record behind them and writes it');
-  await deprecatedDecisions(deps);
+  await markedDecisions(DEPRECATED_RECORD, deps);
   t.same([ gets, puts ], [ 4, 2 ], 'which another isolate then finds written');
 
   await store.put(DEPRECATED_KEY, JSON.stringify({ collaterals: 'not a list' }));
-  await deprecatedDecisions(depsOf(counted(Promise.resolve())));
+  await markedDecisions(DEPRECATED_RECORD, depsOf(counted(Promise.resolve())));
   t.equal(puts, 3, 'and a record that is not one is written over');
   t.equal((await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] }).collaterals.length, 1, 'with the decisions');
 });
@@ -454,22 +198,22 @@ t.test('a record a read put back after a decision is put right by the next check
   const released = new Promise<void>(resolve => { release = resolve; });
   const a = depsOf(bindingOf(store, { put: async (_parameters, write) => { reached(); await released; await write(); } }));
   const b = depsOf(bindingOf(store));
-  const reading = deprecatedDecisions(a);
+  const reading = markedDecisions(DEPRECATED_RECORD, a);
   await atWrite;
 
   // isolate B makes a decision meanwhile, and its command records it
-  await decide('usdt', 'mETH', true);
-  await recordDeprecatedCollaterals(b);
+  await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
+  await recordCollaterals(DEPRECATED_RECORD, b);
   t.equal(await recorded(), 1, 'the command records its decision');
   release();
   t.equal((await reading).decisions.collaterals.length, 0, 'A read the decisions before it');
   t.equal(await recorded(), 0, 'and its write, landing last, put back the decisions before the decision');
 
   now += 4 * 60_000;
-  await deprecatedDecisions(b);
+  await markedDecisions(DEPRECATED_RECORD, b);
   t.equal(await recorded(), 0, 'B, which recorded the decision itself, checks the record again only after five minutes');
   now += 60_000;
-  await deprecatedDecisions(b);
+  await markedDecisions(DEPRECATED_RECORD, b);
   t.equal(await recorded(), 1, 'and puts it right at that check');
 });
 
@@ -510,30 +254,30 @@ t.test('a record that could not be written is written again a minute later, not 
     debug:        { error: () => {}, warn: (message: unknown) => { warnings.push(message); } },
   };
 
-  t.equal((await deprecatedDecisions(deps)).recorded, false, 'the decisions come from the database');
+  t.equal((await markedDecisions(DEPRECATED_RECORD, deps)).recorded, false, 'the decisions come from the database');
   t.same([ puts, warnings ], [ 1, [ 'deprecated collateral record unwritable' ] ], 'and a refused write is a warning, never a failure');
-  await deprecatedDecisions(deps);
+  await markedDecisions(DEPRECATED_RECORD, deps);
   now += 30_000;
-  await deprecatedDecisions(deps);
+  await markedDecisions(DEPRECATED_RECORD, deps);
   t.equal(puts, 1, 'the reads of the next minute do not write again');
 
   now += 31_000;
   refusing = false;
-  await deprecatedDecisions(deps);
+  await markedDecisions(DEPRECATED_RECORD, deps);
   t.equal(puts, 2, 'a minute later a read writes again');
   t.same((await kv.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] }).collaterals, [], 'and the record is written');
-  await deprecatedDecisions(deps);
+  await markedDecisions(DEPRECATED_RECORD, deps);
   t.equal(puts, 2, 'after which reads of the same decisions write nothing');
 
-  await decide('usdt', 'mETH', true);
-  await deprecatedDecisions(deps);
+  await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
+  await markedDecisions(DEPRECATED_RECORD, deps);
   t.equal(puts, 3, 'and the first read of changed decisions records them');
 });
 
 // a read does not wait for its check of the record: it hands the check to its waitUntil, `defer` here
 t.test('a read hands its check of the record to waitUntil, and is answered before the record is written', async t => {
   const { registry, decide } = await fixture(t);
-  await decide('usdt', 'mETH', true);
+  await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
   const store = MemoryKv({});
   let release!: () => void;
   const released = new Promise<void>(resolve => { release = resolve; });
@@ -547,7 +291,7 @@ t.test('a read hands its check of the record to waitUntil, and is answered befor
     defer:        (work: Promise<unknown>) => { deferred.push(work); },
   };
 
-  const read = deprecatedDecisions(deps);
+  const read = markedDecisions(DEPRECATED_RECORD, deps);
   t.ok(await settledWithin(read, 5000), 'the read is answered while the write of the record is held');
   t.equal(deferred.length, 1, 'having handed its check over');
   t.equal(await store.get(DEPRECATED_KEY), null, 'which has not written the record yet');
@@ -556,50 +300,6 @@ t.test('a read hands its check of the record to waitUntil, and is answered befor
   await Promise.all(deferred);
   t.equal((await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] } | null)?.collaterals.length, 1,
     'which the record holds once the namespace takes the write');
-});
-
-/*
- * A command does not leave its record to waitUntil, as a read leaves its
- * check: it answers once the record holds what it committed, so an outage
- * right after it answers with its decision. Each command comes through the
- * worker with an execution context, as in production; without one nothing is
- * handed to waitUntil, and a command that handed its record over would look
- * no different.
- */
-t.test('a command answers once the record holds its decisions, though it has a waitUntil to leave them to', async t => {
-  const { registry, market } = await fixture(t);
-  const collateral = (key: string, symbol: string) => ({
-    chainId:      1,
-    cometAddress: market(key).contracts.comet!,
-    tokenAddress: market(key).collateralAssets.find(asset => asset.token.symbol === symbol)!.token.address,
-  });
-  const weEth = collateral('usdc', 'weETH');
-  const mEth  = collateral('usdt', 'mETH');
-  const commands = [
-    [ 'PATCH', `/registry/v1/admin/networks/1/markets/${weEth.cometAddress}/collaterals/${weEth.tokenAddress}/deprecated`,
-      { isDeprecated: true, reason: 'Linear COM-18' }, [ weEth ] ],
-    [ 'POST', '/registry/v1/admin/deprecated-collaterals/apply',
-      { reason: 'Linear COM-18', collaterals: [ { ...mEth, isDeprecated: true } ] }, [ mEth, weEth ] ],
-  ] as const;
-
-  for (const [ method, path, body, decisions ] of commands) {
-    const store = MemoryKv({});
-    let release!: () => void;
-    const released = new Promise<void>(resolve => { release = resolve; });
-    const env = await envOf(registry.db, bindingOf(store, { put: async (_parameters, write) => { await released; await write(); } }));
-    const { context, handed } = executionContext();
-    const answer = C3Api.fetch(new Request(`https://api.test.local${path}`, {
-      method,
-      headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify(body),
-    }), env, context);
-    t.notOk(await settledWithin(answer, 300), `${method} ${path} does not answer while the namespace holds the write of the record`);
-    t.equal(handed.length, 0, 'and hands nothing to waitUntil');
-    release();
-    t.equal((await answer).status, 200, 'it answers once the record is written');
-    t.same((await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] } | null)?.collaterals, decisions,
-      'with the decisions in force once it committed');
-  }
 });
 
 /*
@@ -639,14 +339,14 @@ t.test('a check of the record that never finished is made again a minute later',
   const store = MemoryKv({});
   const { deps, clock, deferred, puts } = cutOff(registry.db, store);
 
-  t.ok(await settledWithin(deprecatedDecisions(deps), 5000), 'a read is answered while its check is under way');
+  t.ok(await settledWithin(markedDecisions(DEPRECATED_RECORD, deps), 5000), 'a read is answered while its check is under way');
   await until(() => puts() === 1);
   clock.now += 59_000;
-  await deprecatedDecisions(deps);
+  await markedDecisions(DEPRECATED_RECORD, deps);
   t.same([ puts(), deferred.length ], [ 1, 1 ], 'the reads of the minute after a check began leave the record to it, though it never finishes');
 
   clock.now += 2_000;
-  await deprecatedDecisions(deps);
+  await markedDecisions(DEPRECATED_RECORD, deps);
   await deferred[1];
   t.same([ puts(), deferred.length ], [ 2, 2 ], 'a read past that minute checks it again');
   t.same((await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] } | null)?.collaterals, [], 'and writes the record');
@@ -659,7 +359,7 @@ t.test('a check of the record that never finished is made again a minute later',
  */
 t.test('a command waits for a check of the same decisions under way, and leaves the record to it', async t => {
   const { registry, decide } = await fixture(t);
-  await decide('usdt', 'mETH', true);
+  await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
   const store = MemoryKv({});
   let release!: () => void;
   const released = new Promise<void>(resolve => { release = resolve; });
@@ -674,9 +374,9 @@ t.test('a command waits for a check of the same decisions under way, and leaves 
     defer:        () => {},
   };
 
-  t.ok(await settledWithin(deprecatedDecisions(deps), 5000), 'a read is answered while its check is under way');
+  t.ok(await settledWithin(markedDecisions(DEPRECATED_RECORD, deps), 5000), 'a read is answered while its check is under way');
   await until(() => puts === 1);
-  const command = recordDeprecatedCollaterals(deps);
+  const command = recordCollaterals(DEPRECATED_RECORD, deps);
   t.notOk(await settledWithin(command, 300), 'a command that read the same decisions waits for that check');
   t.equal(puts, 1, 'and writes nothing of its own meanwhile');
   release();
@@ -691,14 +391,14 @@ t.test('a command waits for a check of the same decisions under way, and leaves 
  */
 t.test('a command waits for a check of the same decisions no longer than the check holds the record', async t => {
   const { registry, decide } = await fixture(t);
-  await decide('usdt', 'mETH', true);
+  await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
   const store = MemoryKv({});
   const { deps, clock, puts } = cutOff(registry.db, store);
 
-  t.ok(await settledWithin(deprecatedDecisions(deps), 5000), 'a read is answered while its check is under way');
+  t.ok(await settledWithin(markedDecisions(DEPRECATED_RECORD, deps), 5000), 'a read is answered while its check is under way');
   await until(() => puts() === 1);
   clock.now += 60_000 - 50;
-  t.ok(await settledWithin(recordDeprecatedCollaterals(deps), 5000), 'a command near the end of that minute waits out the rest of it');
+  t.ok(await settledWithin(recordCollaterals(DEPRECATED_RECORD, deps), 5000), 'a command near the end of that minute waits out the rest of it');
   t.equal(puts(), 2, 'then writes the record itself');
   t.equal((await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] } | null)?.collaterals.length, 1, 'with the decisions');
 });
@@ -713,10 +413,10 @@ t.test('a command does not wait for a check of other decisions', async t => {
   const store = MemoryKv({});
   const { deps, puts } = cutOff(registry.db, store);
 
-  t.ok(await settledWithin(deprecatedDecisions(deps), 5000), 'a read is answered while its check is under way');
+  t.ok(await settledWithin(markedDecisions(DEPRECATED_RECORD, deps), 5000), 'a read is answered while its check is under way');
   await until(() => puts() === 1);
-  await decide('usdt', 'mETH', true);
-  t.ok(await settledWithin(recordDeprecatedCollaterals(deps), 5000), 'a command that decided meanwhile does not wait for it');
+  await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
+  t.ok(await settledWithin(recordCollaterals(DEPRECATED_RECORD, deps), 5000), 'a command that decided meanwhile does not wait for it');
   t.equal(puts(), 2, 'and writes the record itself');
   t.equal((await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] } | null)?.collaterals.length, 1, 'with its decision');
 });

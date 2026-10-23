@@ -1254,10 +1254,11 @@ back to.
 ## Marking a token strategic
 
 A strategic token is shown wherever the app lists tokens, whatever its
-collateral value, unless every enabled market that takes it hides it or has it
-deprecated: the token list then says `"hidden"` where any of them hides it
+collateral value, unless an enabled market takes it as collateral and every
+one that does hides it or has it deprecated: the token list then says
+`"hidden"` where any of them hides it
 ([Hiding a collateral](#hiding-a-collateral)), and `"deprecated"` where all of
-them have it deprecated
+them have it deprecated and none hides it
 ([Marking a collateral deprecated](#marking-a-collateral-deprecated)). Any
 other token is shown when its collateral is worth at least USD 250,000, or
 when its value cannot be read. The token list reads the mark on every
@@ -1312,9 +1313,9 @@ Authorization: Bearer {{TOKEN}}
 A mark stays when a version that drops its token is switched on: the chain's
 list shows it under `retained`, and the token's history still answers, with
 `"inActiveVersion": false`. It applies again the moment a version that holds
-the token is switched on, so read `retained` before switching such a version
-on, and take a mark away while the token is still served if it should not
-come back.
+the token, and serves a market that names it, is switched on, so read
+`retained` before switching such a version on, and take a mark away while the
+token is still served if it should not come back.
 
 ### A reviewed list of strategic tokens
 
@@ -1430,10 +1431,11 @@ GET {{API}}/registry/v1/networks/1/tokens
 ```
 
 **You should see** `block` with a recent block, and every token with
-`"collateralValueStatus": "fresh"` or `"exception"`. A token every enabled
-market that takes it hides or has deprecated is not shown, whatever else
-holds, strategic or not: it says `"visibilityReason": "hidden"` where any of
-them hides it ([Hiding a collateral](#hiding-a-collateral)), and
+`"collateralValueStatus": "fresh"` or `"exception"`. A token that an enabled
+market takes as collateral, and that every enabled market taking it hides or
+has deprecated, is not shown, whatever else holds, strategic or not: it says
+`"visibilityReason": "hidden"` where any of them hides it
+([Hiding a collateral](#hiding-a-collateral)), and
 `"deprecated"` where all of them have it deprecated and none hides it
 ([Marking a collateral deprecated](#marking-a-collateral-deprecated)). Any
 other strategic token says `"strategic"`; any other is shown by
@@ -1482,12 +1484,12 @@ offers there: it leaves it out of the market's collateral list, of what can
 be supplied, and of the markets overview. A user who still holds some keeps
 seeing it, so that it can be withdrawn. The decision is about one collateral
 of one market — its chain, the market's Comet and the token — so a token can
-be deprecated in one market and current in another. A token deprecated in
-every enabled market that takes it as collateral is left out of token
-discovery as well, even when it is strategic, and even when it is also the
-base or reward token of a market. To keep a collateral out of discovery while
-its market still offers it, hide it instead
-([Hiding a collateral](#hiding-a-collateral)).
+be deprecated in one market and current in another. A token that an enabled
+market takes as collateral, and that every enabled market taking it has
+deprecated, is left out of token discovery as well, even when it is
+strategic, and even when it is also the base or reward token of a market. To
+keep a collateral out of discovery while its market still offers it, hide it
+instead ([Hiding a collateral](#hiding-a-collateral)).
 
 Like a strategic mark, the decision stays when a newer version is switched
 on, and comes back if a version drops the collateral and a later one brings
@@ -1522,11 +1524,12 @@ minutes (`REGISTRY_SNAPSHOT_CACHE_TTL_S`), and the token list for 30 seconds:
   `/registry/v1/active` have `"isDeprecated": true` on that collateral of
   that market;
 - the token list names the market's Comet in the token's `deprecatedIn`, and
-  says `"isDeprecated": true` once the token is deprecated in every enabled
-  market that takes it. Discovery does not show the token once every enabled
-  market that takes it has it deprecated or hides it: `"isVisible": false`,
-  `"visibilityReason": "hidden"` where any of them hides it and `"deprecated"`
-  where none does, whatever the token is worth and even when it is strategic.
+  says `"isDeprecated": true` once an enabled market takes the token and
+  every one that does has it deprecated. Discovery does not show the token
+  once an enabled market takes it and every one that does has it deprecated
+  or hides it: `"isVisible": false`, `"visibilityReason": "hidden"` where any
+  of them hides it and `"deprecated"` where none does, whatever the token is
+  worth and even when it is strategic.
   While another enabled market still offers it as a current collateral without
   hiding it, the list shows it or not as before.
 
@@ -1540,7 +1543,8 @@ curl -s "$API/registry/v1/admin/networks/1/markets/<comet>/collaterals/<token>/d
 A decision stays when a version that drops the collateral from its market is
 switched on: the export below lists it under `retained`, and its history
 still answers, with `"inActiveVersion": false`. It applies again the moment a
-version whose market takes the collateral is switched on.
+version whose market takes the collateral, and is not disabled, is switched
+on.
 
 ### A reviewed list of deprecated collaterals
 
@@ -1647,8 +1651,8 @@ out of the USDT market, which its row `usdt`/`wUSDM` below now decides as
 `isDeprecated`. Apply it once in each environment, as the document below: it
 has the address of every Comet and every token, and holds 12 of the 20. The
 other 8 are taken from the environment itself, in the next step. Once they
-are applied, token discovery no longer shows a token they leave deprecated in
-every enabled market that takes it.
+are applied, token discovery no longer shows a token that an enabled market
+takes and that they leave deprecated in every one that does.
 
 Save it as `deprecated-collaterals-initial.json`:
 
@@ -1778,12 +1782,13 @@ on, and comes back if a version drops the collateral and a later one brings
 it back. You can only decide about a collateral of a market of the version
 that is on, and every change needs a reason, which is kept with who made it.
 So a collateral a new version adds can be hidden only once that version is
-on: from the switch until your request lands, discovery decides it as any
-other token — shown if it is strategic, worth the threshold, or of a value
-that cannot be read. That holds too for a token the list leaves out because
-every other enabled market that takes it hides it or has it deprecated: a
-version that adds it to the collateral of an enabled market offers it there,
-and lets the rest of the rule decide it again, on the token list as in that
+on: from the switch until your request lands, discovery decides one nobody
+has decided about as any other token — shown if it is strategic, worth the
+threshold, or of a value that cannot be read. That holds too for a token the
+list leaves out because every other enabled market that takes it hides it or
+has it deprecated: a version that adds it to the collateral of an enabled
+market, where nobody has decided about it, offers it there, and lets its
+strategic mark and value decide it again, on the token list as in that
 market, until that market hides it as well. Send the request right after the
 switch ([5. Switch it on](#5-switch-it-on)).
 
@@ -1806,10 +1811,12 @@ Content-Type: application/json
 **You should see** `"changed": true` and the time in `updatedAt`. Sending the
 same request again answers `"changed": false` and records nothing, so it is
 safe to repeat. To take the decision back, send `"isHidden": false` with a
-reason. That hands the collateral back to the rest of the rule rather than
-showing it: a token worth less than the threshold and not strategic, say,
-stays out of discovery, and so, on the token list, does one that every enabled
-market that takes it still hides or has deprecated.
+reason. That does not show the collateral by itself: its market's deprecated
+decision, the other markets' decisions on the token list, and its strategic
+mark and value decide it again. A token worth less than the threshold and not
+strategic, say, stays out of discovery, and so, on the token list, does one
+that an enabled market takes and every one that does still hides or has
+deprecated.
 
 The reads say it in their next answer, which a browser may keep for up to 5
 minutes (`REGISTRY_SNAPSHOT_CACHE_TTL_S`), and the token list for 30 seconds:
@@ -1821,7 +1828,8 @@ minutes (`REGISTRY_SNAPSHOT_CACHE_TTL_S`), and the token list for 30 seconds:
   `"visibility_reason": "hidden"` on that collateral, and the summary of every
   market that takes the token names the market's Comet in `hidden_in`. A
   market that has it deprecated answers `"visibility_reason": "deprecated"`,
-  and one with neither decision answers it by the rest of the rule;
+  and one with neither decision answers it by its strategic mark and its
+  value;
 - the token list names the market's Comet in the token's `hiddenIn`. Once
   every enabled market that takes the token hides it or has it deprecated, and
   one of them hides it, discovery does not show the token:
@@ -1840,7 +1848,8 @@ curl -s "$API/registry/v1/admin/networks/1/markets/<comet>/collaterals/<token>/h
 A decision stays when a version that drops the collateral from its market is
 switched on: the export below lists it under `retained`, and its history
 still answers, with `"inActiveVersion": false`. It applies again the moment a
-version whose market takes the collateral is switched on.
+version whose market takes the collateral, and is not disabled, is switched
+on.
 
 Nothing is hidden when an environment is brought up: there is no initial list
 of hidden collaterals, as there is of deprecated ones.

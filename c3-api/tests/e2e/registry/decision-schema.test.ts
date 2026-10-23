@@ -4,8 +4,12 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 import type { Address } from '../../../lib/model/comet-registry.js';
-import { readDeprecatedCollateral, setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
-import { readHiddenCollateral, setHiddenCollateral } from '../../../src/registry/hidden-collateral-repository.js';
+import {
+  DEPRECATED_COLLATERAL_KIND,
+  HIDDEN_COLLATERAL_KIND,
+  readCollateral,
+  setCollateral,
+} from '../../../src/registry/collateral-decision-repository.js';
 import { readTokenPolicy, setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 import {
   Row,
@@ -317,7 +321,7 @@ const DEPRECATED_COLLATERALS: DecisionTables = {
   },
   history:      async (db, subject) => {
     const collateral = { chainId: 1, cometAddress: subject.comet_address as Address, tokenAddress: subject.token_address as Address };
-    const decision   = await readDeprecatedCollateral(db, collateral);
+    const decision   = await readCollateral(db, DEPRECATED_COLLATERAL_KIND, collateral);
     return { decided: decision.isDeprecated, changes: decision.events.map(event => [ event.previousIsDeprecated, event.isDeprecated, event.createdAt ]) };
   },
 };
@@ -335,7 +339,7 @@ const HIDDEN_COLLATERALS: DecisionTables = {
   candidate:    DEPRECATED_COLLATERALS.candidate,
   history:      async (db, subject) => {
     const collateral = { chainId: 1, cometAddress: subject.comet_address as Address, tokenAddress: subject.token_address as Address };
-    const decision   = await readHiddenCollateral(db, collateral);
+    const decision   = await readCollateral(db, HIDDEN_COLLATERAL_KIND, collateral);
     return { decided: decision.isHidden, changes: decision.events.map(event => [ event.previousIsHidden, event.isHidden, event.createdAt ]) };
   },
 };
@@ -485,7 +489,7 @@ t.test('migration 0007 keeps the decisions and events made under 0006, and every
     'and so is every decision');
 
   const collateral = (token: string) => ({ chainId: 1, cometAddress: COMET as `0x${string}`, tokenAddress: token as `0x${string}` });
-  const kept = await readDeprecatedCollateral(db, collateral(first.token));
+  const kept = await readCollateral(db, DEPRECATED_COLLATERAL_KIND, collateral(first.token));
   t.same(
     [ kept.inActiveVersion, kept.isDeprecated, kept.events.map(event => [ event.previousIsDeprecated, event.isDeprecated, event.createdAt ]) ],
     [ false, true, [
@@ -542,7 +546,9 @@ t.test('migration 0007 keeps the decisions and events made under 0006, and every
     'and an expectation that does not hold aborts the write that states it',
   );
 
-  const written = await setDeprecatedCollateral(db, { ...collateral(second.token), isDeprecated: false, actor: 'test-admin', reason: 'decided under 0007' });
+  const written = await setCollateral(db, DEPRECATED_COLLATERAL_KIND, {
+    ...collateral(second.token), isDeprecated: false, actor: 'test-admin', reason: 'decided under 0007',
+  });
   t.same([ written.changed, written.isDeprecated ], [ true, false ], 'the release that reads the new names writes beside them');
   t.equal(await db.prepare(`SELECT max(rowid) AS last FROM deprecated_collateral_events`).first<number>('last'), events.length + 1,
     'its event taking the rowid after the last one written under 0006');
@@ -575,17 +581,17 @@ t.test('migration 0008 adds its tables beside a registry in use', async t => {
     tokenAddress: usdt.collateralAssets.find(asset => asset.token.symbol === 'mETH')!.token.address,
   };
   await setTokenPolicy(db, { chainId: 1, tokenAddress: weth, isStrategic: true, actor: 'test-admin', reason: 'decided before 0008' });
-  await setDeprecatedCollateral(db, { ...mEth, isDeprecated: true, actor: 'test-admin', reason: 'decided before 0008' });
+  await setCollateral(db, DEPRECATED_COLLATERAL_KIND, { ...mEth, isDeprecated: true, actor: 'test-admin', reason: 'decided before 0008' });
 
   await applyMigration(db, '0008_hidden_collaterals.sql');
 
   t.equal(await activeVersionId(db), versionId, 'the version that was on is on');
   t.equal(await count(db, 'market_assets'), counts.market_assets, 'with every row of it');
   t.equal((await readTokenPolicy(db, 1, weth)).isStrategic, true, 'and the token policies decided before it stand');
-  t.equal((await readDeprecatedCollateral(db, mEth)).isDeprecated, true, 'as do the deprecated collaterals');
+  t.equal((await readCollateral(db, DEPRECATED_COLLATERAL_KIND, mEth)).isDeprecated, true, 'as do the deprecated collaterals');
   t.same([ await count(db, 'hidden_collaterals'), await count(db, 'hidden_collateral_events') ], [ 0, 0 ],
     'while nothing is hidden yet');
-  const hidden = await setHiddenCollateral(db, { ...mEth, isHidden: true, actor: 'test-admin', reason: 'decided after 0008' });
+  const hidden = await setCollateral(db, HIDDEN_COLLATERAL_KIND, { ...mEth, isHidden: true, actor: 'test-admin', reason: 'decided after 0008' });
   t.same([ hidden.changed, hidden.isHidden ], [ true, true ], 'and a collateral of the version on can be hidden at once');
   t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
 });
