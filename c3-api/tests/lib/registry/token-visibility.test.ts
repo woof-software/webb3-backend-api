@@ -2,21 +2,22 @@ import t from 'tap';
 
 import { BigFixnum } from '../../../lib/bigfixnum.js';
 
-import type { Address, TokenVisibilityV1 } from '../../../lib/model/comet-registry.js';
+import type { Address, TokenVisibilityV1, VisibilityV1 } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
-import { deprecatedDecisionsOf, hiddenDecisionsOf } from '../../../src/registry/deprecated-collaterals.js';
+import type { Catalog } from '../../../src/registry/catalog.js';
+import { collateralDecisionsOf } from '../../../src/registry/collateral-decisions.js';
 import { positionsOf, recordKey } from '../../../src/registry/token-collateral.js';
 import type { TokenValue } from '../../../src/registry/token-value.js';
 import {
   decimalString,
-  deprecatedOf,
-  hiddenOf,
+  listedTokens,
   tokenList,
   tokensOf,
+  visibilityHere,
   visibilityOf,
-  visibilityWith,
 } from '../../../src/registry/token-visibility.js';
+import type { Exclusion } from '../../../src/registry/token-visibility.js';
 
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 
@@ -36,6 +37,27 @@ const value = (status: TokenValue['status'], usd: string | null): TokenValue => 
   staleAgeSeconds: usd === null ? null : 0,
   exceptions:      [],
 });
+
+type Collateral = { chainId: number, cometAddress: Address, tokenAddress: Address };
+
+// mainnet's list as `within` serves it, with no value read, under the decisions given
+const mainnetList = (within: Catalog, { strategic, deprecated, hidden }: { strategic: Address[], deprecated: Collateral[], hidden: Collateral[] }) => tokenList({
+  registryVersion: { id: 'v', checksum: 'c' },
+  chainId:    1,
+  catalog:    within,
+  network:    'ethereum-mainnet',
+  positions:  positionsOf(within, 'ethereum-mainnet'),
+  view:       { block: { number: 100, timestamp: 1_791_204_000 }, current: null, earlier: [] },
+  strategic:  new Set(strategic),
+  deprecated: collateralDecisionsOf(deprecated),
+  hidden:     collateralDecisionsOf(hidden),
+  now:        NOW,
+});
+
+// what the list decides of a token: where it is deprecated and hidden, and whether discovery shows it
+const decisionOf = ({ isDeprecated, deprecatedIn, hiddenIn, isVisible, visibilityReason }: TokenVisibilityV1) => (
+  { isDeprecated, deprecatedIn, hiddenIn, isVisible, visibilityReason }
+);
 
 t.test('a token is listed once per chain, with every role it plays there', async t => {
   const mainnet = new Map(tokensOf(catalog, 'ethereum-mainnet').map(({ token, roles }) => [ token.symbol, roles ]));
@@ -71,27 +93,28 @@ t.test('a disabled market contributes nothing, a deprecated one is still listed 
   t.notOk(positions.some(position => position.deploymentKey === 'usdt'), 'but the deprecated market holds no position');
 });
 
-t.test('the rule: hidden, then deprecated, then strategic, then unknown, then the threshold', async t => {
-  const cases: Array<[ string, boolean, boolean, boolean, TokenValue, boolean, string ]> = [
-    [ 'hidden everywhere it is taken',        true,  false, false, value('fresh', '1'),           false, 'hidden' ],
-    [ 'hidden and worth the threshold',       true,  false, false, value('fresh', '300000'),      false, 'hidden' ],
-    [ 'hidden and unreadable',                true,  false, false, value('unavailable', null),    false, 'hidden' ],
-    [ 'hidden and strategic',                 true,  false, true,  value('fresh', '300000'),      false, 'hidden' ],
-    [ 'hidden and deprecated',                true,  true,  true,  value('fresh', '300000'),      false, 'hidden' ],
-    [ 'deprecated everywhere it is taken',    false, true,  false, value('fresh', '1'),           false, 'deprecated' ],
-    [ 'deprecated and worth the threshold',   false, true,  false, value('fresh', '300000'),      false, 'deprecated' ],
-    [ 'deprecated and unreadable',            false, true,  false, value('unavailable', null),    false, 'deprecated' ],
-    [ 'deprecated and strategic',             false, true,  true,  value('fresh', '300000'),      false, 'deprecated' ],
-    [ 'strategic below the threshold',        false, false, true,  value('fresh', '1'),           true,  'strategic' ],
-    [ 'strategic and unreadable',             false, false, true,  value('unavailable', null),    true,  'strategic' ],
-    [ 'unreadable',                           false, false, false, value('unavailable', null),    true,  'data_unavailable' ],
-    [ 'exactly the threshold',                false, false, false, value('fresh', '250000'),      true,  'collateral_threshold' ],
-    [ 'a hair below it',                      false, false, false, value('fresh', '249999.9999'), false, 'below_threshold' ],
-    [ 'above it, from an earlier minute',     false, false, false, value('stale', '300000'),      true,  'collateral_threshold' ],
-    [ 'a partial value reaching it (D7)',     false, false, false, value('partial', '250000.5'),  true,  'collateral_threshold' ],
+t.test('the rule: what keeps a token out of discovery, then strategic, then unknown, then the threshold', async t => {
+  const cases: Array<[ string, Exclusion, boolean, TokenValue, boolean, string ]> = [
+    [ 'hidden everywhere it is taken',             'hidden',     false, value('fresh', '1'),                            false, 'hidden' ],
+    [ 'hidden and worth the threshold',            'hidden',     false, value('fresh', '300000'),                       false, 'hidden' ],
+    [ 'hidden and unreadable',                     'hidden',     false, value('unavailable', null),                     false, 'hidden' ],
+    [ 'hidden and strategic',                      'hidden',     true,  value('fresh', '300000'),                       false, 'hidden' ],
+    [ 'deprecated everywhere it is taken',         'deprecated', false, value('fresh', '1'),                            false, 'deprecated' ],
+    [ 'deprecated and worth the threshold',        'deprecated', false, value('fresh', '300000'),                       false, 'deprecated' ],
+    [ 'deprecated and unreadable',                 'deprecated', false, value('unavailable', null),                     false, 'deprecated' ],
+    [ 'deprecated and strategic',                  'deprecated', true,  value('fresh', '300000'),                       false, 'deprecated' ],
+    [ 'strategic below the threshold',             'none',       true,  value('fresh', '1'),                            true,  'strategic' ],
+    [ 'strategic and unreadable',                  'none',       true,  value('unavailable', null),                     true,  'strategic' ],
+    [ 'unreadable',                                'none',       false, value('unavailable', null),                     true,  'data_unavailable' ],
+    [ 'exactly the threshold',                     'none',       false, value('fresh', '250000'),                       true,  'collateral_threshold' ],
+    [ 'a hair below it',                           'none',       false, value('fresh', '249999.9999'),                  false, 'below_threshold' ],
+    [ 'past it by less than a float can tell',     'none',       false, value('fresh', '250000.000000000000000000001'), true,  'collateral_threshold' ],
+    [ 'short of it by less than a float can tell', 'none',       false, value('fresh', '249999.999999999999999999999'), false, 'below_threshold' ],
+    [ 'above it, from an earlier minute',          'none',       false, value('stale', '300000'),                       true,  'collateral_threshold' ],
+    [ 'a partial value reaching it (D7)',          'none',       false, value('partial', '250000.5'),                   true,  'collateral_threshold' ],
   ];
-  for (const [ name, isHidden, isDeprecated, isStrategic, tokenValue, isVisible, reason ] of cases) {
-    t.same(visibilityOf({ isHidden, isDeprecated, isStrategic }, tokenValue), { isVisible, visibilityReason: reason }, name);
+  for (const [ name, exclusion, isStrategic, tokenValue, isVisible, reason ] of cases) {
+    t.same(visibilityOf(exclusion, isStrategic, tokenValue), { isVisible, visibilityReason: reason }, name);
   }
 });
 
@@ -130,8 +153,8 @@ t.test('the list is ordered by symbol and names when each value was read', async
     positions:  positionsOf(catalog, 'scroll-mainnet'),
     view,
     strategic:  new Set<Address>(),
-    deprecated: deprecatedDecisionsOf([]),
-    hidden:     hiddenDecisionsOf([]),
+    deprecated: collateralDecisionsOf([]),
+    hidden:     collateralDecisionsOf([]),
     now:        NOW,
   };
   const list = tokenList(input);
@@ -158,7 +181,8 @@ t.test('the list is ordered by symbol and names when each value was read', async
  * collateral of one Comet, and the list says where a token is one, and
  * whether it is one in every enabled market that takes it. Mainnet's weETH is
  * a collateral of the USDC, WETH and USDT markets of the fixture; mETH of the
- * USDT market alone.
+ * USDT market alone. Each token is strategic here, so that it is shown
+ * wherever no decision keeps it out.
  */
 t.test('a token is deprecated only where every enabled market that takes it marks it so', async t => {
   const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
@@ -166,26 +190,29 @@ t.test('a token is deprecated only where every enabled market that takes it mark
   const token   = (symbol: string) => mainnet.markets.flatMap(entry => entry.collateralAssets)
     .find(asset => asset.token.symbol === symbol)!.token.address;
   const [ WEETH, METH, XAUT ] = [ token('weETH'), token('mETH'), token('XAUt') ];
-  const decided = (...pairs: Array<[ string, Address ]>) => deprecatedDecisionsOf(pairs.map(([ key, tokenAddress ]) => (
-    { chainId: 1, cometAddress: comet(key), tokenAddress }
-  )));
-  const markets = catalog.marketsOn('ethereum-mainnet');
+  const decided = (...pairs: Array<[ string, Address ]>) => pairs.map(([ key, tokenAddress ]) => ({ chainId: 1, cometAddress: comet(key), tokenAddress }));
+  // what the list of `within` decides of a token under the deprecated decisions given, and no hidden one
+  const listed  = (address: Address, deprecated: Collateral[], within = catalog) => decisionOf(
+    mainnetList(within, { strategic: [ address ], deprecated, hidden: [] }).tokens.find(entry => entry.address === address)!,
+  );
+  const shown   = { isVisible: true, visibilityReason: 'strategic' } as const;
+  const kept    = { isVisible: false, visibilityReason: 'deprecated' } as const;
   const sorted  = (...keys: string[]) => keys.map(comet).sort();
 
-  t.same(deprecatedOf(1, WEETH, markets, decided([ 'usdc', WEETH ], [ 'usdt', WEETH ])),
-    { isDeprecated: false, deprecatedIn: sorted('usdc', 'usdt') },
+  t.same(listed(WEETH, decided([ 'usdc', WEETH ], [ 'usdt', WEETH ])),
+    { isDeprecated: false, deprecatedIn: sorted('usdc', 'usdt'), hiddenIn: [], ...shown },
     'deprecated in two of the three enabled markets that take it is not deprecated, and names the two');
-  t.same(deprecatedOf(1, WEETH, markets, decided([ 'usdc', WEETH ], [ 'usdt', WEETH ], [ 'weth', WEETH ])),
-    { isDeprecated: true, deprecatedIn: sorted('usdc', 'usdt', 'weth') }, 'deprecated in all three is');
-  t.same(deprecatedOf(1, METH, markets, decided([ 'usdt', METH ])), { isDeprecated: true, deprecatedIn: sorted('usdt') },
+  t.same(listed(WEETH, decided([ 'usdc', WEETH ], [ 'usdt', WEETH ], [ 'weth', WEETH ])),
+    { isDeprecated: true, deprecatedIn: sorted('usdc', 'usdt', 'weth'), hiddenIn: [], ...kept }, 'deprecated in all three is');
+  t.same(listed(METH, decided([ 'usdt', METH ])), { isDeprecated: true, deprecatedIn: sorted('usdt'), hiddenIn: [], ...kept },
     'as is a token deprecated in the one market that takes it');
 
-  t.same(deprecatedOf(1, METH, markets, decided([ 'usdc', METH ])), { isDeprecated: false, deprecatedIn: [] },
+  t.same(listed(METH, decided([ 'usdc', METH ])), { isDeprecated: false, deprecatedIn: [], hiddenIn: [], ...shown },
     'a decision about a Comet that does not take the token as collateral marks nothing');
-  t.same(deprecatedOf(1, METH, markets, deprecatedDecisionsOf([ { chainId: 8453, cometAddress: comet('usdt'), tokenAddress: METH } ])),
-    { isDeprecated: false, deprecatedIn: [] },
+  t.same(listed(METH, [ { chainId: 8453, cometAddress: comet('usdt'), tokenAddress: METH } ]),
+    { isDeprecated: false, deprecatedIn: [], hiddenIn: [], ...shown },
     'and a decision belongs to its chain: one about the same Comet and token on another chain marks nothing');
-  t.same(deprecatedOf(1, token('WETH'), markets, decided()), { isDeprecated: false, deprecatedIn: [] },
+  t.same(listed(token('WETH'), decided()), { isDeprecated: false, deprecatedIn: [], hiddenIn: [], ...shown },
     'nobody deciding is nothing deprecated');
 
   const changed = catalogOf({
@@ -197,11 +224,11 @@ t.test('a token is deprecated only where every enabled market that takes it mark
         : entry.deploymentKey === 'usdt' ? { ...entry, status: 'deprecated' as const }
         : entry),
     }),
-  }, NOW).marketsOn('ethereum-mainnet');
-  t.same(deprecatedOf(1, WEETH, changed, decided([ 'usdc', WEETH ], [ 'usdt', WEETH ])),
-    { isDeprecated: true, deprecatedIn: sorted('usdc', 'usdt') },
+  }, NOW);
+  t.same(listed(WEETH, decided([ 'usdc', WEETH ], [ 'usdt', WEETH ]), changed),
+    { isDeprecated: true, deprecatedIn: sorted('usdc', 'usdt'), hiddenIn: [], ...kept },
     'a market whose status is deprecated does not keep a token current where it does not mark it');
-  t.same(deprecatedOf(1, XAUT, changed, decided([ 'usdt', XAUT ])), { isDeprecated: false, deprecatedIn: sorted('usdt') },
+  t.same(listed(XAUT, decided([ 'usdt', XAUT ]), changed), { isDeprecated: false, deprecatedIn: sorted('usdt'), hiddenIn: [], ...shown },
     'and a token only such a market takes is named there, but no enabled market makes it deprecated');
 });
 
@@ -224,13 +251,13 @@ t.test('a token deprecated in every enabled market that takes it is not shown, a
     positions: positionsOf(catalog, 'ethereum-mainnet'),
     view:      { block: { number: 100, timestamp: 1_791_204_000 }, current: null, earlier: [] },
     strategic: new Set<Address>([ xaut ]),
-    hidden:    hiddenDecisionsOf([]),
+    hidden:    collateralDecisionsOf([]),
     now:       NOW,
   };
-  const deprecated = deprecatedDecisionsOf(usdt.collateralAssets.map(asset => (
+  const deprecated = collateralDecisionsOf(usdt.collateralAssets.map(asset => (
     { chainId: 1, cometAddress: usdt.contracts.comet!, tokenAddress: asset.token.address }
   )));
-  const before = tokenList({ ...input, deprecated: deprecatedDecisionsOf([]) });
+  const before = tokenList({ ...input, deprecated: collateralDecisionsOf([]) });
   const after  = tokenList({ ...input, deprecated });
 
   const DEPRECATED = [ 'mETH', 'sFRAX', 'wUSDM', 'XAUt' ];
@@ -264,7 +291,8 @@ t.test('a token deprecated in every enabled market that takes it is not shown, a
  * the chain: an enabled market that takes it hides it, and every other one
  * hides it or has it deprecated. Mainnet's weETH is a collateral of the USDC,
  * WETH and USDT markets of the fixture; mETH and XAUt of the USDT market
- * alone.
+ * alone. Each token is strategic here, so that it is shown wherever no
+ * decision keeps it out.
  */
 t.test('a token is hidden only where an enabled market that takes it hides it, and every other one hides it or has it deprecated', async t => {
   const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
@@ -274,38 +302,43 @@ t.test('a token is hidden only where an enabled market that takes it hides it, a
   const [ WEETH, METH, XAUT ] = [ token('weETH'), token('mETH'), token('XAUt') ];
   const of      = (pairs: Array<[ string, Address ]>) => pairs.map(([ key, tokenAddress ]) => ({ chainId: 1, cometAddress: comet(key), tokenAddress }));
   // the decisions of both kinds, each by the market's deployment key and the token
-  const decided = (hidden: Array<[ string, Address ]>, deprecated: Array<[ string, Address ]>) => (
-    { hidden: hiddenDecisionsOf(of(hidden)), deprecated: deprecatedDecisionsOf(of(deprecated)) }
-  );
+  const decided = (hidden: Array<[ string, Address ]>, deprecated: Array<[ string, Address ]>) => ({ hidden: of(hidden), deprecated: of(deprecated) });
   const hid     = (...pairs: Array<[ string, Address ]>) => decided(pairs, []);
-  const markets = catalog.marketsOn('ethereum-mainnet');
+  // what the list of `within` decides of a token under the decisions given
+  const listed  = (address: Address, { hidden, deprecated }: { hidden: Collateral[], deprecated: Collateral[] }, within = catalog) => decisionOf(
+    mainnetList(within, { strategic: [ address ], deprecated, hidden }).tokens.find(entry => entry.address === address)!,
+  );
+  const shown   = { isVisible: true, visibilityReason: 'strategic' } as const;
+  const kept    = { isVisible: false, visibilityReason: 'hidden' } as const;
   const sorted  = (...keys: string[]) => keys.map(comet).sort();
 
-  t.same(hiddenOf(1, WEETH, markets, hid([ 'usdc', WEETH ], [ 'usdt', WEETH ])),
-    { isHidden: false, hiddenIn: sorted('usdc', 'usdt') },
+  t.same(listed(WEETH, hid([ 'usdc', WEETH ], [ 'usdt', WEETH ])),
+    { isDeprecated: false, deprecatedIn: [], hiddenIn: sorted('usdc', 'usdt'), ...shown },
     'hidden in two of the three enabled markets that take it is not hidden, and names the two');
-  t.same(hiddenOf(1, WEETH, markets, hid([ 'usdc', WEETH ], [ 'usdt', WEETH ], [ 'weth', WEETH ])),
-    { isHidden: true, hiddenIn: sorted('usdc', 'usdt', 'weth') }, 'hidden in all three is');
-  t.same(hiddenOf(1, METH, markets, hid([ 'usdt', METH ])), { isHidden: true, hiddenIn: sorted('usdt') },
+  t.same(listed(WEETH, hid([ 'usdc', WEETH ], [ 'usdt', WEETH ], [ 'weth', WEETH ])),
+    { isDeprecated: false, deprecatedIn: [], hiddenIn: sorted('usdc', 'usdt', 'weth'), ...kept }, 'hidden in all three is');
+  t.same(listed(METH, hid([ 'usdt', METH ])), { isDeprecated: false, deprecatedIn: [], hiddenIn: sorted('usdt'), ...kept },
     'as is a token hidden in the one market that takes it');
 
-  t.same(hiddenOf(1, WEETH, markets, decided([ [ 'usdc', WEETH ] ], [ [ 'usdt', WEETH ], [ 'weth', WEETH ] ])),
-    { isHidden: true, hiddenIn: sorted('usdc') },
+  t.same(listed(WEETH, decided([ [ 'usdc', WEETH ] ], [ [ 'usdt', WEETH ], [ 'weth', WEETH ] ])),
+    { isDeprecated: false, deprecatedIn: sorted('usdt', 'weth'), hiddenIn: sorted('usdc'), ...kept },
     'and so is one hidden in one of the three and deprecated in the other two, which none of them offers and leaves to discovery');
-  t.same(hiddenOf(1, WEETH, markets, decided([ [ 'usdc', WEETH ] ], [ [ 'usdc', WEETH ], [ 'usdt', WEETH ], [ 'weth', WEETH ] ])),
-    { isHidden: true, hiddenIn: sorted('usdc') }, 'or deprecated in all three and hidden in one of them as well');
-  t.same(hiddenOf(1, WEETH, markets, decided([ [ 'usdc', WEETH ] ], [ [ 'usdt', WEETH ] ])),
-    { isHidden: false, hiddenIn: sorted('usdc') },
+  t.same(listed(WEETH, decided([ [ 'usdc', WEETH ] ], [ [ 'usdc', WEETH ], [ 'usdt', WEETH ], [ 'weth', WEETH ] ])),
+    { isDeprecated: true, deprecatedIn: sorted('usdc', 'usdt', 'weth'), hiddenIn: sorted('usdc'), ...kept },
+    'or deprecated in all three and hidden in one of them as well');
+  t.same(listed(WEETH, decided([ [ 'usdc', WEETH ] ], [ [ 'usdt', WEETH ] ])),
+    { isDeprecated: false, deprecatedIn: sorted('usdt'), hiddenIn: sorted('usdc'), ...shown },
     'while one the WETH market takes with neither decision is offered there, and is not hidden');
-  t.same(hiddenOf(1, WEETH, markets, decided([], [ [ 'usdc', WEETH ], [ 'usdt', WEETH ], [ 'weth', WEETH ] ])),
-    { isHidden: false, hiddenIn: [] }, 'nor is one deprecated in all three and hidden in none, which is deprecated instead');
+  t.same(listed(WEETH, decided([], [ [ 'usdc', WEETH ], [ 'usdt', WEETH ], [ 'weth', WEETH ] ])),
+    { isDeprecated: true, deprecatedIn: sorted('usdc', 'usdt', 'weth'), hiddenIn: [], isVisible: false, visibilityReason: 'deprecated' },
+    'nor is one deprecated in all three and hidden in none, which is deprecated instead');
 
-  t.same(hiddenOf(1, METH, markets, hid([ 'usdc', METH ])), { isHidden: false, hiddenIn: [] },
+  t.same(listed(METH, hid([ 'usdc', METH ])), { isDeprecated: false, deprecatedIn: [], hiddenIn: [], ...shown },
     'a decision about a Comet that does not take the token as collateral hides nothing');
-  t.same(hiddenOf(1, METH, markets, { ...hid(), hidden: hiddenDecisionsOf([ { chainId: 8453, cometAddress: comet('usdt'), tokenAddress: METH } ]) }),
-    { isHidden: false, hiddenIn: [] },
+  t.same(listed(METH, { ...hid(), hidden: [ { chainId: 8453, cometAddress: comet('usdt'), tokenAddress: METH } ] }),
+    { isDeprecated: false, deprecatedIn: [], hiddenIn: [], ...shown },
     'and a decision belongs to its chain: one about the same Comet and token on another chain hides nothing');
-  t.same(hiddenOf(1, token('WETH'), markets, hid()), { isHidden: false, hiddenIn: [] }, 'nobody deciding is nothing hidden');
+  t.same(listed(token('WETH'), hid()), { isDeprecated: false, deprecatedIn: [], hiddenIn: [], ...shown }, 'nobody deciding is nothing hidden');
 
   const changed = catalogOf({
     ...snapshot,
@@ -316,14 +349,14 @@ t.test('a token is hidden only where an enabled market that takes it hides it, a
         : entry.deploymentKey === 'usdt' ? { ...entry, status: 'deprecated' as const }
         : entry),
     }),
-  }, NOW).marketsOn('ethereum-mainnet');
-  t.same(hiddenOf(1, WEETH, changed, hid([ 'usdc', WEETH ], [ 'usdt', WEETH ])),
-    { isHidden: true, hiddenIn: sorted('usdc', 'usdt') },
+  }, NOW);
+  t.same(listed(WEETH, hid([ 'usdc', WEETH ], [ 'usdt', WEETH ]), changed),
+    { isDeprecated: false, deprecatedIn: [], hiddenIn: sorted('usdc', 'usdt'), ...kept },
     'a market whose status is deprecated does not keep a token shown where it does not hide it');
-  t.same(hiddenOf(1, WEETH, changed, decided([ [ 'usdt', WEETH ] ], [ [ 'usdc', WEETH ] ])),
-    { isHidden: false, hiddenIn: sorted('usdt') },
+  t.same(listed(WEETH, decided([ [ 'usdt', WEETH ] ], [ [ 'usdc', WEETH ] ]), changed),
+    { isDeprecated: true, deprecatedIn: sorted('usdc'), hiddenIn: sorted('usdt'), isVisible: false, visibilityReason: 'deprecated' },
     'nor makes it hidden where it does: its decision is named, while the one enabled market that takes the token has it deprecated');
-  t.same(hiddenOf(1, XAUT, changed, hid([ 'usdt', XAUT ])), { isHidden: false, hiddenIn: sorted('usdt') },
+  t.same(listed(XAUT, hid([ 'usdt', XAUT ]), changed), { isDeprecated: false, deprecatedIn: [], hiddenIn: sorted('usdt'), ...shown },
     'and a token only such a market takes is named there, but no enabled market hides it');
 });
 
@@ -347,11 +380,11 @@ t.test('a token hidden in every enabled market that takes it is not shown, whate
     positions:  positionsOf(catalog, 'ethereum-mainnet'),
     view:       { block: { number: 100, timestamp: 1_791_204_000 }, current: null, earlier: [] },
     strategic:  new Set<Address>([ of('XAUt') ]),
-    deprecated: deprecatedDecisionsOf([ { chainId: 1, cometAddress: usdt.contracts.comet!, tokenAddress: of('mETH') } ]),
+    deprecated: collateralDecisionsOf([ { chainId: 1, cometAddress: usdt.contracts.comet!, tokenAddress: of('mETH') } ]),
     now:        NOW,
   };
-  const before = tokenList({ ...input, hidden: hiddenDecisionsOf([]) });
-  const after  = tokenList({ ...input, hidden: hiddenDecisionsOf(each) });
+  const before = tokenList({ ...input, hidden: collateralDecisionsOf([]) });
+  const after  = tokenList({ ...input, hidden: collateralDecisionsOf(each) });
 
   const HIDDEN = [ 'mETH', 'sFRAX', 'wUSDM', 'XAUt' ];
   const decision = (list: typeof before, among: (symbol: string) => boolean) => list.tokens
@@ -361,7 +394,7 @@ t.test('a token hidden in every enabled market that takes it is not shown, whate
     'the tokens no other market takes are hidden');
   t.same(decision(before, symbol => HIDDEN.includes(symbol)), [
     [ 'mETH', false, 'deprecated' ], [ 'sFRAX', true, 'data_unavailable' ], [ 'wUSDM', true, 'data_unavailable' ], [ 'XAUt', true, 'strategic' ],
-  ], 'which discovery decided by the rest of the rule before');
+  ], 'which discovery decided before by the deprecated decisions, the strategic mark and the value');
   t.same(decision(after, symbol => HIDDEN.includes(symbol)), HIDDEN.map(symbol => [ symbol, false, 'hidden' ]),
     'and does not show now, strategic, deprecated or neither, which the reason says first');
   t.same(decision(after, symbol => !HIDDEN.includes(symbol)), decision(before, symbol => !HIDDEN.includes(symbol)),
@@ -382,10 +415,10 @@ t.test('a token hidden in every enabled market that takes it is not shown, whate
  * Hidden in one enabled market that takes it and deprecated in the others, a
  * token is offered by none of them and left to discovery by none: the list
  * does not show it, for the hiding, though it is not deprecated in every one.
- * weETH is strategic here, so that the rest of the rule shows it. In one
- * market, the rule asks that market's decision in place of the chain's: a
- * market that has the token deprecated, and does not hide it, leaves it to
- * the rest of the rule.
+ * weETH is strategic here, so that it is shown wherever no decision keeps it
+ * out. In one market, the rule asks that market's decisions in place of the
+ * chain's: a market that has the token deprecated, and does not hide it, does
+ * not show it either, for the deprecating.
  */
 t.test('a token hidden in an enabled market that takes it and deprecated in the others is not shown, for the hiding', async t => {
   const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
@@ -395,33 +428,23 @@ t.test('a token hidden in an enabled market that takes it and deprecated in the 
   const of      = (keys: string[]) => keys.map(key => ({ chainId: 1, cometAddress: comet(key), tokenAddress: weEth }));
   const sorted  = (...keys: string[]) => keys.map(comet).sort();
   // weETH as the list of `within` says it, hidden in the markets of the deployment keys `hidden` names, deprecated in those of `deprecated`
-  const listed  = (hidden: string[], deprecated: string[], within = catalog) => tokenList({
-    registryVersion: { id: 'v', checksum: 'c' },
-    chainId:    1,
-    catalog:    within,
-    network:    'ethereum-mainnet',
-    positions:  positionsOf(within, 'ethereum-mainnet'),
-    view:       { block: { number: 100, timestamp: 1_791_204_000 }, current: null, earlier: [] },
-    strategic:  new Set<Address>([ weEth ]),
-    deprecated: deprecatedDecisionsOf(of(deprecated)),
-    hidden:     hiddenDecisionsOf(of(hidden)),
-    now:        NOW,
+  const listed  = (hidden: string[], deprecated: string[], within = catalog) => mainnetList(within, {
+    strategic:  [ weEth ],
+    deprecated: of(deprecated),
+    hidden:     of(hidden),
   }).tokens.find(entry => entry.address === weEth)!;
-  const decision = ({ isDeprecated, deprecatedIn, hiddenIn, isVisible, visibilityReason }: TokenVisibilityV1) => (
-    { isDeprecated, deprecatedIn, hiddenIn, isVisible, visibilityReason }
-  );
 
   const mixed = listed([ 'usdc' ], [ 'weth', 'usdt' ]);
-  t.same(decision(mixed),
+  t.same(decisionOf(mixed),
     { isDeprecated: false, deprecatedIn: sorted('usdt', 'weth'), hiddenIn: sorted('usdc'), isVisible: false, visibilityReason: 'hidden' },
     'hidden in one of the three enabled markets that take it and deprecated in the other two, it is not shown, though not deprecated in every one');
-  t.same(decision(listed([ 'usdc' ], [ 'usdc', 'weth', 'usdt' ])),
+  t.same(decisionOf(listed([ 'usdc' ], [ 'usdc', 'weth', 'usdt' ])),
     { isDeprecated: true, deprecatedIn: sorted('usdc', 'usdt', 'weth'), hiddenIn: sorted('usdc'), isVisible: false, visibilityReason: 'hidden' },
     'deprecated in all three and hidden in one of them as well, it is deprecated, and not shown for the hiding, which is asked first');
-  t.same(decision(listed([], [ 'usdc', 'weth', 'usdt' ])),
+  t.same(decisionOf(listed([], [ 'usdc', 'weth', 'usdt' ])),
     { isDeprecated: true, deprecatedIn: sorted('usdc', 'usdt', 'weth'), hiddenIn: [], isVisible: false, visibilityReason: 'deprecated' },
     'deprecated in all three and hidden in none, it is not shown for being deprecated, as before');
-  t.same(decision(listed([ 'usdc' ], [ 'weth' ])),
+  t.same(decisionOf(listed([ 'usdc' ], [ 'weth' ])),
     { isDeprecated: false, deprecatedIn: sorted('weth'), hiddenIn: sorted('usdc'), isVisible: true, visibilityReason: 'strategic' },
     'and while the USDT market takes it with neither decision, it is offered there, and the rest of the rule shows it');
 
@@ -432,27 +455,28 @@ t.test('a token hidden in an enabled market that takes it and deprecated in the 
       markets: network.markets.map(entry => entry.deploymentKey === 'usdt' ? { ...entry, status: 'deprecated' as const } : entry),
     }),
   }, NOW);
-  t.same(decision(listed([ 'usdt' ], [ 'usdc', 'weth' ], changed)),
+  t.same(decisionOf(listed([ 'usdt' ], [ 'usdc', 'weth' ], changed)),
     { isDeprecated: true, deprecatedIn: sorted('usdc', 'weth'), hiddenIn: sorted('usdt'), isVisible: false, visibilityReason: 'deprecated' },
     'a market whose status is deprecated is named where it hides the token, but its hiding takes no part: the enabled markets have it deprecated');
-  t.same(decision(listed([ 'usdc' ], [ 'usdt' ], changed)),
+  t.same(decisionOf(listed([ 'usdc' ], [ 'usdt' ], changed)),
     { isDeprecated: false, deprecatedIn: sorted('usdt'), hiddenIn: sorted('usdc'), isVisible: true, visibilityReason: 'strategic' },
     'nor does its deprecating: the WETH market takes the token with neither decision');
 
-  t.same(visibilityWith(mixed, { isHidden: true, isDeprecated: false }), { isVisible: false, visibilityReason: 'hidden' },
-    'in the USDC market, which hides it, it is not shown either');
-  t.same(visibilityWith(mixed, { isHidden: false, isDeprecated: true }), { isVisible: false, visibilityReason: 'deprecated' },
+  // in one market, by its own decisions, weETH's value unknown as the list has it
+  const here = (isHidden: boolean, isDeprecated: boolean) => visibilityHere({ isHidden, isDeprecated, isStrategic: mixed.isStrategic }, { valueUsd: null });
+  t.same(here(true, false), { isVisible: false, visibilityReason: 'hidden' }, 'in the USDC market, which hides it, it is not shown either');
+  t.same(here(false, true), { isVisible: false, visibilityReason: 'deprecated' },
     'nor in the WETH and USDT markets, which have it deprecated and do not hide it');
 });
 
 /*
  * What /summary says of a collateral is the rule with the decisions of the
  * collateral's own Comet in place of what the chain decides of hiding and
- * deprecating the token. Where the market's status is deprecated, its
- * decisions may differ from every enabled market's: weETH is hidden by the
- * USDC and WETH markets, the enabled ones that take it, and not by the USDT
- * market, deprecated here, where the rest of the rule decides it, from the
- * value the list wrote.
+ * deprecating the token, and the value the list decided by. Where the
+ * market's status is deprecated, its decisions may differ from every enabled
+ * market's: weETH is hidden, or deprecated, by the USDC and WETH markets, the
+ * enabled ones that take it, and not by the USDT market, deprecated here,
+ * where its strategic mark and its value decide it.
  */
 t.test('in one market, the rule asks that market\'s decisions in place of what the chain decides of hiding and deprecating', async t => {
   const mainnet = snapshot.networks.find(network => network.chainId === 1)!;
@@ -466,42 +490,138 @@ t.test('in one market, the rule asks that market\'s decisions in place of what t
       markets: network.markets.map(entry => entry.deploymentKey === 'usdt' ? { ...entry, status: 'deprecated' as const } : entry),
     }),
   }, NOW);
-  const list = tokenList({
-    registryVersion: { id: 'v', checksum: 'c' },
+  const of      = (keys: string[]) => keys.map(key => ({ chainId: 1, cometAddress: comet(key), tokenAddress: weEth }));
+  // weETH as the summary has it from the list: its entry, and the value the list decided by
+  const listed  = ({ hidden, deprecated }: { hidden: string[], deprecated: string[] }) => listedTokens({
     chainId:    1,
     catalog:    changed,
     network:    'ethereum-mainnet',
     positions:  positionsOf(changed, 'ethereum-mainnet'),
     view:       { block: { number: 100, timestamp: 1_791_204_000 }, current: null, earlier: [] },
     strategic:  new Set<Address>(),
-    deprecated: deprecatedDecisionsOf([]),
-    hidden:     hiddenDecisionsOf([ 'usdc', 'weth' ].map(key => ({ chainId: 1, cometAddress: comet(key), tokenAddress: weEth }))),
+    deprecated: collateralDecisionsOf(of(deprecated)),
+    hidden:     collateralDecisionsOf(of(hidden)),
     now:        NOW,
-  });
-  const listed = list.tokens.find(entry => entry.address === weEth)!;
-  t.same([ listed.isVisible, listed.visibilityReason ], [ false, 'hidden' ], 'the list does not show weETH, which every enabled market hides');
-  const neither = { isHidden: false, isDeprecated: false };
-  t.same(visibilityWith(listed, { isHidden: true, isDeprecated: false }), { isVisible: false, visibilityReason: 'hidden' }, 'nor does a market that hides it');
-  t.same(visibilityWith(listed, neither), { isVisible: true, visibilityReason: 'data_unavailable' },
+  }).find(entry => entry.token.address === weEth)!;
+  const neither = { isHidden: false, isDeprecated: false, isStrategic: false };
+
+  const hiding = listed({ hidden: [ 'usdc', 'weth' ], deprecated: [] });
+  t.same([ hiding.token.isVisible, hiding.token.visibilityReason ], [ false, 'hidden' ], 'the list does not show weETH, which every enabled market hides');
+  t.same(visibilityHere({ ...neither, isHidden: true }, hiding), { isVisible: false, visibilityReason: 'hidden' }, 'nor does a market that hides it');
+  t.same(visibilityHere(neither, hiding), { isVisible: true, visibilityReason: 'data_unavailable' },
     'while in the USDT market, which does not, the rest of the rule shows it, its value unknown');
 
-  const valued = (collateralValueUsd: string | null, overrides: Partial<TokenVisibilityV1> = {}): TokenVisibilityV1 => (
-    { ...listed, collateralValueUsd, ...overrides }
-  );
-  const cases: Array<[ string, TokenVisibilityV1, boolean, string ]> = [
-    [ 'exactly the threshold',                     valued('250000'),                         true,  'collateral_threshold' ],
-    [ 'a hair below it',                           valued('249999.9999'),                    false, 'below_threshold' ],
-    [ 'past it by less than a float can tell',     valued('250000.000000000000000000001'),   true,  'collateral_threshold' ],
-    [ 'short of it by less than a float can tell', valued('249999.999999999999999999999'),   false, 'below_threshold' ],
-    [ 'strategic below it',                        valued('1', { isStrategic: true }),       true,  'strategic' ],
-    // what the chain decides of deprecating takes no part: only this market's decision does
-    [ 'deprecated in every enabled market',        valued('300000', { isDeprecated: true }), true,  'collateral_threshold' ],
+  const deprecating = listed({ hidden: [], deprecated: [ 'usdc', 'weth' ] });
+  t.same([ deprecating.token.isDeprecated, deprecating.token.isVisible, deprecating.token.visibilityReason ], [ true, false, 'deprecated' ],
+    'nor does the list show weETH where every enabled market has it deprecated');
+  t.same(visibilityHere({ ...neither, isDeprecated: true }, deprecating), { isVisible: false, visibilityReason: 'deprecated' },
+    'nor does a market that has it deprecated');
+  t.same(visibilityHere(neither, deprecating), { isVisible: true, visibilityReason: 'data_unavailable' },
+    'while the USDT market, which does not, decides it by its strategic mark and its value: what the chain decides of deprecating takes no part');
+});
+
+/*
+ * The summary decides a collateral by the value the list read of its token,
+ * of which the list writes every digit: a value past the threshold, or short
+ * of it, by less than a float can tell decides the collateral in a market
+ * that neither hides nor deprecates it as it decides the token.
+ */
+t.test('in one market, the rule reads the value the list decided by', async t => {
+  const weEth     = tokensOf(catalog, 'ethereum-mainnet').find(({ token }) => token.symbol === 'weETH')!.token.address;
+  const positions = positionsOf(catalog, 'ethereum-mainnet');
+  const held      = positions.find(position => position.token === weEth)!;
+  const block     = { number: 100, timestamp: 1_791_204_000 };
+  // weETH as mainnet's list has it where its first position is worth `usd` and every other position nothing
+  const listed = (usd: string) => listedTokens({
+    chainId:    1,
+    catalog,
+    network:    'ethereum-mainnet',
+    positions,
+    view:       {
+      block,
+      current: {
+        chainId:     1,
+        minute:      Math.floor(block.timestamp / 60),
+        positionSet: 'positions',
+        block,
+        positions:   positions.map(position => ({
+          key:     position.key,
+          token:   position.token,
+          outcome: {
+            status:   'success' as const,
+            valueUsd: position === held ? { value: usd.replace('.', ''), decimals: usd.split('.')[1]?.length ?? 0 } : { value: '0', decimals: 0 },
+          },
+        })),
+      },
+      earlier: [],
+    },
+    strategic:  new Set<Address>(),
+    deprecated: collateralDecisionsOf([]),
+    hidden:     collateralDecisionsOf([]),
+    now:        NOW,
+  }).find(entry => entry.token.address === weEth)!;
+  const neither = { isHidden: false, isDeprecated: false, isStrategic: false };
+
+  for (const [ usd, reason ] of [ [ '250000.000000000000000000001', 'collateral_threshold' ], [ '249999.999999999999999999999', 'below_threshold' ] ] as const) {
+    const entry = listed(usd);
+    t.same([ entry.token.collateralValueUsd, entry.token.visibilityReason ], [ usd, reason ], `the list writes ${usd} and decides the token by it`);
+    t.same(visibilityHere(neither, entry).visibilityReason, reason, `and a market that neither hides nor deprecates it decides by ${usd} as well`);
+  }
+});
+
+/*
+ * /summary answers each collateral with what discovery says of its token in
+ * the collateral's market, from that market's Comet's decisions, where a kind
+ * of decision may not have been read. It says why the token is shown or not
+ * where the decisions read decide it whichever way the others went: the
+ * hiding decides alone, the deprecating once the hiding is read, and the
+ * strategic mark and the value once every kind is. It says whether the token
+ * is shown wherever the decisions read decide that much, even without why: it
+ * is not shown where this Comet has it deprecated, whatever its hiding, or
+ * where it is not strategic and is worth less than the threshold, whatever its
+ * hiding and its deprecating; and shown where this Comet neither hides nor
+ * deprecates it and its value reaches the threshold or cannot be read,
+ * whatever its strategic mark. Every combination is asked: each kind read
+ * true, read false, or not read, and a value at the threshold, short of it, or
+ * unknown.
+ */
+t.test('in one market, discovery is said to show a token or not only where the decisions read decide it', async t => {
+  const kinds = [ true, false, null ] as const;
+  const values: Array<[ string, TokenValue ]> = [
+    [ 'exactly the threshold', value('fresh', '250000') ],
+    [ 'a hair below it',       value('fresh', '249999.9999') ],
+    [ 'unreadable',            value('unavailable', null) ],
   ];
-  for (const [ name, token, isVisible, reason ] of cases) {
-    t.same(visibilityWith(token, neither), { isVisible, visibilityReason: reason }, `neither hidden nor deprecated here, ${name}`);
-    t.same(visibilityWith(token, { isHidden: false, isDeprecated: true }), { isVisible: false, visibilityReason: 'deprecated' }, `deprecated here, ${name}`);
-    t.same(visibilityWith(token, { isHidden: true, isDeprecated: false }), { isVisible: false, visibilityReason: 'hidden' }, `hidden here, ${name}`);
-    t.same(visibilityWith(token, { isHidden: true, isDeprecated: true }), { isVisible: false, visibilityReason: 'hidden' },
-      `hidden and deprecated here, ${name}: the hiding, which is asked first`);
+  const named = (decision: boolean | null, yes: string, no: string, unread: string) => decision === null ? unread : decision ? yes : no;
+  // what the summary says of a collateral, stated apart from the rule's code
+  const said = (isHidden: boolean | null, isDeprecated: boolean | null, isStrategic: boolean | null, worth: string): Partial<VisibilityV1> => {
+    // a token no hiding or deprecating could show
+    const unwanted = isStrategic === false && worth === 'a hair below it';
+    return (
+        isHidden === true                  ? { isVisible: false, visibilityReason: 'hidden' }
+      : isHidden === null                  ? (isDeprecated === true || unwanted ? { isVisible: false } : {})
+      : isDeprecated === true              ? { isVisible: false, visibilityReason: 'deprecated' }
+      : isDeprecated === null              ? (unwanted ? { isVisible: false } : {})
+      : isStrategic === null               ? (worth === 'a hair below it' ? {} : { isVisible: true })
+      : isStrategic                        ? { isVisible: true, visibilityReason: 'strategic' }
+      : worth === 'unreadable'             ? { isVisible: true, visibilityReason: 'data_unavailable' }
+      : worth === 'exactly the threshold'  ? { isVisible: true, visibilityReason: 'collateral_threshold' }
+      : { isVisible: false, visibilityReason: 'below_threshold' }
+    );
+  };
+  for (const isHidden of kinds) {
+    for (const isDeprecated of kinds) {
+      for (const isStrategic of kinds) {
+        for (const [ worth, tokenValue ] of values) {
+          const name = [
+            named(isHidden, 'hidden here', 'not hidden here', 'its hiding unread'),
+            named(isDeprecated, 'deprecated here', 'not deprecated here', 'its deprecating unread'),
+            named(isStrategic, 'strategic', 'not strategic', 'its strategic mark unread'),
+            worth,
+          ].join(', ');
+          t.same(visibilityHere({ isHidden, isDeprecated, isStrategic }, tokenValue), said(isHidden, isDeprecated, isStrategic, worth), name);
+        }
+      }
+    }
   }
 });

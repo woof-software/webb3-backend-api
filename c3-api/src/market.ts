@@ -17,7 +17,7 @@ import type { MarketIdentity } from '../lib/computations/market/market-summary.j
 
 import { ApiError } from './http/errors.js';
 import type { Catalog } from './registry/catalog.js';
-import { chainTokens, withTokenFields } from './registry/summary-tokens.js';
+import { chainTokens, summaryHeaders, withTokenFields } from './registry/summary-tokens.js';
 
 import {
   AllNetworks,
@@ -195,16 +195,8 @@ async function latestSummary(
    * would change its shape with an activation.
    */
   const flattedSummary = summary.flat();
-  /*
-   * Collaterals marked by the deprecated or the hidden decisions the worker
-   * last recorded, because D1 could not give them, are not confirmed, and the
-   * answer says so as /registry/v1/active does; the router sets the version's
-   * own age over it where the version came from the cache too.
-   */
-  const { deprecated, hidden } = await decisions;
-  return new Response(JSON.stringify(flattedSummary), {
-    headers: deprecated?.recorded || hidden?.recorded ? { 'X-Registry-Stale': '0', 'Cache-Control': 'no-store' } : {},
-  });
+  const headers = summaryHeaders(await decisions);
+  return new Response(JSON.stringify(flattedSummary), { headers });
 }
 
 async function latestRewardsSummary(

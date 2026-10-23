@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 
 import C3Api, { Env } from '../../../entrypoint.js';
 import { POINTER_KEY } from '../../../src/registry/cache.js';
-import { DEPRECATED_KEY, HIDDEN_KEY } from '../../../src/registry/deprecated-collaterals.js';
+import { DEPRECATED_KEY, HIDDEN_KEY } from '../../../src/registry/collateral-decisions.js';
 import { maintainRegistryCache } from '../../../src/registry/scheduled.js';
 
 import { consoleLines } from '../../util/console.js';
@@ -105,7 +105,7 @@ t.test('a validation, an activation and a rollback answer as committed, though n
 
 /*
  * A decision about a collateral records the decisions of its kind for an
- * outage once it has committed (deprecated-collaterals.ts), each kind under
+ * outage once it has committed (collateral-decisions.ts), each kind under
  * its own key. A record the namespace does not take must not fail the
  * command either: the next read that finds the record behind writes it.
  */

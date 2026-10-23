@@ -8,9 +8,12 @@ import { checksumAddress } from '../../../lib/model/comet-registry.js';
 import type { ActiveMarketV1, Address, RegistrySnapshotV1, TokenListV1 } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
-import { setDeprecatedCollateral } from '../../../src/registry/deprecated-collateral-repository.js';
-import { DEPRECATED_KEY, HIDDEN_KEY } from '../../../src/registry/deprecated-collaterals.js';
-import { setHiddenCollateral } from '../../../src/registry/hidden-collateral-repository.js';
+import {
+  DEPRECATED_COLLATERAL_KIND,
+  HIDDEN_COLLATERAL_KIND,
+  setCollateral,
+} from '../../../src/registry/collateral-decision-repository.js';
+import { DEPRECATED_KEY, HIDDEN_KEY } from '../../../src/registry/collateral-decisions.js';
 import { SUMMARY_DEADLINE_MS } from '../../../src/registry/summary-tokens.js';
 import { DEADLINE_MS, positionSetOf, positionsOf, recordKey } from '../../../src/registry/token-collateral.js';
 import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
@@ -21,8 +24,10 @@ import { NodeScript, fakeNode, isValuation, valuations } from '../../util/fake-n
 import { MemoryKv } from '../../util/kv.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
-import { COLLATERAL_KEYS, onSummary } from '../../util/summary-token-fields.js';
+import { COLLATERAL_KEYS, onSummary, visibilityOnSummary } from '../../util/summary-token-fields.js';
 import { failingStatements, makeTestEnv } from '../../util/test-env.js';
+
+import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, TOKEN_POLICIES, statementsOf } from '../registry/decision-scenarios.js';
 
 import '../../../shim/node-self.js';
 
@@ -107,7 +112,7 @@ const decide = (db: D1Database, key: string, symbol: string) => setTokenPolicy(d
   reason:       'decided for a summary test',
 });
 
-const markDeprecated = (db: D1Database, key: string, symbol: string) => setDeprecatedCollateral(db, {
+const markDeprecated = (db: D1Database, key: string, symbol: string) => setCollateral(db, DEPRECATED_COLLATERAL_KIND, {
   chainId:      1,
   cometAddress: cometOf(key),
   tokenAddress: tokenOf(key, symbol),
@@ -116,7 +121,7 @@ const markDeprecated = (db: D1Database, key: string, symbol: string) => setDepre
   reason:       'decided for a summary test',
 });
 
-const hide = (db: D1Database, key: string, symbol: string) => setHiddenCollateral(db, {
+const hide = (db: D1Database, key: string, symbol: string) => setCollateral(db, HIDDEN_COLLATERAL_KIND, {
   chainId:      1,
   cometAddress: cometOf(key),
   tokenAddress: tokenOf(key, symbol),
@@ -346,22 +351,64 @@ t.test('a market whose status is deprecated answers by its own Comet\'s decision
 // matches no statement, so that a database fails only while it is down
 const NO_STATEMENT = /^$/;
 
-// what each kind of decision decides, and what takes them all
+// what each kind of decision decides, and the two fields every kind takes part in: whether the token is shown, and why
 const decidedBy = {
   deprecated: [ 'is_deprecated', 'is_network_deprecated', 'deprecated_in' ],
   hidden:     [ 'is_hidden', 'hidden_in' ],
   strategic:  [ 'is_strategic' ],
-  all:        [ 'is_visible', 'visibility_reason' ],
+  shown:      [ 'is_visible' ],
+  why:        [ 'visibility_reason' ],
 };
+
+// a kind of decision the summary may not have read
+type Unread = 'deprecated' | 'hidden' | 'strategic';
+
+/*
+ * A collateral a summary answered with every decision read, as a summary
+ * answers it while the kinds named cannot be read: without what they decide,
+ * and saying whether its token is shown, and why, only where the decisions
+ * read settle it whichever way the others went (visibilityOnSummary), each as
+ * when every decision was read.
+ */
+function unreadOf(collateral: Collateral, unread: readonly Unread[]): Collateral {
+  const settled = visibilityOnSummary({
+    isHidden:     unread.includes('hidden')     ? null : collateral.is_hidden as boolean,
+    isDeprecated: unread.includes('deprecated') ? null : collateral.is_deprecated as boolean,
+    isStrategic:  unread.includes('strategic')  ? null : collateral.is_strategic as boolean,
+  }, (collateral.total_network_collateral_value_usd as string | undefined) ?? null);
+  const unsettled = [ ...decidedBy.shown, ...decidedBy.why ].filter(field => !(field in settled));
+  return without(collateral, ...unread.flatMap(kind => decidedBy[kind]), ...unsettled) as Collateral;
+}
+
+// a summary answered with every decision read, as unreadOf answers each collateral
+const unreadSummary = (entries: Entry[], unread: readonly Unread[]): Entry[] => entries.map(entry => ({
+  ...entry,
+  collaterals: entry.collaterals!.map(collateral => unreadOf(collateral, unread)),
+}));
+
+// every collateral of a summary answered with every decision read, by name, as unreadOf answers it
+const unreadCollaterals = (entries: Entry[], unread: readonly Unread[]) => new Map(collateralsOf(unreadSummary(entries, unread)).map(read => (
+  [ nameOf(read), read.collateral ]
+)));
+
+// the fields of a collateral in the order the summary writes them, the message of one that is `error` after its status
+const keysOf = (collateral: Collateral) => COLLATERAL_KEYS
+  .flatMap((key): string[] => key === 'status' && 'message' in collateral ? [ key, 'message' ] : [ key ])
+  .filter(key => key in collateral);
+
+// whether a collateral says its token is shown, and why
+const saidOf = (collateral: Collateral) => picked(collateral, ...decidedBy.shown, ...decidedBy.why);
 
 /*
  * The deprecated and the hidden decisions are read as the active reads read
  * them: from D1, or, while D1 cannot be reached, from the record the worker
  * keeps of each kind, and an answer marked with those says that it could not
  * be confirmed. The strategic ones have no record, and what they decide is
- * left out, but for a collateral its Comet hides or has deprecated, which is
- * not shown there whatever they say. Either way the summary is answered: a
- * summary is every market's.
+ * left out. Every value here is worth less than the threshold, so a
+ * collateral its Comet neither hides nor deprecates is told nothing of
+ * whether it is shown, as a strategic mark would show it, while one its Comet
+ * hides or has deprecated is not shown there whatever they say. Either way
+ * the summary is answered: a summary is every market's.
  */
 t.test('while D1 cannot be reached, the deprecated and the hidden decisions come from their records and are said to be unconfirmed', async t => {
   const { registry, env, get } = await workerOf(t);
@@ -382,7 +429,7 @@ t.test('while D1 cannot be reached, the deprecated and the hidden decisions come
   ], 'and records the decisions it read, each kind apart');
   const before = await summaryOf(confirmed);
 
-  for (const [ kind, failing ] of [ [ 'deprecated', /FROM deprecated_collaterals/ ], [ 'hidden', /FROM hidden_collaterals/ ] ] as const) {
+  for (const [ kind, failing ] of [ [ 'deprecated', statementsOf(DEPRECATED_COLLATERALS) ], [ 'hidden', statementsOf(HIDDEN_COLLATERALS) ] ] as const) {
     const partly = await get(OF_MAINNET, { APP_DB: failingStatements(registry.db, failing) });
     t.same([ partly.headers.get('x-registry-stale'), partly.headers.get('cache-control') ], [ '0', 'no-store' ],
       `${kind} decisions D1 did not give, the version it did: the decisions last recorded, said to be no older than now, and not to be kept`);
@@ -401,12 +448,12 @@ t.test('while D1 cannot be reached, the deprecated and the hidden decisions come
     { is_hidden: true, is_visible: false, visibility_reason: 'hidden' }, 'of either kind, and a collateral its Comet hides is not shown there');
   t.strictSame(picked(collateralOf(entryOf(during, 'usdt'), 'mETH'), 'is_hidden', 'is_visible', 'visibility_reason'),
     { is_hidden: false, is_visible: false, visibility_reason: 'deprecated' }, 'nor one its Comet has deprecated and does not hide');
-  const strategic = [ ...decidedBy.strategic, ...decidedBy.all ];
+  const strategic = [ ...decidedBy.strategic, ...decidedBy.shown, ...decidedBy.why ];
+  const expected  = unreadCollaterals(before, [ 'strategic' ]);
   for (const read of collateralsOf(during)) {
-    const decidedHere = (read.entry.deployment_key === 'usdc' && read.collateral.symbol === 'weETH')
-      || (read.entry.deployment_key === 'usdt' && read.collateral.symbol === 'mETH');
-    t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS.filter(key => !(decidedHere ? decidedBy.strategic : strategic).includes(key)),
-      `${nameOf(read)}: without what the strategic decisions decide${decidedHere ? ', but for whether it is shown, which its Comet\'s decision decides' : ''}`);
+    const fields = expected.get(nameOf(read))!;
+    t.strictSame(Object.keys(read.collateral), keysOf(fields),
+      `${nameOf(read)}: without what the strategic decisions decide${'visibility_reason' in fields ? ', but for whether it is shown, which its Comet\'s decision decides' : ''}`);
   }
   t.strictSame(during.map(entry => ({ ...entry, collaterals: entry.collaterals!.map(collateral => without(collateral, ...strategic)) })),
     before.map(entry => ({ ...entry, collaterals: entry.collaterals!.map(collateral => without(collateral, ...strategic)) })),
@@ -421,7 +468,16 @@ t.test('while D1 cannot be reached, the deprecated and the hidden decisions come
 /*
  * A failed read is logged once a minute for each database binding, as the
  * cache logs an outage it answers through, and its fields are left out of
- * every answer all the same.
+ * every answer all the same. Whether discovery shows a token, and why, which
+ * every kind takes part in, are each said only where the decisions read
+ * settle them whichever way the others went. Every value here is worth less
+ * than the threshold, so a collateral the strategic decisions do not mark is
+ * not shown whatever its Comet decided, and is told nothing of it while they
+ * cannot be read, as a mark would show it. mETH, which USDT's Comet has
+ * deprecated, is not shown there whatever its hiding or its strategic mark,
+ * and is told why while the strategic decisions alone cannot be read. XAUt,
+ * strategic, is shown unless its Comet hides it or has it deprecated, and so
+ * is told nothing of it while either cannot be read.
  */
 t.test('decisions that cannot be read leave out what they decide, and are logged under the request', async t => {
   const { registry, get } = await workerOf(t);
@@ -431,24 +487,24 @@ t.test('decisions that cannot be read leave out what they decide, and are logged
   const before = await summaryOf(await get(OF_MAINNET));
 
   const cases = [
-    [ 'the deprecated decisions, with none recorded', /FROM deprecated_collaterals/, [ ...decidedBy.deprecated, ...decidedBy.all ], 'deprecated collateral decisions' ],
-    [ 'the hidden decisions, with none recorded',     /FROM hidden_collaterals/, [ ...decidedBy.hidden, ...decidedBy.all ], 'hidden collateral decisions' ],
-    [ 'the strategic decisions',                      /FROM token_policies WHERE is_strategic/, [ ...decidedBy.strategic, ...decidedBy.all ], 'token policies' ],
+    [ 'the deprecated decisions, with none recorded', statementsOf(DEPRECATED_COLLATERALS), 'deprecated', 'deprecated collateral decisions' ],
+    [ 'the hidden decisions, with none recorded',     statementsOf(HIDDEN_COLLATERALS), 'hidden', 'hidden collateral decisions' ],
+    [ 'the strategic decisions',                      statementsOf(TOKEN_POLICIES), 'strategic', 'token policies' ],
   ] as const;
-  for (const [ what, failing, decided, logged ] of cases) {
+  for (const [ what, failing, kind, logged ] of cases) {
     errors.length = 0;
     const db       = failingStatements(registry.db, failing);
     const response = await get(OF_MAINNET, { APP_DB: db, kv_registry: MemoryKv({}) });
     t.same([ response.status, response.headers.get('x-registry-stale'), response.headers.get('cache-control') ], [ 200, null, null ],
       `${what}: the summary is answered, and says nothing is unconfirmed`);
     const answered = await summaryOf(response);
+    const expected = unreadCollaterals(before, [ kind ]);
     for (const read of collateralsOf(answered)) {
-      // mETH, which USDT's Comet has deprecated, is not shown there whatever the strategic decisions say
-      const alone  = what === 'the strategic decisions' && read.entry.deployment_key === 'usdt' && read.collateral.symbol === 'mETH';
-      const unread = (alone ? decidedBy.strategic : decided) as readonly string[];
-      t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS.filter(key => !unread.includes(key)),
-        `${what}: ${nameOf(read)} without what they decide${alone ? ', but for whether it is shown, which its Comet\'s deprecating decides' : ''}`);
+      const fields = expected.get(nameOf(read))!;
+      t.strictSame([ Object.keys(read.collateral), saidOf(read.collateral) ], [ keysOf(fields), saidOf(fields) ],
+        `${what}: ${nameOf(read)} without what they decide${'visibility_reason' in fields ? ', but for whether it is shown, which its Comet\'s deprecating decides' : ''}`);
     }
+    const decided = [ ...decidedBy[kind], ...decidedBy.shown, ...decidedBy.why ];
     t.strictSame(answered.map(entry => ({ ...entry, collaterals: entry.collaterals!.map(collateral => without(collateral, ...decided)) })),
       before.map(entry => ({ ...entry, collaterals: entry.collaterals!.map(collateral => without(collateral, ...decided)) })),
       `${what}: and everything else as when they were read`);
@@ -467,7 +523,9 @@ t.test('decisions that cannot be read leave out what they decide, and are logged
  * A release deployed before migration 0008 finds no table of hidden
  * decisions to read, where the other routes that read them answer 503: the
  * summary is answered without what they decide, as when D1 cannot give them,
- * and the log says why.
+ * and the log says why. Whether a token is shown is said where the other
+ * decisions settle it: every collateral here is neither strategic nor worth
+ * the threshold, so none is shown, whatever its hiding.
  */
 t.test('a database without the hidden collateral migration leaves out what the hidden decisions decide', async t => {
   const { get } = await workerOf(t, {}, fixture, { through: '0007' });
@@ -476,9 +534,10 @@ t.test('a database without the hidden collateral migration leaves out what the h
   const response = await get(OF_MAINNET, { kv_registry: MemoryKv({}) });
   t.same([ response.status, response.headers.get('x-registry-stale'), response.headers.get('cache-control') ], [ 200, null, null ],
     'the summary is answered, and says nothing is unconfirmed');
-  const unread = [ ...decidedBy.hidden, ...decidedBy.all ];
+  const unread = [ ...decidedBy.hidden, ...decidedBy.why ];
   for (const read of collateralsOf(await summaryOf(response))) {
-    t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS.filter(key => !unread.includes(key)), `${nameOf(read)}: without what they decide`);
+    t.strictSame([ Object.keys(read.collateral), saidOf(read.collateral) ], [ COLLATERAL_KEYS.filter(key => !unread.includes(key)), { is_visible: false } ],
+      `${nameOf(read)}: without what they decide`);
   }
   const logged = 'the summary could not read the hidden collateral decisions';
   t.equal(errors.filter(line => line === logged).length, 1, 'the log says so once');
@@ -488,32 +547,83 @@ t.test('a database without the hidden collateral migration leaves out what the h
 /*
  * Whether discovery shows a token takes every kind of decision, but a Comet's
  * hiding it decides that alone, since the rule asks it first. So a collateral
- * its Comet hides is said not to be shown there even when the other decisions
- * could not be read: a client told nothing would show it. Every other
- * collateral is told nothing of it, as before.
+ * its Comet hides is said not to be shown there, and why, even when the other
+ * decisions could not be read: a client told nothing would show it. Without
+ * the deprecated decisions, every other collateral but weETH, strategic here,
+ * is said not to be shown either, though not why: worth less than the
+ * threshold, it is not shown whether or not its Comet has deprecated it.
+ * Without the strategic ones, every other collateral is told nothing of it,
+ * as a strategic mark would show it.
  */
 t.test('a collateral its Comet hides is not shown there, though the other decisions could not be read', async t => {
   const { registry, get } = await workerOf(t);
   consoleLines(t, [ 'error' ]);
   await decide(registry.db, 'usdc', 'weETH');
   await hide(registry.db, 'usdc', 'weETH');
+  const before = await summaryOf(await get(OF_MAINNET));
 
   const cases = [
-    [ 'the deprecated decisions, with none recorded', /FROM deprecated_collaterals/, decidedBy.deprecated ],
-    [ 'the strategic decisions',                      /FROM token_policies WHERE is_strategic/, decidedBy.strategic ],
+    [ 'the deprecated decisions, with none recorded', statementsOf(DEPRECATED_COLLATERALS), 'deprecated' ],
+    [ 'the strategic decisions',                      statementsOf(TOKEN_POLICIES), 'strategic' ],
   ] as const;
-  for (const [ what, failing, decided ] of cases) {
+  for (const [ what, failing, kind ] of cases) {
     const answered = await summaryOf(await get(OF_MAINNET, { APP_DB: failingStatements(registry.db, failing), kv_registry: MemoryKv({}) }));
     t.strictSame(picked(collateralOf(entryOf(answered, 'usdc'), 'weETH'), 'is_hidden', 'is_visible', 'visibility_reason'),
       { is_hidden: true, is_visible: false, visibility_reason: 'hidden' }, `${what}: weETH in USDC's market, which hides it, is not shown there`);
+    const expected = unreadCollaterals(before, [ kind ]);
     for (const read of collateralsOf(answered)) {
-      const hiddenHere = read.entry.deployment_key === 'usdc' && read.collateral.symbol === 'weETH';
-      const unread     = hiddenHere ? decided : [ ...decided, ...decidedBy.all ];
-      t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS.filter(key => !(unread as readonly string[]).includes(key)),
-        `${what}: ${nameOf(read)} ${hiddenHere ? 'says whether it is shown' : 'is told nothing of whether it is shown'}`);
+      const fields = expected.get(nameOf(read))!;
+      const said   = 'visibility_reason' in fields ? 'says whether it is shown'
+        : 'is_visible' in fields ? `is said ${fields.is_visible ? 'to be' : 'not to be'} shown, though not why`
+        : 'is told nothing of whether it is shown';
+      t.strictSame([ Object.keys(read.collateral), saidOf(read.collateral) ], [ keysOf(fields), saidOf(fields) ], `${what}: ${nameOf(read)} ${said}`);
     }
     t.strictSame(picked(collateralOf(entryOf(answered, 'weth'), 'weETH'), 'is_hidden', 'hidden_in'),
       { is_hidden: false, hidden_in: [ checksumAddress(cometOf('usdc')) ] }, `${what}: while WETH's market says only where it is hidden`);
+  }
+});
+
+/*
+ * The strategic decisions have no record, so while they cannot be read, as
+ * in any outage of D1, the summary cannot tell whether a token is strategic.
+ * A collateral its Comet neither hides nor deprecates is shown, strategic or
+ * not, where its value reaches the threshold or cannot be read, so the
+ * summary says it is shown, though not why: here rETH, which WETH's market
+ * alone takes, held there at 300,000 tokens of a dollar each, and osETH,
+ * whose price reverts there. cbETH, worth less, is told nothing of it, as a
+ * strategic mark would show it.
+ */
+t.test('while the strategic decisions cannot be read, a collateral its value shows is said to be shown, though not why', async t => {
+  const assetOf = (symbol: string) => marketOf('weth').collateralAssets.find(asset => asset.token.symbol === symbol)!;
+  const [ rEth, osEth ] = [ assetOf('rETH'), assetOf('osETH') ];
+  const { registry, get } = await workerOf(t, {
+    answer: ({ name, argument }) => (
+        name === 'totalsCollateral' && argument === rEth.token.address ? [ (300_000n * 10n ** BigInt(rEth.token.decimals)).toString() ]
+      : name === 'getPrice' && argument === osEth.priceFeed.address    ? 'revert'
+      : undefined
+    ),
+  });
+  consoleLines(t, [ 'error', 'warn' ]);
+  let down = false;
+  const db     = failingStatements(registry.db, NO_STATEMENT, { down: () => down });
+  const before = await summaryOf(await get(OF_MAINNET, { APP_DB: db }));
+
+  const policies = await summaryOf(await get(OF_MAINNET, { APP_DB: failingStatements(registry.db, statementsOf(TOKEN_POLICIES)) }));
+  down = true;
+  const outage   = await summaryOf(await get(OF_MAINNET, { APP_DB: db }));
+  for (const [ what, answered ] of [ [ 'the token policies alone', policies ], [ 'D1 down', outage ] ] as const) {
+    const weth = entryOf(answered, 'weth');
+    t.strictSame([ 'rETH', 'osETH', 'cbETH' ].map(symbol => picked(collateralOf(weth, symbol), 'total_network_collateral_value_status', 'is_strategic', ...decidedBy.shown, ...decidedBy.why)), [
+      { total_network_collateral_value_status: 'fresh',       is_visible: true },
+      { total_network_collateral_value_status: 'unavailable', is_visible: true },
+      { total_network_collateral_value_status: 'fresh' },
+    ], `${what}: in WETH's market, rETH, worth the threshold, and osETH, of a value nobody could read, are said to be shown, though not why, and cbETH, worth less, is told nothing`);
+    const expected = unreadCollaterals(before, [ 'strategic' ]);
+    for (const symbol of [ 'rETH', 'osETH' ]) {
+      const fields = expected.get(nameOf({ entry: weth, collateral: collateralOf(weth, symbol) }))!;
+      t.strictSame(Object.keys(collateralOf(weth, symbol)), keysOf(fields), `${what}: ${symbol} without what the strategic decisions decide, but for whether it is shown`);
+    }
+    t.strictSame(answered, unreadSummary(before, [ 'strategic' ]), `${what}: and everything else as when every decision was read`);
   }
 });
 

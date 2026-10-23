@@ -1,13 +1,9 @@
-import type { Address } from '../../lib/model/comet-registry.js';
-
 import { ApiError } from '../http/errors.js';
 import { jsonResponse } from '../http/json.js';
 
 import { isUnreachable } from './cache.js';
-import { readDeprecatedCollaterals } from './deprecated-collateral-repository.js';
-import { DeprecatedDecisions, HiddenDecisions, deprecatedDecisionsOf, hiddenDecisionsOf } from './deprecated-collaterals.js';
+import { DEPRECATED_RECORD, HIDDEN_RECORD, collateralDecisionsOf } from './collateral-decisions.js';
 import { RegistryContext, addressOf, chainIdOf } from './handlers.js';
-import { readHiddenCollaterals } from './hidden-collateral-repository.js';
 import { catalogHeaders } from './request-catalog.js';
 import { collateralView, positionsOf } from './token-collateral.js';
 import { tokenList } from './token-visibility.js';
@@ -43,10 +39,9 @@ async function getTokenPolicy(context: RegistryContext, chainId: string, tokenAd
 }
 
 /*
- * Sets the decision for one token. Asking for the decision already in force
- * answers `changed: false` and writes nothing, so a retried or repeated
- * request is safe; a change is committed with its audit event before it is
- * answered.
+ * Asking for the decision already in force answers `changed: false` and
+ * writes nothing, so a retried or repeated request is safe; a change is
+ * committed with its audit event before it is answered.
  */
 async function patchTokenPolicy(
   context: RegistryContext,
@@ -102,56 +97,28 @@ function visibleOnlyOf(query: URLSearchParams): boolean {
 }
 
 /*
- * The strategic decisions of a chain. A database that does not answer is an
- * outage the client is told about, and fails open on: without them, a
- * strategic token below the threshold would be listed as not shown. Why it
- * did not answer is logged under the request id, beside the answer's own line.
+ * The decisions of one kind the list is made with, read from the database on
+ * every request. A database that does not answer is an outage the client is
+ * told about, a 503, and fails open on, since the list would be wrong without
+ * them: without the token policies it would list a strategic token below the
+ * threshold as not shown, without the deprecated collateral decisions call a
+ * deprecated collateral current and show a token discovery does not, and
+ * without the hidden ones show a token an enabled market hides and none of
+ * them leaves to discovery. Why it did not answer is logged under the request
+ * id, beside the answer's own line.
+ *
+ * The collateral decisions are every chain's, read as the active reads read
+ * them, and the list looks up its own chain's. Unlike the active reads, the
+ * list does not answer from the decisions last recorded: it fails with the
+ * token policies anyway.
  */
-async function strategicTokens(context: RegistryContext, chainId: number): Promise<Set<Address>> {
+async function orRefused<T>(context: RegistryContext, chainId: number, decisions: string, read: () => Promise<T>): Promise<T> {
   try {
-    return await readStrategicTokens(context.db, chainId);
+    return await read();
   } catch (error) {
     if (isUnreachable(error)) {
-      context.debug.error(`the token list could not read the token policies`, { requestId: context.requestId, chainId, error });
-      throw new ApiError('UPSTREAM_UNAVAILABLE', `the token policies could not be read`);
-    }
-    throw error;
-  }
-}
-
-/*
- * The deprecated collateral decisions, read as the strategic ones are: from
- * the database on every request, and a 503 when it does not answer, since
- * without them the list would call a deprecated collateral current, and show
- * a token discovery does not. They are every chain's, read as the active
- * reads read them, and the list looks up its own chain's. Unlike the active
- * reads, the list does not answer from the decisions last recorded: it fails
- * with the token policies anyway.
- */
-async function deprecatedCollaterals(context: RegistryContext, chainId: number): Promise<DeprecatedDecisions> {
-  try {
-    return deprecatedDecisionsOf(await readDeprecatedCollaterals(context.db));
-  } catch (error) {
-    if (isUnreachable(error)) {
-      context.debug.error(`the token list could not read the deprecated collateral decisions`, { requestId: context.requestId, chainId, error });
-      throw new ApiError('UPSTREAM_UNAVAILABLE', `the deprecated collateral decisions could not be read`);
-    }
-    throw error;
-  }
-}
-
-/*
- * The hidden collateral decisions, read as the deprecated ones are, and a 503
- * when the database does not answer, since without them the list would show
- * a token every enabled market that takes it hides.
- */
-async function hiddenCollaterals(context: RegistryContext, chainId: number): Promise<HiddenDecisions> {
-  try {
-    return hiddenDecisionsOf(await readHiddenCollaterals(context.db));
-  } catch (error) {
-    if (isUnreachable(error)) {
-      context.debug.error(`the token list could not read the hidden collateral decisions`, { requestId: context.requestId, chainId, error });
-      throw new ApiError('UPSTREAM_UNAVAILABLE', `the hidden collateral decisions could not be read`);
+      context.debug.error(`the token list could not read the ${decisions}`, { requestId: context.requestId, chainId, error });
+      throw new ApiError('UPSTREAM_UNAVAILABLE', `the ${decisions} could not be read`);
     }
     throw error;
   }
@@ -189,13 +156,24 @@ async function getTokenList(request: Request, context: RegistryContext, chainIdT
    */
   context.tokens.waitUntil(valuing);
   const [ strategic, deprecated, hidden, view ] = await Promise.all([
-    strategicTokens(context, chainId),
-    deprecatedCollaterals(context, chainId),
-    hiddenCollaterals(context, chainId),
+    orRefused(context, chainId, 'token policies', () => readStrategicTokens(context.db, chainId)),
+    orRefused(context, chainId, 'deprecated collateral decisions', () => DEPRECATED_RECORD.read(context.db)),
+    orRefused(context, chainId, 'hidden collateral decisions', () => HIDDEN_RECORD.read(context.db)),
     valuing,
   ]);
 
-  const list = tokenList({ registryVersion, chainId, catalog, network: name, positions, view, strategic, deprecated, hidden, now: context.tokens.now() });
+  const list = tokenList({
+    registryVersion,
+    chainId,
+    catalog,
+    network:    name,
+    positions,
+    view,
+    strategic,
+    deprecated: collateralDecisionsOf(deprecated),
+    hidden:     collateralDecisionsOf(hidden),
+    now:        context.tokens.now(),
+  });
   return jsonResponse(visibleOnly ? { ...list, tokens: list.tokens.filter(token => token.isVisible) } : list, {
     headers: {
       'Cache-Control': 'public, max-age=30',

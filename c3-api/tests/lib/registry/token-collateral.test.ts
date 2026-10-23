@@ -19,7 +19,7 @@ import {
   recordKey,
 } from '../../../src/registry/token-collateral.js';
 
-import { deprecatedDecisionsOf, hiddenDecisionsOf } from '../../../src/registry/deprecated-collaterals.js';
+import { collateralDecisionsOf } from '../../../src/registry/collateral-decisions.js';
 import { tokenValue } from '../../../src/registry/token-value.js';
 import { tokenList } from '../../../src/registry/token-visibility.js';
 
@@ -270,8 +270,8 @@ t.test('a delisted collateral is valued through the constant feed its Comet now 
     positions:  mainnet,
     view,
     strategic:  new Set(),
-    deprecated: deprecatedDecisionsOf([]),
-    hidden:     hiddenDecisionsOf([]),
+    deprecated: collateralDecisionsOf([]),
+    hidden:     collateralDecisionsOf([]),
     now:        NOW,
   });
   const entry = (address: string) => list.tokens.find(token => token.address === address)!;

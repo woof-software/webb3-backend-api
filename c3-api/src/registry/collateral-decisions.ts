@@ -4,7 +4,6 @@ import { throttleBy } from '../../lib/throttle.js';
 import {
   ActiveMarketV1,
   ActiveNetworkV1,
-  Address,
   ServedMarket,
   ServedNetwork,
   isAddress,
@@ -14,21 +13,30 @@ import {
 import type { CacheDeps } from './cache.js';
 import { RegistryUnavailable, isUnreachable } from './cache.js';
 import { nowOf } from './clock.js';
-import type { CollateralOfComet } from './collateral-decision-repository.js';
+import type { CollateralDecisionKind, CollateralOfComet } from './collateral-decision-repository.js';
+import {
+  DEPRECATED_COLLATERAL_KIND,
+  HIDDEN_COLLATERAL_KIND,
+  collateralKey,
+  readMarkedCollaterals,
+} from './collateral-decision-repository.js';
 import { withDeadline } from './deadline.js';
-import { readDeprecatedCollaterals } from './deprecated-collateral-repository.js';
-import { readHiddenCollaterals } from './hidden-collateral-repository.js';
 
 /*
- * The deprecated flags the active reads carry: which collaterals of which
- * Comets an administrator has marked deprecated, merged into the active
- * version's markets when an answer is made.
+ * The decisions about collaterals of Comets that the active reads carry:
+ * which collaterals of which Comets an administrator has marked deprecated,
+ * and which ones hidden (collateral-decision-repository.ts), merged into the
+ * active version's markets when an answer is made. The two kinds are read,
+ * recorded, marked and answered with during an outage the same way, each
+ * under a record and a flag of its own (RecordedKind, markedMarket), so what
+ * is said here of the decisions is said of either kind's.
  *
  * A decision is no part of the version — it outlives every activation — so
  * the version stays cached as it was imported (cache.ts), and the decisions
- * are read beside it on every request, in one statement. An answer names the
- * flags it carries in its ETag, so a client holding a copy made before a
- * decision is sent the new one rather than told its copy is current.
+ * are read beside it on every request, each kind's in one statement. An
+ * answer names the flags it carries in its ETag, so a client holding a copy
+ * made before a decision is sent the new one rather than told its copy is
+ * current.
  *
  * During an outage the version is the one D1 last named (cache.ts), and the
  * flags are the decisions the Worker last recorded in KV: every command that
@@ -38,12 +46,6 @@ import { readHiddenCollaterals } from './hidden-collateral-repository.js';
  * minutes besides. Such an answer says it could not be confirmed, as every
  * answer from the cache does. With nothing recorded there is nothing to
  * answer with, and the read fails as one does past the fallback window.
- *
- * The hidden collaterals (hidden-collateral-repository.ts) are decisions of
- * the same shape about the same collaterals, and are read, recorded, marked
- * and answered with during an outage the same way, each kind under a record
- * and a flag of its own (RecordedKind, markedMarket): what is said here of the
- * decisions is said of either kind's.
  */
 
 /*
@@ -52,47 +54,39 @@ import { readHiddenCollaterals } from './hidden-collateral-repository.js';
  */
 type CollateralDecisions = {
   collaterals: CollateralOfComet[],
-  // whether the decisions name the collateral `token` of the Comet at `comet` on `chainId`; addresses lowercase
-  has:         (chainId: number, comet: Address, token: Address) => boolean,
+  // whether the decisions name the collateral, its addresses lowercase
+  has:         (collateral: CollateralOfComet) => boolean,
   // what tells two sets of decisions apart
   digest:      string,
 };
 
-type DeprecatedDecisions = CollateralDecisions;
-type HiddenDecisions     = CollateralDecisions;
-
 // the decisions a read marks collaterals with, and whether they came from the record rather than from D1
 type CollateralRead = { decisions: CollateralDecisions, recorded: boolean };
-type DeprecatedRead = CollateralRead;
-type HiddenRead     = CollateralRead;
-
-function keyOf(chainId: number, comet: Address, token: Address): string {
-  return `${chainId}:${comet}:${token}`;
-}
 
 // what names a set of collaterals, in whatever order they were listed
 function digestOf(keys: string[]): string {
   return keccak256([ ...keys ].sort().join(',')).slice(0, 16);
 }
 
-function decisionsOf(collaterals: CollateralOfComet[]): CollateralDecisions {
-  const keys = collaterals.map(({ chainId, cometAddress, tokenAddress }) => keyOf(chainId, cometAddress, tokenAddress));
+function collateralDecisionsOf(collaterals: CollateralOfComet[]): CollateralDecisions {
+  const keys = collaterals.map(collateralKey);
   const held = new Set(keys);
   return {
     collaterals,
-    has:    (chainId, comet, token) => held.has(keyOf(chainId, comet, token)),
+    has:    collateral => held.has(collateralKey(collateral)),
     digest: digestOf(keys),
   };
 }
 
 /*
  * The records an outage answers with, one a kind, in the registry's namespace
- * beside the pointer record (cache.ts): every chain's decisions, and when
- * they were recorded. A record does not expire. Decisions do not grow old,
- * they change, and every change records them again.
+ * beside the pointer record (cache.ts), each under the key its kind names:
+ * every chain's decisions, and when they were recorded. A record does not
+ * expire. Decisions do not grow old, they change, and every change records
+ * them again.
  */
-const DEPRECATED_KEY = 'deprecated-collaterals:v1';
-const HIDDEN_KEY     = 'hidden-collaterals:v1';
+const DEPRECATED_KEY = DEPRECATED_COLLATERAL_KIND.recordKey;
+const HIDDEN_KEY     = HIDDEN_COLLATERAL_KIND.recordKey;
 
 type CollateralRecord = { at: string, collaterals: CollateralOfComet[] };
 
@@ -157,19 +151,25 @@ type RecordedKind = {
   known: WeakMap<KVNamespace, Known>,
 };
 
-const DEPRECATED: RecordedKind = {
-  key:   DEPRECATED_KEY,
-  noun:  'deprecated collateral',
-  read:  readDeprecatedCollaterals,
-  known: new WeakMap(),
-};
+/*
+ * The record of a kind of decision about a collateral, as the kind describes
+ * it (collateral-decision-repository.ts). Its read of every chain's decisions
+ * is the token list's too (token-handlers.ts).
+ */
+function recordedKind<Flag extends string, Column extends string, Rows extends string>(
+  kind: CollateralDecisionKind<Flag, Column, Rows>,
+): RecordedKind {
+  return {
+    key:   kind.recordKey,
+    noun:  kind.label,
+    read:  async db => await readMarkedCollaterals(db, kind),
+    known: new WeakMap(),
+  };
+}
 
-const HIDDEN: RecordedKind = {
-  key:   HIDDEN_KEY,
-  noun:  'hidden collateral',
-  read:  readHiddenCollaterals,
-  known: new WeakMap(),
-};
+// made once, here: what an isolate knows of a record is kept in its kind, so a kind made anew would know nothing
+const DEPRECATED_RECORD = recordedKind(DEPRECATED_COLLATERAL_KIND);
+const HIDDEN_RECORD     = recordedKind(HIDDEN_COLLATERAL_KIND);
 
 const CHECK_RECORD_EVERY_MS = 300_000;
 const RETRY_RECORD_AFTER_MS = 60_000;
@@ -186,7 +186,7 @@ async function recordHolds(kind: RecordedKind, deps: CacheDeps, decisions: Colla
   } catch {
     return false;
   }
-  return collaterals !== null && decisionsOf(collaterals).digest === decisions.digest;
+  return collaterals !== null && collateralDecisionsOf(collaterals).digest === decisions.digest;
 }
 
 /*
@@ -275,7 +275,7 @@ async function recordCollaterals(kind: RecordedKind, deps: CacheDeps): Promise<v
   }
   let decisions: CollateralDecisions;
   try {
-    decisions = decisionsOf(await kind.read(deps.db));
+    decisions = collateralDecisionsOf(await kind.read(deps.db));
   } catch (error) {
     deps.debug.warn(`${kind.noun} record not written: the decisions could not be read`, { error });
     return;
@@ -307,7 +307,7 @@ async function recordedDecisions(kind: RecordedKind, deps: CacheDeps, cause: unk
   if (collaterals === null) {
     throw unavailable();
   }
-  return decisionsOf(collaterals);
+  return collateralDecisionsOf(collaterals);
 }
 
 /*
@@ -331,10 +331,10 @@ function reportFallback(kind: RecordedKind, deps: CacheDeps, error: unknown): vo
  * answered with a fault, such as a release ahead of the kind's migration, is
  * raised as it is.
  */
-async function readDecisions(kind: RecordedKind, deps: CacheDeps): Promise<CollateralRead> {
+async function markedDecisions(kind: RecordedKind, deps: CacheDeps): Promise<CollateralRead> {
   let decisions: CollateralDecisions;
   try {
-    decisions = decisionsOf(await kind.read(deps.db));
+    decisions = collateralDecisionsOf(await kind.read(deps.db));
   } catch (error) {
     if (!isUnreachable(error)) {
       throw error;
@@ -350,28 +350,29 @@ async function readDecisions(kind: RecordedKind, deps: CacheDeps): Promise<Colla
   return { decisions, recorded: false };
 }
 
-/*
- * Each kind's decisions, as readDecisions reads them, and what a command that
- * may have changed them does once it has committed (recordCollaterals).
- */
-function deprecatedDecisions(deps: CacheDeps): Promise<DeprecatedRead> {
-  return readDecisions(DEPRECATED, deps);
-}
-
-function recordDeprecatedCollaterals(deps: CacheDeps): Promise<void> {
-  return recordCollaterals(DEPRECATED, deps);
-}
-
-function hiddenDecisions(deps: CacheDeps): Promise<HiddenRead> {
-  return readDecisions(HIDDEN, deps);
-}
-
-function recordHiddenCollaterals(deps: CacheDeps): Promise<void> {
-  return recordCollaterals(HIDDEN, deps);
-}
-
 // the decisions of each kind the active reads mark collaterals with
-type CollateralMarks = { deprecated: DeprecatedDecisions, hidden: HiddenDecisions };
+type CollateralMarks = { deprecated: CollateralDecisions, hidden: CollateralDecisions };
+
+/*
+ * Both kinds' decisions, for the active reads, which mark every collateral
+ * with each: read side by side, each kind by a statement of its own, and said
+ * to come from a record where either kind's did. A kind that could not be
+ * read fails the read, the deprecated kind first. /summary, which answers
+ * without a kind it could not read, reads each kind apart.
+ */
+async function readMarks(deps: CacheDeps): Promise<{ marks: CollateralMarks, recorded: boolean }> {
+  const [ deprecated, hidden ] = await Promise.allSettled([ markedDecisions(DEPRECATED_RECORD, deps), markedDecisions(HIDDEN_RECORD, deps) ]);
+  if (deprecated.status === 'rejected') {
+    throw deprecated.reason;
+  }
+  if (hidden.status === 'rejected') {
+    throw hidden.reason;
+  }
+  return {
+    marks:    { deprecated: deprecated.value.decisions, hidden: hidden.value.decisions },
+    recorded: deprecated.value.recorded || hidden.value.recorded,
+  };
+}
 
 /*
  * A market as the active reads serve it: every collateral says whether it is
@@ -383,11 +384,10 @@ function markedMarket(chainId: number, market: ServedMarket, { deprecated, hidde
   const comet = market.contracts.comet;
   return {
     ...market,
-    collateralAssets: market.collateralAssets.map(asset => ({
-      ...asset,
-      isDeprecated: deprecated.has(chainId, comet, asset.token.address),
-      isHidden:     hidden.has(chainId, comet, asset.token.address),
-    })),
+    collateralAssets: market.collateralAssets.map(asset => {
+      const collateral = { chainId, cometAddress: comet, tokenAddress: asset.token.address };
+      return { ...asset, isDeprecated: deprecated.has(collateral), isHidden: hidden.has(collateral) };
+    }),
   };
 }
 
@@ -406,21 +406,21 @@ function markedNetwork(network: ServedNetwork, marks: CollateralMarks): ActiveNe
 function markedRepresentation(name: string, networks: Array<{ chainId: number, markets: ActiveMarketV1[] }>): string {
   const flagged = (flag: 'isDeprecated' | 'isHidden') => networks.flatMap(network => network.markets.flatMap(market => market.collateralAssets
     .filter(asset => asset[flag])
-    .map(asset => keyOf(network.chainId, market.contracts.comet, asset.token.address))));
+    .map(asset => collateralKey({ chainId: network.chainId, cometAddress: market.contracts.comet, tokenAddress: asset.token.address }))));
   return `${name}+deprecated-${digestOf(flagged('isDeprecated'))}+hidden-${digestOf(flagged('isHidden'))}`;
 }
 
-export type { CollateralDecisions, CollateralMarks, CollateralRead, DeprecatedDecisions, DeprecatedRead, HiddenDecisions, HiddenRead };
+export type { CollateralMarks, CollateralRead, RecordedKind };
 export {
   DEPRECATED_KEY,
+  DEPRECATED_RECORD,
   HIDDEN_KEY,
-  deprecatedDecisions,
-  decisionsOf as deprecatedDecisionsOf,
-  hiddenDecisions,
-  decisionsOf as hiddenDecisionsOf,
+  HIDDEN_RECORD,
+  collateralDecisionsOf,
+  markedDecisions,
   markedMarket,
   markedNetwork,
   markedRepresentation,
-  recordDeprecatedCollaterals,
-  recordHiddenCollaterals,
+  readMarks,
+  recordCollaterals,
 };

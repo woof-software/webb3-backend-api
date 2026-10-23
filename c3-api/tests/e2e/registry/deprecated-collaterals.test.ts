@@ -1,8 +1,5 @@
 import t from 'tap';
 
-import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-
 import type {
   ActiveMarketV1,
   DeprecatedCollateralApplyV1,
@@ -14,6 +11,7 @@ import { foreignKeyViolations } from '../../util/d1.js';
 import { ADMIN_ACTOR, adminClient, count, seedValidated } from '../../util/registry-admin.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 import { registryHarness } from '../../util/registry-harness.js';
+import { readSeedComets, readSeedDeprecated, readSeedDeprecatedText } from '../../util/registry-seed.js';
 
 import { DEPRECATED_COLLATERALS, decisionScenarios } from './decision-scenarios.js';
 
@@ -22,10 +20,11 @@ import { DEPRECATED_COLLATERALS, decisionScenarios } from './decision-scenarios.
  * What every kind of decision does is in decision-scenarios.ts, run here for
  * deprecated collaterals: a decision and its audit, idempotency under a race,
  * survival across activations, the database guard against an activation
- * that races a write, and a list refused for its problems or for a race.
- * Beside them, the tests of deprecated collaterals alone: the market reads
- * that flag them, and the seed document of the runbook, reviewed, applied and
- * exported through the deprecated-collaterals routes.
+ * that races a write, a list refused for its problems or for a race, and the
+ * market reads that flag a deprecated collateral. Beside them, the test of
+ * deprecated collaterals alone: the first list of them the seed holds
+ * (registry/seed/production.deprecated-collaterals.json), reviewed, applied
+ * and exported through the deprecated-collaterals routes.
  *
  * Refusals of malformed requests are in deprecated-collateral-routes.test.ts,
  * and what the active reads answer in deprecated-collateral-reads.test.ts.
@@ -46,7 +45,6 @@ const collateral = (key: string, symbol: string) => mainnet.markets.find(market 
 const USDT = comet('usdt');
 const USDC = comet('usdc');
 const WETH = comet('weth');
-// collateral of the USDT market alone, so a version without it in that market holds no mETH at all
 const METH = collateral('usdt', 'mETH');
 
 // the collaterals a public market read flags deprecated, by symbol
@@ -55,56 +53,81 @@ async function flagged(market: string): Promise<string[]> {
   return body.market.collateralAssets.filter(asset => asset.isDeprecated).map(asset => asset.token.symbol);
 }
 
-/*
- * What a decision changes for every client: the market reads flag a
- * collateral from the moment it is deprecated until the decision is
- * reversed, and only in a version whose Comet takes it.
- */
-t.test('the market reads flag a collateral while it is deprecated', async t => {
-  const db    = await harness.freshDatabase();
-  const first = await seedValidated(db);
-  await admin.switchTo(first);
-  const path = DEPRECATED_COLLATERALS.path(1, { cometAddress: USDT, tokenAddress: METH });
-
-  t.same(await flagged(USDT), [], 'nothing is flagged before anybody decides');
-  await admin.patch(path, { isDeprecated: true, reason: 'Linear COM-18' });
-  t.same(await flagged(USDT), [ 'mETH' ], 'the market reads flag the collateral at once');
-  await admin.patch(path, { isDeprecated: false, reason: 'listed again' });
-  t.same(await flagged(USDT), [], 'and stop flagging it once the decision is reversed');
-
-  await admin.patch(path, { isDeprecated: true, reason: 'Linear COM-18, again' });
-  await admin.switchTo(await seedValidated(db, { networks: DEPRECATED_COLLATERALS.without, versionId: randomUUID() }));
-  t.same(await flagged(USDT), [], 'a version whose Comet does not take the collateral has nothing of it to flag');
-  await admin.switchTo(first, 'rollback');
-  t.same(await flagged(USDT), [ 'mETH' ], 'and a version that brings it back flags it again');
-});
-
 const REVIEW = DEPRECATED_COLLATERALS.list.review;
 const APPLY  = DEPRECATED_COLLATERALS.list.apply;
 
-/*
- * The document the runbook gives an operator to apply once per environment:
- * the first JSON block under its heading, read as the operator copies it.
- */
-function seedDocument(): DeprecatedCollateralListV1 {
-  const runbook = readFileSync('./REGISTRY_RUNBOOK.md', 'utf8');
-  const section = runbook.slice(runbook.indexOf('### The initial list of deprecated collaterals'));
-  return JSON.parse(/```json\n([\s\S]*?)\n```/.exec(section)![1]!);
-}
+type Refused = { error: { code: string, message: string, details?: { problems?: unknown[] } } };
+
+// the list step 7 of the runbook's first bring-up sends, and the file as it sends it
+const list = readSeedDeprecated();
+const text = readSeedDeprecatedText();
 
 /*
- * The seed document of the runbook applies to the fixture, whose mainnet
- * holds the USDC, WETH, USDT and WBTC markets: exactly as written, with every
- * address resolved, the Comets' deployment keys and the tokens' symbols
- * checked, and nothing else touched. The export is a file review and apply
- * take back as it is.
+ * The rows of the wstETH and USDS markets, which the fixture does not hold,
+ * as a review or a refusal names them: each Comet as the seed names its
+ * market, and each token as the fixture's mainnet names its symbol.
  */
-t.test('the seed document of the runbook is reviewed and applied as one', async t => {
+const comets = readSeedComets();
+const named  = (symbol: string) => mainnet.markets.flatMap(market => market.collateralAssets)
+  .find(asset => asset.token.symbol === symbol)!.token.address;
+const UNHELD = ([
+  [ 'wsteth', 'rsETH' ], [ 'wsteth', 'ezETH' ], [ 'wsteth', 'weETH' ],
+  [ 'usds', 'USDe' ], [ 'usds', 'sdeUSD' ], [ 'usds', 'tBTC' ], [ 'usds', 'weETH' ], [ 'usds', 'deUSD' ],
+] as const).map(([ key, symbol ], index) => ({
+  row:          13 + index,
+  chainId:      1,
+  cometAddress: comets[`1/${key}`],
+  tokenAddress: named(symbol),
+  problem:      `${comets[`1/${key}`]} is not a market of the active registry on chain 1`,
+}));
+
+/*
+ * The first list of deprecated collaterals applies where the version holds
+ * every collateral it names, and the fixture's mainnet holds the USDC, WETH,
+ * USDT and WBTC markets: review names the eight rows of the wstETH and USDS
+ * markets as problems, and apply refuses the file whole. The twelve rows of
+ * the markets it holds apply exactly as written, with every address
+ * resolved, the Comets' deployment keys and the tokens' symbols checked, and
+ * nothing else touched. The export is a file review and apply take back as
+ * it is.
+ */
+t.test('the first list of deprecated collaterals is reviewed and applied as one', async t => {
   const db        = await harness.freshDatabase();
   const versionId = await seedValidated(db);
   await admin.switchTo(versionId);
-  const seed = seedDocument();
 
+  t.same(
+    list.collaterals.map(row => `${row.deploymentKey}/${row.symbol}`),
+    [
+      'usdt/mETH', 'usdt/weETH', 'usdt/sdeUSD', 'usdt/wUSDM', 'usdt/deUSD', 'usdt/USDe',
+      'usdc/rsETH', 'usdc/USDe', 'usdc/deUSD', 'usdc/sdeUSD',
+      'wbtc/LBTC', 'wbtc/pumpBTC',
+      'wsteth/rsETH', 'wsteth/ezETH', 'wsteth/weETH',
+      'usds/USDe', 'usds/sdeUSD', 'usds/tBTC', 'usds/weETH', 'usds/deUSD',
+    ],
+    'the file names the twenty pairs of the app\'s list: the twelve of the USDT, USDC and WBTC markets, '
+      + 'then the eight of the wstETH and USDS markets, each market\'s in the order the frontend lists them',
+  );
+  t.ok(list.collaterals.every(row => row.chainId === 1 && row.isDeprecated === true), 'all on mainnet, all deprecated');
+
+  const whole = await admin.post<DeprecatedCollateralReviewV1>(REVIEW, text);
+  t.equal(whole.status, 200, 'review takes the file as it is');
+  t.same(whole.body.summary, { change: 20, unchanged: 0, problems: 8 }, 'every row changes, and eight cannot be applied');
+  t.same(
+    (whole.body.collaterals ?? []).filter(row => row.problem !== null)
+      .map(({ row, chainId, cometAddress, tokenAddress, problem }) => ({ row, chainId, cometAddress, tokenAddress, problem })),
+    UNHELD,
+    'the eight of the wstETH and USDS markets, whose Comets the fixture does not hold',
+  );
+
+  const refused = await admin.post<Refused>(APPLY, text);
+  t.equal(refused.status, 422, 'so apply refuses the file');
+  t.same(refused.body.error?.details?.problems, UNHELD, 'naming the same eight');
+  t.equal(await count(db, 'deprecated_collateral_events'), 0, 'and neither writes anything');
+
+  // the twelve rows of the markets the fixture holds, as the file has them
+  const held = new Set(mainnet.markets.map(market => market.contracts.comet));
+  const seed: DeprecatedCollateralListV1 = { reason: list.reason, collaterals: list.collaterals.filter(row => held.has(row.cometAddress)) };
   t.same(
     seed.collaterals.map(row => `${row.deploymentKey}/${row.symbol}`),
     [
@@ -112,9 +135,8 @@ t.test('the seed document of the runbook is reviewed and applied as one', async 
       'usdc/rsETH', 'usdc/USDe', 'usdc/deUSD', 'usdc/sdeUSD',
       'wbtc/LBTC', 'wbtc/pumpBTC',
     ],
-    'the document names the twelve pairs the repository resolves, in the order the frontend lists them',
+    'the rows of the markets the fixture holds are the twelve of the USDT, USDC and WBTC markets',
   );
-  t.ok(seed.collaterals.every(row => row.chainId === 1 && row.isDeprecated === true), 'all on mainnet, all deprecated');
 
   const review = await admin.post<DeprecatedCollateralReviewV1>(REVIEW, seed);
   t.equal(review.status, 200);
@@ -128,15 +150,18 @@ t.test('the seed document of the runbook is reviewed and applied as one', async 
   t.same(
     (await db.prepare(`SELECT DISTINCT reason FROM deprecated_collateral_events`).all<{ reason: string }>()).results?.map(row => row.reason),
     [ seed.reason ],
-    'each with the document\'s reason',
+    'each with the file\'s reason',
   );
   t.same(await flagged(USDT), [ 'wUSDM', 'mETH', 'weETH', 'sdeUSD', 'deUSD', 'USDe' ], 'the USDT market flags its six');
   t.same(await flagged(USDC), [ 'deUSD', 'sdeUSD', 'rsETH', 'USDe' ], 'the USDC market its four, and not its weETH');
   t.same(await flagged(WETH), [], 'and the WETH market, which the list does not name, none');
 
   const again = await admin.post<DeprecatedCollateralApplyV1>(APPLY, seed);
-  t.same(again.body.summary, { changed: 0, unchanged: 12 }, 'applying the document again changes nothing');
+  t.same(again.body.summary, { changed: 0, unchanged: 12 }, 'applying them again changes nothing');
   t.equal(await count(db, 'deprecated_collateral_events'), 12, 'and records nothing');
+
+  const after = await admin.post<DeprecatedCollateralReviewV1>(REVIEW, text);
+  t.same(after.body.summary, { change: 8, unchanged: 12, problems: 8 }, 'the file now reviews the twelve as unchanged');
 
   const exported = await admin.read<DeprecatedCollateralListV1>(DEPRECATED_COLLATERALS.list.export);
   t.equal(exported.status, 200);

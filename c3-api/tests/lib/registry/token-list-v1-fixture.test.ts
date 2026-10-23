@@ -7,10 +7,10 @@ import {
   EXCEPTION_KINDS,
   VISIBILITY_REASONS,
 } from '../../../lib/model/comet-registry.js';
-import type { Address, MarketV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
+import type { Address, MarketV1, RegistrySnapshotV1, TokenVisibilityV1 } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
-import { deprecatedDecisionsOf, hiddenDecisionsOf } from '../../../src/registry/deprecated-collaterals.js';
+import { collateralDecisionsOf } from '../../../src/registry/collateral-decisions.js';
 import { collateralView, positionsOf } from '../../../src/registry/token-collateral.js';
 import type { BlockRef } from '../../../src/registry/token-collateral.js';
 import { RULE_VERSION, tokenList } from '../../../src/registry/token-visibility.js';
@@ -31,12 +31,12 @@ import '../../../shim/node-self.js';
  * its executable description: exact key sets, value formats, ordering, and the
  * relations between a token's fields that every status and reason keep. The
  * rules that decide a status, its age and a reason are tokenValue's and
- * visibilityOf's, which token-value.test.ts and token-visibility.test.ts hold;
- * a copy of either here would be a second statement of a rule, free to drift
- * from the one the list applies. The last test holds the fixture to them: the
- * scenario it was made from, valued by the real evaluator against a fake node,
- * reproduces it exactly. Each check collects every violation, so a failing run
- * lists all of them at once.
+ * token-visibility.ts's, which token-value.test.ts and
+ * token-visibility.test.ts hold; a copy of either here would be a second
+ * statement of a rule, free to drift from the one the list applies. The last
+ * test holds the fixture to them: the scenario it was made from, valued by the
+ * real evaluator against a fake node, reproduces it exactly. Each check
+ * collects every violation, so a failing run lists all of them at once.
  */
 const FIXTURE_PATH = './tests/fixtures/token-visibility/token-list-v1.json';
 const raw  = readFileSync(FIXTURE_PATH, 'utf8');
@@ -304,7 +304,8 @@ t.test('each status carries the value, time, age and exceptions its rule gives i
 });
 
 /*
- * The order the reasons are asked in is visibilityOf's, which
+ * The order the reasons are asked in is token-visibility.ts's
+ * (exclusionOnChain, which asks the hiding first, then visibilityOf), which
  * token-visibility.test.ts holds; the last test holds the fixture to it.
  */
 t.test('discovery shows every token but a hidden, a deprecated and a below_threshold one', async t => {
@@ -316,6 +317,28 @@ t.test('discovery shows every token but a hidden, a deprecated and a below_thres
     }
   });
   t.same(problems, []);
+});
+
+/*
+ * The compiler never reads the fixture, so the test above is what holds it to
+ * that relation. A token the code makes is held to it by its type,
+ * TokenVisibilityV1: each pairing below is a type error the build expects.
+ */
+t.test('a token whose isVisible and visibilityReason disagree does not compile', async () => {
+  (token: TokenVisibilityV1) => [
+    // @ts-expect-error discovery does not show a token for being hidden, deprecated or short of the threshold
+    { ...token, isVisible: true,  visibilityReason: 'hidden' } satisfies TokenVisibilityV1,
+    // @ts-expect-error
+    { ...token, isVisible: true,  visibilityReason: 'deprecated' } satisfies TokenVisibilityV1,
+    // @ts-expect-error
+    { ...token, isVisible: true,  visibilityReason: 'below_threshold' } satisfies TokenVisibilityV1,
+    // @ts-expect-error and shows one for being strategic, worth the threshold, or of a value that could not be read
+    { ...token, isVisible: false, visibilityReason: 'strategic' } satisfies TokenVisibilityV1,
+    // @ts-expect-error
+    { ...token, isVisible: false, visibilityReason: 'collateral_threshold' } satisfies TokenVisibilityV1,
+    // @ts-expect-error
+    { ...token, isVisible: false, visibilityReason: 'data_unavailable' } satisfies TokenVisibilityV1,
+  ];
 });
 
 /*
@@ -572,8 +595,8 @@ t.test('the scenario the fixture was made from reproduces it exactly', async t =
     positions,
     view,
     strategic:       new Set<Address>([ COMP, WBTC, PUMPBTC ]),
-    deprecated:      deprecatedDecisionsOf(decided(DEPRECATED)),
-    hidden:          hiddenDecisionsOf(decided(HIDDEN)),
+    deprecated:      collateralDecisionsOf(decided(DEPRECATED)),
+    hidden:          collateralDecisionsOf(decided(HIDDEN)),
     now,
   });
   /*
