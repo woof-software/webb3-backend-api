@@ -98,16 +98,6 @@ npm run d1:migrate:production
 
 CI applies the migrations before it deploys, so a migration has to work with
 the release deployed before it, which serves until the deploy that follows.
-Two do not, accepted while production serves nothing from what they change:
-after `0004` a sync that release runs fails, and after `0007`, which renames
-the tables that release reads and writes, its token list, `/active`, market
-reads and legacy collateral routes answer `503 UPSTREAM_UNAVAILABLE` ("the
-database is missing tables this release needs"). Either lasts as long as the
-build and the deploy take, and a worker rolled back to the release before
-fails the same way. In the shared develop database only the token visibility
-test deploy, the `woof-c3-api-token-visibility` worker of
-`woof-token-visibility.wrangler.toml`, reads the tables `0007` renames; the
-develop worker does not.
 
 The Comet registry also binds `kv_registry` for its snapshot cache, its
 last check of the chain and the deprecated and the hidden collateral
@@ -241,24 +231,35 @@ What that means for the endpoints:
   history reads the amounts of a token no version describes at the decimals
   the token reports ([API.md](./API.md));
 - routes that resolve no market — V2 and gas price — never read `APP_DB`,
-  and governance reads it only to name the markets of proposal actions,
-  which the static constants do not. The proposal list, and the vote
-  receipts with their proposals (`with_proposal_data`), describe the
-  actions of the page they answer again, with the markets of the active
-  version merged in, with every token they name and every feed they read,
-  so they read the registry once on every request that answers an action.
-  The version names the markets it serves and the disabled markets it holds
-  without serving them, each by its contract name, or its label where it
-  has none, linked at its address checksummed. A token both know keeps the
-  constants' name and takes the version's decimals, which the constants
-  have wrong for cbBTC on Base. A Comet the active version does not hold
-  shows as its address. While the registry cannot be read, so does every
-  market: every action is then described against the constants alone, by
+  and governance reads it only to name the markets of proposal actions, and
+  the tokens and price feeds the static constants do not name. The proposal
+  list, and the vote receipts with their proposals (`with_proposal_data`),
+  describe the actions of the page they answer again, with the markets of
+  the active version merged in, with every token they name and every feed
+  they read, so they read the registry once on every request that answers
+  an action. The version names the markets it serves and the disabled
+  markets it holds without serving them, each by its contract name, or its
+  label where it has none, their tokens by their symbols and their feeds as
+  `PriceFeed`, each linked at its address checksummed, and a cap or an
+  amount of a token is written at the decimals the version read. Of the
+  tokens and feeds, the constants keep only these: COMP on every chain that
+  has one, WETH on Ethereum, Optimism and Base, ETH and the other
+  underlyings of the V2 cTokens, Arbitrum's bridged USDC (USDC.e), which
+  its chain names as it does native USDC, and on Ethereum the tokens and
+  the two feeds they write in lowercase — cbBTC, USDe, tBTC, LBTC, pumpBTC,
+  wstETH, cbETH, KNC and stETH — whose links keep that case. Such a token
+  keeps the constants' name and link, and takes the version's decimals
+  where the version holds it. A market the active version does not hold,
+  and a token or feed neither it nor the constants name, shows as its
+  address. While the registry cannot be read, so does every one the
+  constants do not keep, and the cap of such a token is written at 18
+  decimals: every action is then described against the constants alone, by
   the build answering rather than the one that cached it, and the answer is
-  given all the same. A governance path that names a Comet as its contract,
-  such as `/governance/ethereum-mainnet/{comet}/proposals`, is refused with
-  `400` `Error: Contract address not known`, as any address the constants
-  do not know is.
+  given all the same. A governance path that names as its contract an
+  address the constants do not keep — a Comet, a token or a feed, such as
+  `/governance/ethereum-mainnet/{comet}/proposals` — is refused with `400`
+  `Error: Contract address not known`, as any address the constants do not
+  know is.
 
 A commit can be imported more than once — discovery tries again after an
 attempt that did not import every root, each time later, and an operator can
@@ -1016,7 +1017,10 @@ the version. Nothing about a new market requires a Worker release.
 
 What a new network still needs here is everything the registry does not
 describe: the governance contracts, a `BridgeReceiver` corollary where
-governance is bridged, and any V2 or tooling contracts the API names.
+governance is bridged, and any V2 or tooling contracts the API names. Its
+COMP stays here too, because the governance routes find COMP by name; its
+other tokens and its price feeds do not belong here, because the registry
+names them.
 
 See `lib/well-known/contracts/polygon-mainnet.ts` for an example.
 

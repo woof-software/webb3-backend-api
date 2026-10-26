@@ -81,10 +81,9 @@ type PinnedVersion = {
 
 /*
  * The registry could not be read: D1 did not answer, and nothing within the
- * fallback window is cached. Every route answers it with 503 — after the
- * cutover there is nothing else to answer from, and silently answering from
- * the static constants would serve markets nobody reviewed or activated. Why
- * D1 did not answer is the cause, for the logs.
+ * fallback window is cached. Every route that resolves a market answers it
+ * with 503 — after the cutover there is nothing else to answer from. Why D1
+ * did not answer is the cause, for the logs.
  *
  * Nothing being active is never this: D1 answered, and the cache says so
  * with null.
