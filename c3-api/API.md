@@ -708,13 +708,21 @@ Aggregate of all governance proposals across Governors alpha and bravo.
 Each action of the page is described against the contracts this API knows
 by name, with the markets of the active registry version merged in, every
 token they name and every price feed they read, and the disabled markets it
-holds: a market is named by its contract name, or its label where it has
-none, and linked at its checksummed address, and a cap or an amount of a
-token is written at the decimals the version read for it, under the
-constants' name where they know the token too. A Comet the version does not
-hold reads as its address. When the registry cannot be read, every action is
-described against the constants alone, and every market in it reads as its
-address. `addAsset` writes the new asset's cap at the decimals its
+holds, with theirs: a market is named by its contract name, or its label
+where it has none, a token by its symbol and a feed as `PriceFeed`, each
+linked at its checksummed address, and a cap or an amount of a token is
+written at the decimals the version read for it. COMP, WETH on Ethereum,
+Optimism and Base, ETH and the other underlyings of the V2 cTokens,
+Arbitrum's bridged USDC (USDC.e), and on Ethereum the tokens and the two
+feeds the constants write in lowercase (cbBTC, USDe, tBTC, LBTC, pumpBTC,
+wstETH, cbETH, KNC and stETH) keep the names and links the constants give
+them, a token at the decimals the version read where it holds one. Any
+other market, token or feed the version does not hold reads as its address.
+When the registry cannot be read, every action is described against the
+constants alone: every market, and every token and feed but those, then
+reads as its address, the cap of such a token is written at 18 decimals,
+and a call that needs its scale, such as a transfer, is shown as it was
+made. `addAsset` writes the new asset's cap at the decimals its
 configuration states. `updateAssetSupplyCap` states none, so the cap of an
 asset neither the constants nor the version know — one added to the market
 since the version was imported — is written at 18 decimals until a version
@@ -2801,8 +2809,7 @@ $ curl -X PATCH 'localhost:8787/registry/v1/admin/networks/1/markets/0x3Afdc9BCA
 One collateral's decision and the changes that led to it, at most 100, newest
 first in the order they were committed, so the first is always the change
 that set the decision in force. `previousIsDeprecated` is `null` for the
-first decision about a collateral. A change recorded before the routes were
-renamed keeps the reason it was given then.
+first decision about a collateral.
 
 A decision stays readable while the active version does not hold the
 collateral in that Comet, with `inActiveVersion: false`; it applies again once
@@ -2988,9 +2995,7 @@ decisions, `is_hidden` and `hidden_in`, which such a database has no table for
 either, `0008` coming after `0007`; and without `visibility_reason`, which
 both take part in. It says `is_visible: false` where the strategic decisions
 settle it, on a collateral that is not strategic and is worth less than the
-threshold ([Collateral tokens](#collateral-tokens)). These routes were
-`…/legacy` and `/registry/v1/admin/legacy-collaterals…`, with `isLegacy`,
-before migration `0007` renamed the feature; the old paths answer `404`.
+threshold ([Collateral tokens](#collateral-tokens)).
 
 ## `PATCH /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/collaterals/{token_address}/hidden`
 ### description:

@@ -986,6 +986,24 @@ function getNetworkIfCrossChain({ network, target, signature }: {
 }
 
 /*
+ * Merges a token of a registry version into the contracts governance names
+ * on its network. A token they already name keeps that name, and takes the
+ * scale the version read from the chain: the constants can be wrong about it
+ * — they had cbBTC on Base at 18 decimals, where it has 8 — and a cap would
+ * then be written 10^10 times too small.
+ */
+function mergeRegistryToken(
+  contracts: WellKnownContractsByNetworkAddress[KnownNetwork.Name],
+  token: Contract<StandaloneContract<ERC20>>,
+): void {
+  const key   = token.address.toLowerCase();
+  const known = contracts[key];
+  contracts[key] = known === undefined
+    ? token
+    : TokenLike.is(known) && known.decimals !== token.decimals ? { ...known, decimals: token.decimals } : known;
+}
+
+/*
  * The static contracts of every network, with the markets, tokens and price
  * feeds of a registry version merged in.
  *
@@ -1027,18 +1045,9 @@ function withRegistryContracts(
       ...market.collateralAssets.map(asset => feedContract(comet.network, asset.priceFeed, block)),
     ];
 
-    /*
-     * A token the constants already name keeps that name, and takes the scale
-     * the version read from the chain: the constants can be wrong about it —
-     * they have cbBTC on Base at 18 decimals, where it has 8 — and a cap would
-     * then be written 10^10 times too small.
-     */
+    // a token the constants already name keeps that name, at the version's scale
     for (const token of tokens) {
-      const key   = token.address.toLowerCase();
-      const known = contracts[key];
-      contracts[key] = known === undefined
-        ? token
-        : TokenLike.is(known) && known.decimals !== token.decimals ? { ...known, decimals: token.decimals } : known;
+      mergeRegistryToken(contracts, token);
     }
     // a feed the constants already name keeps that name
     for (const feed of feeds) {
@@ -1060,5 +1069,6 @@ export {
   describeContractCallForHumans,
   decodeFunctionDataFromSignature,
   getNetworkIfCrossChain,
+  mergeRegistryToken,
   withRegistryContracts,
 };
