@@ -76,12 +76,6 @@ interface Env extends Flags.Env, ServiceBindings {
   COMET_SYNC_LEASE_SECONDS: string,
   REGISTRY_SNAPSHOT_CACHE_TTL_S: string,
   REGISTRY_STALE_FALLBACK_MAX_S: string,
-  /*
-   * how many minutes back the token list may take a collateral value it could
-   * not read now: a whole number from 0 to 30, and anything else, unset
-   * included, is 15
-   */
-  TOKEN_COLLATERAL_MAX_STALE_MINUTES?: string,
   // the operator identity recorded in audit rows, never taken from a request
   COMET_REGISTRY_ADMIN_ACTOR?: string,
   // comet registry secrets, never set in wrangler.toml
@@ -200,12 +194,8 @@ async function answer(request: Request, env: Env, waitUntil: (work: Promise<unkn
    * authenticated writes no script on any origin may read.
    */
   if (isRegistryPath(pathname)) {
-    const { context, requestId, quota, computations } = prepare(env, waitUntil);
-    return secured(await routeRegistry(
-      request,
-      { ...context, requestId },
-      Evaluator.preInstantiate(quota, context, computations),
-    ));
+    const { context, requestId } = prepare(env, waitUntil);
+    return secured(await routeRegistry(request, { ...context, requestId }));
   }
   /*
    * Every other path is a legacy route's. Its preflight reads nothing, so
@@ -238,7 +228,7 @@ export default {
       ? (work: Promise<unknown>) => { handed.push(work); }
       : (work: Promise<unknown>) => executionContext.waitUntil(work);
     const response = await answer(request, env, waitUntil);
-    // until nothing is left: a valuation handed over hands over its minute's record once it is done
+    // until nothing is left, should what was handed over hand over more
     while (handed.length > 0) {
       await Promise.allSettled(handed.splice(0));
     }

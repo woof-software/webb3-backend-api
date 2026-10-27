@@ -83,7 +83,9 @@ t.test(`market-minutely-summary@block:16380543`, async (t) => {
     `market-minutely-summary is the same as the market-summary at` +
       ` the indexed block for that minute`
   );
-  t.strictSame(result1, {
+  // what only the latest summary reports beside marketSummary: each collateral's value and exception, and the block it was read at
+  const { marketBlock, collaterals: valued, ...reported } = result1 as any;
+  t.strictSame({ ...reported, collaterals: valued.map(({ valueUsd: _value, exception: _exception, ...collateral }: any) => collateral) }, {
     chainId: 1,
     comet: {
       address: "0xc3d688B66703497DAA19211EEdff47f25384cdc3",
@@ -110,6 +112,13 @@ t.test(`market-minutely-summary@block:16380543`, async (t) => {
       { address: "0x514910771AF9Ca656af840dff83E8264EcF986CA", symbol: "LINK", status: "success" },
     ],
   });
+  t.equal(marketBlock.number, projected.block.number, `the block the market was read at, the minute's`);
+  t.ok(Number.isInteger(marketBlock.timestamp) && marketBlock.timestamp <= 1_673_432_423, `with the timestamp of its own header, no later than the block asked at`);
+  const scaled = (value: BigFixnum) => value.scaleToDecimals(40).value;
+  t.ok(valued.reduce((sum: BigNumber, { valueUsd }: { valueUsd: BigFixnum }) => sum.add(scaled(valueUsd)), BigNumber.from(0))
+    .eq(scaled(BigFixnum.from({ value: "19860093676810451139983159362475978", decimals: 26 }))),
+    `and the values of its collaterals add up to its total in USD`);
+  t.ok(valued.every(({ exception }: { exception: unknown }) => exception === null), `none of them priced by an exception`);
 
   /*
    * check for select expected cache keys

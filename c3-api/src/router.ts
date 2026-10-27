@@ -21,10 +21,8 @@ import { refuseTestnet, refuseTestnetsParameter } from './testnets.js';
 import { cacheDepsOf } from './registry/cache.js';
 import type { Catalog } from './registry/catalog.js';
 import { RequestCatalog, catalogHeadersOf, requestCatalog } from './registry/request-catalog.js';
-import { tokenCollateralDeps } from './registry/router.js';
-import { SUMMARY_DEADLINE_MS, summaryDecisions } from './registry/summary-tokens.js';
+import { summaryDecisions } from './registry/summary-tokens.js';
 import type { SummaryTokens } from './registry/summary-tokens.js';
-import type * as TokenCollateral from './registry/token-collateral.js';
 
 import * as Evaluator from './evaluator.js';
 
@@ -53,8 +51,8 @@ interface Context extends Evaluator.Context {
 
 /*
  * What the router hands a market handler: the evaluator it made for the
- * route, and what the summary adds to each collateral from the token list
- * (summary-tokens.ts).
+ * route, and where the summary reads the decisions it adds to each
+ * collateral (summary-tokens.ts).
  */
 interface MarketContext extends Context {
   tokens: SummaryTokens;
@@ -444,7 +442,7 @@ async function unsafeRoute(
      */
     const evaluator = instantiateEvaluator('mainnet', { flags: { ...context.flags, ...ROUTE_EVALUATOR_FLAGS } });
     const handler   = handlerMappings[resourceApi][strippedEndpointSuffix];
-    return handler(data, { ...context, evaluator, tokens: summaryTokensOf(context, instantiateEvaluator) });
+    return handler(data, { ...context, evaluator, tokens: summaryTokensOf(context) });
   }
 
   const maybeWellKnownContract = (() => {
@@ -488,15 +486,13 @@ async function unsafeRoute(
 }
 
 /*
- * How the summary values a chain's collateral, as the token list does, and
- * where it reads the decisions: from D1, and the deprecated and the hidden
- * ones from the records the worker keeps of them while D1 cannot be reached,
- * as the active reads do. Nothing is read until the summary asks.
+ * Where the summary reads the decisions: from D1, and the deprecated and the
+ * hidden ones from the records the worker keeps of them while D1 cannot be
+ * reached, as the active reads do. Nothing is read until the summary asks.
  */
-function summaryTokensOf(context: Omit<Context, 'evaluator'>, instantiateEvaluator: Evaluator.InstantiateFn<Scope>): SummaryTokens {
+function summaryTokensOf(context: Omit<Context, 'evaluator'>): SummaryTokens {
   return {
-    collateral: tokenCollateralDeps(context, Evaluator.narrowed<Scope, TokenCollateral.Dependencies>(instantiateEvaluator), SUMMARY_DEADLINE_MS),
-    decisions:  () => summaryDecisions({ ...cacheDepsOf(context.env, context.debug), defer: context.waitUntil }, context.requestId),
+    decisions: () => summaryDecisions({ ...cacheDepsOf(context.env, context.debug), defer: context.waitUntil }, context.requestId),
   };
 }
 

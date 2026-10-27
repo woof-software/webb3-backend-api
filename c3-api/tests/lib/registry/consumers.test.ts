@@ -255,7 +255,6 @@ t.test('a computation takes only a Comet the registry materialized', async t => 
     marketOf<market.MarketLatestSummary>(usdc),
     marketOf<market.HistoricalMarketDaySummaries>(usdc),
     marketOf<market.MarketRewards>(usdc),
-    marketOf<market.AssetCollateralValue>(usdc),
     marketOf<rewards.SupplyRewardsApr>(usdc),
     marketOf<rewards.BorrowRewardsApr>(usdc),
     marketOf<rewards.RewardsSummary>(usdc),
@@ -312,8 +311,6 @@ t.test('a computation takes only a Comet the registry materialized', async t => 
   marketOf<rewards.BorrowRewardsApr>(constant);
   // @ts-expect-error and the rewards summary is made of them
   marketOf<rewards.RewardsSummary>(constant);
-  // @ts-expect-error the token list values the collateral its version describes
-  marketOf<market.AssetCollateralValue>(constant);
   // @ts-expect-error
   argumentOf<typeof usdBasePriceFeedFor>(constant);
   // @ts-expect-error

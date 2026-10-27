@@ -116,16 +116,6 @@ function preInstantiate<Scope extends Compute.Spec>(
   }
 }
 
-/*
- * The evaluators of a scope, typed by a scope within it: an evaluator
- * evaluates every computation of its scope, those of a smaller one among them,
- * but the types of the redexes it builds name its whole scope, so the compiler
- * cannot take it for an evaluator of the smaller one.
- */
-function narrowed<Scope extends Compute.Spec, Within extends Scope>(instantiate: InstantiateFn<Scope>): InstantiateFn<Within> {
-  return instantiate as unknown as InstantiateFn<Within>;
-}
-
 /* FIXME: this is a gnarly hack for namespace conflicts in test.
  * Mapping of keys (network + seed) to some memory caches.
  */
@@ -147,7 +137,6 @@ function getOrCreateMemoryCache(
 }
 
 export {
-  narrowed,
   preInstantiate,
   type Context,
   type Implementation,

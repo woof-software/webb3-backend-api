@@ -1,16 +1,15 @@
-import { checksumAddress } from '../../lib/model/comet-registry.js';
-import type { TokenVisibilityV1, VisibilityReasonV1 } from '../../lib/model/comet-registry.js';
+import type { BlockRefV1, VisibilityReasonV1 } from '../../lib/model/comet-registry.js';
 
 // what a collateral of /summary answers, in the order it writes it, where every decision was read and every value is known
 const COLLATERAL_KEYS = [
   'address', 'symbol', 'status',
   'name', 'decimals', 'is_deprecated', 'is_network_deprecated', 'deprecated_in', 'is_hidden', 'hidden_in', 'is_strategic', 'network_roles',
-  'total_network_collateral_value_usd', 'total_network_collateral_value_status',
-  'network_value_at', 'network_value_block', 'network_value_stale_age_seconds', 'network_value_exceptions',
+  'collateral_value_usd', 'collateral_value_status',
+  'collateral_value_at', 'collateral_value_block', 'collateral_value_stale_age_seconds', 'collateral_value_exceptions',
   'is_visible', 'visibility_reason',
 ] as const;
 
-// the token list's threshold, in whole USD
+// the threshold of discovery, in whole USD
 const THRESHOLD_USD = 250_000n;
 
 /*
@@ -19,7 +18,7 @@ const THRESHOLD_USD = 250_000n;
  * every way a decision that could not be read might have gone: from whether
  * the market's Comet hides the token and whether it has it deprecated,
  * whether the token is strategic on its chain, each null where that kind of
- * decision could not be read, and the value the list writes of the token,
+ * decision could not be read, and the collateral's value in that market,
  * null where it is not known. The token is not shown where the Comet hides it
  * or has it deprecated, or where it is not strategic and is worth less than
  * the threshold, whatever the other decisions are; it is shown where the
@@ -33,7 +32,7 @@ function visibilityOnSummary(
   { isHidden, isDeprecated, isStrategic }: { isHidden: boolean | null, isDeprecated: boolean | null, isStrategic: boolean | null },
   valueUsd: string | null,
 ): { is_visible?: boolean, visibility_reason?: VisibilityReasonV1 } {
-  // the list writes every digit and no exponent, so the whole part tells a value short of a whole threshold
+  // the summary writes every digit and no exponent, so the whole part tells a value short of a whole threshold
   const below    = valueUsd !== null && BigInt(valueUsd.split('.')[0]) < THRESHOLD_USD;
   const notShown = isHidden === true || isDeprecated === true || (isStrategic === false && below);
   const shown    = isHidden === false && isDeprecated === false && (isStrategic === true || !below);
@@ -53,37 +52,38 @@ function visibilityOnSummary(
   };
 }
 
+// a price exception as a collateral of /summary names the one that priced it
+type ExceptionOnSummary = { kind: string, price_feed_address: string, provenance: string, expires_at: string | null };
+
 /*
- * What a collateral of /summary says of its token as the token list says it:
- * every field of the list's token, under the summary's names, each address
- * checksummed, and a value that is not known left out. `is_deprecated` and
- * `is_hidden` are the market's own, and the list has no such fields. So is
- * whether discovery shows the token: by the market's Comet's decisions
- * (`here`), and by the token's strategic mark and value as the list has them
- * (visibilityOnSummary), every decision read.
+ * The value fields of a collateral of /summary, stated apart from the code:
+ * its value in its market, `usd`, every digit, or null where it is not known;
+ * the block the market was read at, null where the node did not give its
+ * header; and the exceptions that priced it. A value that is known says when
+ * it was read, where that is known too, and is never stale; one that is not is
+ * `unavailable`, and says neither.
  */
-function onSummary(token: TokenVisibilityV1, here: { isHidden: boolean, isDeprecated: boolean }) {
+function valueOnSummary({ usd, block, exceptions = [] }: { usd: string | null, block: BlockRefV1 | null, exceptions?: ExceptionOnSummary[] }) {
   return {
-    name:                  token.name,
-    decimals:              token.decimals,
-    is_network_deprecated: token.isDeprecated,
-    deprecated_in:         token.deprecatedIn.map(address => checksumAddress(address)),
-    hidden_in:             token.hiddenIn.map(address => checksumAddress(address)),
-    is_strategic:          token.isStrategic,
-    network_roles:         token.roles,
-    ...(token.collateralValueUsd === null ? {} : { total_network_collateral_value_usd: token.collateralValueUsd }),
-    total_network_collateral_value_status: token.collateralValueStatus,
-    ...(token.valueAt         === null ? {} : { network_value_at: token.valueAt }),
-    ...(token.valueBlock      === null ? {} : { network_value_block: token.valueBlock }),
-    ...(token.staleAgeSeconds === null ? {} : { network_value_stale_age_seconds: token.staleAgeSeconds }),
-    network_value_exceptions: token.exceptions.map(({ kind, priceFeedAddress, provenance, expiresAt }) => ({
-      kind,
-      price_feed_address: checksumAddress(priceFeedAddress),
-      provenance,
-      expires_at:         expiresAt,
-    })),
-    ...visibilityOnSummary({ ...here, isStrategic: token.isStrategic }, token.collateralValueUsd),
+    ...(usd === null ? {} : { collateral_value_usd: usd }),
+    collateral_value_status: usd === null ? 'unavailable' : exceptions.length === 0 ? 'fresh' : 'exception',
+    ...(usd === null || block === null ? {} : {
+      collateral_value_at:                new Date(block.timestamp * 1000).toISOString(),
+      collateral_value_block:             block,
+      collateral_value_stale_age_seconds: 0,
+    }),
+    collateral_value_exceptions: exceptions,
   };
 }
 
-export { COLLATERAL_KEYS, onSummary, visibilityOnSummary };
+// a decimal string as an exact number of 10^-40ths, so that values of any scale add up exactly
+function scaled(value: string): bigint {
+  const [ whole, fraction = '' ] = value.split('.');
+  if (fraction.length > 40) {
+    throw new Error(`${value} has more than 40 decimals`);
+  }
+  return BigInt(whole!) * 10n ** 40n + BigInt(fraction.padEnd(40, '0'));
+}
+
+export type { ExceptionOnSummary };
+export { COLLATERAL_KEYS, scaled, valueOnSummary, visibilityOnSummary };

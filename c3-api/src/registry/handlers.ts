@@ -20,8 +20,6 @@ import type { CollateralOfComet } from './collateral-decision-repository.js';
 import type { CollateralMarks, RecordedKind } from './collateral-decisions.js';
 import { markedMarket, markedNetwork, markedRepresentation } from './collateral-decisions.js';
 import { conflict } from './errors.js';
-import type { RequestCatalog } from './request-catalog.js';
-import type { TokenCollateralDeps } from './token-collateral.js';
 import { registryHeaders } from './version-headers.js';
 import type { VersionRef } from './version-headers.js';
 import {
@@ -99,13 +97,6 @@ type RegistryContext = {
    */
   marks:  () => Promise<{ marks: CollateralMarks, recorded: boolean }>,
   record: (kind: RecordedKind) => Promise<void>,
-  /*
-   * The registry version of the request as the market routes load it, so the
-   * token list values a chain's markets from the same catalog they use.
-   */
-  catalog: RequestCatalog,
-  // what the token list values collateral with: the node, an evaluator, KV and the clock
-  tokens: TokenCollateralDeps,
 };
 
 const SCHEMA_VERSION = 1;

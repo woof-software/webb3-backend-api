@@ -1,19 +1,23 @@
-import t from 'tap';
+import t, { Test } from 'tap';
 
 import * as Eth      from '../../../../lib/eth-constants.js';
+import * as Fallible from '../../../../lib/fallible/fallible.js';
 import { BigNumber } from '../../../../lib/bignumber.js';
 import { BigFixnum } from '../../../../lib/bigfixnum.js';
 
+import * as comet  from '../../../../lib/computations/comet.js';
 import * as market from '../../../../lib/computations/market.js';
 
 import type { PriceRead } from '../../../../lib/computations/comet.js';
 import type { Collateral } from '../../../../lib/computations/market/collaterals.js';
 
-import type { RegistryComet } from '../../../../lib/model/comet-registry.js';
+import type { Address, PriceExceptionV1, RegistryComet } from '../../../../lib/model/comet-registry.js';
 import { checksumAddress } from '../../../../lib/model/comet-registry.js';
+import { catalogOf } from '../../../../src/registry/catalog.js';
 
-import { evaluatorOver, stub } from '../../../util/evaluator.js';
-import { fixtureCatalog } from '../../../util/registry-fixture.js';
+import { consoleLines } from '../../../util/console.js';
+import { evaluatorOver, memoryCache, stub } from '../../../util/evaluator.js';
+import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../../util/registry-fixture.js';
 
 import '../../../../shim/node-self.js';
 
@@ -24,6 +28,8 @@ import '../../../../shim/node-self.js';
  */
 const network = 'ethereum-mainnet' as const;
 const block   = { number: 50_000_000, timestamp: 1_790_000_000 };
+// the header of that block as the node gives it, its timestamp its own
+const HEADER  = { number: block.number, timestamp: block.timestamp - 7 };
 
 const marketOf = (deploymentKey: string) => fixtureCatalog().marketsOn(network).find(entry => entry.deploymentKey === deploymentKey)!.comet;
 const usdt = marketOf('usdt');
@@ -43,13 +49,14 @@ const reverted = (message = 'execution reverted') => ({ status: 'error' as const
  * one feed that prices it both ways on a market quoted in USD.
  */
 const READS = {
-  basePrice:    read(at8(99_890_608)),
-  baseUsdPrice: read(at8(99_890_608)),
-  borrowApr:    BigFixnum.from({ decimals: 2, value: 5 }),
-  supplyApr:    BigFixnum.from({ decimals: 2, value: 3 }),
-  totalBorrow:  BigFixnum.from({ decimals: 6, value: 1_000_000_000 }),
-  totalSupply:  BigFixnum.from({ decimals: 6, value: 2_000_000_000 }),
-  utilization:  BigNumber.from('500000000000000000'),
+  basePrice:         read(at8(99_890_608)),
+  baseUsdPrice:      read(at8(99_890_608)),
+  borrowApr:         BigFixnum.from({ decimals: 2, value: 5 }),
+  supplyApr:         BigFixnum.from({ decimals: 2, value: 3 }),
+  totalBorrow:       BigFixnum.from({ decimals: 6, value: 1_000_000_000 }),
+  totalSupply:       BigFixnum.from({ decimals: 6, value: 2_000_000_000 }),
+  utilization:       BigNumber.from('500000000000000000'),
+  ethGetBlockHeader: HEADER as typeof HEADER | null,
 };
 
 type Reads = { [Name in keyof typeof READS]?: unknown } & { contract?: RegistryComet, collaterals: Collateral[] };
@@ -73,15 +80,29 @@ function summaryOf(reads: Reads): Promise<any> {
   return evaluate(pull1({ marketLatestSummary: contextOf(reads.contract ?? usdt) }));
 }
 
-// a collateral of the summary's market as collaterals reports it: `held` whole tokens of eighteen decimals at `price`
-function collateral(asset: string, symbol: string, held: number, price: PriceRead): Collateral {
+/*
+ * A collateral of the summary's market as collaterals reports it: `held`
+ * whole tokens of eighteen decimals at `price`, priced by `exception`, if any.
+ */
+function collateral(asset: string, symbol: string, held: number, price: PriceRead, exception: PriceExceptionV1 | null = null): Collateral {
   return {
     asset:           asset as Eth.Address,
     symbol,
     totalCollateral: BigFixnum.from({ multiplier: BigNumber.from(10).pow(18), value: BigNumber.from(10).pow(18).mul(held) }),
-    price,
+    price:           { ...price, exception },
   };
 }
+
+// each collateral of a summary by its symbol: its value in USD, written as the computation writes a total, and the exception that priced it
+const valuesOf = (summary: any) => Object.fromEntries(summary.collaterals.map(({ symbol, valueUsd, exception }: any) => (
+  [ symbol, [ valueUsd === null ? null : valueUsd.toString(), exception ] ]
+)));
+
+// a summary without what only the latest summary reports: each collateral's value and exception, and the block it was read at
+const asMarketSummary = ({ marketBlock: _block, collaterals, ...summary }: any) => ({
+  ...summary,
+  collaterals: collaterals.map(({ valueUsd: _value, exception: _exception, ...collateral }: any) => collateral),
+});
 
 // USDT's market holds three COMP at 42.17 USD and two WETH at 2514.24289343 USD
 const usdtComp = (price: PriceRead = read(at8(4_217_000_000)))   => collateral(COMP, 'COMP', 3, price);
@@ -107,12 +128,14 @@ t.test('a market whose every price reads reports every field, in the order the A
     basePrice:               '0.99890608',
     collateralAssetSymbols:  [ 'COMP', 'WETH' ],
     collaterals: [
-      { address: COMP, symbol: 'COMP', status: 'success' },
-      { address: WETH, symbol: 'WETH', status: 'success' },
+      { address: COMP, symbol: 'COMP', status: 'success', valueUsd: '126.51', exception: null },
+      { address: WETH, symbol: 'WETH', status: 'success', valueUsd: '5028.48578686', exception: null },
     ],
+    marketBlock: HEADER,
   };
-  t.strictSame(summary, expected, 'each total at the base price, and each collateral with its status');
-  t.equal(JSON.stringify(summary), JSON.stringify(expected), 'in the order the API writes them');
+  const written = { ...summary, collaterals: summary.collaterals.map((each: any) => ({ ...each, valueUsd: each.valueUsd.toString() })) };
+  t.strictSame(written, expected, 'each total at the base price, each collateral with its status and its value, and the block the market was read at');
+  t.equal(JSON.stringify(written), JSON.stringify(expected), 'in the order the API writes them');
 });
 
 t.test('a market reports what marketSummary reports of it, as it reports it', async t => {
@@ -145,8 +168,8 @@ t.test('a market reports what marketSummary reports of it, as it reports it', as
     t.equal(basePrice, (reads.basePrice ?? READS.basePrice).price.toString(), `${status}: the base price its totals are valued at`);
 
     t.equal(before.status, status, `marketSummary reports the market as ${status}`);
-    t.strictSame(latest, before, `${status}: every field as marketSummary reports it`);
-    t.equal(JSON.stringify(latest), JSON.stringify(before), `${status}: in its order`);
+    t.strictSame(asMarketSummary(latest), before, `${status}: every field as marketSummary reports it`);
+    t.equal(JSON.stringify(asMarketSummary(latest)), JSON.stringify(before), `${status}: in its order`);
   }
 });
 
@@ -164,7 +187,7 @@ t.test('a market quoted in USD whose base price reverts reports every field it c
   // the fields up to the utilization, without the totals of the base price and with them
   const unpriced = [ 'totalCollateralValue', 'totalCollateralValueUsd', 'utilization' ];
   const priced   = [ 'totalBorrowValue', 'totalSupplyValue', 'totalCollateralValue', 'totalBorrowValueUsd', 'totalSupplyValueUsd', 'totalCollateralValueUsd', 'utilization' ];
-  const after    = [ 'collateralAssetSymbols', 'collaterals' ];
+  const after    = [ 'collateralAssetSymbols', 'collaterals', 'marketBlock' ];
   const cases = [
     { reads: { basePrice: BASE, baseUsdPrice: USD }, message: BASE.message, keys: [ ...unpriced, ...after ], name: 'both revert' },
     { reads: { baseUsdPrice: USD },                  message: USD.message,  keys: [ ...priced, 'basePrice', ...after ], name: 'its USD price reverts' },
@@ -260,7 +283,7 @@ t.test('while the version and the chain differ, the summary and the history both
       scale:     BigNumber.from(10).pow(18),
     })),
     assetTotalCollateral: stub(({ assetNumber }) => BigFixnum.from({ value: assetNumber + 1 })),
-    assetPrice:           stub(() => read(BigFixnum.from({ value: 2 }))),
+    assetPrice:           stub(() => ({ ...read(BigFixnum.from({ value: 2 })), exception: null })),
   });
   const context = contextOf(usdt);
   const [ history, latest ] = await evaluate(split([
@@ -268,7 +291,7 @@ t.test('while the version and the chain differ, the summary and the history both
     pull1({ marketLatestSummary: context }),
   ])) as [ any, any ];
 
-  for (const [ name, summary ] of [ [ 'the summary', latest ], [ 'the history', history ] ]) {
+  for (const [ name, summary ] of [ [ 'the summary', asMarketSummary(latest) ], [ 'the history', history ] ]) {
     t.equal(summary.status, 'partially', `${name}: partial`);
     t.strictSame(summary.collateralAssetSymbols, versioned.map(asset => asset.token.symbol), `${name}: with the sixteen collaterals of the version`);
     t.strictSame(summary.collaterals.map((each: any) => each.status), versioned.map((_, assetNumber) => assetNumber === 3 ? 'error' : 'success'),
@@ -282,6 +305,11 @@ t.test('while the version and the chain differ, the summary and the history both
     t.equal(summary.totalCollateralValue, String(2 * (136 - 4)),
       `${name}: and the total leaves it and the seventeenth out: indices 1 to 16 but 4, at two each`);
   }
+  t.strictSame(latest.collaterals[3], { ...history.collaterals[3], valueUsd: null, exception: null },
+    'the summary: its value not known, since what the Comet holds of it was never read, though the Comet holds something there');
+  t.strictSame(latest.collaterals.filter((_: unknown, assetNumber: number) => assetNumber !== 3).map((each: any) => each.valueUsd.toString()),
+    versioned.map((_, assetNumber) => String(2 * (assetNumber + 1))).filter((_, assetNumber) => assetNumber !== 3),
+    'and every other at what the Comet holds of it, at two each');
 });
 
 /*
@@ -319,4 +347,320 @@ t.test('a total in USD is reported where the total and what converts it were rea
     'its base price reverts: the total of its collateral alone, which needs no base price');
   t.strictSame(inUsdOf(await inEth(ETH, reverted())), {}, 'its USD price reverts: none, since nothing converts them');
   t.strictSame(inUsdOf(await inEth(reverted(), reverted())), {}, 'both revert: none');
+});
+
+/*
+ * What the market holds of each collateral, in USD, as the totals are made:
+ * at its price, and on a market quoted in its base asset through the base
+ * asset's USD price. The values that are known add up to the total in USD,
+ * exactly. Nothing held is worth nothing, whatever its price, read or not; a
+ * price of zero is nothing in USD, whatever converts it; and a value is not
+ * known where its price could not be read, or, on a market quoted in its base
+ * asset, the USD price that converts it.
+ */
+t.test('each collateral is worth what the market holds of it at its price, in USD, as the totals are made', async t => {
+  const usdQuoted = await summaryOf({ collaterals: [ usdtComp(), usdtWeth() ] });
+  t.strictSame(valuesOf(usdQuoted), { COMP: [ '126.51', null ], WETH: [ '5028.48578686', null ] },
+    'a market quoted in USD: three COMP at 42.17 and two WETH at 2514.24289343');
+  t.equal(usdQuoted.totalCollateralValueUsd, '5154.99578686', 'which add up to its total in USD');
+
+  // WETH's market is quoted in ETH, at 2500 USD per ETH
+  const [ cbETH, wstETH, rETH, rsETH ] = weth.registry.market.collateralAssets.map(asset => checksumAddress(asset.token.address));
+  const collaterals = [
+    collateral(cbETH!,  'cbETH',  4, read(at8(105_000_000))),
+    collateral(wstETH!, 'wstETH', 5, read(at8(0))),
+    collateral(rETH!,   'rETH',   6, reverted()),
+    collateral(rsETH!,  'rsETH',  0, reverted()),
+  ];
+  const ETH_USD = read(at8(250_000_000_000));
+  const converted = await summaryOf({ contract: weth, basePrice: read(at8(100_000_000)), baseUsdPrice: ETH_USD, collaterals });
+  t.strictSame(valuesOf(converted), {
+    cbETH:  [ '10500.0', null ],
+    wstETH: [ '0.0', null ],
+    rETH:   [ null, null ],
+    rsETH:  [ '0', null ],
+  }, 'a market quoted in ETH: four cbETH at 1.05 ETH and 2500 USD per ETH, five wstETH at nothing, rETH unpriced, and no rsETH, whose price reverts');
+  t.equal(converted.totalCollateralValueUsd, '10500.0', 'and the values that are known add up to its total in USD');
+  t.strictSame(converted.collaterals.map((each: any) => each.status), [ 'success', 'success', 'error', 'error' ],
+    'each collateral with the status its price read, a holding of nothing among them');
+
+  const unconverted = await summaryOf({ contract: weth, basePrice: read(at8(100_000_000)), baseUsdPrice: reverted(), collaterals });
+  t.strictSame(valuesOf(unconverted), {
+    cbETH:  [ null, null ],
+    wstETH: [ '0.0', null ],
+    rETH:   [ null, null ],
+    rsETH:  [ '0', null ],
+  }, 'its USD price reverts: only what is worth nothing whatever converts it is known');
+  t.notOk('totalCollateralValueUsd' in unconverted, 'as no total in USD is');
+});
+
+/*
+ * A price stated by the registry, or read from the feed a remap names, is
+ * named on the collateral by what it does and to which feed, which is all
+ * that keys the market's cached summary of an exception (catalog.ts,
+ * marketDigest): the route describes it as the version that answers does. A
+ * value that is nothing held, or not known, names none.
+ */
+t.test('a collateral names the exception that priced it by its kind and its feed, where its value is known and held', async t => {
+  const FIXED: PriceExceptionV1 = {
+    kind:             'fixed_price',
+    priceFeedAddress: '0x351a133fd850ea81ed8a782016e308acbaddec91',
+    price:            { value: '102447384', decimals: 8 },
+    provenance:       'stated for the test',
+    expiresAt:        null,
+  };
+  const ZERO: PriceExceptionV1 = { kind: 'zero_price', priceFeedAddress: '0xe3a409ed15cd53afdefdd191ad945cec528a2496', provenance: 'stated', expiresAt: null };
+  const [ cbETH, wstETH, rETH ] = weth.registry.market.collateralAssets.map(asset => checksumAddress(asset.token.address));
+  const priced = await summaryOf({
+    contract:     weth,
+    basePrice:    read(at8(100_000_000)),
+    baseUsdPrice: read(at8(250_000_000_000)),
+    collaterals:  [
+      collateral(cbETH!,  'cbETH',  2, read(at8(102_447_384)), FIXED),
+      collateral(wstETH!, 'wstETH', 5, read(at8(0)), ZERO),
+      collateral(rETH!,   'rETH',   0, read(at8(102_447_384)), FIXED),
+    ],
+  });
+  t.strictSame(valuesOf(priced), {
+    cbETH:  [ '5122.3692', { kind: 'fixed_price', priceFeedAddress: FIXED.priceFeedAddress } ],
+    wstETH: [ '0.0', { kind: 'zero_price', priceFeedAddress: ZERO.priceFeedAddress } ],
+    rETH:   [ '0', null ],
+  }, 'two cbETH at the price stated, and wstETH at zero, each naming its exception, while nothing held names none');
+
+  const unconverted = await summaryOf({
+    contract:     weth,
+    basePrice:    read(at8(100_000_000)),
+    baseUsdPrice: reverted(),
+    collaterals:  [ collateral(cbETH!, 'cbETH', 2, read(at8(102_447_384)), FIXED) ],
+  });
+  t.strictSame(valuesOf(unconverted), { cbETH: [ null, null ] }, 'and a value not known names none either, though its price was stated');
+});
+
+/*
+ * The value of a collateral is read at the block the summary reads its market
+ * at, and dated by that block's header, read beside the rest. A header the
+ * node does not give leaves the block null, and fails nothing else.
+ */
+t.test('the block the market was read at is the header the node gave of it, or null', async t => {
+  const reads   = { collaterals: [ usdtComp(), usdtWeth() ] };
+  const asked: unknown[] = [];
+  const { evaluate, pull1 } = evaluatorOver({
+    marketLatestSummary: market.marketLatestSummary,
+    ...readsOf(reads),
+    collaterals:         stub(() => reads.collaterals),
+    ethGetBlockHeader:   stub(context => { asked.push(context.blockNumber); return HEADER; }),
+  });
+  const summary = await evaluate(pull1({ marketLatestSummary: contextOf(usdt) })) as any;
+  t.strictSame(summary.marketBlock, HEADER, 'the number of the block read, with its own timestamp');
+  t.strictSame(asked, [ block.number ], 'asked for once, at the block the summary was asked at');
+
+  const headless = await summaryOf({ ...reads, ethGetBlockHeader: null });
+  t.equal(headless.marketBlock, null, 'a header the node did not give is null');
+  t.strictSame({ ...headless, marketBlock: HEADER }, summary, 'and everything else is as with it');
+});
+
+/*
+ * A remap whose replacement reverts at the summary's block while the feed it
+ * replaces answers: at the latest block, a replacement that has stopped
+ * answering. The summary values the collateral through the feed it replaces,
+ * as though no remap named it, and reports the replacement as a price read
+ * reports a feed that reverts: as the version names it, read by the Comet on
+ * its network at the block, with the replacement's own message, whatever the
+ * market holds of the collateral. The history reads the same prices, and
+ * neither reports nor answers anything of the revert. The reads below
+ * assetPrice answer from tables: USDT's market holds its first two
+ * collaterals, COMP, priced through COMP / USD, which a version remaps to
+ * REPLACEMENT, and WETH, and a feed answers 1.0 unless a test says otherwise.
+ *
+ * A feed that reverts is logged once a minute per network and feed, in the
+ * memory of the process (get-price.ts), so the clock of each test below is a
+ * minute later at every reading: every line that is due is written, and none
+ * masks another, in its test or in a later one.
+ */
+const REPLACEMENT   = '0x7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a' as Address;
+const STOPPED       = 'execution reverted: the replacement stopped answering';
+const usdtCompAsset = usdt.registry.market.collateralAssets[0]!;
+const usdtWethAsset = usdt.registry.market.collateralAssets[1]!;
+
+// USDT's market in a version that remaps each feed of `remaps` to the replacement beside it
+function remappedOf(remaps: [ Address, Address ][]): RegistryComet {
+  const snapshot = loadRegistrySnapshotFixture();
+  return catalogOf({
+    ...snapshot,
+    networks: snapshot.networks.map(entry => entry.chainId !== 1 ? entry : {
+      ...entry,
+      priceExceptions: [ ...entry.priceExceptions, ...remaps.map(([ feed, replacement ]) => ({
+        kind:                 'deprecated_price_remap' as const,
+        priceFeedAddress:     feed,
+        replacementPriceFeed: { address: replacement, decimals: 8 },
+        provenance:           'the feed retired; its replacement answers the same pair',
+        expiresAt:            null,
+      })) ],
+    }),
+  }).marketsOn(network).find(entry => entry.deploymentKey === 'usdt')!.comet;
+}
+
+// USDT's market in a version that remaps COMP / USD to REPLACEMENT
+const remapped = remappedOf([ [ usdtCompAsset.priceFeed.address, REPLACEMENT ] ]);
+
+let clock = Date.now();
+// a clock a minute later at every reading, for the length of a test
+const minuteByMinute = (t: Test) => t.capture(Date, 'now', () => (clock += 60_000));
+
+/*
+ * The reads of the summary of USDT's market through the real collaterals and
+ * assetPrice: what its Comet holds at its first two indices, `held` COMP and
+ * one WETH, each priced 1.0 by its feed unless `prices` answers that feed, by
+ * its address, lowercase; and the rest of the market as `reads` names it, or
+ * else as READS has it.
+ */
+function pricedReads(prices: Record<string, PriceRead>, held = 3, reads: Omit<Reads, 'collaterals'> = {}) {
+  const assets = [ usdtCompAsset, usdtWethAsset ];
+  return {
+    ...readsOf({ ...reads, collaterals: [] }),
+    collaterals:          market.collaterals,
+    assetPrice:           comet.assetPrice,
+    numAssets:            stub(() => assets.length),
+    assetInfo:            stub(({ assetNumber }) => ({
+      asset:     checksumAddress(assets[assetNumber]!.token.address),
+      priceFeed: checksumAddress(assets[assetNumber]!.priceFeed.address),
+      scale:     BigNumber.from(10).pow(assets[assetNumber]!.token.decimals),
+    })),
+    assetTotalCollateral: stub(({ assetNumber }) => BigFixnum.from({ value: assetNumber === 0 ? held : 1 })),
+    getPrice:             stub(({ priceFeed }) => prices[priceFeed.address.toLowerCase()] ?? read(at8(100_000_000))),
+  };
+}
+
+// the latest summary of `contract`, USDT's market, over those reads
+function latestOf(contract: RegistryComet, prices: Record<string, PriceRead>, held = 3, reads: Omit<Reads, 'collaterals'> = {}): Promise<any> {
+  const { evaluate, pull1 } = evaluatorOver({ marketLatestSummary: market.marketLatestSummary, ...pricedReads(prices, held, reads) });
+  return evaluate(pull1({ marketLatestSummary: contextOf(contract) }));
+}
+
+// the line that reports REPLACEMENT, read by USDT's Comet at block `number`
+const stoppedAt = (number: number) => `price feed reverted: ${REPLACEMENT} read by ${remapped.address} on ${network} at block ${number}: ${STOPPED}`;
+
+t.test('a remap whose replacement stopped answering is reported by the latest summary, which values the collateral through the feed it replaces', async t => {
+  minuteByMinute(t);
+  const logged = consoleLines(t, [ 'warn' ]);
+  for (const held of [ 3, 0 ]) {
+    logged.length = 0;
+    const summary = await latestOf(remapped, { [REPLACEMENT]: reverted(STOPPED) }, held);
+    const plain   = await latestOf(usdt, {}, held);
+    t.strictSame(logged, [ stoppedAt(block.number) ],
+      `${held} COMP held: reported once, naming the replacement as the version names it, the Comet, the network and the block, with the replacement's own message`);
+    t.match(summary.collaterals[0], { symbol: 'COMP', status: 'success', exception: null }, `${held} COMP held: priced through the feed the remap replaces, by no exception`);
+    t.strictSame(summary, plain, `${held} COMP held: and answered as the market is where no remap names that feed, with nothing of the revert`);
+  }
+});
+
+/*
+ * Each such replacement of a market is reported, however the rest of the
+ * market reads: where its base price or its USD price could not be read,
+ * which makes the market an error, and where a version remaps the feeds of
+ * both its collaterals, COMP / USD to REPLACEMENT and WETH / USD to SECOND,
+ * and both replacements have stopped answering.
+ */
+t.test('the latest summary reports each replacement that stopped answering, however the rest of its market reads', async t => {
+  minuteByMinute(t);
+  const logged  = consoleLines(t, [ 'warn' ]);
+  const SECOND  = '0x7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b' as Address;
+  const RETIRED = 'execution reverted: the second replacement stopped answering';
+  // USDT's market in a version that remaps WETH / USD to SECOND as well
+  const twice = remappedOf([ [ usdtCompAsset.priceFeed.address, REPLACEMENT ], [ usdtWethAsset.priceFeed.address, SECOND ] ]);
+
+  for (const [ price, reads ] of [ [ 'base price', { basePrice: reverted() } ], [ 'USD price', { baseUsdPrice: reverted() } ] ] as const) {
+    logged.length = 0;
+    const summary = await latestOf(remapped, { [REPLACEMENT]: reverted(STOPPED) }, 3, reads);
+    t.equal(summary.status, 'error', `its ${price} reverts: the market is an error`);
+    t.match(summary.collaterals[0], { symbol: 'COMP', status: 'success', exception: null }, `its ${price} reverts: COMP priced through the feed the remap replaces`);
+    t.strictSame(logged, [ stoppedAt(block.number) ], `its ${price} reverts: and the replacement reported all the same`);
+  }
+
+  logged.length = 0;
+  const both = await latestOf(twice, { [REPLACEMENT]: reverted(STOPPED), [SECOND]: reverted(RETIRED) });
+  t.strictSame(both.collaterals.map(({ symbol, status, exception }: any) => [ symbol, status, exception ]), [ [ 'COMP', 'success', null ], [ 'WETH', 'success', null ] ],
+    'both feeds remapped: each collateral priced through the feed its remap replaces, by no exception');
+  t.strictSame([ ...logged ].sort(), [
+    stoppedAt(block.number),
+    `price feed reverted: ${SECOND} read by ${twice.address} on ${network} at block ${block.number}: ${RETIRED}`,
+  ].sort(), 'and each replacement reported once, with its own message');
+});
+
+t.test('the latest summary reports nothing more where the replacement answers, where neither feed answers, or where no remap names the feed', async t => {
+  minuteByMinute(t);
+  const logged = consoleLines(t, [ 'warn' ]);
+
+  const replaced = await latestOf(remapped, { [REPLACEMENT]: read(at8(200_000_000)) });
+  t.match(replaced.collaterals[0], { symbol: 'COMP', status: 'success', exception: { kind: 'deprecated_price_remap' } }, 'a replacement that answers prices COMP, naming the remap');
+  t.strictSame(logged, [], 'and nothing is reported');
+
+  const neither = await latestOf(remapped, {
+    [REPLACEMENT]:                     reverted(STOPPED),
+    [usdtCompAsset.priceFeed.address]: reverted('execution reverted: the feed it replaces'),
+  });
+  t.match(neither.collaterals[0], { symbol: 'COMP', status: 'error', message: STOPPED }, 'where neither answers, COMP is an error, with the revert of its replacement');
+  t.strictSame(logged, [ stoppedAt(block.number) ], 'reported once, by the price read, and not again by the summary');
+
+  logged.length = 0;
+  const unmapped = await latestOf(usdt, { [usdtWethAsset.priceFeed.address]: reverted('execution reverted: WETH / USD') });
+  t.match(unmapped.collaterals[1], { symbol: 'WETH', status: 'error' }, 'a feed no remap names that reverts makes its collateral an error');
+  t.strictSame(logged, [], 'which the summary does not report: the read of the feed does, and here that read is a table');
+});
+
+t.test('the history reads the same prices, and neither reports nor answers anything of a replacement that reverts', async t => {
+  minuteByMinute(t);
+  const logged = consoleLines(t, [ 'warn' ]);
+  // what `asked` answers, on an evaluator of its own, over the reads of a replacement that reverts
+  const historyOf = (asked: object): Promise<any> => {
+    const { evaluate, pull1 } = evaluatorOver({
+      marketSummary:    market.marketSummary,
+      marketDaySummary: market.marketDaySummary,
+      ...pricedReads({ [REPLACEMENT]: reverted(STOPPED) }),
+    });
+    return evaluate(pull1(asked as any));
+  };
+  const summary = await historyOf({ marketSummary: contextOf(remapped) });
+  const day     = await historyOf({ marketDaySummary: contextOf(remapped) });
+
+  for (const [ what, answer ] of [ [ 'marketSummary', summary ], [ 'a day of the history', day ] ] as const) {
+    t.equal(answer.status, 'success', `${what}: a success`);
+    t.strictSame(answer.collaterals.map(({ symbol, status }: any) => [ symbol, status ]), [ [ 'COMP', 'success' ], [ 'WETH', 'success' ] ],
+      `${what}: COMP priced through the feed the remap replaces`);
+    t.strictSame(answer.collaterals.map((collateral: object) => Object.keys(collateral)), [ [ 'address', 'symbol', 'status' ], [ 'address', 'symbol', 'status' ] ],
+      `${what}: each collateral with its address, its symbol and its status alone`);
+    t.notOk(JSON.stringify(answer).includes(REPLACEMENT) || JSON.stringify(answer).includes(STOPPED), `${what}: and nothing of the replacement or of its revert`);
+  }
+  t.strictSame(logged, [], 'and neither reports the replacement');
+});
+
+t.test('the minutely summary caches nothing of the revert, and a minute it has cached reports nothing', async t => {
+  minuteByMinute(t);
+  const logged = consoleLines(t, [ 'warn' ]);
+  const cache  = memoryCache();
+  // the minute at its own block, as the route asks for it, which is what is cached (market-minutely-summary.ts)
+  const projected = Fallible.must(market.marketMinutelySummary.index.project(contextOf(remapped)));
+  const minute = () => {
+    const { evaluate, pull1 } = evaluatorOver({
+      marketMinutelySummary: market.marketMinutelySummary,
+      marketLatestSummary:   market.marketLatestSummary,
+      ...pricedReads({ [REPLACEMENT]: reverted(STOPPED) }),
+    }, { cache });
+    return evaluate(pull1({ marketMinutelySummary: { ...projected, block: { ...projected.block, timestamp: block.timestamp } } })) as Promise<any>;
+  };
+
+  const first = await minute();
+  t.strictSame(logged, [ stoppedAt(projected.block.number) ], 'a minute nobody read reports the replacement, at the block of the minute');
+  const cached = Object.entries(cache.store).filter(([ key ]) => key.startsWith('marketMinutelySummary-'));
+  t.equal(cached.length, 1, 'which it caches');
+  const value = (cached[0]?.[1] ?? null) as any;
+  t.strictSame(value?.collaterals?.map((collateral: object) => Object.keys(collateral)), [
+    [ 'address', 'symbol', 'status', 'valueUsd', 'exception' ],
+    [ 'address', 'symbol', 'status', 'valueUsd', 'exception' ],
+  ], 'each collateral with its status, its value and its exception alone');
+  t.notOk(JSON.stringify(value).includes(STOPPED) || JSON.stringify(value).includes(REPLACEMENT), 'and nothing of the replacement or of its revert');
+
+  logged.length = 0;
+  t.equal(JSON.stringify(await minute()), JSON.stringify(first), 'the same minute is answered from the cache, as it was');
+  t.strictSame(logged, [], 'and reports nothing');
 });
