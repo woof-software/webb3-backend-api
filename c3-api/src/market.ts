@@ -139,7 +139,7 @@ async function latestSummary(
 ): Promise<Response> {
   const selectedNetworks = networksOf(network);
   // once for every network, while their latest blocks are read
-  const decisions = context.tokens.decisions();
+  const decisions = context.decisions();
 
   const { evaluate, pipe1, split, value } = context.evaluator;
 
@@ -188,7 +188,7 @@ async function latestSummary(
       ]);
       const tokens = chainTokens(catalog, network, selectedContracts[0]!.registry.chainId, read);
 
-      return entries.map((entry, index) => withTokenFields(snakeifyCamelObject(entry), selectedContracts[index]!, tokens));
+      return entries.map((entry, index) => snakeifyCamelObject(withTokenFields(entry, selectedContracts[index]!, tokens)));
     })
   );
 

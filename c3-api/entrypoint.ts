@@ -126,10 +126,10 @@ function secured(response: Response, cors: Record<string, string> = {}): Respons
 }
 
 /*
- * What a request is evaluated with, whichever router answers it: its context,
+ * What a request is answered with, whichever router answers it: its context,
  * the id it is answered under, what it may spend, and every computation the
- * evaluators of either router evaluate. Each router is handed evaluators of
- * these typed by the scope its own handlers read.
+ * legacy router's evaluators evaluate. The registry router is handed the
+ * context and the id alone.
  *
  * It takes the request's waitUntil, so no call can drop it by leaving it out.
  */

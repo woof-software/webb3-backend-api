@@ -4,7 +4,7 @@ import * as Compute  from '../../symbolic/computation.js';
 import type { Address, PriceExceptionV1, PriceFeedV1, RegistryAnnotation, RegistryComet } from '../../model/comet-registry.js';
 
 import type { AssetInfo } from './asset-info.js';
-import { reportRevert, type GetPrice, type PriceRead } from './get-price.js';
+import { reportRevert, type GetPrice, type PriceError } from './get-price.js';
 
 /*
  * The price of a collateral asset, or why it could not be read: one
@@ -12,15 +12,20 @@ import { reportRevert, type GetPrice, type PriceRead } from './get-price.js';
  *
  * A price names the exception of the registry it was priced by: one that
  * states it, or a remap whose replacement answered. A price read from a feed
- * the Comet names, a remap's fallback among them, and a price that could not
- * be read name none. A price the fallback gave carries what the replacement
- * reverted with instead, which its reader reports or not (PricePlan).
+ * the Comet names, and a price that could not be read, name none. A price a
+ * remap's fallback gave, which is read from the feed the Comet names as well,
+ * names the remap all the same, and carries what the replacement reverted
+ * with: whether to value by it, and whether to report the revert, are its
+ * reader's to decide (PricePlan).
  */
-type AssetPriceRead = PriceRead & {
-  exception: PriceExceptionV1 | null,
-  // on a price a remap's fallback gave: the replacement, which reverted, and its message
-  replacementRevert?: { feed: Address, message: string },
-};
+type RemapException = Extract<PriceExceptionV1, { kind: 'deprecated_price_remap' }>;
+
+type AssetPriceRead = (
+  | { status: 'success', price: BigFixnum, exception: PriceExceptionV1 | null }
+  // a price a remap's fallback gave
+  | { status: 'success', price: BigFixnum, exception: RemapException, replacementRevert: { feed: Address, message: string } }
+  | PriceError & { exception: null }
+);
 
 type AssetPrice = Compute.Spec<{
   name: 'assetPrice',
@@ -50,17 +55,19 @@ function exceptionFor(annotation: RegistryAnnotation, priceFeed: Address): Price
  * feed it describes is known not to answer; a remap reads the feed it names
  * instead, and falls back on the feed it replaces, which still answers at a
  * block before the replacement was deployed. Whether that answer is one to
- * use is the reader's to decide: the summaries use it as they use the answer
- * of any feed the Comet names, and so does the value of a collateral that
- * discovery decides by (market-latest-summary.ts). So is whether the
- * replacement's revert is one to report: the latest summary reads a block
- * after the replacement was deployed, where a revert means it has stopped
- * answering, and reports it; the history reads days older than the
+ * use is the reader's to decide: the totals of the summaries count it as they
+ * count the answer of any feed the Comet names, and the value of a
+ * collateral that discovery decides by does not, since a feed the remap
+ * retired is no feed to show a token by (market-latest-summary.ts). So is
+ * whether the replacement's revert is one to report: the latest summary reads
+ * a block after the replacement was deployed, where a revert means it has
+ * stopped answering, and reports it; the history reads days older than the
  * replacement too, where its revert is expected, and does not.
  */
 type PricePlan = (
   | { fixed: BigFixnum, exception: PriceExceptionV1 }
-  | { read: PriceFeedV1, fallback: PriceFeedV1 | null, exception: PriceExceptionV1 | null }
+  | { read: PriceFeedV1, fallback: null, exception: null }
+  | { read: PriceFeedV1, fallback: PriceFeedV1, exception: RemapException }
 );
 
 function pricePlanOf(annotation: RegistryAnnotation, feed: PriceFeedV1): PricePlan {
@@ -103,8 +110,8 @@ function decimalsOf(annotation: RegistryAnnotation, priceFeed: Address): number 
 
 const { implement, pipe1 } = Compute.Functor<AssetPrice>({});
 const assetPrice = implement({
-  // 3: with the exception that priced it, and where a remap fell back, what its replacement reverted with
-  version: 3,
+  // 4: where a remap fell back, naming the remap beside what its replacement reverted with
+  version: 4,
   compute: ({ apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network }) => pipe1([
     { assetInfo: { apiHost, nodeHost, nodeKey, assetNumber, blockNumber, contract, network } },
     ({ priceFeed }) => {
@@ -127,14 +134,11 @@ const assetPrice = implement({
        * replacement is reported here only when neither answers. At the
        * latest block the replacement answers, and nothing more is read,
        * unless it has stopped answering: the feed it replaces is then read
-       * as at an older block. Wherever that feed answers, its price carries
-       * the replacement's revert, for the reader to report or not
-       * (PricePlan): the latest summary reports it, and the history does not
-       * (market-latest-summary.ts).
-       *
-       * Only the replacement's answer is the remap's: the feed it replaces
-       * answers as any feed the Comet names does, and the price it gives
-       * names no exception.
+       * as at an older block. Wherever that feed answers, its price names the
+       * remap it fell back from and carries the replacement's revert, for the
+       * reader to value by and to report or not (PricePlan): the latest
+       * summary reports it and leaves the collateral's value unknown, and the
+       * history does neither (market-latest-summary.ts).
        */
       const unreported = { ...frame, unreported: true } as const;
       return pipe1([
@@ -143,7 +147,7 @@ const assetPrice = implement({
           { getPrice: { ...unreported, priceFeed: fallback } },
           (own): AssetPriceRead => {
             if (own.status === 'success') {
-              return { ...own, exception: null, replacementRevert: { feed: read.address, message: replaced.message } };
+              return { ...own, exception, replacementRevert: { feed: read.address, message: replaced.message } };
             }
             reportRevert(replaced.message, read.address, contract.address, network, blockNumber);
             return { ...replaced, exception: null };
@@ -154,5 +158,5 @@ const assetPrice = implement({
   ]),
 });
 
-export type { AssetPriceRead, PricePlan };
-export { AssetPrice, assetPrice, decimalsOf, exceptionFor, pricePlanOf };
+export type { AssetPriceRead };
+export { AssetPrice, assetPrice, decimalsOf, exceptionFor };

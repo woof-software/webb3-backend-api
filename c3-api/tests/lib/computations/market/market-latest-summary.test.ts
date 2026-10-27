@@ -9,7 +9,9 @@ import * as comet  from '../../../../lib/computations/comet.js';
 import * as market from '../../../../lib/computations/market.js';
 
 import type { PriceRead } from '../../../../lib/computations/comet.js';
+import type { AssetPriceRead } from '../../../../lib/computations/comet/asset-price.js';
 import type { Collateral } from '../../../../lib/computations/market/collaterals.js';
+import type { CollateralValue } from '../../../../lib/computations/market/market-latest-summary.js';
 
 import type { Address, PriceExceptionV1, RegistryComet } from '../../../../lib/model/comet-registry.js';
 import { checksumAddress } from '../../../../lib/model/comet-registry.js';
@@ -89,7 +91,7 @@ function collateral(asset: string, symbol: string, held: number, price: PriceRea
     asset:           asset as Eth.Address,
     symbol,
     totalCollateral: BigFixnum.from({ multiplier: BigNumber.from(10).pow(18), value: BigNumber.from(10).pow(18).mul(held) }),
-    price:           { ...price, exception },
+    price:           price.status === 'success' ? { ...price, exception } : { ...price, exception: null },
   };
 }
 
@@ -399,7 +401,8 @@ t.test('each collateral is worth what the market holds of it at its price, in US
  * named on the collateral by what it does and to which feed, which is all
  * that keys the market's cached summary of an exception (catalog.ts,
  * marketDigest): the route describes it as the version that answers does. A
- * value that is nothing held, or not known, names none.
+ * value that is nothing held names none, and so does one not known, but where
+ * a remap fell back (below).
  */
 t.test('a collateral names the exception that priced it by its kind and its feed, where its value is known and held', async t => {
   const FIXED: PriceExceptionV1 = {
@@ -437,6 +440,37 @@ t.test('a collateral names the exception that priced it by its kind and its feed
 });
 
 /*
+ * What a price, a collateral as it was read and a value can be is in the
+ * type of each, so a reader of one never has to rule out what the
+ * computations do not make: each one below is a type error the build
+ * expects. A collateral as the summary reports it pairs its price's status
+ * with its value, and the two are not tied, since nothing reads one by the
+ * other: an error beside a value that names an exception compiles, though
+ * none is made.
+ */
+t.test('a price, a collateral or a value the computations do not make does not compile', async () => {
+  const FIXED: PriceExceptionV1 = {
+    kind:             'fixed_price',
+    priceFeedAddress: '0x351a133fd850ea81ed8a782016e308acbaddec91',
+    price:            { value: '102447384', decimals: 8 },
+    provenance:       'stated for the test',
+    expiresAt:        null,
+  };
+  const APPLIED = { kind: FIXED.kind, priceFeedAddress: FIXED.priceFeedAddress } as const;
+  const REVERT  = { feed: '0x5555555555555555555555555555555555555555', message: 'execution reverted' } as const;
+  (price: BigFixnum) => [
+    // @ts-expect-error a price that could not be read names no exception
+    { status: 'error', message: 'execution reverted', exception: FIXED } satisfies AssetPriceRead,
+    // @ts-expect-error nor carries a replacement's revert, which only a price the fallback gave does
+    { status: 'error', message: 'execution reverted', exception: null, replacementRevert: REVERT } satisfies AssetPriceRead,
+    // @ts-expect-error another asset at the collateral's index leaves the collateral unpriced
+    { asset: COMP, symbol: 'COMP', totalCollateral: null, price: { status: 'success', price, exception: null } } satisfies Collateral,
+    // @ts-expect-error a value that is not known names no exception but the remap that fell back
+    { valueUsd: null, exception: APPLIED } satisfies CollateralValue,
+  ];
+});
+
+/*
  * The value of a collateral is read at the block the summary reads its market
  * at, and dated by that block's header, read beside the rest. A header the
  * node does not give leaves the block null, and fails nothing else.
@@ -462,15 +496,18 @@ t.test('the block the market was read at is the header the node gave of it, or n
 /*
  * A remap whose replacement reverts at the summary's block while the feed it
  * replaces answers: at the latest block, a replacement that has stopped
- * answering. The summary values the collateral through the feed it replaces,
- * as though no remap named it, and reports the replacement as a price read
- * reports a feed that reverts: as the version names it, read by the Comet on
- * its network at the block, with the replacement's own message, whatever the
- * market holds of the collateral. The history reads the same prices, and
- * neither reports nor answers anything of the revert. The reads below
- * assetPrice answer from tables: USDT's market holds its first two
- * collaterals, COMP, priced through COMP / USD, which a version remaps to
- * REPLACEMENT, and WETH, and a feed answers 1.0 unless a test says otherwise.
+ * answering. The summary counts the collateral in its totals at the price of
+ * the feed it replaces, as though no remap named it, but does not value the
+ * collateral by it: its value is not known, and names the remap. It reports
+ * the replacement as a price read reports a feed that reverts: as the version
+ * names it, read by the Comet on its network at the block, with the
+ * replacement's own message, whatever the market holds of the collateral,
+ * and what it holds none of is worth nothing all the same. The history reads
+ * the same prices, and neither reports nor answers anything of the revert.
+ * The reads below assetPrice answer from tables: USDT's market holds its
+ * first two collaterals, COMP, priced through COMP / USD, which a version
+ * remaps to REPLACEMENT, and WETH, and a feed answers 1.0 unless a test says
+ * otherwise.
  *
  * A feed that reverts is logged once a minute per network and feed, in the
  * memory of the process (get-price.ts), so the clock of each test below is a
@@ -540,18 +577,27 @@ function latestOf(contract: RegistryComet, prices: Record<string, PriceRead>, he
 // the line that reports REPLACEMENT, read by USDT's Comet at block `number`
 const stoppedAt = (number: number) => `price feed reverted: ${REPLACEMENT} read by ${remapped.address} on ${network} at block ${number}: ${STOPPED}`;
 
-t.test('a remap whose replacement stopped answering is reported by the latest summary, which values the collateral through the feed it replaces', async t => {
+// the remap of COMP / USD as a summary names it on a collateral
+const REMAP = { kind: 'deprecated_price_remap', priceFeedAddress: usdtCompAsset.priceFeed.address } as const;
+
+t.test('a remap whose replacement stopped answering is reported by the latest summary, which counts the collateral in its totals and leaves its value unknown', async t => {
   minuteByMinute(t);
-  const logged = consoleLines(t, [ 'warn' ]);
-  for (const held of [ 3, 0 ]) {
-    logged.length = 0;
-    const summary = await latestOf(remapped, { [REPLACEMENT]: reverted(STOPPED) }, held);
-    const plain   = await latestOf(usdt, {}, held);
-    t.strictSame(logged, [ stoppedAt(block.number) ],
-      `${held} COMP held: reported once, naming the replacement as the version names it, the Comet, the network and the block, with the replacement's own message`);
-    t.match(summary.collaterals[0], { symbol: 'COMP', status: 'success', exception: null }, `${held} COMP held: priced through the feed the remap replaces, by no exception`);
-    t.strictSame(summary, plain, `${held} COMP held: and answered as the market is where no remap names that feed, with nothing of the revert`);
-  }
+  const logged  = consoleLines(t, [ 'warn' ]);
+  const summary = await latestOf(remapped, { [REPLACEMENT]: reverted(STOPPED) });
+  const plain   = await latestOf(usdt, {});
+  t.strictSame(logged, [ stoppedAt(block.number) ],
+    'reported once, naming the replacement as the version names it, the Comet, the network and the block, with the replacement\'s own message');
+  t.strictSame(summary.collaterals[0], { address: COMP, symbol: 'COMP', status: 'success', valueUsd: null, exception: REMAP },
+    'COMP, priced through the feed the remap replaces: of a value not known, naming the remap');
+  t.equal(plain.collaterals[0].valueUsd.toString(), '3.0', 'which values the three COMP at 1.0 where no remap names that feed');
+  t.match(summary, { totalCollateralValue: '4.0', totalCollateralValueUsd: '4.0' }, 'the totals count them so all the same, beside the one WETH at 1.0');
+  t.strictSame({ ...summary, collaterals: summary.collaterals.slice(1) }, { ...plain, collaterals: plain.collaterals.slice(1) },
+    'and the market is answered as where no remap names that feed, but for COMP\'s value, with nothing of the revert');
+
+  logged.length = 0;
+  const none = await latestOf(remapped, { [REPLACEMENT]: reverted(STOPPED) }, 0);
+  t.strictSame(logged, [ stoppedAt(block.number) ], 'no COMP held: reported all the same');
+  t.strictSame(none, await latestOf(usdt, {}, 0), 'and worth nothing, naming no exception, as where no remap names that feed');
 });
 
 /*
@@ -573,14 +619,17 @@ t.test('the latest summary reports each replacement that stopped answering, howe
     logged.length = 0;
     const summary = await latestOf(remapped, { [REPLACEMENT]: reverted(STOPPED) }, 3, reads);
     t.equal(summary.status, 'error', `its ${price} reverts: the market is an error`);
-    t.match(summary.collaterals[0], { symbol: 'COMP', status: 'success', exception: null }, `its ${price} reverts: COMP priced through the feed the remap replaces`);
+    t.match(summary.collaterals[0], { symbol: 'COMP', status: 'success', valueUsd: null, exception: REMAP },
+      `its ${price} reverts: COMP priced through the feed the remap replaces, of a value not known, naming the remap`);
     t.strictSame(logged, [ stoppedAt(block.number) ], `its ${price} reverts: and the replacement reported all the same`);
   }
 
   logged.length = 0;
   const both = await latestOf(twice, { [REPLACEMENT]: reverted(STOPPED), [SECOND]: reverted(RETIRED) });
-  t.strictSame(both.collaterals.map(({ symbol, status, exception }: any) => [ symbol, status, exception ]), [ [ 'COMP', 'success', null ], [ 'WETH', 'success', null ] ],
-    'both feeds remapped: each collateral priced through the feed its remap replaces, by no exception');
+  t.strictSame(both.collaterals.map(({ symbol, status, valueUsd, exception }: any) => [ symbol, status, valueUsd, exception ]), [
+    [ 'COMP', 'success', null, REMAP ],
+    [ 'WETH', 'success', null, { kind: 'deprecated_price_remap', priceFeedAddress: usdtWethAsset.priceFeed.address } ],
+  ], 'both feeds remapped: each collateral priced through the feed its remap replaces, of a value not known, naming its own remap');
   t.strictSame([ ...logged ].sort(), [
     stoppedAt(block.number),
     `price feed reverted: ${SECOND} read by ${twice.address} on ${network} at block ${block.number}: ${RETIRED}`,
@@ -599,7 +648,8 @@ t.test('the latest summary reports nothing more where the replacement answers, w
     [REPLACEMENT]:                     reverted(STOPPED),
     [usdtCompAsset.priceFeed.address]: reverted('execution reverted: the feed it replaces'),
   });
-  t.match(neither.collaterals[0], { symbol: 'COMP', status: 'error', message: STOPPED }, 'where neither answers, COMP is an error, with the revert of its replacement');
+  t.match(neither.collaterals[0], { symbol: 'COMP', status: 'error', message: STOPPED, valueUsd: null, exception: null },
+    'where neither answers, COMP is an error, with the revert of its replacement, and its value, not known, names nothing');
   t.strictSame(logged, [ stoppedAt(block.number) ], 'reported once, by the price read, and not again by the summary');
 
   logged.length = 0;
@@ -658,6 +708,8 @@ t.test('the minutely summary caches nothing of the revert, and a minute it has c
     [ 'address', 'symbol', 'status', 'valueUsd', 'exception' ],
     [ 'address', 'symbol', 'status', 'valueUsd', 'exception' ],
   ], 'each collateral with its status, its value and its exception alone');
+  t.strictSame(value?.collaterals?.[0], { address: COMP, symbol: 'COMP', status: 'success', valueUsd: null, exception: REMAP },
+    'COMP of a value not known, naming the remap');
   t.notOk(JSON.stringify(value).includes(STOPPED) || JSON.stringify(value).includes(REPLACEMENT), 'and nothing of the replacement or of its revert');
 
   logged.length = 0;

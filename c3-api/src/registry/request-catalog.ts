@@ -107,26 +107,17 @@ function requestCatalog(deps: CacheDeps): RequestCatalog {
 }
 
 /*
- * The headers a registry-dependent response carries: they name the version a
- * client was served without changing any response body.
- */
-function catalogHeaders(catalog: Catalog, staleFor: number | null): Record<string, string> {
-  return {
-    ...registryHeaders({ id: catalog.versionId, checksum: catalog.checksum }, staleFor),
-  };
-}
-
-/*
  * The headers of whatever a request answered, by the version it loaded: none
- * when it loaded none, since nothing it said depended on one. A failure that
- * came after the version was read names it too, because an error a client
- * reports is only diagnosable if it says what it was computed against. Both
- * routers set these over everything else a response carries.
+ * when it loaded none, since nothing it said depended on one. They name the
+ * version a client was served without changing any response body. A failure
+ * that came after the version was read names it too, because an error a
+ * client reports is only diagnosable if it says what it was computed against.
+ * The legacy router sets these over everything else a response carries.
  */
 function catalogHeadersOf(registry: RequestCatalog): Record<string, string> {
   const catalog = registry.loaded();
-  return catalog === null ? {} : catalogHeaders(catalog, registry.staleFor());
+  return catalog === null ? {} : registryHeaders({ id: catalog.versionId, checksum: catalog.checksum }, registry.staleFor());
 }
 
 export type { RequestCatalog };
-export { catalogHeaders, catalogHeadersOf, requestCatalog };
+export { catalogHeadersOf, requestCatalog };

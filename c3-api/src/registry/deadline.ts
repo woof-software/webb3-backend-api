@@ -16,4 +16,4 @@ async function withDeadline<T>(work: Promise<T>, milliseconds: number): Promise<
   }
 }
 
-export { TIMED_OUT, withDeadline };
+export { withDeadline };
