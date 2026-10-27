@@ -32,16 +32,14 @@ const EXCEPTION_KINDS = [ 'zero_price', 'fixed_price', 'deprecated_price_remap' 
 const ACTIVATION_ACTIONS = [ 'activate', 'rollback' ] as const;
 
 /*
- * How the token list valued a token, and why discovery shows it or not.
- * `partial` is a value read from only some of a token's positions that
- * already reaches the threshold (decision D7 of the TOK-0 audit). `hidden`
- * and `deprecated` each name a token that an enabled market takes and none of
- * them leaves to discovery, offering it without hiding it: `hidden` where an
- * administrator hid it in one of them, and `deprecated` where every one of
- * them has it deprecated and none hides it. Discovery shows neither, whatever
- * else holds.
+ * What /summary says of the value of a collateral in its market, and why
+ * discovery shows its token there or not. `exception` is a value a price
+ * exception of the registry priced, and `unavailable` one that could not be
+ * read. `hidden` is a token the market's Comet hides, and `deprecated` one it
+ * has deprecated and does not hide: discovery shows neither, whatever else
+ * holds.
  */
-const COLLATERAL_VALUE_STATUSES = [ 'fresh', 'exception', 'partial', 'stale', 'unavailable' ] as const;
+const COLLATERAL_VALUE_STATUSES = [ 'fresh', 'exception', 'unavailable' ] as const;
 const VISIBILITY_REASONS        = [ 'hidden', 'deprecated', 'strategic', 'collateral_threshold', 'below_threshold', 'data_unavailable' ] as const;
 
 type ContractRole  = (typeof CONTRACT_ROLES)[number];
@@ -626,16 +624,6 @@ type HiddenCollateralListV1     = CollateralDecisionListV1<'isHidden', 'hiddenCo
 type HiddenCollateralReviewV1   = CollateralDecisionReviewV1<'hiddenCollaterals'>;
 type HiddenCollateralApplyV1    = CollateralDecisionApplyV1<'isHidden', 'hiddenCollaterals'>;
 
-/*
- * The token list: every token the active version serves on one chain, with
- * its strategic decision, its collateral value in USD across the chain's
- * enabled markets, and whether discovery shows it.
- *
- * Values are decimal strings, never numbers: a value is exact, and a client
- * that compares or formats it must not lose a digit doing so. Each token says
- * when its value was read, which may be an earlier minute than the list's own
- * `block` when the latest could not be read.
- */
 type CollateralValueStatusV1 = (typeof COLLATERAL_VALUE_STATUSES)[number];
 type VisibilityReasonV1      = (typeof VISIBILITY_REASONS)[number];
 
@@ -651,57 +639,8 @@ type VisibilityV1 = (
   | { isVisible: false, visibilityReason: Extract<VisibilityReasonV1, NotShownV1> }
 );
 
+// a block a value was read at: its number, and its timestamp in seconds
 type BlockRefV1 = { number: number, timestamp: number };
-
-// a price exception the value applied: what the registry stated in place of reading a feed
-type AppliedPriceExceptionV1 = {
-  kind:             ExceptionKind,
-  priceFeedAddress: Address,
-  provenance:       string,
-  expiresAt:        string | null,
-};
-
-/*
- * `deprecatedIn` names the Comets of the chain's served markets that take the
- * token as a collateral an administrator marked deprecated, sorted.
- * `isDeprecated` says it is deprecated in every enabled market that takes it,
- * of which there is at least one: none of them offers it any longer, and
- * discovery does not show it, whatever else holds. A token deprecated in some
- * of them only is left to the others, which offer it: it is not shown where
- * every one of them hides it, and is otherwise decided by its strategic mark
- * and its value.
- *
- * `hiddenIn` names, the same way, the Comets that take the token as a
- * collateral an administrator hid. The decisions keep a token out of
- * discovery, before anything else is asked, where an enabled market takes it
- * and none of them leaves it to discovery, offering it without hiding it: as
- * `hidden` where one of them hides it, which only the reason says, the list
- * having no flag of its own for it, and otherwise as `deprecated`, which
- * `isDeprecated` says as well (src/registry/token-visibility.ts).
- */
-type TokenVisibilityV1 = TokenV1 & {
-  roles:                 AssetRole[],
-  isStrategic:           boolean,
-  isDeprecated:          boolean,
-  deprecatedIn:          Address[],
-  hiddenIn:              Address[],
-  collateralValueUsd:    string | null,
-  collateralValueStatus: CollateralValueStatusV1,
-  valueAt:               string | null,
-  valueBlock:            BlockRefV1 | null,
-  staleAgeSeconds:       number | null,
-  exceptions:            AppliedPriceExceptionV1[],
-} & VisibilityV1;
-
-type TokenListV1 = {
-  registryVersion: VersionRefV1,
-  chainId:         number,
-  thresholdUsd:    string,
-  ruleVersion:     number,
-  computedAt:      string,
-  block:           BlockRefV1 | null,
-  tokens:          TokenVisibilityV1[],
-};
 
 /*
  * What a Comet contract carries when it was materialized from the registry:
@@ -748,7 +687,6 @@ export type {
   ActiveSnapshotV1,
   Address,
   AssetDisplayOverrideV1,
-  AppliedPriceExceptionV1,
   AssetRole,
   BaseAssetV1,
   BlockRefV1,
@@ -801,7 +739,6 @@ export type {
   ServedMarket,
   ServedNetwork,
   TokenPoliciesV1,
-  TokenListV1,
   TokenPolicyApplyV1,
   TokenPolicyDecisionV1,
   TokenPolicyDetailV1,
@@ -817,7 +754,6 @@ export type {
   VersionRefV1,
   VisibilityReasonV1,
   VisibilityV1,
-  TokenVisibilityV1,
 };
 
 export {

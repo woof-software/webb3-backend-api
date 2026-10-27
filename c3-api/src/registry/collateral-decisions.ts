@@ -151,11 +151,7 @@ type RecordedKind = {
   known: WeakMap<KVNamespace, Known>,
 };
 
-/*
- * The record of a kind of decision about a collateral, as the kind describes
- * it (collateral-decision-repository.ts). Its read of every chain's decisions
- * is the token list's too (token-handlers.ts).
- */
+// the record of a kind of decision about a collateral, as the kind describes it (collateral-decision-repository.ts)
 function recordedKind<Flag extends string, Column extends string, Rows extends string>(
   kind: CollateralDecisionKind<Flag, Column, Rows>,
 ): RecordedKind {

@@ -29,7 +29,6 @@ import {
 
 type Dependencies = (
   | evm.Evm
-  | market.AssetCollateralValue
   | market.MarketDaySummary
   | market.HistoricalMarketDaySummaries
   | market.MarketRewards
@@ -142,7 +141,7 @@ async function latestSummary(
   // once for every network, while their latest blocks are read
   const decisions = context.tokens.decisions();
 
-  const { evaluate, pipe1, pull1, split, value } = context.evaluator;
+  const { evaluate, pipe1, split, value } = context.evaluator;
 
   const summary = await Promise.all(
     selectedNetworks.map(async (network) => {
@@ -156,34 +155,38 @@ async function latestSummary(
       }
 
       /*
-       * One evaluation per network for its markets, not one per market. They
-       * share the latest block, read once, and every round of their reads
-       * reaches the node as one batch: four calls to the node provider proxy
-       * per network, whatever its market count. An evaluation per market made
-       * four for every market, and all networks at once took 116 — each call
-       * a round trip of its own, and a subrequest, of which an invocation has
-       * 10,000 on the Workers Paid plan stage and production run on, and 50
-       * on the Free plan (README, "Workers Plan").
+       * One evaluation per network, not per market. Its markets share the
+       * latest block, read once, and every round of their reads reaches the
+       * node as one batch: four calls to the node provider proxy per network,
+       * whatever its market count. An evaluation per market made four for
+       * every market, and all networks at once took 116 — each call a round
+       * trip of its own, and a subrequest, of which an invocation has 10,000
+       * on the Workers Paid plan stage and production run on, and 50 on the
+       * Free plan (README, "Workers Plan"). The header of each market's
+       * block, which dates the value of its collateral, rides in the first
+       * round of its reads, once for the markets read at the same block.
        *
        * Networks stay separate evaluations: within one, the batches of
        * different networks would go to the node one after another. The
-       * token list's values of the network's collateral are read at the same
-       * block, beside the markets: one call more in a minute nobody has
-       * valued (summary-tokens.ts).
+       * decisions are read meanwhile, and each collateral is decided by them
+       * and by its value in its market once both are in (summary-tokens.ts).
        */
-      const latestBlock = await evaluate(pull1({ ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: "latest", network } }));
-      const [ entries, tokens ] = await Promise.all([
-        evaluate(split(selectedContracts.map((contract) => {
-          const origin = { apiHost, nodeHost, nodeKey, network, contract, block: latestBlock };
-          if (!market.marketMinutelySummary.index.covers(origin)) {
-            return value(described(unreachedMarket(contract, latestBlock), contract));
-          }
-          const projected = Fallible.must(market.marketMinutelySummary.index.project(origin));
-          projected.block.timestamp = latestBlock.timestamp;
-          return pipe1([ { marketMinutelySummary: projected }, computed => described(computed, contract) ]);
-        }))),
-        chainTokens(context.tokens.collateral, catalog, network, selectedContracts[0]!.registry.chainId, latestBlock, decisions),
+      const [ entries, read ] = await Promise.all([
+        evaluate(pipe1([
+          { ethGetBlock: { apiHost, nodeHost, nodeKey, blockReference: "latest", network } },
+          (latestBlock) => split(selectedContracts.map((contract) => {
+            const origin = { apiHost, nodeHost, nodeKey, network, contract, block: latestBlock };
+            if (!market.marketMinutelySummary.index.covers(origin)) {
+              return value(described(unreachedMarket(contract, latestBlock), contract));
+            }
+            const projected = Fallible.must(market.marketMinutelySummary.index.project(origin));
+            projected.block.timestamp = latestBlock.timestamp;
+            return pipe1([ { marketMinutelySummary: projected }, computed => described(computed, contract) ]);
+          })),
+        ])),
+        decisions,
       ]);
+      const tokens = chainTokens(catalog, network, selectedContracts[0]!.registry.chainId, read);
 
       return entries.map((entry, index) => withTokenFields(snakeifyCamelObject(entry), selectedContracts[index]!, tokens));
     })

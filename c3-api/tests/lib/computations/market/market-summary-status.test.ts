@@ -404,7 +404,8 @@ t.test('a collateral the registry prices is never read', async t => {
   t.match(priced, { status: 'success' }, 'its exception answers for it');
   t.equal((priced as any).price.toString(), '0.0');
 
-  t.strictSame(await evaluate(pull1({ assetPrice: { ...context, assetNumber: 1 } })), reverted, 'any other feed is read');
+  t.strictSame(await evaluate(pull1({ assetPrice: { ...context, assetNumber: 1 } })), { ...reverted, exception: null },
+    'any other feed is read, and its price names no exception');
   t.strictSame(reads, [ COMP ]);
 });
 

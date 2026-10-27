@@ -252,20 +252,20 @@ t.test('a namespace slow to take a write holds no answer: the records an outage 
     return { answer: C3Api.fetch(new Request(`https://api.test.local${path}`), env, context), handed };
   };
 
-  const active = await request('/registry/v1/active');
-  const tokens = await request('/registry/v1/networks/10/tokens');
-  const market = await request(`/market/${MAINNET}/${UNKNOWN}/summary`);
-  t.ok(await settledWithin(Promise.all([ active.answer, tokens.answer, market.answer ]), 5000),
+  const active   = await request('/registry/v1/active');
+  const networks = await request('/registry/v1/networks');
+  const market   = await request(`/market/${MAINNET}/${UNKNOWN}/summary`);
+  t.ok(await settledWithin(Promise.all([ active.answer, networks.answer, market.answer ]), 5000),
     'the registry routes and a market route answer while those writes are held');
-  t.same([ active.handed.length, tokens.handed.length, market.handed.length ], [ 3, 1, 1 ],
+  t.same([ active.handed.length, networks.handed.length, market.handed.length ], [ 3, 1, 1 ],
     'each having handed its writes to waitUntil: the pointer record, and on /active the checks of either kind of decision');
   t.same([ await store.get(POINTER_KEY), await store.get(DEPRECATED_KEY), await store.get(HIDDEN_KEY) ], [ null, null, null ],
     'none of which has landed');
 
   held.release();
-  t.same([ (await active.answer).status, (await tokens.answer).status, (await market.answer).status ], [ 200, 404, 400 ],
-    'the token list of a chain the version does not hold, and a market of no version, refused after the version was read');
-  await Promise.all([ ...active.handed, ...tokens.handed, ...market.handed ].map(entry => entry.work));
+  t.same([ (await active.answer).status, (await networks.answer).status, (await market.answer).status ], [ 200, 200, 400 ],
+    'the networks, which need no decision, and a market of no version, refused after the version was read');
+  await Promise.all([ ...active.handed, ...networks.handed, ...market.handed ].map(entry => entry.work));
   t.ok(await store.get(POINTER_KEY) !== null, 'the pointer record lands once the namespace takes it');
   t.ok(await store.get(DEPRECATED_KEY) !== null && await store.get(HIDDEN_KEY) !== null, 'and so does the record of each kind of decision');
 });

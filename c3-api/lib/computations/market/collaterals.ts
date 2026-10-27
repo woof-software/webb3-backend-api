@@ -11,16 +11,17 @@ import type {
   AssetPrice,
   AssetTotalCollateral,
   NumAssets,
-  PriceRead,
 } from '../comet.js';
+import type { AssetPriceRead } from '../comet/asset-price.js';
 
 /*
  * Every collateral asset of a market, in the order the Comet numbers them:
  * what it is, how much of it the market holds, and its price or why that
- * could not be read. The summary's collateral value and its report of which
- * collateral could not be priced both come from this one pass, so each read
- * is made once — an evaluator that does not remember what it computed would
- * otherwise make every one of them twice.
+ * could not be read, with the exception of the registry that priced it. The
+ * summary's collateral value, the value of each collateral, and its report of
+ * which collateral could not be priced all come from this one pass, so each
+ * read is made once — an evaluator that does not remember what it computed
+ * would otherwise make every one of them twice.
  *
  * What a collateral is — its token and its symbol — is what the registry
  * version says, never what the token answers: a token whose symbol() answers
@@ -35,8 +36,9 @@ import type {
 type Collateral = {
   asset:           Eth.Address,
   symbol:          string,
-  totalCollateral: BigFixnum,
-  price:           PriceRead,
+  // null where the Comet holds another asset at the collateral's index, so what it holds of this one was not read
+  totalCollateral: BigFixnum | null,
+  price:           AssetPriceRead,
 };
 
 type Collaterals = Compute.Spec<{
@@ -49,8 +51,8 @@ type Collaterals = Compute.Spec<{
 
 const { implement, join, pipe, pipe1, value } = Compute.Functor<Collaterals>({});
 const collaterals = implement({
-  // 2: what each collateral is comes from the registry version, not from the chain
-  version: 2,
+  // 3: with the exception each price applied, and no holding where the Comet holds another asset
+  version: 3,
   compute({ apiHost, nodeHost, nodeKey, blockNumber, contract, network }) {
     const frame = { apiHost, nodeHost, nodeKey, blockNumber, contract, network };
     return pipe1([
@@ -72,10 +74,11 @@ const collaterals = implement({
               ({ asset }) => normalizeAddress(asset) !== position.token.address
                 ? value<Collateral>({
                     ...identity,
-                    totalCollateral: BigFixnum.from({ value: 0 }),
+                    totalCollateral: null,
                     price: {
-                      status:  'error',
-                      message: `asset ${assetNumber} of the Comet is ${asset}, not the ${position.token.symbol} the registry version describes`,
+                      status:    'error',
+                      message:   `asset ${assetNumber} of the Comet is ${asset}, not the ${position.token.symbol} the registry version describes`,
+                      exception: null,
                     },
                   })
                 : pipe([
@@ -97,9 +100,10 @@ const collaterals = implement({
   },
 });
 
+// what the market holds of the collaterals that could be priced, in the unit their feeds answer in
 function collateralValue(collaterals: Collateral[]): BigFixnum {
   return collaterals.reduce(
-    (sum, { totalCollateral, price }) => price.status === 'success'
+    (sum, { totalCollateral, price }) => price.status === 'success' && totalCollateral !== null
       ? sum.add(totalCollateral.mul(price.price))
       : sum,
     BigFixnum.from({ value: 0 }),

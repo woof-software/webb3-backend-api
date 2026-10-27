@@ -14,8 +14,6 @@ import { BorrowRatePerSecond  } from './comet/borrow-rate-per-second.js';
 import { AssetTotalCollateral } from './comet/asset-total-collateral.js';
 import { BaseBorrowMin        } from './comet/base-borrow-min.js';
 import { BaseUsdPrice         } from './comet/base-usd-price.js';
-import { CollateralTotal      } from './comet/collateral-total.js';
-import { CollateralAssetInfo  } from './comet/collateral-asset-info.js';
 
 export type Comet = (
   | GetPrice
@@ -34,8 +32,6 @@ export type Comet = (
   | BorrowBalanceOf
   | BaseBorrowMin
   | BaseUsdPrice
-  | CollateralAssetInfo
-  | CollateralTotal
 );
 
 export { GetPrice,     getPrice     } from './comet/get-price.js';
@@ -54,18 +50,6 @@ export {
   CometBasePrice,
   cometBasePrice,
 } from './comet/comet-base-price.js';
-
-export {
-  CollateralAssetInfo,
-  collateralAssetInfo,
-} from './comet/collateral-asset-info.js';
-export type { CollateralAssetInfoRead } from './comet/collateral-asset-info.js';
-
-export {
-  CollateralTotal,
-  collateralTotal,
-} from './comet/collateral-total.js';
-export type { CollateralTotalRead } from './comet/collateral-total.js';
 
 export {
   SupplyRatePerSecond,

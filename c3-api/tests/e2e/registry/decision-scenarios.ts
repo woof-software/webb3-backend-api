@@ -46,9 +46,8 @@ import type { RegistryHarness } from '../../util/registry-harness.js';
  * deprecated-collateral-routes.test.ts and hidden-collateral-routes.test.ts.
  * The descriptions also drive the tests in Node that need a kind's tables or
  * routes: collateral-read-scenarios.ts and the two files that run it,
- * decision-read.test.ts, token-list-service.test.ts and
- * ../market/summary-tokens.test.ts. This module is not a test file, and tap
- * does not run it on its own.
+ * decision-read.test.ts and ../market/summary-tokens.test.ts. This module is
+ * not a test file, and tap does not run it on its own.
  */
 
 // what a decision is about, by the names its answers and its list rows give its addresses: a token, or a collateral of a Comet
@@ -712,7 +711,7 @@ const TOKEN_POLICIES: DecisionKindUnderTest = {
       `row 6 repeats row 5 (chain 1, ${WETH})`,
     ],
   },
-  // the token list needs the tables too, and says so in token-list-routes.test.ts
+  // no public read needs the tables: /summary is answered without what they decide (summary-tokens.test.ts)
   migrations: { through: [ '0004' ], reads: [] },
 };
 
@@ -727,16 +726,11 @@ const METH  = collateralOf('usdt', 'mETH');
 // collateral of the USDC, WETH and USDT markets
 const WEETH = collateralOf('usdt', 'weETH');
 
-/*
- * The public reads that need a collateral kind's tables: the active reads
- * mark every collateral by both kinds' decisions, and the token list reads
- * both kinds.
- */
+// the public reads that need a collateral kind's tables: the active reads mark every collateral by both kinds' decisions
 const MARKING_READS: Array<[ string, string ]> = [
   [ 'the bootstrap read', '/registry/v1/active' ],
   [ 'the market list',    '/registry/v1/networks/1/markets' ],
   [ 'a market',           `/registry/v1/networks/1/markets/${USDT_COMET}` ],
-  [ 'the token list',     '/registry/v1/networks/1/tokens' ],
 ];
 
 /*

@@ -8,7 +8,6 @@ import {
   getNetworks,
   getVersion,
 } from './handlers.js';
-import { getTokenList } from './token-handlers.js';
 
 /*
  * The exact public registry routes. Paths are matched in full rather than by
@@ -20,7 +19,6 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/networks$/,                                   handler: 'networks' },
   { pattern: /^\/registry\/v1\/networks\/([^/]+)\/markets$/,                 handler: 'markets' },
   { pattern: /^\/registry\/v1\/networks\/([^/]+)\/markets\/([^/]+)$/,        handler: 'market' },
-  { pattern: /^\/registry\/v1\/networks\/([^/]+)\/tokens$/,                  handler: 'tokens' },
   { pattern: /^\/registry\/v1\/versions\/([^/]+)$/,                          handler: 'version' },
 ] as const;
 
@@ -46,7 +44,6 @@ async function routePublic(
     case 'markets':  return getMarkets(request, context, first!, maxAge);
     case 'market':   return getMarket(request, context, first!, second!, maxAge);
     case 'version':  return getVersion(request, context, first!, maxAge);
-    case 'tokens':   return getTokenList(request, context, first!);
   }
 }
 

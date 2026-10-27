@@ -212,19 +212,13 @@ async function readTokenPolicy(db: D1Database, chainId: number, tokenAddress: Ad
 }
 
 /*
- * The tokens of a chain an administrator has marked strategic, for the token
- * list. Unlike the reads above, this one does not resolve the active version:
- * the list resolves it through the request's catalog, which already names the
- * version it answers for, and a decision belongs to no version.
+ * The tokens an administrator has marked strategic, every chain's at once, by
+ * chain id, for the summary of every network: one statement, not one a
+ * chain. Unlike the reads above, this one does not resolve the active
+ * version: the summary resolves it through the request's catalog, which
+ * already names the version it answers for, and a decision belongs to no
+ * version.
  */
-async function readStrategicTokens(db: D1Database, chainId: number): Promise<Set<Address>> {
-  const { results } = await db.prepare(
-    `SELECT token_address FROM token_policies WHERE chain_id = ?1 AND is_strategic = 1`
-  ).bind(chainId).all<{ token_address: Address }>();
-  return new Set((results ?? []).map(row => row.token_address));
-}
-
-// the same for every chain at once, by chain id, for the summary of every network: one statement, not one a chain
 async function readStrategicTokensByChain(db: D1Database): Promise<Map<number, Set<Address>>> {
   const { results } = await db.prepare(
     `SELECT chain_id, token_address FROM token_policies WHERE is_strategic = 1`
@@ -418,7 +412,6 @@ export type { DecisionList, ListedDecision, PolicyChange };
 export {
   applyTokenPolicies,
   exportTokenPolicies,
-  readStrategicTokens,
   readStrategicTokensByChain,
   readTokenPolicies,
   readTokenPolicy,

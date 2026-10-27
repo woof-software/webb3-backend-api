@@ -2,38 +2,38 @@ import type * as KnownNetwork from '../../lib/well-known/networks/network.js';
 import { throttleBy } from '../../lib/throttle.js';
 
 import { checksumAddress, normalizeAddress } from '../../lib/model/comet-registry.js';
-import type { Address } from '../../lib/model/comet-registry.js';
+import type { Address, BlockRefV1, CollateralValueStatusV1, PriceExceptionV1 } from '../../lib/model/comet-registry.js';
+import type { ValuedCollateral } from '../../lib/computations/market/market-latest-summary.js';
 
 import type { CacheDeps } from './cache.js';
 import type { Catalog, RegistryComet } from './catalog.js';
 import { nowOf } from './clock.js';
 import { DEPRECATED_RECORD, HIDDEN_RECORD, collateralDecisionsOf, markedDecisions } from './collateral-decisions.js';
 import type { CollateralRead } from './collateral-decisions.js';
-import { collateralView, positionsOf } from './token-collateral.js';
-import type { BlockRef, TokenCollateralDeps } from './token-collateral.js';
 import { readStrategicTokensByChain } from './token-policy-repository.js';
-import { listedTokens, visibilityHere } from './token-visibility.js';
-import type { ListedToken } from './token-visibility.js';
+import { chainTokensOf, decimalString, visibilityHere } from './token-visibility.js';
+import type { ChainToken } from './token-visibility.js';
 import { staleHeaders } from './version-headers.js';
 
 /*
- * What /summary says of each collateral beside what it read of the market:
- * every field the token list gives its token (token-handlers.ts), written flat
- * on the collateral. A field about the token across its chain says `network`
- * in its name, since on a market it would read as the market's own: the value
- * is what every enabled market of the chain holds. `is_visible` is whether
- * discovery shows the token, not whether this market offers it, and is the
- * market's own: the list's rule, with whether this market's Comet hides the
- * token and whether it has it deprecated in place of what the chain decides of
- * either, and the value the list decided by (token-visibility.ts,
- * visibilityHere).
+ * What /summary says of each collateral beside what it read of the market,
+ * written flat on the collateral: what holds of its token on the chain, the
+ * collateral's own value in this market, and whether discovery shows the
+ * token here. A field about the token across its chain says `network` in its
+ * name, since on a market it would read as the market's own; the value is
+ * the collateral's in this market, and says `collateral`. `is_visible` is
+ * whether discovery shows the token, not whether this market offers it, and
+ * is the market's own: the rule asked with whether this market's Comet hides
+ * the token and whether it has it deprecated, the chain's strategic mark, and
+ * that value (token-visibility.ts, visibilityHere).
  *
- * The values are the list's own, from the record of the chain's minute
- * (token-collateral.ts): valued at the latest block the summary read, or found
- * in the isolate or in KV where the list or another summary valued that minute
- * already. They are added once the computations have answered, as the labels
- * of a market are (market.ts, described), so no version or cache key of those
- * changes.
+ * The value is what the summary read of the market, at the market's own block,
+ * and the time it was read at is that block's: both are read with the market
+ * (marketLatestSummary) and cached with its summary of the minute
+ * (marketMinutelySummary), a header the node did not give included. The
+ * decisions are read with every request, and the fields added once the
+ * computations have answered, as the labels of a market are (market.ts,
+ * described), so no cache key holds a decision.
  */
 
 // every chain's strategic tokens, by chain id
@@ -46,23 +46,10 @@ type SummaryDecisions = {
   strategic:  StrategicTokens | null,
 };
 
-/*
- * What the router hands the summary: what values a chain's collateral, as the
- * token list values it but with the summary's own deadline, and the read of
- * the decisions, which a request makes once for all its networks.
- */
+// what the router hands the summary: the read of the decisions, which a request makes once for all its networks
 type SummaryTokens = {
-  collateral: TokenCollateralDeps,
-  decisions:  () => Promise<SummaryDecisions>,
+  decisions: () => Promise<SummaryDecisions>,
 };
-
-/*
- * How long a summary waits for a minute nobody has valued yet, where the token
- * list waits 4 seconds: every market of the summary waits for its chain's
- * collateral. A valuation the summary stops waiting for goes on, and the next
- * request of the minute answers from it.
- */
-const SUMMARY_DEADLINE_MS = 2_000;
 
 /*
  * When this isolate says it could not read a kind of decision, per database
@@ -73,14 +60,13 @@ const SUMMARY_DEADLINE_MS = 2_000;
 const unreadDue = throttleBy<D1Database>(60_000);
 
 /*
- * The decisions, every kind read at once. No read fails the summary, where
- * the token list answers 503 for it: on the legacy router a database fault
- * would be a 500 of every market's summary. A read that failed leaves out the
- * fields it decides on every request, and is logged under the id of the
- * request that found it (unreadDue). The deprecated and the hidden decisions
- * are read as /registry/v1/active reads them, and come from the records the
- * worker keeps while D1 cannot be reached; the strategic ones have no such
- * record.
+ * The decisions, every kind read at once. No read fails the summary: on the
+ * legacy router a database fault would be a 500 of every market's summary. A
+ * read that failed leaves out the fields it decides on every request, and is
+ * logged under the id of the request that found it (unreadDue). The
+ * deprecated and the hidden decisions are read as /registry/v1/active reads
+ * them, and come from the records the worker keeps while D1 cannot be
+ * reached; the strategic ones have no such record.
  */
 async function summaryDecisions(deps: CacheDeps, requestId: string): Promise<SummaryDecisions> {
   const unread = (decisions: string) => (error: unknown) => {
@@ -107,72 +93,94 @@ function summaryHeaders({ deprecated, hidden }: SummaryDecisions): Record<string
   return staleHeaders(deprecated?.recorded || hidden?.recorded ? 0 : null);
 }
 
-// the token list's entry of every token of a chain and its value, by address, and the decisions it was made with
+// every token of a chain, by address, and the decisions it was made with
 type ChainTokens = {
   chainId:   number,
-  tokens:    ReadonlyMap<Address, ListedToken>,
+  tokens:    ReadonlyMap<Address, ChainToken>,
   decisions: SummaryDecisions,
 };
 
 /*
- * The tokens of a chain at the latest block the summary read, listed as the
- * token list lists them. A kind of decision that could not be read is taken
- * as no decision, and what it decides is left out of every collateral
- * (collateralFields).
+ * The tokens of a chain, with what holds of them across it. A kind of
+ * decision that could not be read is taken as no decision, and what it
+ * decides is left out of every collateral (collateralFields).
  */
-async function chainTokens(
-  deps: TokenCollateralDeps,
-  catalog: Catalog,
-  network: KnownNetwork.Name,
-  chainId: number,
-  latest: BlockRef,
-  reading: Promise<SummaryDecisions>,
-): Promise<ChainTokens> {
-  const positions = positionsOf(catalog, network);
-  const [ view, decisions ] = await Promise.all([
-    collateralView(deps, { chainId, network, positions, versionId: catalog.versionId }, latest),
-    reading,
-  ]);
-  const listed = listedTokens({
+function chainTokens(catalog: Catalog, network: KnownNetwork.Name, chainId: number, decisions: SummaryDecisions): ChainTokens {
+  const tokens = chainTokensOf({
     chainId,
     catalog,
     network,
-    positions,
-    view,
     strategic:  decisions.strategic?.get(chainId) ?? new Set(),
     deprecated: decisions.deprecated?.decisions ?? collateralDecisionsOf([]),
     hidden:     decisions.hidden?.decisions ?? collateralDecisionsOf([]),
-    now:        deps.now(),
   });
-  return { chainId, tokens: new Map(listed.map(entry => [ entry.token.address, entry ])), decisions };
+  return { chainId, tokens: new Map(tokens.map(token => [ token.address, token ])), decisions };
+}
+
+// what the summary read of a collateral's value: its value in USD, or null, and the exception that priced it
+type Valued = Pick<ValuedCollateral, 'valueUsd' | 'exception'>;
+
+/*
+ * The price exception that priced a collateral, as the version that answers
+ * describes it, where the summary read names it by what it does and to which
+ * feed: the summary may have been read under another version that describes
+ * it otherwise. Each version it is answered with holds it, since what keys
+ * the summary, the market's digest, takes in every exception of its network
+ * but why it was added and until when it applies (catalog.ts, marketDigest),
+ * and a network has one exception for a feed. Its expiry is an instant, which
+ * a version stored before expiries were normalized may state with an offset;
+ * the catalog has already dropped an expiry it cannot parse, so this one
+ * parses.
+ */
+function exceptionsOf({ exception }: Valued, described: readonly PriceExceptionV1[]) {
+  const applied = exception === null ? [] : described.filter(each => each.kind === exception.kind && each.priceFeedAddress === exception.priceFeedAddress);
+  return applied.map(each => ({
+    kind:               each.kind,
+    price_feed_address: checksumAddress(each.priceFeedAddress),
+    provenance:         each.provenance,
+    // null where the exception does not expire: that is known, not left out
+    expires_at:         each.expiresAt === null ? null : new Date(Date.parse(each.expiresAt)).toISOString(),
+  }));
 }
 
 /*
  * One collateral's token under the summary's names, after what was read of
  * it: its name and decimals; `is_deprecated` and `is_hidden`, the decisions of
- * this market's Comet, as /registry/v1/active marks its collateral; and the
- * rest as the list says it of the whole chain, but for whether discovery
- * shows the token (visibilityHere). A field whose decision could not be read
- * is left out, and so is a value that is not known: never null, as the
- * summary leaves out whatever it cannot give.
+ * this market's Comet, as /registry/v1/active marks its collateral; what holds
+ * of the token across the chain; the collateral's value in this market; and
+ * whether discovery shows it here (visibilityHere). A field whose decision
+ * could not be read is left out, and so is a value that is not known: never
+ * null, as the summary leaves out whatever it cannot give. A value is read
+ * with the market, at its block, and never carried over from an earlier
+ * minute, so it is never stale; where the node did not give that block's
+ * header, the block, the time and the age are left out, and the value stays.
  *
  * Whether discovery shows the token is said wherever the decisions read settle
  * it, whichever way those that could not be read went, and why only where they
  * settle that as well (visibilityHere): one this Comet hides or has
  * deprecated, or one that is not strategic and is worth less than the
- * threshold, is said not to be shown here even when this Comet's other
+ * threshold here, is said not to be shown here even when this Comet's other
  * decisions about it could not be read, since a client that is told nothing
  * shows the token; and one this Comet neither hides nor deprecates, worth the
- * threshold or of a value that cannot be read, is said to be shown even when
- * the strategic marks could not be.
+ * threshold here or of a value that cannot be read, is said to be shown even
+ * when the strategic marks could not be.
  */
-function collateralFields({ token, valueUsd }: ListedToken, { chainId, decisions }: ChainTokens, comet: Address) {
+function collateralFields(
+  token: ChainToken,
+  { chainId, decisions }: ChainTokens,
+  comet: Address,
+  valued: Valued,
+  block: BlockRefV1 | null,
+  described: readonly PriceExceptionV1[],
+) {
   const { deprecated, hidden, strategic } = decisions;
+  const { valueUsd, exception } = valued;
   const collateral   = { chainId, cometAddress: comet, tokenAddress: token.address };
   const isHidden     = hidden === null ? null : hidden.decisions.has(collateral);
   const isDeprecated = deprecated === null ? null : deprecated.decisions.has(collateral);
   const isStrategic  = strategic === null ? null : token.isStrategic;
   const visibility   = visibilityHere({ isHidden, isDeprecated, isStrategic }, { valueUsd });
+  const status: CollateralValueStatusV1 = valueUsd === null ? 'unavailable' : exception === null ? 'fresh' : 'exception';
   return {
     name:     token.name,
     decimals: token.decimals,
@@ -187,44 +195,52 @@ function collateralFields({ token, valueUsd }: ListedToken, { chainId, decisions
     }),
     ...(isStrategic === null ? {} : { is_strategic: isStrategic }),
     network_roles: token.roles,
-    ...(token.collateralValueUsd === null ? {} : { total_network_collateral_value_usd: token.collateralValueUsd }),
-    total_network_collateral_value_status: token.collateralValueStatus,
-    ...(token.valueAt         === null ? {} : { network_value_at: token.valueAt }),
-    ...(token.valueBlock      === null ? {} : { network_value_block: token.valueBlock }),
-    ...(token.staleAgeSeconds === null ? {} : { network_value_stale_age_seconds: token.staleAgeSeconds }),
-    network_value_exceptions: token.exceptions.map(exception => ({
-      kind:               exception.kind,
-      price_feed_address: checksumAddress(exception.priceFeedAddress),
-      provenance:         exception.provenance,
-      // null where the exception does not expire: that is known, not left out
-      expires_at:         exception.expiresAt,
-    })),
+    ...(valueUsd === null ? {} : { collateral_value_usd: decimalString(valueUsd) }),
+    collateral_value_status: status,
+    ...(valueUsd === null || block === null ? {} : {
+      collateral_value_at:                new Date(block.timestamp * 1000).toISOString(),
+      collateral_value_block:             { number: block.number, timestamp: block.timestamp },
+      collateral_value_stale_age_seconds: 0,
+    }),
+    collateral_value_exceptions: exceptionsOf(valued, described),
     ...(visibility.isVisible        === undefined ? {} : { is_visible: visibility.isVisible }),
     ...(visibility.visibilityReason === undefined ? {} : { visibility_reason: visibility.visibilityReason }),
   };
 }
 
-// a collateral as the summary read it: its token's address, checksummed, its symbol, and its status
-type SummaryCollateral = { address: string, symbol: string, status: string, message?: string };
+/*
+ * A collateral as the summary read it: its token's address, checksummed, its
+ * symbol and its status, and its value with the exception that priced it,
+ * which the summary answers in fields of its own (collateralFields).
+ */
+type SummaryCollateral = { address: string, symbol: string, status: string, message?: string } & Valued;
 
 /*
- * A market of the summary with each collateral's token fields. A market the
- * chain has not reached has no collaterals (market.ts, unreachedMarket), and
- * is answered as it was.
+ * A market of the summary with each collateral's token fields, and without
+ * what they were made of: each collateral's value as it was read, and the
+ * block the market was read at, which no answer carries as they are. A
+ * market the chain has not reached has no collaterals, nor a block
+ * (market.ts, unreachedMarket), and is answered as it was.
  */
-function withTokenFields<Entry extends { collaterals?: SummaryCollateral[] }>(entry: Entry, contract: RegistryComet, chain: ChainTokens): Entry {
+function withTokenFields<Entry extends { collaterals?: SummaryCollateral[], market_block?: BlockRefV1 | null }>(
+  { market_block: block = null, ...entry }: Entry,
+  contract: RegistryComet,
+  chain: ChainTokens,
+) {
   if (entry.collaterals === undefined) {
     return entry;
   }
   const comet = normalizeAddress(contract.address);
   return {
     ...entry,
-    collaterals: entry.collaterals.map(collateral => {
-      const listed = chain.tokens.get(normalizeAddress(collateral.address));
-      return listed === undefined ? collateral : { ...collateral, ...collateralFields(listed, chain, comet) };
+    collaterals: entry.collaterals.map(({ valueUsd, exception, ...collateral }) => {
+      const token = chain.tokens.get(normalizeAddress(collateral.address));
+      return token === undefined
+        ? collateral
+        : { ...collateral, ...collateralFields(token, chain, comet, { valueUsd, exception }, block, contract.registry.priceExceptions) };
     }),
   };
 }
 
 export type { ChainTokens, StrategicTokens, SummaryDecisions, SummaryTokens };
-export { SUMMARY_DEADLINE_MS, chainTokens, summaryDecisions, summaryHeaders, withTokenFields };
+export { chainTokens, summaryDecisions, summaryHeaders, withTokenFields };

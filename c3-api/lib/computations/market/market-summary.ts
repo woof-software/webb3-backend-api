@@ -163,6 +163,7 @@ const marketSummary = implement({
         if (baseUsdPrice.status === 'error') {
           return { ...identity, status: 'error', message: baseUsdPrice.message };
         }
+        // a price's replacementRevert is the latest summary's to report, not a day's (market-latest-summary.ts)
         const statuses = collaterals.map(collateralStatusOf);
         /*
          * The totals are in the unit the market's own feeds answer in: USD,
@@ -171,7 +172,8 @@ const marketSummary = implement({
          * what a client that converts them itself expects. Beside each is the
          * same total in USD: as it is for a market quoted in USD, and through
          * the base asset's USD price for one quoted in its base asset, as the
-         * token list converts a collateral's value.
+         * latest summary converts the value of each collateral
+         * (market-latest-summary.ts).
          */
         const quoted = {
           borrow:     totalBorrow.mul(basePrice.price),

@@ -5,7 +5,6 @@ import { MarketDaySummary     } from './market/market-day-summary.js';
 import { Collaterals          } from './market/collaterals.js';
 import { MarketLatestSummary  } from './market/market-latest-summary.js';
 import { MarketMinutelySummary } from './market/market-minutely-summary.js';
-import { AssetCollateralValue } from './market/asset-collateral-value.js';
 
 import { HistoricalMarketDaySummaries }
   from './market/historical-market-day-summaries.js';
@@ -19,7 +18,6 @@ export type Market = (
   | MarketLatestSummary
   | HistoricalMarketDaySummaries
   | MarketMinutelySummary
-  | AssetCollateralValue
 );
 
 export { BorrowApr, borrowApr         } from './market/borrow-apr.js';
@@ -49,11 +47,3 @@ export {
   MarketMinutelySummary,
   marketMinutelySummary,
 } from './market/market-minutely-summary.js';
-/*
- * Only the computation: the entrypoint spreads this module into the map of
- * computations, so a helper exported here would be registered as one.
- */
-export {
-  AssetCollateralValue,
-  assetCollateralValue,
-} from './market/asset-collateral-value.js';

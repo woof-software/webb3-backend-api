@@ -1,5 +1,3 @@
-import { ROUTE_EVALUATOR_FLAGS } from '../../lib/flags.js';
-
 import { corsHeaders } from '../http/cors.js';
 import { ApiError, ApiErrorCode, failureResponse } from '../http/errors.js';
 import { knownFailure } from '../http/failures.js';
@@ -13,9 +11,6 @@ import { readMarks, recordCollaterals } from './collateral-decisions.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
-import { catalogHeadersOf, requestCatalog } from './request-catalog.js';
-import type * as TokenCollateral from './token-collateral.js';
-import { DEADLINE_MS, maxStaleMinutesOf } from './token-collateral.js';
 import { registryHeaders } from './version-headers.js';
 
 /*
@@ -155,39 +150,10 @@ function withHeaders(response: Response, headers: Record<string, string>): Respo
   return response;
 }
 
-/*
- * What the token list values collateral with: the node, an evaluator that
- * reads every position of a chain in one batch, as the market summaries read
- * theirs, KV and the clock. Both routers make it here, so the list and
- * /summary value a chain alike and share its records; each says how long it
- * waits for a minute.
- */
-function tokenCollateralDeps(
-  { env, debug, flags, waitUntil }: Evaluator.Context,
-  instantiateEvaluator: Evaluator.InstantiateFn<TokenCollateral.Dependencies>,
-  deadlineMs: number,
-): TokenCollateral.TokenCollateralDeps {
-  return {
-    frame:           { apiHost: env.V3_API_HOST, nodeHost: env.NODE_PROXY_HOST, nodeKey: env.NODE_PROXY_KEY },
-    evaluator:       networkEnv => instantiateEvaluator(networkEnv, {
-      flags: { ...flags, ...ROUTE_EVALUATOR_FLAGS },
-    }),
-    kv:              networkEnv => env[`kv_${networkEnv}`],
-    maxStaleMinutes: maxStaleMinutesOf(env),
-    now:             () => new Date(),
-    debug,
-    // keeps the valuation alive past the answer of the request that started it
-    waitUntil,
-    deadlineMs,
-  };
-}
-
 async function routeRegistry(
   request: Request,
   // the request's context, with the id the entrypoint gave it, which its error answer and its log lines carry
-  { env, debug, flags, waitUntil, requestId }: Evaluator.Context & { requestId: string },
-  // the evaluators the token list values collateral with
-  instantiateEvaluator: Evaluator.InstantiateFn<TokenCollateral.Dependencies>,
+  { env, debug, waitUntil, requestId }: Evaluator.Context & { requestId: string },
 ): Promise<Response> {
   const pathname = withoutTrailingSlash(new URL(request.url).pathname);
   const route    = isAdminPath(pathname) ? 'admin' : 'public';
@@ -200,13 +166,6 @@ async function routeRegistry(
   const cors = corsHeaders(route);
 
   const deps = { ...cacheDepsOf(env, debug), defer: waitUntil };
-  /*
-   * The registry version of this request. It is loaded at most once, by the
-   * first handler that needs it — the token list resolves every market and
-   * token of its chain from it — and every answer given after it was loaded
-   * says which version that was.
-   */
-  const registry = requestCatalog(deps);
   // the active version a handler has read: a public answer that fails after that names it
   let served: CachedSnapshot | null = null;
   const context: RegistryContext = {
@@ -230,21 +189,18 @@ async function routeRegistry(
     },
     marks:   () => readMarks(deps),
     record:  kind => recordCollaterals(kind, deps),
-    catalog: registry,
-    tokens:  tokenCollateralDeps({ env, debug, flags, waitUntil }, instantiateEvaluator, DEADLINE_MS),
   };
 
-  let response: Response;
   try {
-    const answered = route === 'admin'
+    const response = route === 'admin'
       ? await routeAdmin(request, env, context, pathname)
       : await routePublic(request, context, pathname, { maxAge: deps.ttlSeconds });
-    if (answered === null) {
+    if (response === null) {
       throw new ApiError('NOT_FOUND', `no registry route matches ${pathname}`);
     }
-    response = withHeaders(answered, cors);
+    return withHeaders(response, cors);
   } catch (error) {
-    response = failureResponse(asApiError(error), error, {
+    return failureResponse(asApiError(error), error, {
       requestId,
       pathname,
       debug,
@@ -252,7 +208,6 @@ async function routeRegistry(
       headers: { ...cors, ...(route === 'public' && served !== null ? servedHeaders(served) : {}) },
     });
   }
-  return withHeaders(response, catalogHeadersOf(registry));
 }
 
-export { ERROR_STATUS, asApiError, isRegistryPath, routeRegistry, tokenCollateralDeps };
+export { ERROR_STATUS, asApiError, isRegistryPath, routeRegistry };
