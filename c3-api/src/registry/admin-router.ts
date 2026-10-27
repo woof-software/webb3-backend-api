@@ -45,6 +45,14 @@ import {
 } from './handlers.js';
 import { isExplicit } from './importer.js';
 import type { InvocationResult } from './importer.js';
+import {
+  getInactiveMarket,
+  getInactiveMarketExport,
+  patchInactiveMarket,
+  postInactiveMarketApply,
+  postInactiveMarketReview,
+} from './inactive-market-handlers.js';
+import type { ListedMarketDecision } from './inactive-market-repository.js';
 import type { SyncOutcome } from './rows.js';
 import { runRegistrySync, transportFor } from './scheduled.js';
 import {
@@ -150,6 +158,11 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/token-policies\/apply$/,                                method: 'POST', handler: 'applyTokenPolicies',  family: 'policy' },
   ...collateralRoutes(DEPRECATED_COLLATERAL_KIND, DEPRECATED_RECORD),
   ...collateralRoutes(HIDDEN_COLLATERAL_KIND, HIDDEN_RECORD),
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/inactive$/,         method: 'GET',   handler: 'inactiveMarket',        family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/markets\/([^/]+)\/inactive$/,         method: 'PATCH', handler: 'setInactiveMarket',     family: 'policy' },
+  { pattern: /^\/registry\/v1\/admin\/inactive-markets$/,                                      method: 'GET',   handler: 'exportInactiveMarkets', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/inactive-markets\/review$/,                              method: 'POST',  handler: 'reviewInactiveMarkets', family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/inactive-markets\/apply$/,                               method: 'POST',  handler: 'applyInactiveMarkets',  family: 'policy' },
 ] as const;
 
 const MAX_REASON = 1000;
@@ -180,21 +193,23 @@ const MAX_OVERLAYS_BODY_BYTES  = 512 * 1024;
 
 /*
  * A list of decisions in one request, of token policies, of deprecated
- * collaterals or of hidden ones: every token, or every collateral, of every
- * network of a registry fits, with a reason on each row. The list is written
- * as a handful of statements whatever its length, so the bound is the body,
- * not D1.
+ * collaterals or of hidden ones, or of inactive markets: every token, every
+ * collateral or every market of every network of a registry fits, with a
+ * reason on each row. The list is written as a handful of statements whatever
+ * its length, so the bound is the body, not D1.
  */
 const MAX_DECISIONS_PER_REQUEST = 500;
 const MAX_DECISIONS_BODY_BYTES  = 1024 * 1024;
 
 // the bodies larger than an ordinary command, by the handler of the route that takes them
 const BODY_BYTES: Partial<Record<typeof ROUTES[number]['handler'], number>> = {
-  overlays:            MAX_OVERLAYS_BODY_BYTES,
-  reviewTokenPolicies: MAX_DECISIONS_BODY_BYTES,
-  applyTokenPolicies:  MAX_DECISIONS_BODY_BYTES,
-  reviewCollaterals:   MAX_DECISIONS_BODY_BYTES,
-  applyCollaterals:    MAX_DECISIONS_BODY_BYTES,
+  overlays:              MAX_OVERLAYS_BODY_BYTES,
+  reviewTokenPolicies:   MAX_DECISIONS_BODY_BYTES,
+  applyTokenPolicies:    MAX_DECISIONS_BODY_BYTES,
+  reviewCollaterals:     MAX_DECISIONS_BODY_BYTES,
+  applyCollaterals:      MAX_DECISIONS_BODY_BYTES,
+  reviewInactiveMarkets: MAX_DECISIONS_BODY_BYTES,
+  applyInactiveMarkets:  MAX_DECISIONS_BODY_BYTES,
 };
 
 /*
@@ -620,12 +635,34 @@ function collateralListSpec<Flag extends string, Column extends string, Rows ext
 }
 
 /*
+ * A list of inactive markets, its rows under a member of its own, so that no
+ * other kind's review takes its export, and with no token: a row that names
+ * one is refused. `retained` names the decisions the active version does not
+ * hold, and is not read.
+ */
+const INACTIVE_MARKET_LIST: DecisionListSpec<ListedMarketDecision> = {
+  bodyKeys:    [ 'registryVersion', 'reason', 'inactiveMarkets', 'retained' ],
+  listKey:     'inactiveMarkets',
+  what:        'inactive markets',
+  fields:      [ [ 'chainId', 'chainId' ], [ 'cometAddress', 'address' ], [ 'deploymentKey', 'name' ], [ 'isInactive', 'flag' ] ],
+  decisionOf:  (value, reason) => ({
+    chainId:       value.chainId as number,
+    cometAddress:  normalizeAddress(value.cometAddress as string),
+    deploymentKey: (value.deploymentKey as string | null | undefined) ?? null,
+    isInactive:    value.isInactive as boolean,
+    reason,
+  }),
+  addressesOf: decision => [ decision.cometAddress ],
+};
+
+/*
  * The body of a list's review and apply (`POST /token-policies/review` and
  * `/apply`, `POST /deprecated-collaterals/review` and `/apply`, `POST
- * /hidden-collaterals/review` and `/apply`): a list as the export answers it,
- * edited. `registryVersion` says where it was exported from and is not
- * checked, since a decision belongs to no version. Every problem of every row
- * is reported at once, so a file is fixed in one pass.
+ * /hidden-collaterals/review` and `/apply`, `POST /inactive-markets/review`
+ * and `/apply`): a list as the export answers it, edited. `registryVersion`
+ * says where it was exported from and is not checked, since a decision
+ * belongs to no version. Every problem of every row is reported at once, so a
+ * file is fixed in one pass.
  */
 function decisionListOf<Listed extends { chainId: number }>(
   body: Record<string, unknown>,
@@ -834,6 +871,30 @@ async function routeAdmin(
       return await route.collateral.review(context, body);
     case 'applyCollaterals':
       return await route.collateral.apply(context, body);
+    case 'inactiveMarket':
+      // a chain id and the Comet, as on the collateral routes
+      return await getInactiveMarket(context, versionId!, second!);
+    case 'setInactiveMarket': {
+      /*
+       * Marking a market inactive changes what the app offers in it, so it
+       * carries a reason like every other decision, and the audit event
+       * stores it beside the actor.
+       */
+      requireExactKeys(body, [ 'isInactive', 'reason' ]);
+      if (typeof(body.isInactive) !== 'boolean') {
+        throw new ApiError('BAD_REQUEST', `isInactive must be a boolean`);
+      }
+      return await patchInactiveMarket(context, versionId!, second!, {
+        isInactive: body.isInactive,
+        reason:     requireReason(body),
+      });
+    }
+    case 'exportInactiveMarkets':
+      return await getInactiveMarketExport(context);
+    case 'reviewInactiveMarkets':
+      return await postInactiveMarketReview(context, decisionListOf(body, INACTIVE_MARKET_LIST));
+    case 'applyInactiveMarkets':
+      return await postInactiveMarketApply(context, decisionListOf(body, INACTIVE_MARKET_LIST));
   }
 }
 

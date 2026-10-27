@@ -87,13 +87,13 @@ t.test('a database that answers with a fault is a 500 that says nothing but the 
 
 /*
  * A missing table is such a fault too. Only the token policy, deprecated
- * collateral and hidden collateral tables are answered otherwise, by the
- * routes that read them, with a 503 that names the remedy
+ * collateral, hidden collateral and inactive market tables are answered
+ * otherwise, by the routes that read them, with a 503 that names the remedy
  * (token-policy-routes, deprecated-collateral-routes,
- * hidden-collateral-routes); a registry table missing is a 500 on the active
- * reads as everywhere else.
+ * hidden-collateral-routes, inactive-market-routes); a registry table missing
+ * is a 500 on the active reads as everywhere else.
  */
-t.test('a missing table is a 500, unless it is a token policy, deprecated collateral or hidden collateral table', async t => {
+t.test('a missing table is a 500, unless it is a token policy, deprecated collateral, hidden collateral or inactive market table', async t => {
   const logs = captureLogs(t);
   const env  = await envWith({ APP_DB: failingDatabase('D1_ERROR: no such table: registry_state: SQLITE_ERROR') });
 

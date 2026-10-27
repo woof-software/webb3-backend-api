@@ -6,7 +6,7 @@ import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { ADMIN_TOKEN, adminTestEnv } from '../../util/test-env.js';
 
 import type { DecisionKindUnderTest } from './decision-scenarios.js';
-import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, TOKEN_POLICIES } from './decision-scenarios.js';
+import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, INACTIVE_MARKETS, TOKEN_POLICIES } from './decision-scenarios.js';
 
 import '../../../shim/node-self.js';
 
@@ -14,6 +14,8 @@ import '../../../shim/node-self.js';
  * The read of one decision of each kind, through the worker's own entry point
  * in Node, where a test holds the database binding the worker reads through:
  * the other answers of its route are decision-scenarios.ts's, in workerd.
+ * Beside it, which budget of the limiter each route of a kind spends, which
+ * the limiter of a test in Node is asked for by name.
  *
  * A read hands the kind's states statement its subject in the form a write
  * hands it a decision, as the decision not taken and without a reason
@@ -28,12 +30,20 @@ let seed = 0;
 
 type Refused = { error: { code: string, message: string, details?: { registryVersion?: { id: string } } } };
 
-function envOf(db: D1Database): Promise<Env> {
-  return adminTestEnv({ APP_DB: db, MEMORY_CACHE_SEED: `decision-read-${seed++}` });
+function envOf(db: D1Database, overrides: Partial<Env> = {}): Promise<Env> {
+  return adminTestEnv({ APP_DB: db, MEMORY_CACHE_SEED: `decision-read-${seed++}`, ...overrides });
 }
 
 function read(path: string): Request {
   return new Request(`https://api.test.local${path}`, { headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}` } });
+}
+
+function command(method: string, path: string, body: unknown): Request {
+  return new Request(`https://api.test.local${path}`, {
+    method,
+    headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
+    body:    JSON.stringify(body),
+  });
 }
 
 // `db`, and what every statement prepared through it was bound to
@@ -67,10 +77,14 @@ const MEMBERS: Record<string, string> = { cometAddress: 'm', tokenAddress: 't' }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+// a kind's label with its article, as a title names one decision of it: a token policy, an inactive market
+const withArticle = (label: string) => `${/^[aeiou]/.test(label) ? 'an' : 'a'} ${label}`;
+
 type Refusal = [ number, Record<string, string>, string ];
 
 const [ [ , NOT_A_TOKEN ] ] = TOKEN_POLICIES.unheld;
 const [ [ , NOT_A_MARKET ], [ , NOT_TAKEN ], [ , A_BASE ] ] = DEPRECATED_COLLATERALS.unheld;
+const [ [ , NO_SUCH_COMET ], , [ , ELSEWHERE ] ] = INACTIVE_MARKETS.unheld;
 
 const COLLATERAL_REFUSALS: Refusal[] = [
   [ 10, DEPRECATED_COLLATERALS.subject, 'chain 10 is not part of the active registry' ],
@@ -87,6 +101,12 @@ const KINDS: Array<[ DecisionKindUnderTest, Refusal[] ]> = [
   ] ],
   [ DEPRECATED_COLLATERALS, COLLATERAL_REFUSALS ],
   [ HIDDEN_COLLATERALS, COLLATERAL_REFUSALS ],
+  [ INACTIVE_MARKETS, [
+    [ 10, INACTIVE_MARKETS.subject, 'chain 10 is not part of the active registry' ],
+    [ 1, NO_SUCH_COMET, `${NO_SUCH_COMET.cometAddress} is not a market of the active registry on chain 1` ],
+    // the Comet of a market the version holds on another chain alone
+    [ 1, ELSEWHERE, `${ELSEWHERE.cometAddress} is not a market of the active registry on chain 1` ],
+  ] ],
 ];
 
 for (const [ kind, refusals ] of KINDS) {
@@ -106,7 +126,7 @@ for (const [ kind, refusals ] of KINDS) {
       'and whose one decision is the subject, as the decision not taken, without a reason');
   });
 
-  t.test(`a read of a ${kind.label} decision about a ${kind.noun} nobody decided about, which the active version does not hold, is refused with why`, async t => {
+  t.test(`a read of ${withArticle(kind.label)} decision about a ${kind.noun} nobody decided about, which the active version does not hold, is refused with why`, async t => {
     const registry = await activeRegistryDatabase();
     t.teardown(() => registry.dispose());
     const env = await envOf(registry.db);
@@ -122,3 +142,39 @@ for (const [ kind, refusals ] of KINDS) {
     }
   });
 }
+
+/*
+ * Which budget each route of a kind spends (admin-router.ts, limit): a read,
+ * the export and a review the read family's, and a change and an apply the
+ * policy family's, which every decision command shares. The limiter of a
+ * test in Node lets everything through, and the one in workerd is tested on
+ * other routes (security.test.ts), so the families are held here by the key
+ * the limiter is asked for, `registry-admin:<fingerprint>:<family>`. A
+ * request spends before its body is read, so a body refused for its shape
+ * has spent all the same, and these write nothing.
+ */
+t.test('each route of a kind spends its family\'s budget: a change and an apply the policy family\'s, the rest the read family\'s', async t => {
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+  const keys: string[] = [];
+  const env = await envOf(registry.db, {
+    REGISTRY_ADMIN_RATE_LIMITER: { limit: async ({ key }) => { keys.push(key); return { success: true }; } },
+  });
+
+  for (const [ kind ] of KINDS) {
+    keys.length = 0;
+    const answers = [];
+    for (const request of [
+      read(kind.path(1, kind.subject)),
+      command('PATCH', kind.path(1, kind.subject), {}),
+      read(kind.list.export),
+      command('POST', kind.list.review, {}),
+      command('POST', kind.list.apply, {}),
+    ]) {
+      answers.push((await C3Api.fetch(request, env)).status);
+    }
+    t.same(answers, [ 200, 400, 200, 400, 400 ], `${kind.label}: each request reaches its route`);
+    t.same(keys.map(key => key.slice(key.lastIndexOf(':') + 1)), [ 'read', 'policy', 'read', 'read', 'policy' ],
+      `${kind.label}: a decision's read, its change, the export, a review and an apply spend, in turn, the families read, policy, read, read and policy`);
+  }
+});

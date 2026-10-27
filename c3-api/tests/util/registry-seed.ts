@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 
-import type { DeprecatedCollateralListV1, RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
+import type { DeprecatedCollateralListV1, InactiveMarketListV1, RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
 import { marketKey } from '../../lib/model/comet-registry.js';
 
 /*
@@ -49,6 +49,21 @@ function readSeedDeprecated(): DeprecatedCollateralListV1 {
 }
 
 /*
+ * The markets the app listed apart by its own list of chains, which an
+ * environment marks inactive once its first version is on: the body of
+ * `POST …/inactive-markets/review` and `/apply`, as the file holds it.
+ */
+const INACTIVE_PATH = './registry/seed/production.inactive-markets.json';
+
+function readSeedInactiveText(): string {
+  return readFileSync(INACTIVE_PATH, 'utf8');
+}
+
+function readSeedInactive(): InactiveMarketListV1 {
+  return JSON.parse(readSeedInactiveText()) as InactiveMarketListV1;
+}
+
+/*
  * The body cut down to the networks and markets a snapshot holds, in the
  * file's order, and its expectations with them: a key in expectedDigests
  * without its document is refused with 400.
@@ -68,4 +83,13 @@ function bodyFor(snapshot: Pick<RegistrySnapshotV1, 'networks'>, seed: SeedBody 
 }
 
 export type { SeedBody };
-export { bodyFor, readSeed, readSeedComets, readSeedDeprecated, readSeedDeprecatedText, readSeedText };
+export {
+  bodyFor,
+  readSeed,
+  readSeedComets,
+  readSeedDeprecated,
+  readSeedDeprecatedText,
+  readSeedInactive,
+  readSeedInactiveText,
+  readSeedText,
+};

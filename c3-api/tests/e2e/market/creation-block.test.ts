@@ -4,14 +4,17 @@ import C3Api, { Env } from '../../../entrypoint.js';
 
 import type { NetworkV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
+import { setInactiveMarket } from '../../../src/registry/inactive-market-repository.js';
 import { failures, validateCandidate } from '../../../src/registry/validation.js';
 
 import { consoleLines } from '../../util/console.js';
 import { asked, fakeNode, serve } from '../../util/fake-node.js';
-import { makeTestEnv } from '../../util/test-env.js';
+import { failingStatements, makeTestEnv } from '../../util/test-env.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 import { onSummary } from '../../util/summary-registry-fields.js';
+
+import { INACTIVE_MARKETS, statementsOf } from '../registry/decision-scenarios.js';
 
 import '../../../shim/node-self.js';
 
@@ -96,6 +99,7 @@ const UNREACHED_ON_SUMMARY = {
   is_wrapped_native: false,
   is_default:        false,
   is_institutional:  false,
+  is_inactive:       false,
   status:            'error',
   message:           MESSAGE,
 };
@@ -230,6 +234,29 @@ t.test('a read of another market that reverts still fails the summary with 500',
   const response = await get('/market/all-networks/all-contracts/summary');
   t.equal(response.status, 500);
   t.equal((await response.json() as Envelope).error.code, 'INTERNAL', 'as the fault a revert of a read that is not a price is');
+});
+
+/*
+ * Whether an administrator has marked a market inactive is answered on a
+ * market the chain has not reached as on every market, nothing of the chain
+ * being read for it: USDT's, marked inactive, says so in its error, and is
+ * not inactive where the decisions could not be read.
+ */
+t.test('a market created past the latest block says whether it is inactive, as every market does', async t => {
+  const snapshot = unreachedSnapshot();
+  const registry = await activeRegistryDatabase({ snapshot });
+  t.teardown(() => registry.dispose());
+  serve(t, fakeNode(snapshot, LATEST));
+  consoleLines(t, [ 'warn', 'error' ]);
+  await setInactiveMarket(registry.db, { chainId: 1, cometAddress: USDT, isInactive: true, actor: 'test', reason: 'decided for a creation block test' });
+  const summaryOf = async (db: D1Database) => await (await C3Api.fetch(
+    new Request(`https://api.test.local/market/${MAINNET}/${USDT}/summary`),
+    makeTestEnv({ APP_DB: db, MEMORY_CACHE_SEED: `creation-block: ${t.fullname}` }),
+  )).json() as Entry[];
+
+  t.strictSame(await summaryOf(registry.db), [ { ...UNREACHED_ON_SUMMARY, is_inactive: true } ], 'that market, marked inactive, says so in its error');
+  t.strictSame(await summaryOf(failingStatements(registry.db, statementsOf(INACTIVE_MARKETS))), [ UNREACHED_ON_SUMMARY ],
+    'and where the decisions could not be read, with nothing recorded, it is not inactive');
 });
 
 /*

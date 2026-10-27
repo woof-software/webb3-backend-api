@@ -294,6 +294,7 @@ function collateralKind<Flag extends string, Column extends string, Rows extends
     leftAbort:   'collateral is not in the active registry',
     missingFrom,
     misnamed,
+    addressOf:   collateral => collateral.tokenAddress,
     named:       (state, collateral) => `${state.symbol ?? collateral.tokenAddress} of ${state.deployment_key ?? collateral.cometAddress}`,
   };
 }

@@ -487,8 +487,9 @@ async function unsafeRoute(
 
 /*
  * Where the summary reads the decisions: from D1, and the deprecated and the
- * hidden ones from the records the worker keeps of them while D1 cannot be
- * reached, as the active reads do. Nothing is read until the summary asks.
+ * hidden ones, and the inactive markets, from the records the worker keeps of
+ * them while D1 cannot be reached, as the active reads do the first two.
+ * Nothing is read until the summary asks.
  */
 function summaryTokensOf(context: Omit<Context, 'evaluator'>): SummaryTokens {
   return {

@@ -8,9 +8,10 @@ import { registryHeaders } from './version-headers.js';
 /*
  * The decisions an administrator makes about what the registry serves, with
  * the audit of every change to each: token policies
- * (token-policy-repository.ts), and the deprecated and the hidden collaterals
- * of Comets (collateral-decision-repository.ts, which describes both kinds).
- * All are written, read, reviewed and applied here, the same way: each kind
+ * (token-policy-repository.ts), the deprecated and the hidden collaterals of
+ * Comets (collateral-decision-repository.ts, which describes both kinds), and
+ * the markets marked inactive (inactive-market-repository.ts). All are
+ * written, read, reviewed and applied here, the same way: each kind
  * describes itself to the store (DecisionKind), and its module answers in the
  * types lib/model/comet-registry.ts gives it.
  *
@@ -31,17 +32,14 @@ type StateRow = {
   version_id: string | null,
   checksum:   string | null,
   network_id: string | null,
-  token_id:   string | null,
-  symbol:     string | null,
   updated_at: string | null,
   updated_by: string | null,
   written_id: string | null,
 };
 
-// what every kind's decision is about: a token, of a chain or of a Comet
+// what every kind's decision is about: a token of a chain, a collateral of a Comet, or a market
 type SubjectBase = {
-  // lowercase, as the registry stores every address
-  tokenAddress: Address,
+  chainId: number,
 };
 
 // what every kind's decision says beside what it is about
@@ -54,10 +52,11 @@ type DecisionBase = {
  * A kind of decision, as the store writes, reads, reviews and applies it:
  * `Subject` is what a decision is about, and all a read asks for, `Decision`
  * what one write records, `Listed` a row of a list. Its statements name its
- * own tables and no other kind's. Token policies keep theirs as they are
- * written; the two kinds about a collateral of a Comet build theirs from one
- * template over their tables' names (collateral-decision-repository.ts), since
- * those tables differ in nothing else.
+ * own tables and no other kind's. Token policies and inactive markets keep
+ * theirs as they are written; the two kinds about a collateral of a Comet
+ * build theirs from one template over their tables' names
+ * (collateral-decision-repository.ts), since those tables differ in nothing
+ * else.
  *
  * The store's functions take their types from the kind alone. The subjects
  * and decisions handed to them are NoInfer, so a literal is checked against
@@ -85,7 +84,8 @@ type DecisionKind<Subject extends SubjectBase, Decision extends Subject & Decisi
   missingFrom: (state: State, subject: Subject) => string | null,
   // what a row names that the active version names otherwise, or null
   misnamed:    (decision: Listed, state: State) => string | null,
-  // what a row is about, as a problem names it
+  // what a row is about, as a problem names it: its address, the token's or the Comet's, and its name
+  addressOf:   (subject: Subject) => Address,
   named:       (state: State, subject: Subject) => string,
 };
 
@@ -309,7 +309,7 @@ async function planDecisions<Subject extends SubjectBase, Decision extends Subje
     const problem = kind.missingFrom(state, decision)
       ?? kind.misnamed(decision, state)
       ?? (action === 'change' && decision.reason === null
-        ? `${decision.tokenAddress} (${kind.named(state, decision)}) changes, and needs a reason: its own or the list's`
+        ? `${kind.addressOf(decision)} (${kind.named(state, decision)}) changes, and needs a reason: its own or the list's`
         : null);
     return { row: index + 1, decision, state, current, action, problem };
   });

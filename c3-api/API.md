@@ -164,10 +164,12 @@ as usual. The message names the block:
 `/summary` answers it with what the registry version says of the market as
 well, as it answers every market, since none of that is read: the rewards
 contract and the bulker in `comet`, and the market's keys and labels after
-it ([Market registry fields](#market-registry-fields)):
+it ([Market registry fields](#market-registry-fields)); and whether an
+administrator has marked it inactive, which is read with every request from
+the decisions, not from the chain ([Inactive markets](#inactive-markets)):
 
 ```json
-{ "chain_id": 1, "comet": { "address": "0x3Afd…0840", "rewards": "0x1B0e…5a40", "bulker": "0xa397…00c7" }, "deployment_key": "usdt", "display_name": "USDT", "base_asset_name": "Tether", "is_wrapped_native": false, "is_default": false, "is_institutional": false, "status": "error", "message": "creationBlock 33400000 is past the latest block, 23400000" }
+{ "chain_id": 1, "comet": { "address": "0x3Afd…0840", "rewards": "0x1B0e…5a40", "bulker": "0xa397…00c7" }, "deployment_key": "usdt", "display_name": "USDT", "base_asset_name": "Tether", "is_wrapped_native": false, "is_default": false, "is_institutional": false, "is_inactive": false, "status": "error", "message": "creationBlock 33400000 is past the latest block, 23400000" }
 ```
 
 Writing an overlay refuses such a block, but a version can hold one that
@@ -213,7 +215,8 @@ therefore appear under two names across the API, so match a market by
 registry version says of it, as `/registry/v1/active` serves the market.
 `comet` names the market's Comet (`address`), then its rewards contract
 (`rewards`) and its bulker (`bulker`): the market's `contracts.rewards` and
-`contracts.bulker`. The rest comes right after `comet`, before `status`:
+`contracts.bulker`. The rest comes right after `comet`, before `is_inactive`
+([Inactive markets](#inactive-markets)) and `status`:
 
 - `deployment_key` (`deploymentKey`): the market's key in the version, unique
   within its chain; with `chain_id` it names the market, such as `usdc`
@@ -233,7 +236,7 @@ registry version says of it, as `/registry/v1/active` serves the market.
   its institutional section
 
 ```json
-{ "chain_id": 1, "comet": { "address": "0xc3d6…cdc3", "rewards": "0x1B0e…5a40", "bulker": "0xa397…00c7" }, "deployment_key": "usdc", "display_name": "USDC", "base_asset_name": "USD Coin", "is_wrapped_native": false, "is_default": true, "is_institutional": false, "status": "success", … }
+{ "chain_id": 1, "comet": { "address": "0xc3d6…cdc3", "rewards": "0x1B0e…5a40", "bulker": "0xa397…00c7" }, "deployment_key": "usdc", "display_name": "USDC", "base_asset_name": "USD Coin", "is_wrapped_native": false, "is_default": true, "is_institutional": false, "is_inactive": false, "status": "success", … }
 ```
 
 Each address is checksummed, as `address` is, where `/registry/v1/active`
@@ -247,7 +250,61 @@ Everywhere else `comet` is the Comet's `address` alone. The rewards routes
 answer the rewards contract as `comet_rewards.address`, and the two labels
 as `base_asset.symbol` and `base_asset.description`
 ([Market labels](#market-labels)). A day of a history answers none of it,
-and `/market/{network}/{address}/rewards/summary` names no market.
+and `/market/{network}/{address}/rewards/summary` names no market. None of
+them answers `is_inactive` either.
+
+## Inactive markets
+
+`/summary` answers on every market whether an administrator has marked it
+inactive: `is_inactive`, a boolean, right after `is_institutional`, on every
+entry of all three forms — a `success`, a `partially` and an `error`, and a
+market the chain has not reached ([Market status](#market-status)). An
+inactive market is one the app takes no new deposits or loans in and lists
+apart, while those who hold positions in it still withdraw and repay. It is
+an administrator's decision about the market, by its chain and its Comet
+(`PATCH /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/inactive`),
+and it outlives every registry version.
+
+A market is active unless a decision in force marks it inactive:
+`is_inactive` is `true` only for such a market, and `false` for every other
+one — a market nobody has decided about, one whose decision was taken back,
+and every market while the decisions cannot be read at all, as on a database
+without migration `0009`, or one that cannot be reached with nothing
+recorded. The log then says `the summary could not read the inactive market
+decisions`, once a minute, and no header changes. An answer without the key
+comes from a release without the decision, and a client reads its markets as
+active.
+
+```json
+{ "chain_id": 137, "comet": { "address": "0xaeB318360f27748Acb200CE616E389A6C9409a07", … }, "deployment_key": "usdt", "display_name": "USDT0", …, "is_default": false, "is_institutional": false, "is_inactive": true, "status": "success", … }
+```
+
+It is none of the other things that sound alike:
+
+- not `status`, which on `/summary` is the status of the price read:
+  `success`, `partially` or `error`;
+- not the market's lifecycle status in the registry — `enabled`,
+  `deprecated` or `disabled` — which `/summary` does not carry: a market whose
+  status is `deprecated` is `is_inactive: false` unless it is marked inactive,
+  and a `disabled` one is not answered at all;
+- not `collaterals[].is_deprecated`, which is about one collateral of the
+  market: a market can be inactive with no collateral deprecated, and a
+  collateral deprecated in a market that is not;
+- not whether a registry version is active — `inActiveVersion` on the
+  administrative reads, `REGISTRY_NOT_ACTIVE` — which is about the versions
+  and what they hold.
+
+No public `/registry/v1` read carries it, and neither do the history and the
+rewards routes; only the inactive market routes under `/registry/v1/admin/`
+answer it, as `isInactive`. Marking a market inactive changes nothing else
+`/summary` answers: its collaterals are decided and valued as any market's
+([Collateral tokens](#collateral-tokens)). The decisions are read with every
+request, so a decision is in the next answer, and it needs no new registry
+version. When the database cannot be reached, they are the ones the API last
+recorded, and the answer says it could not confirm them, with
+`X-Registry-Stale` — `0` where the version itself was read — and
+`Cache-Control: no-store`. A client that camel-cases the answer reads
+`isInactive`.
 
 ## Pagination
 
@@ -291,6 +348,8 @@ Point-in-time summary at the current block of various market statistics:
 - What the active registry version says of the market: its rewards contract
   and its bulker beside its Comet, in `comet`, and its keys and labels — see
   [Market registry fields](#market-registry-fields)
+- Whether an administrator has marked the market inactive (`is_inactive`) —
+  see [Inactive markets](#inactive-markets)
 - What could be priced: `status`, and `collaterals` with each collateral's
   own status — see [Market status](#market-status)
 - What each collateral's token is: its name and decimals, whether this
@@ -398,9 +457,9 @@ of it is worth at least USD 250,000, compared exactly (`collateral_threshold`),
 or when that value cannot be read (`data_unavailable`), and is not shown
 otherwise (`below_threshold`). What the other markets of the chain hold of
 the token, or decide about it, takes no part, and every market the active
-version serves is decided so, whatever its status: a token nobody marked
-strategic, which the chain's markets together hold USD 250,000 of and each
-less, is shown in none of them.
+version serves is decided so, whatever its status, and whether or not it is
+inactive: a token nobody marked strategic, which the chain's markets together
+hold USD 250,000 of and each less, is shown in none of them.
 
 A collateral its Comet hides, or has deprecated, stays in `collaterals` and in
 `collateral_asset_symbols`, and counts in `total_collateral_value` as any
@@ -411,17 +470,20 @@ market.
 The decisions are read with every request. The deprecated and the hidden
 ones are read as `/registry/v1/active` reads them: when the database cannot
 be reached, they are the ones the API last recorded, and the answer says it
-could not confirm them — one kind from its record is enough — with
+could not confirm them — one kind from its record is enough, the inactive
+markets' among them ([Inactive markets](#inactive-markets)) — with
 `X-Registry-Stale` — `0` where the version itself was read — and
 `Cache-Control: no-store`. Decisions that cannot be read at all leave out the
 fields they decide, and the summary is answered without them: without the
 deprecated ones, `is_deprecated`, `is_network_deprecated` and
 `deprecated_in`; without the hidden ones, `is_hidden` and `hidden_in`;
 without the strategic ones, which nothing records for an outage,
-`is_strategic`. `is_visible` and `visibility_reason` take all three kinds,
-and each is written wherever the decisions read settle it, whichever way the
-others went — a client told nothing shows a token, and one that is not to be
-shown must not be shown for want of another decision:
+`is_strategic`. The inactive markets decide nothing of a collateral, and
+without them every market is answered active. `is_visible` and
+`visibility_reason` take all three kinds, and each is written wherever the
+decisions read settle it, whichever way the others went — a client told
+nothing shows a token, and one that is not to be shown must not be shown for
+want of another decision:
 
 - `visibility_reason`, with `is_visible`, once every kind the rule asks up to
   the one that decides is read: `hidden` as soon as the hidden decisions are
@@ -504,6 +566,7 @@ bulker:
   "slug": "usdc-test-base-revert",
   "is_default": false,
   "is_institutional": false,
+  "is_inactive": false,
   "status": "error",
   "message": "execution reverted",
   "borrow_apr": "0.014999999976144",
@@ -539,6 +602,7 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
   "is_wrapped_native": false,
   "is_default": true,
   "is_institutional": false,
+  "is_inactive": false,
   "status": "success",
   "borrow_apr": "0.024456245200128",
   "supply_apr": "0.008780799134304",
@@ -1256,9 +1320,10 @@ it is; a monitor matches `details.code` for those. Besides
 a database that could not be reached, and a database without the migration of
 the tables a route reads — the token policies' on the token policy routes,
 the deprecated collaterals' on `/active`, the market reads and the deprecated
-collateral routes, and the hidden collaterals' on the same reads and the
-hidden collateral routes — are a `503`, here as on every endpoint
-([Errors](#errors)): those are the answers worth trying again.
+collateral routes, the hidden collaterals' on the same reads and the hidden
+collateral routes, and the inactive markets' (`0009`) on the inactive market
+routes alone — are a `503`, here as on every endpoint ([Errors](#errors)):
+those are the answers worth trying again.
 
 Every `CONFLICT` names in `details.code` the conflict it met, which is what a
 script matches; the message says the same to a person, and may change. An
@@ -1279,7 +1344,8 @@ overlay write below is any of `PUT …/overlay` and `PUT …/overlays`:
 | `REWARD_FEED_WITHOUT_REWARD` | an overlay write | a market's document names a `rewardPriceFeed`, and its rewards contract names no reward token |
 | `TOKEN_LEFT_REGISTRY` | `PATCH …/policy`, `POST …/token-policies/apply` | a version without the token, or without a token of the list, was activated while it was being written |
 | `COLLATERAL_LEFT_REGISTRY` | `PATCH …/deprecated`, `POST …/deprecated-collaterals/apply`, `PATCH …/hidden`, `POST …/hidden-collaterals/apply` | a version whose market does not take the collateral, or a collateral of the list, was activated while it was being written |
-| `DECISION_CHANGED` | `POST …/token-policies/apply`, `POST …/deprecated-collaterals/apply`, `POST …/hidden-collaterals/apply` | someone else changed a decision of the list while it was being applied |
+| `MARKET_LEFT_REGISTRY` | `PATCH …/inactive`, `POST …/inactive-markets/apply` | a version without the market, or without a market of the list, was activated while it was being written |
+| `DECISION_CHANGED` | `POST …/token-policies/apply`, `POST …/deprecated-collaterals/apply`, `POST …/hidden-collaterals/apply`, `POST …/inactive-markets/apply` | someone else changed a decision of the list while it was being applied |
 
 Public reads carry `X-Registry-Version` and `X-Registry-Checksum`, which a
 browser can read. Every one of them is cacheable by its version, carries
@@ -1335,13 +1401,13 @@ request is rate limited twice, reads as well as commands:
   and each family of routes. Every read shares one budget, so a monitor
   polling the status spends it with an operator who holds the same token, and
   each kind of command has one of its own. `POST …/token-policies/review`,
-  `POST …/deprecated-collaterals/review` and
-  `POST …/hidden-collaterals/review`, which write nothing, count as reads;
+  `POST …/deprecated-collaterals/review`, `POST …/hidden-collaterals/review`
+  and `POST …/inactive-markets/review`, which write nothing, count as reads;
   the decisions an administrator makes about what the app offers and what
   discovery shows — `PATCH …/policy`, `POST …/token-policies/apply`,
   `PATCH …/deprecated`, `POST …/deprecated-collaterals/apply`,
-  `PATCH …/hidden` and `POST …/hidden-collaterals/apply` — share one
-  `policy` budget.
+  `PATCH …/hidden`, `POST …/hidden-collaterals/apply`, `PATCH …/inactive`
+  and `POST …/inactive-markets/apply` — share one `policy` budget.
 
 Past either budget the answer is `429` `RATE_LIMITED`, saying in
 `Retry-After` how many seconds to wait, and in its message which budget ran
@@ -1350,9 +1416,10 @@ out: `too many administrative requests from this address`, or
 
 A command's body is at most 64 KiB — 512 KiB for `PUT …/overlays`, and 1 MiB
 for `POST …/token-policies/review`, `POST …/deprecated-collaterals/review`,
-`POST …/hidden-collaterals/review` and their `…/apply` — and a larger one is
-refused with `413`. A `reason`, wherever a command takes one, is at most 1,000
-characters, and a longer one is refused with `400`.
+`POST …/hidden-collaterals/review`, `POST …/inactive-markets/review` and their
+`…/apply` — and a larger one is refused with `413`. A `reason`, wherever a
+command takes one, is at most 1,000 characters, and a longer one is refused
+with `400`.
 
 The body is JSON, sent as `application/json` or as a `+json` type such as
 `application/merge-patch+json`, or without a `Content-Type`. The type is read
@@ -1378,7 +1445,10 @@ keeps showing it to a user who still holds some of it, so that it can be
 withdrawn. The decision is about one collateral of one market, so a token can
 be deprecated in one market and current in another. It is not the market's
 `status`: a market whose status is `deprecated` is itself no longer offered,
-while `isDeprecated` says so of one collateral of a market:
+while `isDeprecated` says so of one collateral of a market. Nor is the
+market's `status` how a market the app no longer takes new deposits or loans
+in is told apart: such a market stays `enabled` and is marked inactive, which
+only `/summary` answers ([`is_inactive`](#inactive-markets)):
 
 ```json
 {
@@ -2799,7 +2869,9 @@ without the fields they decide, `is_deprecated`, `is_network_deprecated` and
 after `0007`; and without `visibility_reason`, which both take part in. It
 says `is_visible: false` where the strategic decisions settle it, on a
 collateral that is not strategic and is worth less than the threshold in its
-market ([Collateral tokens](#collateral-tokens)).
+market ([Collateral tokens](#collateral-tokens)). It answers every market
+`is_inactive: false`, the table of inactive markets coming later still, in
+`0009` ([Inactive markets](#inactive-markets)).
 
 ## `PATCH /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/collaterals/{token_address}/hidden`
 ### description:
@@ -3075,4 +3147,287 @@ fields they decide, `is_hidden` and `hidden_in`, and without
 `visibility_reason`, which they take part in; it says `is_visible: false`
 where the other decisions settle it, on a collateral its Comet has deprecated
 and on one that is not strategic and is worth less than the threshold in its
-market ([Collateral tokens](#collateral-tokens)).
+market ([Collateral tokens](#collateral-tokens)). It answers every market
+`is_inactive: false`, the table of inactive markets coming after, in `0009`
+([Inactive markets](#inactive-markets)).
+
+## `PATCH /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/inactive`
+### description:
+
+Marks a market inactive, or takes that decision back. An inactive market is
+one the app takes no new deposits or loans in and lists apart, while those who
+hold positions in it still withdraw and repay; the decision is how the app
+tells it apart, in place of a list of chains of its own. Of the public reads,
+only `/summary` carries it, as `is_inactive: true` on that market in all three
+forms ([Inactive markets](#inactive-markets)), and reads the decisions on
+every request, so a change is in its next answer. Nothing else the registry
+serves changes: no public `/registry/v1` read carries the decision, so no
+`ETag` moves, and the market's collaterals are decided and valued as any
+market's. Under `/registry/v1/admin/`, only the inactive market routes answer
+it, as `isInactive`.
+
+It is not the market's `status`, which a registry version sets: a market
+marked inactive keeps its status, `enabled` as a rule, and one whose status is
+`deprecated` is not inactive unless it is marked so. A `disabled` market is
+served by no read, and would cut off those who hold positions in it, so a
+market the app should list apart is marked inactive, never disabled
+([Marking a market inactive](./REGISTRY_RUNBOOK.md#marking-a-market-inactive)).
+
+A decision belongs to the market as the chain knows it — a chain id and the
+Comet's address — and not to a registry version, as a decision about a
+collateral does: it survives every activation, and a version that drops the
+market and a later one that brings it back bring the decision back with it.
+The chain is part of it: one Comet can stand at the same address on two
+chains, and is two markets, decided apart. It is decided only for a market
+the active version holds, of any status: a chain the version does not hold,
+or a Comet no market of that chain has there, answers `404`, and no active
+version answers `503 REGISTRY_NOT_ACTIVE`. A decision is about one market at
+a time: nothing marks every market of a chain, and the default market is
+decided about as any other. The address may be in any case; it is stored and
+answered lowercase.
+
+The body is exactly a boolean and the reason, which is required and stored
+with the audit event beside the actor:
+
+```json
+{ "isInactive": true, "reason": "Inactive market the app listed apart by its own list of chains (INACTIVE_CHAIN_IDS) until the registry served it (Linear COM-19)" }
+```
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "chainId": 534352,
+  "cometAddress": "0xb2f97c1bd3bf02f5e74d13f02e3e26f93d77ce44",
+  "isInactive": true,
+  "changed": true,
+  "updatedAt": "2026-10-28T10:00:00.000Z"
+}
+```
+
+A market nobody has decided about is not inactive. Asking for the decision
+already in force answers `changed: false`, writes nothing and keeps the time
+the decision was made, so a repeated or retried request is safe; `updatedAt`
+is `null` for a market nobody has ever decided about. A change is committed
+with its audit event before it is answered, and the answer names the version
+it was checked against, in the body and in `X-Registry-Version`. If a version
+without the market is activated while the change is being written, the write
+is rolled back, event and all, and the request answers `409` with
+`MARKET_LEFT_REGISTRY`. Once it has committed, the command records the
+inactive markets in force, every chain's, for `/summary` to answer with while
+the database cannot be reached.
+
+It answers, besides:
+
+- `400` for a chain id or an address that is not one, a body with any other
+  member (`unexpected properties: …`), `isInactive must be a boolean`, and a
+  missing, blank or longer than 1,000 characters reason;
+- `401` without the administrative token, `405` with `Allow: GET, PATCH,
+  OPTIONS` for another method, `413` for a body past 64 KiB, and `429` past
+  the `policy` budget, which it shares with every decision command;
+- `503 UPSTREAM_UNAVAILABLE` when the database does not answer, or has no
+  migration `0009` yet (below).
+
+```sh
+$ curl -X PATCH 'localhost:8787/registry/v1/admin/networks/534352/markets/0xB2f97c1Bd3bf02f5e74d13f02E3e26F93D77CE44/inactive' \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"isInactive": true, "reason": "Inactive market the app listed apart by its own list of chains (INACTIVE_CHAIN_IDS) until the registry served it (Linear COM-19)"}'
+```
+
+## `GET /registry/v1/admin/networks/{chain_id}/markets/{comet_address}/inactive`
+### description:
+
+One market's inactive decision and the changes that led to it, at most 100,
+newest first in the order they were committed, so the first is always the
+change that set the decision in force. `previousIsInactive` is `null` for the
+first decision about a market.
+
+`inActiveVersion` says whether the active version holds the market, whatever
+its status. It is not whether the market is inactive, which `isInactive`
+says, nor whether a version is active. A decision stays readable while the
+active version does not hold the market, with `inActiveVersion: false`; it
+applies again once a version that holds it is activated and serves it. Only a
+market the active version does not hold and nobody has decided about answers
+`404`.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "chainId": 534352,
+  "cometAddress": "0xb2f97c1bd3bf02f5e74d13f02e3e26f93d77ce44",
+  "inActiveVersion": true,
+  "isInactive": true,
+  "updatedAt": "2026-10-28T10:00:00.000Z",
+  "updatedBy": "registry-admin:stage",
+  "events": [
+    {
+      "id": "3b8f2c1d-5e6a-4f7b-8c9d-0e1f2a3b4c5d",
+      "previousIsInactive": null,
+      "isInactive": true,
+      "actor": "registry-admin:stage",
+      "reason": "Inactive market the app listed apart by its own list of chains (INACTIVE_CHAIN_IDS) until the registry served it (Linear COM-19)",
+      "createdAt": "2026-10-28T10:00:00.000Z"
+    }
+  ]
+}
+```
+
+## `GET /registry/v1/admin/inactive-markets`
+### description:
+
+Every market of the active version with the inactive decision in force, as a
+list review and apply take back: the file an operator edits instead of
+writing Comets by hand. Rows are ordered by chain, then by deployment key,
+and a disabled market is listed too: a decision about one applies once the
+market is served. The rows are under `inactiveMarkets`, so that no other
+kind's review takes the file: one sent to another kind's review or apply is
+refused with `400`, `unexpected properties: …`, and so is another kind's
+file sent here.
+
+`retained` lists the decisions kept for markets the active version does not
+hold on their chain, each with when and by whom it was made. Each applies
+again as soon as a version that holds the market, and serves it, is
+activated, so it is worth reviewing before one is.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "reason": null,
+  "inactiveMarkets": [
+    { "chainId": 1, "cometAddress": "0xc3d688b66703497daa19211eedff47f25384cdc3", "deploymentKey": "usdc", "isInactive": false },
+    { "chainId": 130, "cometAddress": "0x2c7118c4c88b9841fcf839074c26ae8f035f2921", "deploymentKey": "usdc", "isInactive": true }
+  ],
+  "retained": []
+}
+```
+
+## `POST /registry/v1/admin/inactive-markets/review`
+### description:
+
+What applying a list would change, row by row, without writing anything. The
+body is a list as the export answers it, edited, of 1 to 500 rows and at most
+1 MiB:
+
+- `inactiveMarkets[]`: `chainId`, `cometAddress` (in any case) and
+  `isInactive` are required; `deploymentKey` is optional and only checked — a
+  market the active version calls by another key is reported as the mistake
+  it usually is; `reason` is optional. A row takes no other member: a
+  `tokenAddress` or a `symbol`, which a list of collaterals has, is refused.
+- `reason` at the top is the reason for every row that changes and has none
+  of its own. A row that changes a decision needs one or the other; a row that
+  leaves its market as it is needs neither.
+- `registryVersion` and `retained` say where the list was exported from and
+  what the active version does not hold, and are not read: a decision belongs
+  to no version.
+
+`registry/seed/production.inactive-markets.json` is such a list, the first
+one an environment applies
+([The initial list of inactive markets](./REGISTRY_RUNBOOK.md#the-initial-list-of-inactive-markets)).
+
+A malformed body answers `400`, `the list of inactive markets is invalid`,
+with every problem of every row in `details.problems` — `row 2 has unexpected
+properties: tokenAddress`, `row 3: cometAddress must be an address`,
+`row 6 repeats row 5 (chain 1, 0x…)` — and a body without 1 to 500 rows
+`inactiveMarkets must be a list of 1 to 500 decisions`. A well-formed one
+answers `200`, with each row's `problem` in place of refusing:
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "summary": { "change": 1, "unchanged": 0, "problems": 0 },
+  "inactiveMarkets": [
+    {
+      "row": 1,
+      "chainId": 130,
+      "cometAddress": "0x2c7118c4c88b9841fcf839074c26ae8f035f2921",
+      "deploymentKey": "usdc",
+      "current": false,
+      "requested": true,
+      "action": "change",
+      "reason": "Inactive market the app listed apart by its own list of chains (INACTIVE_CHAIN_IDS) until the registry served it (Linear COM-19)",
+      "problem": null
+    }
+  ]
+}
+```
+
+A `problem` is one of: a chain the active version does not hold
+(`chain 130 is not part of the active registry`), a Comet no market of that
+chain has there (`0x… is not a market of the active registry on chain 1`),
+a deployment key that names another market
+(`the list names 0x… usdt, which the active registry calls usdc`), or a
+change without a reason (`0x… (usdc) changes, and needs a reason: its own or
+the list's`).
+
+The body to apply is the rows the review shows as changes, each with the
+members an export row has and the reason it will be recorded with:
+
+```sh
+$ jq '{reason: null, inactiveMarkets: [.inactiveMarkets[] | select(.action == "change") | {chainId, cometAddress, deploymentKey, isInactive: .requested, reason}]}' \
+    review.json > inactive-markets.json
+```
+
+## `POST /registry/v1/admin/inactive-markets/apply`
+### description:
+
+Applies a list — the same body as review — in one transaction, as
+`POST …/hidden-collaterals/apply` applies one: every decision it changes is
+written with its own audit event, and the transaction requires every row, the
+unchanged ones included, to hold what the list says once it is done. A list is
+applied completely or not at all:
+
+- a list with any `problem` answers `422`, `<n> row(s) of the list cannot be
+  applied; nothing was written`, naming each such row in `details.problems`
+  as `{ row, chainId, cometAddress, problem }`, and writes nothing;
+- a version without one of its markets activated while the list is being
+  written answers `409` with `MARKET_LEFT_REGISTRY`, and a decision of the
+  list changed by someone else meanwhile `409` with `DECISION_CHANGED`;
+  either writes nothing.
+
+The list is compared with the decisions in force when it is applied, not when
+it was reviewed, so review it right before applying it: a decision someone
+made in between is changed like any other row the list contradicts, and shows
+in the answer as a change. A list of only the rows the review shows as
+changes, which is what the runbook applies
+([A reviewed list of inactive markets](./REGISTRY_RUNBOOK.md#a-reviewed-list-of-inactive-markets)),
+leaves every other decision as it is. A row the comparison finds unchanged is
+not written, only checked, so a decision made on that market while the list is
+being written is never reverted by it. Applying the same list again changes
+nothing. Once it has committed, the command records the inactive markets in
+force, as a single change does. It spends the `policy` budget, as every
+decision command does.
+
+```json
+{
+  "registryVersion": { "id": "d9698ddd-ab86-46bc-a412-c71df7d20414", "checksum": "…" },
+  "summary": { "changed": 1, "unchanged": 0 },
+  "inactiveMarkets": [
+    {
+      "row": 1,
+      "chainId": 130,
+      "cometAddress": "0x2c7118c4c88b9841fcf839074c26ae8f035f2921",
+      "deploymentKey": "usdc",
+      "isInactive": true,
+      "changed": true,
+      "updatedAt": "2026-10-28T10:00:00.000Z"
+    }
+  ]
+}
+```
+
+```sh
+$ curl -X POST 'localhost:8787/registry/v1/admin/inactive-markets/apply' \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    --data @inactive-markets.json
+```
+
+When an environment is brought up, the first list is applied right after its
+first version is activated
+([The initial list of inactive markets](./REGISTRY_RUNBOOK.md#the-initial-list-of-inactive-markets)):
+the markets of the chains the app listed apart by its own list.
+
+Every inactive market route answers `503 UPSTREAM_UNAVAILABLE` naming the D1
+migrations when the environment's database does not have migration `0009`
+yet — a release deployed before its migration. Nothing else reads the
+decisions, so `/active` and the market reads answer as before, and `/summary`
+answers every market `is_inactive: false`, logging that it could not read
+them ([Inactive markets](#inactive-markets)).

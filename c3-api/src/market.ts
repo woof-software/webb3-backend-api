@@ -17,7 +17,7 @@ import type { MarketIdentity } from '../lib/computations/market/market-summary.j
 
 import { ApiError } from './http/errors.js';
 import type { Catalog } from './registry/catalog.js';
-import { chainTokens, summaryHeaders, withTokenFields } from './registry/summary-tokens.js';
+import { chainTokens, inactiveOf, summaryHeaders, withTokenFields } from './registry/summary-tokens.js';
 
 import {
   AllNetworks,
@@ -107,11 +107,16 @@ function reportUnreached(contract: RegistryComet, message: string): void {
  * alone, and only the rewards routes answer some of the rest, in fields of
  * their own: the rewards contract and the labels (market-rewards.ts).
  *
+ * Beside them, whether an administrator has marked the market inactive, a
+ * decision no version holds: read with every request, so it is answered on
+ * the next one, and false wherever no such decision is known, one that could
+ * not be read included (summary-tokens.ts, inactiveOf).
+ *
  * An address is checksummed, as the Comet's is, where the version stores it
  * lowercase. A contract or a slug the version has none of is left out, never
  * null, as the summary leaves out whatever it cannot give.
  */
-function described<Summary extends MarketIdentity>({ chainId, comet, ...summary }: Summary, contract: RegistryComet) {
+function described<Summary extends MarketIdentity>({ chainId, comet, ...summary }: Summary, contract: RegistryComet, isInactive: boolean) {
   const market         = contract.registry.market;
   const rewardsAddress = contract.rewards?.contract.address;
   const { bulker } = market.contracts;
@@ -129,6 +134,7 @@ function described<Summary extends MarketIdentity>({ chainId, comet, ...summary 
     ...(market.slug === null ? {} : { slug: market.slug }),
     isDefault:       market.isDefault,
     isInstitutional: market.isInstitutional,
+    isInactive,
     ...summary,
   };
 }
@@ -141,7 +147,7 @@ async function latestSummary(
   // once for every network, while their latest blocks are read
   const decisions = context.tokens.decisions();
 
-  const { evaluate, pipe1, split, value } = context.evaluator;
+  const { evaluate, pipe1, pull1, split, value } = context.evaluator;
 
   const summary = await Promise.all(
     selectedNetworks.map(async (network) => {
@@ -168,8 +174,9 @@ async function latestSummary(
        *
        * Networks stay separate evaluations: within one, the batches of
        * different networks would go to the node one after another. The
-       * decisions are read meanwhile, and each collateral is decided by them
-       * and by its value in its market once both are in (summary-tokens.ts).
+       * decisions are read meanwhile, and each market is described, and each
+       * collateral decided by them and by its value in its market, once both
+       * are in (summary-tokens.ts).
        */
       const [ entries, read ] = await Promise.all([
         evaluate(pipe1([
@@ -177,18 +184,21 @@ async function latestSummary(
           (latestBlock) => split(selectedContracts.map((contract) => {
             const origin = { apiHost, nodeHost, nodeKey, network, contract, block: latestBlock };
             if (!market.marketMinutelySummary.index.covers(origin)) {
-              return value(described(unreachedMarket(contract, latestBlock), contract));
+              return value(unreachedMarket(contract, latestBlock));
             }
             const projected = Fallible.must(market.marketMinutelySummary.index.project(origin));
             projected.block.timestamp = latestBlock.timestamp;
-            return pipe1([ { marketMinutelySummary: projected }, computed => described(computed, contract) ]);
+            return pull1({ marketMinutelySummary: projected });
           })),
         ])),
         decisions,
       ]);
       const tokens = chainTokens(catalog, network, selectedContracts[0]!.registry.chainId, read);
 
-      return entries.map((entry, index) => withTokenFields(snakeifyCamelObject(entry), selectedContracts[index]!, tokens));
+      return entries.map((entry, index) => {
+        const contract = selectedContracts[index]!;
+        return withTokenFields(snakeifyCamelObject(described(entry, contract, inactiveOf(read, contract))), contract, tokens);
+      });
     })
   );
 

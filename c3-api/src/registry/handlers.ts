@@ -17,9 +17,10 @@ import type { Log } from '../log.js';
 
 import type { CachedSnapshot, PinnedVersion } from './cache.js';
 import type { CollateralOfComet } from './collateral-decision-repository.js';
-import type { CollateralMarks, RecordedKind } from './collateral-decisions.js';
+import type { CollateralMarks, DecisionSet, RecordedKind } from './collateral-decisions.js';
 import { markedMarket, markedNetwork, markedRepresentation } from './collateral-decisions.js';
 import { conflict } from './errors.js';
+import type { MarketOfChain } from './inactive-market-repository.js';
 import { registryHeaders } from './version-headers.js';
 import type { VersionRef } from './version-headers.js';
 import {
@@ -93,10 +94,11 @@ type RegistryContext = {
    * the collaterals of the active version with (collateral-decisions.ts):
    * read from D1, or during an outage from the record the Worker keeps of
    * each kind. `record` keeps a kind's record after a command that may have
-   * changed it, and never fails the command.
+   * changed it, a kind about a collateral or the inactive markets alike, and
+   * never fails the command.
    */
   marks:  () => Promise<{ marks: CollateralMarks, recorded: boolean }>,
-  record: (kind: RecordedKind) => Promise<void>,
+  record: <Decisions extends DecisionSet>(kind: RecordedKind<Decisions>) => Promise<void>,
 };
 
 const SCHEMA_VERSION = 1;
@@ -277,6 +279,11 @@ function addressOf(value: string): Address {
 
 function collateralOf(chainId: string, cometAddress: string, tokenAddress: string): CollateralOfComet {
   return { chainId: chainIdOf(chainId), cometAddress: addressOf(cometAddress), tokenAddress: addressOf(tokenAddress) };
+}
+
+// a market a decision names by its chain and its Comet, whatever its status (inactive-market-repository.ts)
+function marketOfChain(chainId: string, cometAddress: string): MarketOfChain {
+  return { chainId: chainIdOf(chainId), cometAddress: addressOf(cometAddress) };
 }
 
 /*
@@ -704,6 +711,7 @@ export {
   getVersion,
   getVersions,
   getVersionDetail,
+  marketOfChain,
   postActivation,
   postValidate,
 };

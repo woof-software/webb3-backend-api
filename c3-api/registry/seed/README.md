@@ -28,7 +28,10 @@ written.
 [`production.deprecated-collaterals.json`](./production.deprecated-collaterals.json)
 is the first list of deprecated collaterals, which an environment takes once
 its first version is on
-([The deprecated collaterals](#the-deprecated-collaterals)).
+([The deprecated collaterals](#the-deprecated-collaterals)), and
+[`production.inactive-markets.json`](./production.inactive-markets.json) the
+first list of inactive markets, which it takes right after
+([The inactive markets](#the-inactive-markets)).
 
 Nothing in the Worker reads these files: the tests read them from the
 repository, and they reach neither `dist` nor the bundle.
@@ -132,7 +135,7 @@ and the two feeds of Ethereum they write in lowercase.
 |---|---|
 | `displayName`, `slug`, `isInstitutional`, `baseAsset.displayName` | What the frontend lists the market as, copied from `woof-software/webb3-frontend@98c38cd16937206f3fbad59205343e4c9cf9d165` `src/helpers/markets.ts`, the only place they existed. It shows a WETH market as ETH, because it wraps the native token for the user — but Ronin's WETH market as WETH; bridged USDC as USDC.e on Polygon and Arbitrum, and as USDbC on Base; and Tether as it was renamed, USDT0 on Polygon and USD₮0 on Arbitrum. The institutional USDC market shares its label with `1/usdc`, so it has the slug `usdc-institutional`, and is listed in the institutional section |
 | `contractName`, `creationBlock` | The Comet's display name and creation block in the static constants (`lib/well-known/contracts`) |
-| `status` | `enabled`: every market here was served |
+| `status` | `enabled`: every market here was served. The markets of the six chains the app listed apart as inactive stay `enabled`: whether a market is inactive is a decision of its own, which [`production.inactive-markets.json`](#the-inactive-markets) holds |
 | `isDefault` | `1/usdc` alone, the market the application opens |
 | `capabilities.transactionHistory` | The markets whose history was served, which `transaction-history-items-handler.ts` listed by hand: `1/usdc`, `1/weth`, `1/usdt`, `1/institutional_usdc`, `10/usdc`, `10/usdt`, `10/weth`, `137/usdc`, `8453/usdc`, `8453/usdbc`, `8453/weth`, `42161/usdc` and `42161/usdc.e`. No other market had reachable history |
 | `capabilities.rewards`, `capabilities.accountRewards` | On, but on Scroll and Ronin, which the rewards computations skipped by name because no reward feed answers there, and on `1/institutional_usdc` (below) |
@@ -250,4 +253,54 @@ and names the 8 of the wstETH and USDS markets as problems, apply refuses
 the file whole, and the 12 apply as written. Only a version imported from
 the source holds the other two markets, so their rows are checked there: by
 the review of step 7, and before an environment depends on the file, by
+[the preflight](../../REGISTRY_RUNBOOK.md#the-preflight).
+
+## The inactive markets
+
+[`production.inactive-markets.json`](./production.inactive-markets.json)
+holds the markets the app listed apart by its own list of chains,
+`INACTIVE_CHAIN_IDS`, until the registry served them (Linear COM-19): every
+market the seed holds on Unichain, Polygon, Ronin, Mantle, Linea and Scroll,
+ten of them, each `"isInactive": true`, under one reason. It is a list as
+`GET /registry/v1/admin/inactive-markets` exports one, which
+`POST …/inactive-markets/review` and `…/apply` take as it is: each row names
+its chain, its Comet, lowercase, and the market's key.
+
+It is not part of the seed, since a market can be marked only while a version
+that holds it is on. Step 8 of
+[the first bring-up](../../REGISTRY_RUNBOOK.md#8-mark-the-initial-inactive-markets)
+sends it right after step 7, from the root of a checkout: a review of the
+file as it is, then an apply of what the review shows as changes.
+
+```sh
+curl -s -X POST "$API/registry/v1/admin/inactive-markets/review" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data-binary @c3-api/registry/seed/production.inactive-markets.json > review.json
+```
+
+The review writes nothing, and holds every row against the version that is
+on: the chain one it holds, the Comet one of its markets on that chain, the
+key the one the version gives that market. A row it finds a problem in keeps
+the list from being applied at all; the runbook says what to do about one.
+Like the seed, the list is sent once: in an environment that is up, a market
+is decided with the inactive market routes
+([REGISTRY_RUNBOOK.md](../../REGISTRY_RUNBOOK.md#marking-a-market-inactive)),
+a market the source adds later on one of these chains among them.
+
+The file changes by hand, in a pull request, as the seed does. Where each
+address comes from, the runbook says
+([The initial list of inactive markets](../../REGISTRY_RUNBOOK.md#the-initial-list-of-inactive-markets)).
+[`tests/lib/registry/seed-inactive-markets.test.ts`](../../tests/lib/registry/seed-inactive-markets.test.ts)
+holds the file to its form — as `JSON.stringify` writes it, ten rows in the
+order the export lists them, lowercase addresses, every row inactive, one
+reason and no market twice — each Comet to the one `production.comets.json`
+names for the row's market, and the rows to every market `production.json`
+holds on the six chains, none of them the default.
+[`tests/e2e/registry/inactive-markets.test.ts`](../../tests/e2e/registry/inactive-markets.test.ts)
+sends it as it is to a version of the registry's fixture, which holds Scroll's
+market alone of them: the review resolves that row and names the other nine
+by the chains the fixture does not hold, apply refuses the file whole, and
+Scroll's row applies as written. Only a version imported from the source
+holds the other nine, so their rows are checked there: by the review of step
+8, and before an environment depends on the file, by
 [the preflight](../../REGISTRY_RUNBOOK.md#the-preflight).

@@ -1,0 +1,65 @@
+{
+  "reason": "Inactive market the app listed apart by its own list of chains (INACTIVE_CHAIN_IDS) until the registry served it (Linear COM-19)",
+  "inactiveMarkets": [
+    {
+      "chainId": 130,
+      "cometAddress": "0x2c7118c4c88b9841fcf839074c26ae8f035f2921",
+      "deploymentKey": "usdc",
+      "isInactive": true
+    },
+    {
+      "chainId": 130,
+      "cometAddress": "0x6c987dde50db1dcdd32cd4175778c2a291978e2a",
+      "deploymentKey": "weth",
+      "isInactive": true
+    },
+    {
+      "chainId": 137,
+      "cometAddress": "0xf25212e676d1f7f89cd72ffee66158f541246445",
+      "deploymentKey": "usdc",
+      "isInactive": true
+    },
+    {
+      "chainId": 137,
+      "cometAddress": "0xaeb318360f27748acb200ce616e389a6c9409a07",
+      "deploymentKey": "usdt",
+      "isInactive": true
+    },
+    {
+      "chainId": 2020,
+      "cometAddress": "0x4006ed4097ee51c09a04c3b0951d28ccf19e6dfe",
+      "deploymentKey": "weth",
+      "isInactive": true
+    },
+    {
+      "chainId": 2020,
+      "cometAddress": "0xc0afdbd1ceb621ef576ba969ce9d4cef78dbc0c0",
+      "deploymentKey": "wron",
+      "isInactive": true
+    },
+    {
+      "chainId": 5000,
+      "cometAddress": "0x606174f62cd968d8e684c645080fa694c1d7786e",
+      "deploymentKey": "usde",
+      "isInactive": true
+    },
+    {
+      "chainId": 59144,
+      "cometAddress": "0x8d38a3d6b3c3b7d96d6536da7eef94a9d7dbc991",
+      "deploymentKey": "usdc",
+      "isInactive": true
+    },
+    {
+      "chainId": 59144,
+      "cometAddress": "0x60f2058379716a64a7a5d29219397e79bc552194",
+      "deploymentKey": "weth",
+      "isInactive": true
+    },
+    {
+      "chainId": 534352,
+      "cometAddress": "0xb2f97c1bd3bf02f5e74d13f02e3e26f93d77ce44",
+      "deploymentKey": "usdc",
+      "isInactive": true
+    }
+  ]
+}

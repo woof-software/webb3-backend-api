@@ -63,7 +63,7 @@ type ListedDecision = Decision & { symbol: string | null };
 type DecisionList   = { reason: string | null, decisions: ListedDecision[] };
 
 // each token of a JSON parameter (`c` its chain, `t` its address) as the active version and the stored decision describe it
-type TokenState = StateRow & { is_strategic: number | null };
+type TokenState = StateRow & { token_id: string | null, symbol: string | null, is_strategic: number | null };
 
 function statesStatement(db: D1Database, tokens: string): D1PreparedStatement {
   return db.prepare(
@@ -152,6 +152,7 @@ const TOKEN_POLICY_KIND: DecisionKind<TokenOfChain, Decision, ListedDecision, To
   misnamed:    (decision, state) => decision.symbol !== null && state.symbol !== decision.symbol
     ? `the list names ${decision.tokenAddress} ${decision.symbol}, which the active registry calls ${state.symbol}`
     : null,
+  addressOf:   token => token.tokenAddress,
   named:       (state, token) => state.symbol ?? token.tokenAddress,
 };
 

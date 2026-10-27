@@ -123,9 +123,10 @@ type ConflictCode = (
   // cancelling a sync run
   | 'SYNC_RUN_HELD'
   | 'SYNC_RUN_ENDED'
-  // writing token policies, deprecated collaterals and hidden ones
+  // writing token policies, deprecated collaterals and hidden ones, and inactive markets
   | 'TOKEN_LEFT_REGISTRY'
   | 'COLLATERAL_LEFT_REGISTRY'
+  | 'MARKET_LEFT_REGISTRY'
   | 'DECISION_CHANGED'
 );
 

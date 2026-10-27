@@ -6,6 +6,7 @@ import type {
   ActiveMarketV1,
   Address,
   CollateralDecisionListV1,
+  InactiveMarketListV1,
   NetworkV1,
   TokenPoliciesV1,
 } from '../../../lib/model/comet-registry.js';
@@ -18,6 +19,7 @@ import {
   member,
   setCollateral,
 } from '../../../src/registry/collateral-decision-repository.js';
+import { applyInactiveMarkets, setInactiveMarket } from '../../../src/registry/inactive-market-repository.js';
 import { applyTokenPolicies, setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
 import { foreignKeyViolations } from '../../util/d1.js';
@@ -28,8 +30,8 @@ import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 import type { RegistryHarness } from '../../util/registry-harness.js';
 
 /*
- * What token policies, deprecated collaterals and hidden collaterals do
- * alike. All are kinds of one store of decisions
+ * What token policies, deprecated collaterals, hidden collaterals and
+ * inactive markets do alike. All are kinds of one store of decisions
  * (src/registry/decision-store.ts) behind routes of one shape, so a decision,
  * a list of them, the races around their writes and the refusals of their
  * routes are tested here once, over a description of each kind
@@ -41,16 +43,18 @@ import type { RegistryHarness } from '../../util/registry-harness.js';
  *
  * Each kind runs them from its own files, beside the tests only it has:
  * decisionScenarios from token-policies.test.ts,
- * deprecated-collaterals.test.ts and hidden-collaterals.test.ts,
- * decisionRouteScenarios from token-policy-routes.test.ts,
- * deprecated-collateral-routes.test.ts and hidden-collateral-routes.test.ts.
+ * deprecated-collaterals.test.ts, hidden-collaterals.test.ts and
+ * inactive-markets.test.ts, decisionRouteScenarios from
+ * token-policy-routes.test.ts, deprecated-collateral-routes.test.ts,
+ * hidden-collateral-routes.test.ts and inactive-market-routes.test.ts.
  * The descriptions also drive the tests in Node that need a kind's tables or
  * routes: collateral-read-scenarios.ts and the two files that run it,
- * decision-read.test.ts and ../market/summary-tokens.test.ts. This module is
- * not a test file, and tap does not run it on its own.
+ * inactive-market-reads.test.ts, decision-read.test.ts and
+ * ../market/summary-tokens.test.ts. This module is not a test file, and tap
+ * does not run it on its own.
  */
 
-// what a decision is about, by the names its answers and its list rows give its addresses: a token, or a collateral of a Comet
+// what a decision is about, by the names its answers and its list rows give its addresses: a token, a collateral of a Comet, or a market by its Comet
 type Subject = Record<string, Address>;
 
 /*
@@ -610,6 +614,11 @@ function withoutCollateral(address: Address): NetworkV1[] {
   }));
 }
 
+// the fixture without the market of one Comet
+function withoutMarket(comet: Address): NetworkV1[] {
+  return snapshot.networks.map(network => ({ ...network, markets: network.markets.filter(market => market.contracts.comet !== comet) }));
+}
+
 // tokens of the fixture, as the registry stores them
 const WETH  = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
 const WBTC  = '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599';
@@ -889,5 +898,122 @@ const HIDDEN_COLLATERALS = collateralKindUnderTest({
   through:    [ '0007' ],
 });
 
+// the Comet of the fixture's Scroll market, which no other chain of the fixture holds
+const SCROLL_COMET = snapshot.networks.find(network => network.chainId === 534352)!.markets[0]!.contracts.comet!;
+
+// a row of a list of inactive markets, which the malformed rows are made from
+const MARKET_ROW = { chainId: 1, cometAddress: USDT_COMET, isInactive: true };
+
+/*
+ * Inactive markets, as the scenarios drive them: a decision about a market of
+ * the fixture's mainnet, by its Comet. No public read of /registry/v1 carries
+ * them, so the market reads flag nothing by them, and no public read needs
+ * their tables: /summary answers every market active without them
+ * (summary-tokens.test.ts). Through 0008 every table is there but these.
+ */
+const INACTIVE_MARKETS: DecisionKindUnderTest = {
+  noun:      'market',
+  label:     'inactive market',
+  adjective: 'inactive',
+  flagged:   false,
+  flag:      'isInactive',
+  previous:  'previousIsInactive',
+  tables:    { rows: 'inactive_markets', events: 'inactive_market_events' },
+  left:      { code: 'MARKET_LEFT_REGISTRY', message: /left the active registry on chain/ },
+  path:      (chainId, { cometAddress }) => `/registry/v1/admin/networks/${chainId}/markets/${cometAddress}/inactive`,
+  list:      {
+    export: '/registry/v1/admin/inactive-markets',
+    review: '/registry/v1/admin/inactive-markets/review',
+    apply:  '/registry/v1/admin/inactive-markets/apply',
+    key:    'inactiveMarkets',
+    what:   'inactive markets',
+    other:  'hiddenCollaterals',
+  },
+  reads:     () => [],
+  subject:   { cometAddress: USDT_COMET },
+  other:     { cometAddress: WETH_COMET },
+  without:   withoutMarket(USDT_COMET),
+  set:       (db, { subject, flag, actor, reason }) =>
+    setInactiveMarket(db, { chainId: 1, cometAddress: subject.cometAddress, isInactive: flag, actor, reason }),
+  apply:     (db, { reason, rows }, actor) => applyInactiveMarkets(db, {
+    reason,
+    decisions: rows.map(([ { cometAddress }, isInactive, given ]) => ({ chainId: 1, cometAddress, deploymentKey: null, isInactive, reason: given })),
+  }, actor),
+  // the export, which keeps the decisions for markets the version does not hold
+  listing:   async admin => {
+    const { body } = await admin.read<InactiveMarketListV1>('/registry/v1/admin/inactive-markets');
+    return {
+      versionId:  body.registryVersion?.id,
+      decisionOf: subject => body.inactiveMarkets.find(listed => listed.chainId === 1 && listed.cometAddress === subject.cometAddress)?.isInactive,
+      retained:   body.retained,
+    };
+  },
+  retained:  (subject, updatedAt) => ({ chainId: 1, ...subject, isInactive: true, updatedAt, updatedBy: ADMIN_ACTOR }),
+  // a missing chain, a missing Comet, a market another's key names, a change without a reason, and a token's address, which is no Comet
+  problems:  {
+    list: {
+      reason:          null,
+      inactiveMarkets: [
+        { chainId: 1,  cometAddress: USDT_COMET, deploymentKey: 'usdt', isInactive: true, reason: 'no longer offered' },
+        { chainId: 10, cometAddress: USDT_COMET, isInactive: true, reason: 'no longer offered' },
+        { chainId: 1,  cometAddress: NOWHERE, isInactive: true, reason: 'no longer offered' },
+        { chainId: 1,  cometAddress: USDC_COMET, deploymentKey: 'usdt', isInactive: true, reason: 'no longer offered' },
+        { chainId: 1,  cometAddress: WETH_COMET, isInactive: true },
+        { chainId: 1,  cometAddress: WETH, isInactive: false },
+      ],
+    },
+    named: [
+      [ 1, null ],
+      [ 2, 'chain 10 is not part of the active registry' ],
+      [ 3, `${NOWHERE} is not a market of the active registry on chain 1` ],
+      [ 4, `the list names ${USDC_COMET} usdt, which the active registry calls usdc` ],
+      [ 5, `${WETH_COMET} (weth) changes, and needs a reason: its own or the list's` ],
+      [ 6, `${WETH} is not a market of the active registry on chain 1` ],
+    ],
+  },
+  unheld:    [
+    [ 'a Comet no market of the chain has', { cometAddress: NOWHERE }, /is not a market of the active registry on chain 1/ ],
+    [ 'a token\'s address, which is no Comet', { cometAddress: WETH }, new RegExp(`${WETH} is not a market of the active registry on chain 1`) ],
+    // a decision is about a market of its own chain, and the version holds this Comet on another
+    [
+      'the Comet of a market of another chain',
+      { cometAddress: SCROLL_COMET },
+      new RegExp(`${SCROLL_COMET} is not a market of the active registry on chain 1`),
+    ],
+  ],
+  // `retained` is what an export keeps for markets the version does not hold, and a list does not read it
+  malformed: {
+    list: {
+      reason:          '\u0000no longer offered',
+      retained:        [ { anything: 'is not read' } ],
+      inactiveMarkets: [
+        'usdt',
+        { ...MARKET_ROW, note: 'x' },
+        { chainId: '1', cometAddress: '0x12', deploymentKey: 5, isInactive: 'yes', reason: ' ' },
+        { ...MARKET_ROW, reason: 'x'.repeat(1001) },
+        MARKET_ROW,
+        // the same address in another case, which names the same market
+        { ...MARKET_ROW, cometAddress: USDT_COMET.toUpperCase().replace('0X', '0x') },
+        // what a row of a list of collaterals names beside its market, which a list of markets refuses rather than ignores
+        { ...MARKET_ROW, tokenAddress: METH, symbol: 'mETH' },
+      ],
+    },
+    problems: [
+      'reason cannot contain a NUL character',
+      'row 1 must be an object',
+      'row 2 has unexpected properties: note',
+      'row 3: chainId must be a positive integer',
+      'row 3: cometAddress must be an address',
+      'row 3: deploymentKey must be null or a string',
+      'row 3: isInactive must be a boolean',
+      'row 3: reason must be null or a non-empty string of at most 1000 characters',
+      'row 4: reason must be null or a non-empty string of at most 1000 characters',
+      `row 6 repeats row 5 (chain 1, ${USDT_COMET})`,
+      'row 7 has unexpected properties: symbol, tokenAddress',
+    ],
+  },
+  migrations: { through: [ '0008' ], reads: [] },
+};
+
 export type { DecisionKindUnderTest };
-export { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, TOKEN_POLICIES, decisionRouteScenarios, decisionScenarios, statementsOf };
+export { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, INACTIVE_MARKETS, TOKEN_POLICIES, decisionRouteScenarios, decisionScenarios, statementsOf };

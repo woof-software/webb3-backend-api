@@ -97,13 +97,13 @@ const ERROR_STATUS: Record<RegistryErrorCode, ApiErrorCode> = {
 
 /*
  * A release that reached an environment before its token policy, deprecated
- * collateral or hidden collateral migration finds those tables missing. The
- * remedy is known and is an operator's, so it is said, rather than answered
- * as an internal error only the logs explain. Any other table missing is a
- * fault like the rest, and stays a 500.
+ * collateral, hidden collateral or inactive market migration finds those
+ * tables missing. The remedy is known and is an operator's, so it is said,
+ * rather than answered as an internal error only the logs explain. Any other
+ * table missing is a fault like the rest, and stays a 500.
  */
 function missingSchema(error: unknown): boolean {
-  return /no such table: (token_polic|deprecated_collateral|hidden_collateral)/i.test(String(error));
+  return /no such table: (token_polic|deprecated_collateral|hidden_collateral|inactive_market)/i.test(String(error));
 }
 
 /*

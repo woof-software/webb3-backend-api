@@ -46,6 +46,12 @@ import { withDeadline } from './deadline.js';
  * minutes besides. Such an answer says it could not be confirmed, as every
  * answer from the cache does. With nothing recorded there is nothing to
  * answer with, and the read fails as one does past the fallback window.
+ *
+ * A record is kept the same way for any kind whose decisions a read takes on
+ * every request (RecordedKind): each kind reads its decisions, says what they
+ * are and what its record holds, and the rest is done here. The markets an
+ * administrator marked inactive keep one too, which only /summary reads
+ * (inactive-markets.ts).
  */
 
 /*
@@ -60,10 +66,16 @@ type CollateralDecisions = {
   digest:      string,
 };
 
-// the decisions a read marks collaterals with, and whether they came from the record rather than from D1
-type CollateralRead = { decisions: CollateralDecisions, recorded: boolean };
+// what a kind's decisions are to their record: whatever else they hold, what tells two sets of them apart
+type DecisionSet = { digest: string };
 
-// what names a set of collaterals, in whatever order they were listed
+// the decisions a read takes, and whether they came from the record rather than from D1
+type DecisionRead<Decisions extends DecisionSet> = { decisions: Decisions, recorded: boolean };
+
+// the decisions a read marks collaterals with, and whether they came from the record rather than from D1
+type CollateralRead = DecisionRead<CollateralDecisions>;
+
+// what names a set of collaterals, or of whatever a kind decides about, in whatever order they were listed
 function digestOf(keys: string[]): string {
   return keccak256([ ...keys ].sort().join(',')).slice(0, 16);
 }
@@ -90,7 +102,7 @@ const HIDDEN_KEY     = HIDDEN_COLLATERAL_KIND.recordKey;
 
 type CollateralRecord = { at: string, collaterals: CollateralOfComet[] };
 
-function recordOf(value: unknown): CollateralOfComet[] | null {
+function collateralsIn(value: unknown): CollateralOfComet[] | null {
   const record = value as CollateralRecord | null;
   if (record === null || typeof(record) !== 'object' || typeof(record.at) !== 'string' || !Array.isArray(record.collaterals)) {
     return null;
@@ -141,14 +153,18 @@ type Known = {
 
 /*
  * A kind of decision as its record is kept: the record's key, what a log line
- * calls the kind, its read of every chain's decisions from D1, and what each
- * isolate knows of its record, which is the kind's own, as the record is.
+ * calls the kind, its read of every chain's decisions from D1, the decisions
+ * a value of its record holds (null for one that is not such a record), the
+ * record that holds them, and what each isolate knows of its record, which is
+ * the kind's own, as the record is. A kind about a collateral is the default.
  */
-type RecordedKind = {
-  key:   string,
-  noun:  string,
-  read:  (db: D1Database) => Promise<CollateralOfComet[]>,
-  known: WeakMap<KVNamespace, Known>,
+type RecordedKind<Decisions extends DecisionSet = CollateralDecisions> = {
+  key:         string,
+  noun:        string,
+  read:        (db: D1Database) => Promise<Decisions>,
+  decisionsIn: (value: unknown) => Decisions | null,
+  recordOf:    (decisions: Decisions, at: string) => unknown,
+  known:       WeakMap<KVNamespace, Known>,
 };
 
 // the record of a kind of decision about a collateral, as the kind describes it (collateral-decision-repository.ts)
@@ -156,10 +172,15 @@ function recordedKind<Flag extends string, Column extends string, Rows extends s
   kind: CollateralDecisionKind<Flag, Column, Rows>,
 ): RecordedKind {
   return {
-    key:   kind.recordKey,
-    noun:  kind.label,
-    read:  async db => await readMarkedCollaterals(db, kind),
-    known: new WeakMap(),
+    key:         kind.recordKey,
+    noun:        kind.label,
+    read:        async db => collateralDecisionsOf(await readMarkedCollaterals(db, kind)),
+    decisionsIn: value => {
+      const collaterals = collateralsIn(value);
+      return collaterals === null ? null : collateralDecisionsOf(collaterals);
+    },
+    recordOf:    (decisions, at): CollateralRecord => ({ at, collaterals: decisions.collaterals }),
+    known:       new WeakMap(),
   };
 }
 
@@ -175,14 +196,14 @@ function timeOf(deps: CacheDeps): number {
 }
 
 // whether the record holds these decisions; one that cannot be read, or is not a record, does not
-async function recordHolds(kind: RecordedKind, deps: CacheDeps, decisions: CollateralDecisions): Promise<boolean> {
-  let collaterals: CollateralOfComet[] | null;
+async function recordHolds<Decisions extends DecisionSet>(kind: RecordedKind<Decisions>, deps: CacheDeps, decisions: Decisions): Promise<boolean> {
+  let held: Decisions | null;
   try {
-    collaterals = recordOf(await deps.kv.get(kind.key, 'json'));
+    held = kind.decisionsIn(await deps.kv.get(kind.key, 'json'));
   } catch {
     return false;
   }
-  return collaterals !== null && collateralDecisionsOf(collaterals).digest === decisions.digest;
+  return held !== null && held.digest === decisions.digest;
 }
 
 /*
@@ -190,13 +211,17 @@ async function recordHolds(kind: RecordedKind, deps: CacheDeps, decisions: Colla
  * and says whether KV refused them. It never fails: the answer, or the
  * command, is already made, and failing to record it must not fail it.
  */
-async function writeRecord(kind: RecordedKind, deps: CacheDeps, decisions: CollateralDecisions, check: boolean): Promise<boolean> {
+async function writeRecord<Decisions extends DecisionSet>(
+  kind: RecordedKind<Decisions>,
+  deps: CacheDeps,
+  decisions: Decisions,
+  check: boolean,
+): Promise<boolean> {
   try {
     if (check && await recordHolds(kind, deps, decisions)) {
       return false;
     }
-    const record: CollateralRecord = { at: new Date(timeOf(deps)).toISOString(), collaterals: decisions.collaterals };
-    await deps.kv.put(kind.key, JSON.stringify(record));
+    await deps.kv.put(kind.key, JSON.stringify(kind.recordOf(decisions, new Date(timeOf(deps)).toISOString())));
     return false;
   } catch (error) {
     deps.debug.warn(`${kind.noun} record unwritable`, { error });
@@ -209,7 +234,7 @@ async function writeRecord(kind: RecordedKind, deps: CacheDeps, decisions: Colla
  * the record say so. A check that a later one replaced meanwhile settles only
  * itself, so what it found never overwrites what the later one finds.
  */
-function record(kind: RecordedKind, deps: CacheDeps, decisions: CollateralDecisions, check: boolean): Promise<void> {
+function record<Decisions extends DecisionSet>(kind: RecordedKind<Decisions>, deps: CacheDeps, decisions: Decisions, check: boolean): Promise<void> {
   const entry: Known = { digest: decisions.digest, due: timeOf(deps) + RETRY_RECORD_AFTER_MS, pending: null };
   kind.known.set(deps.kv, entry);
   entry.pending = writeRecord(kind, deps, decisions, check).then(refused => {
@@ -230,7 +255,7 @@ function record(kind: RecordedKind, deps: CacheDeps, decisions: CollateralDecisi
  * The answer does not wait for the check: it is handed to the request's
  * waitUntil (`defer`), as the pointer record's write is (cache.ts).
  */
-async function remember(kind: RecordedKind, deps: CacheDeps, decisions: CollateralDecisions): Promise<void> {
+async function remember<Decisions extends DecisionSet>(kind: RecordedKind<Decisions>, deps: CacheDeps, decisions: Decisions): Promise<void> {
   if (deps.staleSeconds <= 0) {
     return;
   }
@@ -265,13 +290,13 @@ async function settlesWithin(work: Promise<void>, milliseconds: number): Promise
  * not write is written by a later read (remember): of any isolate that last
  * found other decisions there, or of this one a minute later.
  */
-async function recordCollaterals(kind: RecordedKind, deps: CacheDeps): Promise<void> {
+async function recordCollaterals<Decisions extends DecisionSet>(kind: RecordedKind<Decisions>, deps: CacheDeps): Promise<void> {
   if (deps.staleSeconds <= 0) {
     return;
   }
-  let decisions: CollateralDecisions;
+  let decisions: Decisions;
   try {
-    decisions = collateralDecisionsOf(await kind.read(deps.db));
+    decisions = await kind.read(deps.db);
   } catch (error) {
     deps.debug.warn(`${kind.noun} record not written: the decisions could not be read`, { error });
     return;
@@ -290,7 +315,7 @@ async function recordCollaterals(kind: RecordedKind, deps: CacheDeps): Promise<v
  * leaves the read nothing to answer with: the registry is unavailable, as it
  * is past the fallback window.
  */
-async function recordedDecisions(kind: RecordedKind, deps: CacheDeps, cause: unknown): Promise<CollateralDecisions> {
+async function recordedDecisions<Decisions extends DecisionSet>(kind: RecordedKind<Decisions>, deps: CacheDeps, cause: unknown): Promise<Decisions> {
   const unavailable = () => new RegistryUnavailable(`the ${kind.noun} decisions could not be read`, cause);
   let value: unknown;
   try {
@@ -299,11 +324,11 @@ async function recordedDecisions(kind: RecordedKind, deps: CacheDeps, cause: unk
     deps.debug.warn(`${kind.noun} record unreadable`, { error });
     throw unavailable();
   }
-  const collaterals = recordOf(value);
-  if (collaterals === null) {
+  const decisions = kind.decisionsIn(value);
+  if (decisions === null) {
     throw unavailable();
   }
-  return collateralDecisionsOf(collaterals);
+  return decisions;
 }
 
 /*
@@ -313,7 +338,7 @@ async function recordedDecisions(kind: RecordedKind, deps: CacheDeps, cause: unk
  */
 const fallbackDue = throttleBy<D1Database>(60_000);
 
-function reportFallback(kind: RecordedKind, deps: CacheDeps, error: unknown): void {
+function reportFallback<Decisions extends DecisionSet>(kind: RecordedKind<Decisions>, deps: CacheDeps, error: unknown): void {
   if (!fallbackDue(deps.db, kind.key, timeOf(deps))) {
     return;
   }
@@ -321,16 +346,15 @@ function reportFallback(kind: RecordedKind, deps: CacheDeps, error: unknown): vo
 }
 
 /*
- * The decisions of a kind the active reads mark collaterals with: every
- * chain's, from D1, or — when D1 could not be reached, in an environment that
- * answers from the cache at all — the ones last recorded. A database that
- * answered with a fault, such as a release ahead of the kind's migration, is
- * raised as it is.
+ * The decisions of a recorded kind, as a read takes them: every chain's, from
+ * D1, or — when D1 could not be reached, in an environment that answers from
+ * the cache at all — the ones last recorded. A database that answered with a
+ * fault, such as a release ahead of the kind's migration, is raised as it is.
  */
-async function markedDecisions(kind: RecordedKind, deps: CacheDeps): Promise<CollateralRead> {
-  let decisions: CollateralDecisions;
+async function markedDecisions<Decisions extends DecisionSet>(kind: RecordedKind<Decisions>, deps: CacheDeps): Promise<DecisionRead<Decisions>> {
+  let decisions: Decisions;
   try {
-    decisions = collateralDecisionsOf(await kind.read(deps.db));
+    decisions = await kind.read(deps.db);
   } catch (error) {
     if (!isUnreachable(error)) {
       throw error;
@@ -406,13 +430,14 @@ function markedRepresentation(name: string, networks: Array<{ chainId: number, m
   return `${name}+deprecated-${digestOf(flagged('isDeprecated'))}+hidden-${digestOf(flagged('isHidden'))}`;
 }
 
-export type { CollateralMarks, CollateralRead, RecordedKind };
+export type { CollateralMarks, CollateralRead, DecisionRead, DecisionSet, RecordedKind };
 export {
   DEPRECATED_KEY,
   DEPRECATED_RECORD,
   HIDDEN_KEY,
   HIDDEN_RECORD,
   collateralDecisionsOf,
+  digestOf,
   markedDecisions,
   markedMarket,
   markedNetwork,
