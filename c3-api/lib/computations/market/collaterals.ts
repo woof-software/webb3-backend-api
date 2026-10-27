@@ -17,7 +17,8 @@ import type { AssetPriceRead } from '../comet/asset-price.js';
 /*
  * Every collateral asset of a market, in the order the Comet numbers them:
  * what it is, how much of it the market holds, and its price or why that
- * could not be read, with the exception of the registry that priced it. The
+ * could not be read, with the exception of the registry that priced it, or
+ * the remap that fell back on the feed it replaces (asset-price.ts). The
  * summary's collateral value, the value of each collateral, and its report of
  * which collateral could not be priced all come from this one pass, so each
  * read is made once — an evaluator that does not remember what it computed
@@ -33,13 +34,11 @@ import type { AssetPriceRead } from '../comet/asset-price.js';
  * listed yet at that block is left out, as is one the version does not
  * describe: until a version does, nothing says what it is.
  */
-type Collateral = {
-  asset:           Eth.Address,
-  symbol:          string,
-  // null where the Comet holds another asset at the collateral's index, so what it holds of this one was not read
-  totalCollateral: BigFixnum | null,
-  price:           AssetPriceRead,
-};
+type Collateral = { asset: Eth.Address, symbol: string } & (
+  // the Comet holds another asset at the collateral's index, so what it holds of this one was not read, nor its price
+  | { totalCollateral: null, price: Extract<AssetPriceRead, { status: 'error' }> }
+  | { totalCollateral: BigFixnum, price: AssetPriceRead }
+);
 
 type Collaterals = Compute.Spec<{
   name: 'collaterals',
@@ -51,8 +50,8 @@ type Collaterals = Compute.Spec<{
 
 const { implement, join, pipe, pipe1, value } = Compute.Functor<Collaterals>({});
 const collaterals = implement({
-  // 3: with the exception each price applied, and no holding where the Comet holds another asset
-  version: 3,
+  // 4: where a remap fell back, its price naming the remap
+  version: 4,
   compute({ apiHost, nodeHost, nodeKey, blockNumber, contract, network }) {
     const frame = { apiHost, nodeHost, nodeKey, blockNumber, contract, network };
     return pipe1([
@@ -100,14 +99,23 @@ const collaterals = implement({
   },
 });
 
-// what the market holds of the collaterals that could be priced, in the unit their feeds answer in
-function collateralValue(collaterals: Collateral[]): BigFixnum {
-  return collaterals.reduce(
-    (sum, { totalCollateral, price }) => price.status === 'success' && totalCollateral !== null
-      ? sum.add(totalCollateral.mul(price.price))
-      : sum,
-    BigFixnum.from({ value: 0 }),
-  );
+/*
+ * What the market holds of a collateral at its price, in the unit its feed
+ * answers in, or null where either was not read: the one product the totals
+ * and the value of each collateral are made of (market-latest-summary.ts), so
+ * the values that are known add up to the total, but for a price a remap's
+ * fallback gave, which the totals count and no value is made of.
+ */
+function quotedOf({ totalCollateral, price }: Collateral): BigFixnum | null {
+  return totalCollateral === null || price.status === 'error' ? null : totalCollateral.mul(price.price);
 }
 
-export { Collateral, Collaterals, collateralValue, collaterals };
+// what the market holds of the collaterals that could be priced, in the unit their feeds answer in
+function collateralValue(collaterals: Collateral[]): BigFixnum {
+  return collaterals.reduce((sum, collateral) => {
+    const quoted = quotedOf(collateral);
+    return quoted === null ? sum : sum.add(quoted);
+  }, BigFixnum.from({ value: 0 }));
+}
+
+export { Collateral, Collaterals, collateralValue, collaterals, quotedOf };

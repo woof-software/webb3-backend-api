@@ -5,6 +5,8 @@ import * as Compute from '../../symbolic/computation.js';
 
 import * as KnownNetwork from '../../well-known/networks/network.js';
 
+import type { BlockRefV1 } from '../../model/comet-registry.js';
+
 import { throttle } from '../../throttle.js';
 
 import { validateResult } from './eth-get-block.js';
@@ -35,7 +37,7 @@ type EthGetBlockHeader = Compute.Spec<{
     network:     KnownNetwork.Name,
     blockNumber: Eth.BlockNumber,
   },
-  returns: { number: number, timestamp: number } | null,
+  returns: BlockRefV1 | null,
 }>;
 
 /*

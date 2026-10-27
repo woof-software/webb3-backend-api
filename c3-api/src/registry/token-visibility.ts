@@ -1,16 +1,6 @@
 import { BigFixnum } from '../../lib/bigfixnum.js';
 
-import * as KnownNetwork from '../../lib/well-known/networks/network.js';
-
-import {
-  ASSET_ROLES,
-  Address,
-  AssetRole,
-  TokenV1,
-  VisibilityV1,
-} from '../../lib/model/comet-registry.js';
-
-import type { Catalog, CatalogMarket } from './catalog.js';
+import type { VisibilityV1 } from '../../lib/model/comet-registry.js';
 
 /*
  * Whether discovery shows the token of a collateral in its market: where the
@@ -39,81 +29,22 @@ const THRESHOLD_USD = BigFixnum.from({ value: 250000 });
 // what keeps a token out of discovery, if anything; not null, which /summary gives a decision it could not read
 type Exclusion = 'hidden' | 'deprecated' | 'none';
 
-// a kind of decision as the rule asks it (collateral-decisions.ts): whether it names a collateral, its addresses lowercase
-type Decisions = { has: (collateral: { chainId: number, cometAddress: Address, tokenAddress: Address }) => boolean };
-
-/*
- * Every token the active version serves on a chain, with every role it plays
- * in the markets that serve it. A deprecated market is still served, so its
- * tokens are listed; a disabled one is never materialized. A reward token is
- * the market's reward asset.
- */
-function tokensOf(catalog: Catalog, network: KnownNetwork.Name): Array<{ token: TokenV1, roles: AssetRole[] }> {
-  const found = new Map<Address, { token: TokenV1, roles: Set<AssetRole> }>();
-  const add = (token: TokenV1, role: AssetRole) => {
-    const entry = found.get(token.address) ?? { token, roles: new Set<AssetRole>() };
-    entry.roles.add(role);
-    found.set(token.address, entry);
-  };
-  for (const { market } of catalog.marketsOn(network)) {
-    add(market.baseAsset.token, 'base');
-    if (market.rewardAsset !== null) {
-      add(market.rewardAsset.token, 'reward');
-    }
-    market.collateralAssets.forEach(asset => add(asset.token, 'collateral'));
-  }
-  return [ ...found.values() ].map(({ token, roles }) => ({ token, roles: ASSET_ROLES.filter(role => roles.has(role)) }));
-}
-
 function exclusionHere({ isHidden, isDeprecated }: { isHidden: boolean, isDeprecated: boolean }): Exclusion {
   return isHidden ? 'hidden' : isDeprecated ? 'deprecated' : 'none';
 }
 
-/*
- * What the decisions of a chain's served markets say of a token they take as
- * collateral: the Comets that have it deprecated, and those that hide it,
- * sorted; and whether it is deprecated in every enabled market that takes it,
- * of which there is at least one. A market whose status is `deprecated`
- * offers the token no longer: its decisions are named, and take no part in
- * whether the token is deprecated across the chain. None of it decides
- * whether discovery shows the token in a market, which that market's own
- * decisions do (visibilityHere).
- */
-function decisionsOnChain(
-  chainId: number,
-  token: Address,
-  markets: CatalogMarket[],
-  { deprecated, hidden }: { deprecated: Decisions, hidden: Decisions },
-): { isDeprecated: boolean, deprecatedIn: Address[], hiddenIn: Address[] } {
-  const taking = markets
-    .filter(({ market }) => market.collateralAssets.some(asset => asset.token.address === token))
-    .map(({ market }) => {
-      const collateral = { chainId, cometAddress: market.contracts.comet, tokenAddress: token };
-      return { market, isHidden: hidden.has(collateral), isDeprecated: deprecated.has(collateral) };
-    });
-  const enabled = taking.filter(({ market }) => market.status === 'enabled');
-  return {
-    isDeprecated: enabled.length > 0 && enabled.every(entry => entry.isDeprecated),
-    deprecatedIn: taking.filter(entry => entry.isDeprecated).map(({ market }) => market.contracts.comet).sort(),
-    hiddenIn:     taking.filter(entry => entry.isHidden).map(({ market }) => market.contracts.comet).sort(),
-  };
-}
-
-// what a collateral is worth in USD in its market, or null where that could not be read
-type Worth = { valueUsd: BigFixnum | null };
-
 // of a value, the rule reads only whether it is known and what it is worth
-function visibilityOf(exclusion: Exclusion, isStrategic: boolean, value: Worth): VisibilityV1 {
+function visibilityOf(exclusion: Exclusion, isStrategic: boolean, valueUsd: BigFixnum | null): VisibilityV1 {
   if (exclusion !== 'none') {
     return { isVisible: false, visibilityReason: exclusion };
   }
   if (isStrategic) {
     return { isVisible: true, visibilityReason: 'strategic' };
   }
-  if (value.valueUsd === null) {
+  if (valueUsd === null) {
     return { isVisible: true, visibilityReason: 'data_unavailable' };
   }
-  return value.valueUsd.gte(THRESHOLD_USD)
+  return valueUsd.gte(THRESHOLD_USD)
     ? { isVisible: true,  visibilityReason: 'collateral_threshold' }
     : { isVisible: false, visibilityReason: 'below_threshold' };
 }
@@ -130,66 +61,17 @@ function visibilityOf(exclusion: Exclusion, isStrategic: boolean, value: Worth):
  */
 function visibilityHere(
   { isHidden, isDeprecated, isStrategic }: { isHidden: boolean | null, isDeprecated: boolean | null, isStrategic: boolean | null },
-  value: Worth,
+  valueUsd: BigFixnum | null,
 ): Partial<VisibilityV1> {
   const either     = (decision: boolean | null) => decision === null ? [ true, false ] : [ decision ];
   const exclusions = either(isHidden).flatMap(hiding => either(isDeprecated).map(deprecating => (
     exclusionHere({ isHidden: hiding, isDeprecated: deprecating })
   )));
-  const answers    = exclusions.flatMap(exclusion => either(isStrategic).map(strategic => visibilityOf(exclusion, strategic, value)));
+  const answers    = exclusions.flatMap(exclusion => either(isStrategic).map(strategic => visibilityOf(exclusion, strategic, valueUsd)));
   const [ first ]  = answers;
   const agreed     = (part: keyof VisibilityV1) => answers.every(answer => answer[part] === first[part]);
   return agreed('visibilityReason') ? first : agreed('isVisible') ? { isVisible: first.isVisible } : {};
 }
 
-/*
- * A value as the API writes it: every digit, no trailing zeros, no exponent.
- * BigFixnum's own string keeps a trailing ".0" and refuses large scales, so
- * the digits are placed here.
- */
-function decimalString(value: BigFixnum): string {
-  const negative = value.value.isNegative();
-  const digits   = value.value.abs().toString();
-  if (value.decimals === 0) {
-    return `${negative ? '-' : ''}${digits}`;
-  }
-  const padded   = digits.padStart(value.decimals + 1, '0');
-  const whole    = padded.slice(0, padded.length - value.decimals);
-  const fraction = padded.slice(padded.length - value.decimals).replace(/0+$/, '');
-  return `${negative ? '-' : ''}${fraction === '' ? whole : `${whole}.${fraction}`}`;
-}
-
-type ChainInput = {
-  chainId:    number,
-  catalog:    Catalog,
-  network:    KnownNetwork.Name,
-  strategic:  ReadonlySet<Address>,
-  deprecated: Decisions,
-  hidden:     Decisions,
-};
-
-// a token of a chain, with what holds of it across the chain: its roles, its strategic mark and the collateral decisions about it
-type ChainToken = TokenV1 & {
-  roles:        AssetRole[],
-  isStrategic:  boolean,
-  isDeprecated: boolean,
-  deprecatedIn: Address[],
-  hiddenIn:     Address[],
-};
-
-// every token of a chain, in no particular order, with what holds of it across the chain (summary-tokens.ts)
-function chainTokensOf(input: ChainInput): ChainToken[] {
-  const markets = input.catalog.marketsOn(input.network);
-  return tokensOf(input.catalog, input.network).map(({ token, roles }): ChainToken => ({
-    address:     token.address,
-    symbol:      token.symbol,
-    name:        token.name,
-    decimals:    token.decimals,
-    roles,
-    isStrategic: input.strategic.has(token.address),
-    ...decisionsOnChain(input.chainId, token.address, markets, input),
-  }));
-}
-
-export type { ChainToken, Exclusion, Worth };
-export { THRESHOLD_USD, chainTokensOf, decimalString, tokensOf, visibilityHere, visibilityOf };
+export type { Exclusion };
+export { visibilityHere, visibilityOf };

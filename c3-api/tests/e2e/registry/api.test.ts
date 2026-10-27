@@ -273,6 +273,7 @@ t.test('a public read that fails after the version was read names the version', 
   for (const [ path, init, status, what ] of [
     [ `/registry/v1/versions/${randomUUID()}`, {}, 404, 'a version nobody validated' ],
     [ '/registry/v1/unknown', {}, 404, 'an unknown path' ],
+    [ '/registry/v1/networks/1/tokens', {}, 404, 'the path the public token list had' ],
     [ '/registry/v1/active', { method: 'POST' }, 405, 'a method the route does not take' ],
     [ `/registry/v1/admin/versions/${randomUUID()}`, auth, 404, 'an administrative read' ],
   ] as const) {
@@ -281,40 +282,6 @@ t.test('a public read that fails after the version was read names the version', 
     t.equal(refused.headers.get('x-registry-version'), null, 'naming no version');
     t.equal(refused.headers.get('x-registry-checksum'), null);
   }
-});
-
-/*
- * The public read of a chain's tokens is gone with the value it answered: its
- * path answers as any path no route matches, with or without a trailing
- * slash or a query, in any method, and before any version is read, so it
- * names none. Its preflight is answered, as every registry path's is.
- */
-t.test('the path of the public read of a chain\'s tokens answers as an unknown path', async t => {
-  const db        = await freshDatabase();
-  const versionId = await seedValidated(db);
-  await server.fetch(...admin(`/registry/v1/admin/versions/${versionId}/activate`, { reason: 'activate' }));
-
-  const unknown = await server.fetch('/registry/v1/unknown');
-  const headers = (response: { headers: { get: (name: string) => string | null } }) => [ 'access-control-allow-origin', 'cache-control', 'x-registry-version', 'x-registry-checksum', 'allow' ]
-    .map(name => [ name, response.headers.get(name) ]);
-  for (const [ path, init, what ] of [
-    [ '/registry/v1/networks/1/tokens',           {},                 'a GET' ],
-    [ '/registry/v1/networks/1/tokens/',          {},                 'a GET with a trailing slash' ],
-    [ '/registry/v1/networks/1/tokens?a=b',       {},                 'a GET with a query' ],
-    [ '/registry/v1/networks/1/tokens',           { method: 'HEAD' }, 'a HEAD' ],
-    [ '/registry/v1/networks/1/tokens',           { method: 'POST' }, 'a POST, which a route would refuse with 405' ],
-  ] as const) {
-    const refused = await server.fetch(path, init);
-    t.equal(refused.status, 404, `${what} is a 404`);
-    if (init.method !== 'HEAD') {
-      const { error } = await refused.json() as { error: { code: string, message: string } };
-      t.same([ error.code, error.message ], [ 'NOT_FOUND', 'no registry route matches /registry/v1/networks/1/tokens' ],
-        `${what}: no route matches the path`);
-    }
-    t.same(headers(refused), headers(unknown), `${what}: with the headers of an unknown path, naming no version`);
-  }
-  const preflight = await server.fetch('/registry/v1/networks/1/tokens', { method: 'OPTIONS' });
-  t.equal(preflight.status, 204, 'and its preflight is answered, as every registry path\'s is');
 });
 
 /*

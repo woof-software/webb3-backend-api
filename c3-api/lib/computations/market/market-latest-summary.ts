@@ -5,7 +5,7 @@ import * as Fallible     from '../../fallible/fallible.js';
 
 import { BigFixnum } from '../../bigfixnum.js';
 
-import type { BlockRefV1, PriceExceptionV1 } from '../../model/comet-registry.js';
+import type { BlockRefV1, CollateralValueStatusV1, PriceExceptionV1 } from '../../model/comet-registry.js';
 
 import type {
   BasePrice,
@@ -21,7 +21,7 @@ import type { EthGetBlockHeader } from '../evm/eth-get-block-header.js';
 
 import type { BorrowApr } from './borrow-apr.js';
 import type { SupplyApr } from './supply-apr.js';
-import { type Collateral, type Collaterals, collateralValue } from './collaterals.js';
+import { type Collateral, type Collaterals, collateralValue, quotedOf } from './collaterals.js';
 import { collateralStatusOf, type CollateralStatus, type MarketIdentity, type MarketSummary } from './market-summary.js';
 
 /*
@@ -46,17 +46,21 @@ import { collateralStatusOf, type CollateralStatus, type MarketIdentity, type Ma
  *
  * A collateral's value is what the market holds of it, at its price, converted
  * to USD as the totals are: so the values that are known add up to
- * totalCollateralValueUsd, where that is reported. What the market holds none
- * of is worth nothing, whatever its price says or fails to say, and a price of
- * zero is nothing in USD whatever converts it. A value is null where the
- * Comet holds another asset at the collateral's index, where its price could
- * not be read, or where what converts it to USD could not.
+ * totalCollateralValueUsd, where that is reported, but where a remap fell
+ * back (below). What the market holds none of is worth nothing, whatever its
+ * price says or fails to say, and a price of zero is nothing in USD whatever
+ * converts it. A value is null where the Comet holds another asset at the
+ * collateral's index, where its price could not be read, or where what
+ * converts it to USD could not.
  *
  * A remap whose replacement reverts at the block while the feed it replaces
- * answers values its collateral at that feed's price, as the totals are, and
- * names no exception (asset-price.ts). The block is within a minute of the
- * latest, after the replacement was deployed — the registry read its decimals
- * on chain when an overlay named it — so the replacement has stopped
+ * answers leaves its collateral's value null, naming the remap, while the
+ * totals count the collateral at that feed's price, as the history does
+ * (asset-price.ts): the remap retired that feed, and what it still answers
+ * must not decide whether discovery shows a token, which shows one whose
+ * value is not known (token-visibility.ts). The block is within a minute of
+ * the latest, after the replacement was deployed — the registry read its
+ * decimals on chain when an overlay named it — so the replacement has stopped
  * answering, and this summary reports its revert as a feed that reverts is
  * reported (get-price.ts): naming the replacement and the Comet, at the
  * block, with the replacement's own message, once a minute per network and
@@ -70,17 +74,16 @@ import { collateralStatusOf, type CollateralStatus, type MarketIdentity, type Ma
  */
 
 // a price exception of the registry as a summary names it, whatever the version that answers says of it besides
-type AppliedException = Pick<PriceExceptionV1, 'kind' | 'priceFeedAddress'>;
+type AppliedException<Kind extends PriceExceptionV1['kind'] = PriceExceptionV1['kind']> = Pick<Extract<PriceExceptionV1, { kind: Kind }>, 'kind' | 'priceFeedAddress'>;
 
-/*
- * A collateral as the latest summary reports it: its status, its value in USD
- * or null, and the exception that priced it, which a value that is nothing
- * held or not known has none of.
- */
-type ValuedCollateral = CollateralStatus & {
-  valueUsd:  BigFixnum | null,
-  exception: AppliedException | null,
-};
+// nothing held names no exception, whatever priced it; a remap that fell back is named where it leaves the value unknown, to say why
+type CollateralValue = (
+  | { valueUsd: null, exception: null }
+  | { valueUsd: null, exception: AppliedException<'deprecated_price_remap'> }
+  | { valueUsd: BigFixnum, exception: AppliedException | null }
+);
+
+type ValuedCollateral = CollateralStatus & CollateralValue;
 
 // what the summary reports of a market however its base asset was priced
 type Reported = {
@@ -125,37 +128,32 @@ type MarketLatestSummary = Compute.Spec<{
   ),
 }>;
 
-// what a collateral is worth in USD, by the rules above, given what converts a total to USD, or null where that could not be read
-function valueUsdOf({ totalCollateral, price }: Collateral, inUsd: ((total: BigFixnum) => BigFixnum) | null): BigFixnum | null {
-  if (totalCollateral === null) {
-    return null;
+// a collateral's value by the rules above, given what converts a total to USD, or null where that could not be read
+function valueOf(collateral: Collateral, inUsd: ((total: BigFixnum) => BigFixnum) | null): CollateralValue {
+  const { totalCollateral, price } = collateral;
+  if (totalCollateral !== null && totalCollateral.value.isZero()) {
+    return { valueUsd: BigFixnum.from({ value: 0 }), exception: null };
   }
-  if (totalCollateral.value.isZero()) {
-    return BigFixnum.from({ value: 0 });
+  if ('replacementRevert' in price) {
+    return { valueUsd: null, exception: { kind: price.exception.kind, priceFeedAddress: price.exception.priceFeedAddress } };
   }
-  if (price.status === 'error') {
-    return null;
+  const quoted   = quotedOf(collateral);
+  const valueUsd = quoted === null ? null : quoted.value.isZero() ? quoted : inUsd === null ? null : inUsd(quoted);
+  if (valueUsd === null || price.exception === null) {
+    return { valueUsd, exception: null };
   }
-  const quoted = totalCollateral.mul(price.price);
-  return quoted.value.isZero() ? quoted : inUsd === null ? null : inUsd(quoted);
+  return { valueUsd, exception: { kind: price.exception.kind, priceFeedAddress: price.exception.priceFeedAddress } };
 }
 
-function valuedOf(collateral: Collateral, inUsd: ((total: BigFixnum) => BigFixnum) | null): ValuedCollateral {
-  const { totalCollateral, price } = collateral;
-  const valueUsd = valueUsdOf(collateral, inUsd);
-  const held     = totalCollateral !== null && !totalCollateral.value.isZero();
-  const priced   = held && valueUsd !== null ? price.exception : null;
-  return {
-    ...collateralStatusOf(collateral),
-    valueUsd,
-    exception: priced === null ? null : { kind: priced.kind, priceFeedAddress: priced.priceFeedAddress },
-  };
+// how a value was read, as /summary says it (collateral_value_status): the value alone decides it
+function valueStatusOf({ valueUsd, exception }: CollateralValue): CollateralValueStatusV1 {
+  return valueUsd === null ? 'unavailable' : exception === null ? 'fresh' : 'exception';
 }
 
 const { implement, pipe } = Compute.Functor<MarketLatestSummary>({});
 const marketLatestSummary = implement({
-  // 6: with each collateral's value in USD and the exception that priced it, and the block the market was read at
-  version: 6,
+  // 7: a remap that fell back leaves its collateral's value unknown, and is named on it
+  version: 7,
   compute({ apiHost, nodeHost, nodeKey, network, contract, block }) {
     const { chainId } = Fallible.must(
       KnownNetwork.lookup({ name: network })
@@ -186,10 +184,10 @@ const marketLatestSummary = implement({
         collaterals: held,
         ethGetBlockHeader: header,
       }): MarketLatestSummary['returns'] => {
-        // a remap's replacement that has stopped answering is reported, and answered in nothing (above)
-        for (const { price: { replacementRevert } } of held) {
-          if (replacementRevert !== undefined) {
-            reportRevert(replacementRevert.message, replacementRevert.feed, contract.address, network, block.number);
+        // a remap's replacement that has stopped answering is reported, and its revert answered in nothing (above)
+        for (const { price } of held) {
+          if ('replacementRevert' in price) {
+            reportRevert(price.replacementRevert.message, price.replacementRevert.feed, contract.address, network, block.number);
           }
         }
         const totals = basePrice.status === 'success'
@@ -206,7 +204,7 @@ const marketLatestSummary = implement({
             address: contract.address,
           },
         };
-        const collaterals = held.map(collateral => valuedOf(collateral, inUsd));
+        const collaterals = held.map((collateral): ValuedCollateral => ({ ...collateralStatusOf(collateral), ...valueOf(collateral, inUsd) }));
         const fields: Reported & Partial<Priced> = {
           borrowApr: borrowApr.toString(),
           supplyApr: supplyApr.toString(),
@@ -252,11 +250,11 @@ const marketLatestSummary = implement({
 });
 
 export type {
-  AppliedException,
-  ValuedCollateral,
+  CollateralValue,
 };
 
 export {
   MarketLatestSummary,
   marketLatestSummary,
+  valueStatusOf,
 };
