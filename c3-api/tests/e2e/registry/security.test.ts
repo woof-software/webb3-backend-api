@@ -1,11 +1,9 @@
 import t from 'tap';
 
-import { createTestHarness } from 'wrangler';
+import { sha256 } from '../../../lib/hash.js';
 
-import type { Env } from '../../../entrypoint.js';
-import { sha256Hex } from '../../../src/http/bearer-auth.js';
-
-import { applyMigrations } from '../../util/d1.js';
+import { registryHarness } from '../../util/registry-harness.js';
+import { ADMIN_TOKEN } from '../../util/test-env.js';
 
 /*
  * What protects the administrative API, exercised through the worker: the
@@ -16,28 +14,9 @@ import { applyMigrations } from '../../util/d1.js';
  * an answer that is refused cheaply, refused before it says anything about
  * the registry, and refused the same way whatever the caller guessed.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-
-const server = createTestHarness({
-  workers: [ {
-    configPath: './wrangler.toml',
-    secrets:    { COMET_REGISTRY_ADMIN_TOKEN_HASH: await sha256Hex(ADMIN_TOKEN) },
-  } ],
-});
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { server, freshDatabase } = await registryHarness({ admin: true });
 
 const auth = { 'Authorization': `Bearer ${ADMIN_TOKEN}` };
-
-async function freshDatabase(): Promise<D1Database> {
-  await server.reset();
-  const { APP_DB } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(APP_DB);
-  return APP_DB;
-}
 
 t.test('the token is what the routes are behind, and nothing else', async t => {
   await freshDatabase();
@@ -46,7 +25,7 @@ t.test('the token is what the routes are behind, and nothing else', async t => {
     [ 'no header',        undefined ],
     [ 'another scheme',   { 'Authorization': `Basic ${ADMIN_TOKEN}` } ],
     [ 'an empty token',   { 'Authorization': 'Bearer ' } ],
-    [ 'the token hash',   { 'Authorization': `Bearer ${await sha256Hex(ADMIN_TOKEN)}` } ],
+    [ 'the token hash',   { 'Authorization': `Bearer ${await sha256(ADMIN_TOKEN)}` } ],
     [ 'a prefix of it',   { 'Authorization': `Bearer ${ADMIN_TOKEN.slice(0, -1)}` } ],
     [ 'more after it',    { 'Authorization': `Bearer ${ADMIN_TOKEN} garbage` } ],
   ];

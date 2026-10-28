@@ -1,5 +1,7 @@
 import type { NotServed } from '../../lib/json-rpc.js';
 
+import type { Log } from '../log.js';
+
 /*
  * Typed HTTP errors with one JSON envelope.
  *
@@ -55,6 +57,9 @@ class ApiError extends Error {
    */
   readonly headers: Record<string, string>;
 
+  constructor(code: Exclude<ApiErrorCode, 'CONFLICT'>, message: string, details?: Record<string, unknown>, headers?: Record<string, string>);
+  // a CONFLICT names the conflict it met in details.code, which a script matches (API.md)
+  constructor(code: ApiErrorCode, message: string, details: Record<string, unknown> & { code: string }, headers?: Record<string, string>);
   constructor(
     code: ApiErrorCode,
     message: string,
@@ -78,6 +83,14 @@ function methodNotAllowed(method: string, pathname: string, allowed: string[]): 
     { allowed },
     { 'Allow': allow },
   );
+}
+
+/*
+ * The answer to a request that needs the active version while none is, on
+ * every route: not an outage but what D1 said, so it has a code of its own.
+ */
+function noActiveVersion(): ApiError {
+  return new ApiError('REGISTRY_NOT_ACTIVE', `No active registry snapshot is available`);
 }
 
 /*
@@ -121,11 +134,6 @@ function errorResponse(error: ApiError, requestId: string, headers: Record<strin
   });
 }
 
-type FailureLog = {
-  error: (...parameters: unknown[]) => unknown,
-  warn:  (...parameters: unknown[]) => unknown,
-};
-
 /*
  * The answer to a request that failed, and the log line an operator finds it
  * by, under the same request id.
@@ -144,7 +152,7 @@ function failureResponse(
   { requestId, pathname, debug, label, headers = {} }: {
     requestId: string,
     pathname:  string,
-    debug:     FailureLog,
+    debug:     Pick<Log, 'error' | 'warn'>,
     // what the log line says failed, such as the router that answered
     label:     string,
     headers?:  Record<string, string>,
@@ -159,5 +167,5 @@ function failureResponse(
   return errorResponse(error, requestId, headers);
 }
 
-export type { ApiErrorCode, FailureLog };
-export { ApiError, failureResponse, isApiError, methodNotAllowed, nodeUnavailable };
+export type { ApiErrorCode };
+export { ApiError, failureResponse, isApiError, methodNotAllowed, noActiveVersion, nodeUnavailable };

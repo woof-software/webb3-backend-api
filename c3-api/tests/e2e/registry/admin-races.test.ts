@@ -1,16 +1,13 @@
 import t from 'tap';
 
-import { createTestHarness } from 'wrangler';
-
-import type { Env } from '../../../entrypoint.js';
 import type { Address, PriceFeedV1 } from '../../../lib/model/comet-registry.js';
 import { replaceMarketOverlay, validateStoredVersion } from '../../../src/registry/admin.js';
 import { overlayOfMarket } from '../../../src/registry/overlay.js';
 import { readSnapshot, snapshotChecksum } from '../../../src/registry/repository.js';
 
-import { applyMigrations } from '../../util/d1.js';
 import { interleaved } from '../../util/interleave.js';
 import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-fixture.js';
+import { registryHarness } from '../../util/registry-harness.js';
 
 /*
  * Administrative commands racing each other over one candidate.
@@ -22,21 +19,14 @@ import { loadRegistrySnapshotFixture, seedCandidate } from '../../util/registry-
  * command that does not check that what it read still holds loses an update,
  * or records a decision about rows that are no longer there.
  */
-const server = createTestHarness({ workers: [ { configPath: './wrangler.toml' } ] });
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { freshDatabase } = await registryHarness();
 
 const snapshot = loadRegistrySnapshotFixture();
 const usdc     = snapshot.networks.find(network => network.chainId === 1)!.markets
   .find(market => market.deploymentKey === 'usdc')!;
 
 async function freshCandidate(): Promise<{ db: D1Database, versionId: string }> {
-  await server.reset();
-  const { APP_DB: db } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(db);
+  const db = await freshDatabase();
   const { versionId } = await seedCandidate(db, snapshot);
   return { db, versionId };
 }
@@ -82,7 +72,7 @@ t.test('a review written while a candidate is validated stops the validation', a
 
   await t.rejects(
     validateStoredVersion(racing, versionId),
-    { status: 409, message: /changed while it was being validated/ },
+    { status: 409, details: { code: 'CANDIDATE_CHANGED' }, message: /changed while it was being validated/ },
     'the validation is refused',
   );
   t.equal(await statusOf(db, versionId), 'importing', 'the candidate is left as the review left it');
@@ -138,7 +128,7 @@ t.test('a review that loses to a validation is refused as a conflict', async t =
 
   await t.rejects(
     rename(racing, versionId, 'Too late'),
-    { status: 409, message: /validated registry version cannot be changed/ },
+    { status: 409, details: { code: 'VERSION_NOT_IMPORTING' }, message: /validated registry version cannot be changed/ },
     'the review is refused',
   );
   t.equal(await statusOf(db, versionId), 'validated');
@@ -158,7 +148,7 @@ t.test('of two reviews written at once, the later one is refused, not lost', asy
 
   await t.rejects(
     rename(racing, versionId, 'First'),
-    { status: 409, message: /changed while this overlay was being written/ },
+    { status: 409, details: { code: 'OVERLAY_CHANGED' }, message: /changed while this overlay was being written/ },
     'the review decided against what the other one replaced is refused',
   );
   t.equal(await labelOf(db, versionId), 'Second', 'the review that was written stands');
@@ -184,12 +174,12 @@ t.test('a change decided against an overlay that has since changed is refused', 
 
   await t.rejects(
     rename(db, versionId, 'Third', { expectedDigest: first.digest }),
-    { status: 409, message: /no longer the one this was decided against/ },
+    { status: 409, details: { code: 'OVERLAY_CHANGED' }, message: /no longer the one this was decided against/ },
     'one decided against an overlay replaced since is refused',
   );
   await t.rejects(
     rename(db, versionId, 'Fourth', { expectedDigest: null }),
-    { status: 409, message: /no longer the one this was decided against/ },
+    { status: 409, details: { code: 'OVERLAY_CHANGED' }, message: /no longer the one this was decided against/ },
     'and so is one that expects a market nobody has reviewed',
   );
   t.equal(await labelOf(db, versionId), 'Second');

@@ -1,17 +1,16 @@
-import * as jsonRpc from '../../lib/json-rpc.js';
-
 import { corsHeaders } from '../http/cors.js';
-import { ApiError, ApiErrorCode, failureResponse, isApiError, nodeUnavailable } from '../http/errors.js';
+import { ApiError, ApiErrorCode, failureResponse } from '../http/errors.js';
+import { knownFailure } from '../http/failures.js';
 
 import type * as Evaluator from '../evaluator.js';
 
 import { routeAdmin } from './admin-router.js';
-import type { CacheDeps, CachedSnapshot } from './cache.js';
+import type { CachedSnapshot } from './cache.js';
 import { activeSnapshot, cacheDepsOf, isUnreachable, versionSnapshot, warmSnapshot } from './cache.js';
+import { readMarks, recordCollaterals } from './collateral-decisions.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
-import { isRegistryUnavailable, unavailableError } from './request-catalog.js';
 import { registryHeaders } from './version-headers.js';
 
 /*
@@ -51,16 +50,6 @@ function isAdminPath(pathname: string): boolean {
  */
 function withoutTrailingSlash(pathname: string): string {
   return pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
-}
-
-/*
- * The cache one request reads the active version through. It is built per
- * request and asked at most once, so two handlers of one response cannot be
- * served different versions.
- */
-function activeReader(deps: CacheDeps): () => Promise<CachedSnapshot | null> {
-  let pending: Promise<CachedSnapshot | null> | null = null;
-  return () => pending ??= activeSnapshot(deps);
 }
 
 /*
@@ -107,31 +96,49 @@ const ERROR_STATUS: Record<RegistryErrorCode, ApiErrorCode> = {
 };
 
 /*
+ * A release that reached an environment before its token policy, deprecated
+ * collateral or hidden collateral migration finds those tables missing. The
+ * remedy is known and is an operator's, so it is said, rather than answered
+ * as an internal error only the logs explain. Any other table missing is a
+ * fault like the rest, and stays a 500.
+ */
+function missingSchema(error: unknown): boolean {
+  return /no such table: (token_polic|deprecated_collateral|hidden_collateral)/i.test(String(error));
+}
+
+/*
  * What a failure means to a client, or null for a fault the client is told
- * nothing about. A registry error keeps its own code in `details.code`, under
- * the class of answer in `error.code`.
+ * nothing about: what it means on every route (knownFailure), and what only
+ * the registry's routes read into it. A registry error keeps its own code in
+ * `details.code`, under the class of answer in `error.code`.
  */
 function asApiError(error: unknown): ApiError | null {
-  if (isApiError(error)) {
-    return error;
-  }
   if (isRegistryError(error)) {
     return new ApiError(ERROR_STATUS[error.code], error.message, { code: error.code });
   }
-  if (isRegistryUnavailable(error)) {
-    return unavailableError(error);
-  }
-  // a node provider that did not serve a call no registry code names: a 503, as on every route
-  if (jsonRpc.isNotServed(error)) {
-    return nodeUnavailable(error);
+  const known = knownFailure(error);
+  if (known !== null) {
+    return known;
   }
   /*
    * A database that could not be reached, wherever a route read it, is the
    * registry being unavailable: a 503 whichever route found out. One that
    * answered with a fault is not this, and stays a 500.
+   *
+   * The legacy routes do not read this into a message. They read D1 only
+   * through the request catalog, which raises an outage as
+   * RegistryUnavailable; what else fails them — KV, Tally, a computation —
+   * may say `unavailable` or `timed out` of itself, as `KV GET failed: 503
+   * Service Unavailable` does, and stays a 500 there.
    */
   if (isUnreachable(error)) {
     return new ApiError('UPSTREAM_UNAVAILABLE', `a service the registry depends on did not answer`);
+  }
+  if (missingSchema(error)) {
+    return new ApiError(
+      'UPSTREAM_UNAVAILABLE',
+      `the database is missing tables this release needs: apply the D1 migrations to this environment`,
+    );
   }
   return null;
 }
@@ -146,7 +153,7 @@ function withHeaders(response: Response, headers: Record<string, string>): Respo
 async function routeRegistry(
   request: Request,
   // the request's context, with the id the entrypoint gave it, which its error answer and its log lines carry
-  { env, debug, requestId }: Evaluator.Context & { requestId: string },
+  { env, debug, waitUntil, requestId }: Evaluator.Context & { requestId: string },
 ): Promise<Response> {
   const pathname = withoutTrailingSlash(new URL(request.url).pathname);
   const route    = isAdminPath(pathname) ? 'admin' : 'public';
@@ -158,8 +165,7 @@ async function routeRegistry(
   }
   const cors = corsHeaders(route);
 
-  const deps = cacheDepsOf(env, debug);
-  const read = activeReader(deps);
+  const deps = { ...cacheDepsOf(env, debug), defer: waitUntil };
   // the active version a handler has read: a public answer that fails after that names it
   let served: CachedSnapshot | null = null;
   const context: RegistryContext = {
@@ -167,7 +173,7 @@ async function routeRegistry(
     actor:   env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`,
     requestId,
     debug,
-    active:  async () => (served = await read()),
+    active:  async () => (served = await activeSnapshot(deps)),
     version: versionId => versionSnapshot(deps, versionId),
     /*
      * Warming is an optimization, and an optimization may not fail a command
@@ -181,6 +187,8 @@ async function routeRegistry(
         debug.warn(`registry snapshot not warmed`, { versionId, error });
       }
     },
+    marks:   () => readMarks(deps),
+    record:  kind => recordCollaterals(kind, deps),
   };
 
   try {

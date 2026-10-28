@@ -52,7 +52,6 @@ t.test('the catalog materializes every resolvable market of one version', async 
   t.equal(catalog.versionId, snapshot.registryVersion.id, 'it answers for the version it was built from');
   t.equal(catalog.checksum, snapshot.registryVersion.checksum, 'and carries the checksum of that version');
   t.equal(catalog.markets().length, marketsOf(snapshot.networks).length, 'every market of the fixture is present');
-  t.equal(catalog.networks().length, snapshot.networks.length);
 
   const usdc = catalog.marketAt(MAINNET, USDC);
   t.ok(usdc, 'a market is addressed by its Comet address');
@@ -112,7 +111,8 @@ t.test('a disabled market is unreachable, a deprecated one is readable', async t
 /*
  * Governance names a market whatever the version says of it, so the catalog
  * also hands it the markets it does not serve: each as a name at its Comet,
- * which no computation takes and nothing serves.
+ * which no computation takes and nothing serves, with the tokens it names and
+ * the feeds it reads, as a served market's Comet carries them.
  */
 t.test('a market the catalog does not serve is still named for governance', async t => {
   t.same(catalogOf(snapshot).unservedMarkets(), [], 'a version that serves every market it holds has none besides');
@@ -124,8 +124,19 @@ t.test('a market the catalog does not serve is still named for governance', asyn
       markets: network.markets.map(market => ({ ...market, status: 'disabled' as const, isDefault: false })),
     }),
   };
-  t.same(catalogOf(offScroll).unservedMarkets().map(contract => `${contract.network}: ${contract.displayName}`),
+  const unserved = catalogOf(offScroll).unservedMarkets();
+  t.same(unserved.map(({ comet }) => `${comet.network}: ${comet.displayName}`),
     [ `${SCROLL}: cUSDCv3` ], 'a network that serves nothing has its markets named too');
+  const [ scroll ] = unserved;
+  t.same(scroll?.tokens.map(token => `${token.canonicalName} ${token.decimals}`), [ 'USDC 6', 'COMP 18', 'WETH 18', 'wstETH 18' ],
+    'with its base, reward and collateral tokens, at the scale the version read');
+  const market = snapshot.networks.find(network => network.key === SCROLL)!.markets[0]!;
+  t.same(scroll?.feeds.map(feed => feed.address.toLowerCase()),
+    [ market.baseAsset.priceFeed.address, ...market.collateralAssets.map(asset => asset.priceFeed.address) ],
+    'and the feeds it reads: its reward token has none');
+  const unpaid = catalogOf(withMarket('usdc', entry => ({ ...entry, contracts: { ...entry.contracts, rewards: null } }), offScroll));
+  t.same(unpaid.unservedMarkets()[0]?.tokens.map(token => token.canonicalName), [ 'USDC', 'WETH', 'wstETH' ],
+    'nor a reward token where the market pays none');
   const unnameable = catalogOf({
     ...offScroll,
     networks: offScroll.networks.map(network => network.key !== SCROLL ? network : { ...network, key: 'nowhere-mainnet', chainId: 999999 }),
@@ -162,8 +173,7 @@ t.test('a network this API cannot name is not served', async t => {
     ],
   });
 
-  t.equal(catalog.networks().length, snapshot.networks.length, 'the unknown network is dropped');
-  t.equal(catalog.markets().length, marketsOf(snapshot.networks).length, 'and so are its markets');
+  t.equal(catalog.markets().length, marketsOf(snapshot.networks).length, 'the unknown network is dropped, and so are its markets');
 });
 
 /*
@@ -285,10 +295,11 @@ t.test('a market carries what it has of its rewards, and nothing in place of the
 /*
  * A network whose every market is disabled serves nothing: a chain the
  * source has just added arrives that way, with nothing about it reviewed,
- * and the catalog does not offer it. One whose markets are deprecated is
- * still served, because positions and history in them stay reachable.
+ * and the catalog serves none of its markets. One whose markets are
+ * deprecated is still served, because positions and history in them stay
+ * reachable.
  */
-t.test('a network with no market the API serves is not one the catalog offers', async t => {
+t.test('a network of disabled markets serves none of them, and one of deprecated markets serves them all', async t => {
   const status = (status: MarketV1['status']): RegistrySnapshotV1 => ({
     ...snapshot,
     networks: snapshot.networks.map(network => network.key !== SCROLL ? network : {
@@ -298,12 +309,10 @@ t.test('a network with no market the API serves is not one the catalog offers', 
   });
 
   const disabled = catalogOf(status('disabled'));
-  t.notOk(disabled.networks().some(network => network.key === SCROLL), 'a network of disabled markets is not listed');
-  t.same(disabled.marketsOn(SCROLL), [], 'and serves no market');
+  t.same(disabled.marketsOn(SCROLL), [], 'a network of disabled markets serves no market');
 
   const deprecated = catalogOf(status('deprecated'));
-  t.ok(deprecated.networks().some(network => network.key === SCROLL), 'a network of deprecated markets is');
-  t.equal(deprecated.marketsOn(SCROLL).length, 1);
+  t.equal(deprecated.marketsOn(SCROLL).length, 1, 'a network of deprecated markets serves them');
 });
 
 /*
