@@ -15,7 +15,7 @@ import type { RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
  * its number: the latest block as given, and one below it as many seconds
  * older as it is blocks below it. `script` changes what one read answers — a
  * value, a revert, an error of the node, or a failure of the call — or what a
- * block read does, and can hold a request back, for a while or for good.
+ * block read does.
  *
  * It is the one fake node of the Comet reads, so a read the computations
  * start to make is added here once. A read it does not know fails the test,
@@ -57,8 +57,6 @@ type NodeScript = {
   answer?: (read: Read) => unknown[] | NodeError | 'revert' | 'fail' | undefined,
   // what a read of a block answers in place of it: another block, null, as a node answers for a block it does not have, or an error
   block?:  (reference: number | 'latest') => Block | null | 'fail' | undefined,
-  // what a request waits for before it is answered; 'forever' never answers it
-  hold?:   (request: { network: string, calls: Call[] }) => Promise<unknown> | 'forever' | undefined,
 };
 
 type FakeNode = {
@@ -127,11 +125,6 @@ function fakeNode(snapshot: RegistrySnapshotV1, latest: Block, script: NodeScrip
     const body = await request.json() as Call | Call[];
     const calls = body instanceof Array ? body : [ body ];
     requests.push({ network, calls });
-    const hold = script.hold?.({ network, calls });
-    if (hold === 'forever') {
-      return new Promise<Response>(() => {});
-    }
-    await hold;
     const responses = calls.map(call => answer(network, call));
     return new Response(JSON.stringify(body instanceof Array ? responses : responses[0]));
   };

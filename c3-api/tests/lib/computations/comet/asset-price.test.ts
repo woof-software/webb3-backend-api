@@ -118,19 +118,21 @@ t.test('a remapped feed is read from its replacement', async t => {
 });
 
 /*
- * Whether the replacement's revert is one to report is its reader's to tell:
- * at a block before it was deployed, which the history reads, it is expected,
- * and at the latest block, which the summary reads, the replacement has
- * stopped answering (market-latest-summary.ts). So the price the feed the
- * Comet named gives carries the revert, naming the replacement as the version
- * names it, and the computation reports nothing itself.
+ * Whether the replacement's revert is one to report, and whether the price
+ * the feed the Comet named gives is one to value by, are its reader's to
+ * tell: at a block before the replacement was deployed, which the history
+ * reads, its revert is expected, and at the latest block, which the summary
+ * reads, the replacement has stopped answering (market-latest-summary.ts). So
+ * that price names the remap it fell back from and carries the revert, naming
+ * the replacement as the version names it, and the computation reports
+ * nothing itself.
  */
 t.test('a block before the replacement was deployed is read from the feed the Comet named', async t => {
   const logged = consoleLines(t, [ 'warn' ]);
   const { answer, reads } = await priceOf(RETIRED, { [RETIRED]: price(18) });
 
-  t.strictSame(answer, { ...price(18), exception: null, replacementRevert: { feed: REPLACEMENT, message: 'no feed answers at that address' } },
-    'at the scale the version states for that feed, which no exception priced, carrying what the replacement reverted with');
+  t.strictSame(answer, { ...price(18), exception: exceptionOf(usdt, RETIRED), replacementRevert: { feed: REPLACEMENT, message: 'no feed answers at that address' } },
+    'at the scale the version states for that feed, naming the remap it fell back from, and carrying what the replacement reverted with');
   t.strictSame(reads, [ [ REPLACEMENT, 8, true ], [ RETIRED, 18, true ] ], 'once the replacement reverted');
   t.strictSame(logged, [], 'and the revert of a replacement that did not exist yet is not reported here');
 });
@@ -205,8 +207,9 @@ t.test('a replacement with no code yet falls back through a real read, which rep
     assetPrice: { apiHost: '', nodeHost, nodeKey, network, contract, blockNumber: block, assetNumber: 0 },
   }));
 
-  t.match(answer, { status: 'success', exception: null });
-  t.equal((answer as any).price.toString(), '2500.0', 'the feed the Comet named, at its eight decimals, which no exception priced');
+  t.match(answer, { status: 'success' });
+  t.equal((answer as any).price.toString(), '2500.0', 'the feed the Comet named, at its eight decimals');
+  t.strictSame((answer as any).exception, exceptionOf(contract, RETIRED_TOO), 'naming the remap it fell back from');
   t.strictSame((answer as any).replacementRevert, { feed: replacement, message: 'execution reverted' }, 'carrying what the replacement reverted with');
   t.strictSame(logged, [], 'and the replacement\'s revert is not reported here');
   fetch.satisfy(t);

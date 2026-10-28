@@ -824,7 +824,9 @@ The words of the rule, as these sections, API.md and the code use them:
 - a collateral's _value_ is what its market holds of it (`totalsCollateral`)
   at its price, in USD, at the block the summary read the market at: what the
   market holds none of is worth nothing, whatever its price, and a value
-  whose price, or whose conversion to USD, could not be read is not known;
+  whose price, or whose conversion to USD, could not be read is not known, as
+  is one a remap prices through the feed it replaces, its replacement having
+  stopped answering;
 - a token a market leaves to discovery is decided there _by its strategic
   mark and its value_: shown when it is strategic, when its value there
   cannot be read, or when it is worth at least the threshold there, and
@@ -844,11 +846,13 @@ A market's collateral is valued with the rest of its summary, from the same
 reads: what the Comet holds of each collateral and its price, at the market's
 block of the minute, the block every other field of the market is read at,
 converted to USD as its totals are (`marketLatestSummary`), so the values
-that are known add up to its `total_collateral_value_usd`. The header of that
-block is read beside them, in the first round of the market's reads, once
-for the markets of a network read at the same block, and dates each value; a
-header the node does not give leaves the date out and fails nothing, and the
-log says `block header not read` once a minute per network. All of it is
+that are known add up to its `total_collateral_value_usd`, but where a remap
+fell back on the feed it replaces, which the total counts and the value does
+not. The header of that block is read beside them, in the first round of the
+market's reads, once for the markets of a network read at the same block,
+and dates the market's values, once (`collateral_value_block`); a header the
+node does not give leaves the date out and fails nothing, and the log says
+`block header not read` once a minute per network. All of it is
 cached with the summary of the minute (`marketMinutelySummary`), so a
 request in a minute already read asks the node for the latest block alone. A
 value is never carried over from an earlier minute: a node that does not

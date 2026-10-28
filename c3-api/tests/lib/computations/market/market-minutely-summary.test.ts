@@ -112,8 +112,8 @@ t.test(`market-minutely-summary@block:16380543`, async (t) => {
       { address: "0x514910771AF9Ca656af840dff83E8264EcF986CA", symbol: "LINK", status: "success" },
     ],
   });
-  t.equal(marketBlock.number, projected.block.number, `the block the market was read at, the minute's`);
-  t.ok(Number.isInteger(marketBlock.timestamp) && marketBlock.timestamp <= 1_673_432_423, `with the timestamp of its own header, no later than the block asked at`);
+  // 16,380,541 was mined at 2023-01-11T02:19:59Z
+  t.strictSame(marketBlock, { number: 16_380_541, timestamp: 1_673_403_599 }, `the block the market was read at, the minute's, with the timestamp of its own header`);
   const scaled = (value: BigFixnum) => value.scaleToDecimals(40).value;
   t.ok(valued.reduce((sum: BigNumber, { valueUsd }: { valueUsd: BigFixnum }) => sum.add(scaled(valueUsd)), BigNumber.from(0))
     .eq(scaled(BigFixnum.from({ value: "19860093676810451139983159362475978", decimals: 26 }))),

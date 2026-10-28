@@ -48,10 +48,11 @@ import type { RegistryHarness } from '../../util/registry-harness.js';
  * token-policy-routes.test.ts, deprecated-collateral-routes.test.ts,
  * hidden-collateral-routes.test.ts and inactive-market-routes.test.ts.
  * The descriptions also drive the tests in Node that need a kind's tables or
- * routes: collateral-read-scenarios.ts and the two files that run it,
- * inactive-market-reads.test.ts, decision-read.test.ts and
- * ../market/summary-tokens.test.ts. This module is not a test file, and tap
- * does not run it on its own.
+ * routes: decision-read.test.ts, ../market/summary-tokens.test.ts,
+ * ../market/creation-block.test.ts, inactive-market-reads.test.ts and
+ * collateral-read-scenarios.ts, which deprecated-collateral-reads.test.ts and
+ * hidden-collateral-reads.test.ts run. This module is not a test file, and
+ * tap does not run it on its own.
  */
 
 // what a decision is about, by the names its answers and its list rows give its addresses: a token, a collateral of a Comet, or a market by its Comet

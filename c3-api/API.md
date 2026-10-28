@@ -354,8 +354,9 @@ Point-in-time summary at the current block of various market statistics:
   own status — see [Market status](#market-status)
 - What each collateral's token is: its name and decimals, whether this
   market has it deprecated or hidden, and its roles and decisions across the
-  whole chain; what this market holds of the collateral, in USD; and whether
-  discovery shows the token in this market — see
+  whole chain; what this market holds of the collateral, in USD, and, once
+  for the market, the block it read that at (`collateral_value_block`); and
+  whether discovery shows the token in this market — see
   [Collateral tokens](#collateral-tokens) below
 
 Every form of the route answers a list: of the one market `{address}` names;
@@ -380,7 +381,8 @@ block.
 After what was read of it, each collateral says what holds of its token on
 its chain, what this market's own decisions make of it, and what this market
 holds of it, in fields of its own, in every form of the route. The base asset
-has none of them.
+has none of them. The market says once, right before `collaterals`, the
+block it read those values at (`collateral_value_block`, below).
 
 | Field | Says it of | What it is |
 |---|---|---|
@@ -393,12 +395,9 @@ has none of them.
 | `hidden_in` | the chain | the Comets of the chain's markets that hide it, checksummed, in the order of their addresses |
 | `is_strategic` | the chain | whether an administrator marked the token strategic on the chain |
 | `network_roles` | the chain | the roles it plays in the chain's markets: `base`, `reward`, `collateral` |
-| `collateral_value_usd` | this market | what this market holds of it as collateral, in USD, a decimal string with every digit and nothing more: `"1843210.123456"`, `"0"` |
+| `collateral_value_usd` | this market | what this market holds of it as collateral, in USD, a decimal string written as the market's totals are, with every digit: `"1843210.123456"`, and `"10500.0"` for a whole value; `"0"` for what the market holds none of, and `"0.0"` for a price of zero |
 | `collateral_value_status` | this market | `fresh`, `exception` or `unavailable` (below) |
-| `collateral_value_at` | this market | when that value was read: the time of the block below, an instant |
-| `collateral_value_block` | this market | the block it was read at, `{ "number", "timestamp" }`: the block this market was read at |
-| `collateral_value_stale_age_seconds` | this market | `0`: the value is read with the market, and never carried over from an earlier minute |
-| `collateral_value_exceptions` | this market | the price exception of the registry that priced the value, if any: `kind`, `price_feed_address`, checksummed, `provenance`, and `expires_at`, an instant, or `null` for one that does not expire |
+| `collateral_value_exception` | this market | the price exception of the registry that priced the value, or the remap that left it unknown (below): `kind`, `price_feed_address`, checksummed, `provenance`, and `expires_at`, an instant, or `null` for one that does not expire; `null` where none did |
 | `is_visible` | this market | whether token discovery shows the token in this market, by the rule below, wherever the decisions that could be read settle it (below) |
 | `visibility_reason` | this market | why, by the same rule: `hidden`, `deprecated`, `strategic`, `data_unavailable`, `collateral_threshold` or `below_threshold`, where the decisions that could be read settle that as well, so it can be left out beside `is_visible` |
 
@@ -413,38 +412,49 @@ collateral's price at that block — read through the feed the Comet names for
 it, or as the registry's price exception for that feed states — and, on a
 market quoted in its base asset, converted at `base_usd_price`, as the
 market's totals are: so the values that are known add up exactly to the
-market's `total_collateral_value_usd`, where that is answered. What the
-market holds none of is worth `"0"`, whatever its price says or fails to say,
-and a price of zero is `"0"` whatever converts it. What the other markets of
-the chain hold of the token takes no part. `collateral_value_status` says
-what the value is:
+market's `total_collateral_value_usd`, where that is answered, but for a
+remap that fell back (below). What the market holds none of is worth `"0"`,
+whatever its price says or fails to say, and a price of zero is `"0.0"`
+whatever converts it. What the other markets of the chain hold of the token
+takes no part. `collateral_value_status` says what the value is:
 
 | Status | The value |
 |---|---|
 | `fresh` | what the market holds, at the price the Comet's feed answered at the market's block, or nothing held |
-| `exception` | the same, priced by a price exception of the registry: a price it states (`fixed_price`, `zero_price`), or the feed a remap names in place of the one the Comet names, which answered; `collateral_value_exceptions` names it |
-| `unavailable` | not known: the collateral's price could not be read (it is `error`), the Comet holds another asset at its index, or, on a market quoted in its base asset, `base_usd_price` could not be read |
+| `exception` | the same, priced by a price exception of the registry: a price it states (`fixed_price`, `zero_price`), or the feed a remap names in place of the one the Comet names, which answered; `collateral_value_exception` names it |
+| `unavailable` | not known: the collateral's price could not be read (it is `error`); the Comet holds another asset at its index; on a market quoted in its base asset, `base_usd_price` could not be read; or a remap's replacement reverted while the feed it replaces answered, and `collateral_value_exception` names the remap (below) |
 
 A remap whose replacement reverts at the market's block while the feed it
 replaces still answers — a replacement that has stopped answering, since the
-summary reads a block after it was deployed — is read from the feed it
-replaces, as the market's totals are: that value is `fresh`, names no
-exception, and decides whether discovery shows the token as any other value
-does. The log says `price feed reverted`, naming the replacement.
+summary reads a block after it was deployed — leaves the collateral's value
+unknown: the remap retired that feed, and what it still answers is no value
+to decide discovery by. The collateral is `unavailable`, without
+`collateral_value_usd`, and `collateral_value_exception` names the remap;
+discovery shows it (`data_unavailable`) unless this market's Comet hides it
+or has it deprecated, or it is strategic. The market's totals still count it,
+at the price of the feed the remap replaces, as the history does, so the
+values that are known do not add up to `total_collateral_value_usd`: the
+total is greater by what the market holds of that collateral at that price.
+What the market holds none of is worth `"0"` all the same, and names no
+exception. The log says `price feed reverted`, naming the replacement.
 
-`collateral_value_block` and `collateral_value_at` are the block the market
-was read at: the summary reads each market at the block of its minute, the
-chain's latest block less what the market's creation block leaves over of a
-minute's blocks, so markets of one chain may name different blocks, up to a
-minute's blocks behind the latest. Its timestamp is the block's own, from its
-header, which the summary reads beside the rest of the market. Where the node
-gives no header of that block — a provider that does not have it yet, or a
-read of it that failed — the value and its status are answered all the same,
-and the block, the time and the stale age are left out of that market's
-collaterals for that minute; the log says `block header not read`. A value
-that is not known is left out too, never `null`: `collateral_value_usd`,
-`collateral_value_at`, `collateral_value_block` and
-`collateral_value_stale_age_seconds` of a value that is `unavailable`.
+`collateral_value_block`, `{ "number", "timestamp" }`, right before
+`collaterals`, is the block the market was read at, which dates the value of
+each of its collaterals: the summary reads each market at the block of its
+minute, the chain's latest block less what the market's creation block
+leaves over of a minute's blocks, so markets of one chain may name different
+blocks, up to a minute's blocks behind the latest. Its timestamp is the
+block's own, from its header, which the summary reads beside the rest of the
+market. A value is read with the market, and never carried over from an
+earlier minute. Where the node gives no header of that block — a provider
+that does not have it yet, or a read of it that failed — the values and their
+statuses are answered all the same, and the market leaves out
+`collateral_value_block` for that minute; the log says
+`block header not read`. A market the chain has not reached answers neither
+collaterals nor the block ([Market status](#market-status)). A value that is
+not known is left out too, never `null`: `collateral_value_usd` of a value
+that is `unavailable`. `collateral_value_exception` is always there, `null`
+where no exception priced the value or left it unknown.
 
 `is_visible` and `visibility_reason` are this market's: whether discovery
 shows the token here, not whether this market offers it, which is what
@@ -511,12 +521,13 @@ deprecated in USDT's alone, it is deprecated there, so not shown there, and
 still offered by the two others; hidden in USDC's alone, it is not shown
 there, and WETH's market, which decided neither, shows it for what it holds of
 it. mETH, which USDT's market alone takes, is deprecated there, so across the
-whole chain, and discovery does not show it. In USDT's market, read at its
-block of the minute:
+whole chain, and discovery does not show it. In USDT's market, whose
+`collateral_value_block` is `{ "number": 23512342, "timestamp": 1791201587 }`,
+its block of the minute:
 
 ```json
-{ "address": "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee", "symbol": "weETH", "status": "success", "name": "Wrapped eETH", "decimals": 18, "is_deprecated": true, "is_network_deprecated": false, "deprecated_in": [ "0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840" ], "is_hidden": false, "hidden_in": [ "0xc3d688B66703497DAA19211EEdff47f25384cdc3" ], "is_strategic": false, "network_roles": [ "collateral" ], "collateral_value_usd": "2930142.87", "collateral_value_status": "fresh", "collateral_value_at": "2026-10-05T11:59:47.000Z", "collateral_value_block": { "number": 23512342, "timestamp": 1791201587 }, "collateral_value_stale_age_seconds": 0, "collateral_value_exceptions": [], "is_visible": false, "visibility_reason": "deprecated" }
-{ "address": "0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa", "symbol": "mETH", "status": "success", "name": "mETH", "decimals": 18, "is_deprecated": true, "is_network_deprecated": true, "deprecated_in": [ "0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840" ], "is_hidden": false, "hidden_in": [], "is_strategic": false, "network_roles": [ "collateral" ], "collateral_value_usd": "1204.5", "collateral_value_status": "fresh", "collateral_value_at": "2026-10-05T11:59:47.000Z", "collateral_value_block": { "number": 23512342, "timestamp": 1791201587 }, "collateral_value_stale_age_seconds": 0, "collateral_value_exceptions": [], "is_visible": false, "visibility_reason": "deprecated" }
+{ "address": "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee", "symbol": "weETH", "status": "success", "name": "Wrapped eETH", "decimals": 18, "is_deprecated": true, "is_network_deprecated": false, "deprecated_in": [ "0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840" ], "is_hidden": false, "hidden_in": [ "0xc3d688B66703497DAA19211EEdff47f25384cdc3" ], "is_strategic": false, "network_roles": [ "collateral" ], "collateral_value_usd": "2930142.87", "collateral_value_status": "fresh", "collateral_value_exception": null, "is_visible": false, "visibility_reason": "deprecated" }
+{ "address": "0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa", "symbol": "mETH", "status": "success", "name": "mETH", "decimals": 18, "is_deprecated": true, "is_network_deprecated": true, "deprecated_in": [ "0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840" ], "is_hidden": false, "hidden_in": [], "is_strategic": false, "network_roles": [ "collateral" ], "collateral_value_usd": "1204.5", "collateral_value_status": "fresh", "collateral_value_exception": null, "is_visible": false, "visibility_reason": "deprecated" }
 ```
 
 In the weETH of the USDC market, `is_deprecated` is `false` and `is_hidden`
@@ -575,6 +586,7 @@ bulker:
   "total_collateral_value_usd": "0.0",
   "utilization": "0",
   "collateral_asset_symbols": [ "USDT", "WETH" ],
+  "collateral_value_block": { "number": 23512343, "timestamp": 1791201599 },
   "collaterals": [
     { "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7", "symbol": "USDT", "status": "success", "name": "Tether USD", "decimals": 6, … },
     { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "status": "success", "name": "Wrapped Ether", "decimals": 18, … }
@@ -616,6 +628,7 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
   "base_usd_price": "0.99996",
   "base_price": "0.99996",
   "collateral_asset_symbols": [ "COMP", "WBTC", "WETH", "UNI", "LINK", …, "weETH", … ],
+  "collateral_value_block": { "number": 23512341, "timestamp": 1791201575 },
   "collaterals": [
     {
       "address": "0xc00e94Cb662C3520282E6f5717214004A7f26888",
@@ -632,10 +645,7 @@ $ curl 'localhost:8787/market/mainnet/0xc3d688B66703497DAA19211EEdff47f25384cdc3
       "network_roles": [ "reward", "collateral" ],
       "collateral_value_usd": "431926.105318",
       "collateral_value_status": "fresh",
-      "collateral_value_at": "2026-10-05T11:59:35.000Z",
-      "collateral_value_block": { "number": 23512341, "timestamp": 1791201575 },
-      "collateral_value_stale_age_seconds": 0,
-      "collateral_value_exceptions": [],
+      "collateral_value_exception": null,
       "is_visible": true,
       "visibility_reason": "collateral_threshold"
     },
@@ -665,10 +675,12 @@ same numbers. A WETH market is quoted in ETH, and reports, for instance:
 30 days of historical `/summary`s — two in stage, and one in a local run —
 one block sampled per day, oldest first, up to the most recent day sampled.
 Each day carries its `date` and `timestamp`, its totals in USD converted at
-that day's price, and the fields of the summary but `base_price`, what the
-registry version says of the market
+that day's price, and the fields of the summary but `base_price`, whether the
+market is inactive ([Inactive markets](#inactive-markets)), what the
+registry version says of it
 ([Market registry fields](#market-registry-fields)) — its `comet` is the
-Comet's `address` alone — and the fields of each collateral's token and value
+Comet's `address` alone — and what the summary says of each collateral's
+token, its value and the block that value was read at
 ([Collateral tokens](#collateral-tokens)): a collateral is its `address`,
 `symbol` and `status`, with its `message` where it is `error`.
 

@@ -21,7 +21,7 @@ import { consoleLines } from '../util/console.js';
 import { evaluatorOver, stub } from '../util/evaluator.js';
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../util/registry-fixture.js';
 import { REGISTRY_KEYS } from '../util/summary-registry-fields.js';
-import { summaryTokens } from '../util/summary-decisions.js';
+import { summaryDecisionsOf } from '../util/summary-decisions.js';
 
 import '../../shim/node-self.js';
 
@@ -119,7 +119,7 @@ function uninstantiated(answer: Answer) {
     // a local run, whose history samples one day
     flags: { ...flags, environment: 'local' },
     evaluator,
-    tokens: summaryTokens(),
+    decisions: summaryDecisionsOf(),
     evaluations: () => evaluator.evaluations,
   };
   return context as unknown as MarketContext & { evaluations(): number };

@@ -4,7 +4,7 @@ import C3Api, { Env } from '../../../entrypoint.js';
 
 import * as market from '../../../lib/computations/market.js';
 import { checksumAddress } from '../../../lib/model/comet-registry.js';
-import type { ActiveMarketV1, Address, NetworkV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
+import type { ActiveMarketV1, Address, BlockRefV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
 import { POINTER_KEY } from '../../../src/registry/cache.js';
 import {
@@ -19,12 +19,12 @@ import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js
 
 import { consoleLines } from '../../util/console.js';
 import { executionContext, settledWithin } from '../../util/execution-context.js';
-import { NodeScript, blockAt, fakeNode, headerReads } from '../../util/fake-node.js';
+import { NodeScript, fakeNode, headerReads } from '../../util/fake-node.js';
 import { MemoryKv } from '../../util/kv.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 import { readSeedInactive } from '../../util/registry-seed.js';
-import { COLLATERAL_KEYS, valueOnSummary, visibilityOnSummary } from '../../util/summary-token-fields.js';
+import { COLLATERAL_KEYS, visibilityOnSummary } from '../../util/summary-token-fields.js';
 import { failingStatements, makeTestEnv } from '../../util/test-env.js';
 
 import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, INACTIVE_MARKETS, TOKEN_POLICIES, statementsOf } from '../registry/decision-scenarios.js';
@@ -81,7 +81,7 @@ async function workerOf(t: Test, script: NodeScript = {}, snapshot: RegistrySnap
 }
 
 type Collateral = { address: string, symbol: string, status: string, [field: string]: unknown };
-type Entry      = { chain_id: number, comet: { address: string }, deployment_key: string, is_inactive?: boolean, collaterals?: Collateral[] };
+type Entry      = { chain_id: number, comet: { address: string }, deployment_key: string, is_inactive?: boolean, collateral_value_block?: BlockRefV1, collaterals?: Collateral[] };
 
 async function summaryOf(response: Response): Promise<Entry[]> {
   if (response.status !== 200) {
@@ -154,20 +154,21 @@ function fixedPumpBtc(expiresAt: string | null): RegistrySnapshotV1 {
 }
 
 /*
- * The block each market is read at in the minute of LATEST: the latest block
- * less what its creation block leaves over of a minute's blocks on its chain,
- * as the minutely index projects it — five blocks on mainnet, and thirty on
- * Base and on Scroll — by chain and deployment key.
+ * The block each market is read at in the minute of LATEST, by chain and
+ * deployment key: the latest block less what its creation block leaves over
+ * of a minute's blocks on its chain, as the minutely index projects it — five
+ * blocks on mainnet, and thirty on Base and on Scroll — with the timestamp the
+ * node gives it, a second older for each block below the latest.
  */
-const MARKET_BLOCKS: Record<string, number> = {
-  '1 usdc':      23_499_996,
-  '1 weth':      23_500_000,
-  '1 usdt':      23_499_997,
-  '1 wbtc':      23_499_997,
-  '8453 aero':   23_499_995,
-  '534352 usdc': 23_499_984,
+const MARKET_BLOCK_REFS: Record<string, BlockRefV1> = {
+  '1 usdc':      { number: 23_499_996, timestamp: 1_791_204_926 },
+  '1 weth':      { number: 23_500_000, timestamp: 1_791_204_930 },
+  '1 usdt':      { number: 23_499_997, timestamp: 1_791_204_927 },
+  '1 wbtc':      { number: 23_499_997, timestamp: 1_791_204_927 },
+  '8453 aero':   { number: 23_499_995, timestamp: 1_791_204_925 },
+  '534352 usdc': { number: 23_499_984, timestamp: 1_791_204_914 },
 };
-const marketBlockOf = (entry: Entry) => blockAt(LATEST, MARKET_BLOCKS[`${entry.chain_id} ${entry.deployment_key}`]!);
+const MARKET_BLOCKS = Object.fromEntries(Object.entries(MARKET_BLOCK_REFS).map(([ market, { number } ]) => [ market, number ]));
 
 t.test('every form of the summary answers each collateral with the fields of its token, after what was read of it', async t => {
   const { node, get } = await workerOf(t);
@@ -206,90 +207,109 @@ t.test('every form of the summary says of every market whether it is inactive, r
   }
 });
 
-// the roles a token plays in the markets a network serves, in the order the summary writes them
-function rolesOn(network: NetworkV1, address: string): string[] {
-  const roles = new Set<string>();
-  for (const entry of network.markets.filter(each => each.status !== 'disabled')) {
-    if (entry.baseAsset.token.address === address) roles.add('base');
-    if (entry.rewardAsset?.token.address === address) roles.add('reward');
-    if (entry.collateralAssets.some(asset => asset.token.address === address)) roles.add('collateral');
-  }
-  return [ 'base', 'reward', 'collateral' ].filter(role => roles.has(role));
-}
+// the Comets of mainnet the test decides about, checksummed, as the summary names a Comet
+const USDC_COMET = '0xc3d688B66703497DAA19211EEdff47f25384cdc3';
+const USDT_COMET = '0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840';
+
+// the tokens of mainnet that play another role there than a collateral's: COMP, the reward of its markets, and their base assets
+const ROLES: Record<string, string[]> = {
+  COMP: [ 'reward', 'collateral' ],
+  USDC: [ 'base', 'collateral' ],
+  WETH: [ 'base', 'collateral' ],
+  USDT: [ 'base', 'collateral' ],
+  WBTC: [ 'base', 'collateral' ],
+};
+
+// what the collateral decisions say of each collateral the test decides about; any other is deprecated and hidden nowhere
+const DECIDED: Record<string, { is_deprecated: boolean, is_network_deprecated: boolean, deprecated_in: string[], is_hidden: boolean, hidden_in: string[] }> = {
+  '1 usdc weETH': { is_deprecated: false, is_network_deprecated: false, deprecated_in: [ USDT_COMET ], is_hidden: true,  hidden_in: [ USDC_COMET ] },
+  '1 weth weETH': { is_deprecated: false, is_network_deprecated: false, deprecated_in: [ USDT_COMET ], is_hidden: false, hidden_in: [ USDC_COMET ] },
+  '1 usdt weETH': { is_deprecated: true,  is_network_deprecated: false, deprecated_in: [ USDT_COMET ], is_hidden: false, hidden_in: [ USDC_COMET ] },
+  '1 usdt mETH':  { is_deprecated: true,  is_network_deprecated: true,  deprecated_in: [ USDT_COMET ], is_hidden: false, hidden_in: [] },
+};
+
+// the tokens the test marks strategic on mainnet
+const STRATEGIC = [ 'XAUt', 'cbBTC' ];
+
+// whether discovery shows each collateral the test decides about, and why; any other, worth a dollar, is short of the threshold
+const SAID: Record<string, { is_visible: boolean, visibility_reason: string }> = {
+  '1 usdc cbBTC': { is_visible: true,  visibility_reason: 'strategic' },
+  '1 weth cbBTC': { is_visible: true,  visibility_reason: 'strategic' },
+  '1 usdt cbBTC': { is_visible: true,  visibility_reason: 'strategic' },
+  '1 usdt XAUt':  { is_visible: true,  visibility_reason: 'strategic' },
+  '1 usdc weETH': { is_visible: false, visibility_reason: 'hidden' },
+  '1 usdt weETH': { is_visible: false, visibility_reason: 'deprecated' },
+  '1 usdt mETH':  { is_visible: false, visibility_reason: 'deprecated' },
+};
 
 /*
- * What a collateral says of its token, stated apart from the code: its name
- * and decimals as the version has them; where on its chain it is deprecated
- * and hidden, by the Comets the test decided about, sorted, and whether every
- * enabled market that takes it has it deprecated; whether it is strategic,
- * and its roles; its value in its market, at its market's block, priced by
- * `exceptions`; and whether discovery shows it there, by its Comet's own
- * decisions and that value.
- */
-function expectedOf(
-  network: NetworkV1,
-  entry: Entry,
-  collateral: Collateral,
-  decided: { strategic: string[], deprecated: Array<[ string, string ]>, hidden: Array<[ string, string ]> },
-  usd: string,
-  exceptions: Array<{ kind: string, price_feed_address: string, provenance: string, expires_at: string | null }> = [],
-) {
-  const address = collateral.address.toLowerCase();
-  const token   = network.markets.flatMap(each => each.collateralAssets).find(asset => asset.token.address === address)!.token;
-  const taking  = network.markets.filter(each => each.collateralAssets.some(asset => asset.token.address === address));
-  const marked  = (pairs: Array<[ string, string ]>) => taking
-    .filter(each => network.chainId === 1 && pairs.some(([ key, symbol ]) => key === each.deploymentKey && symbol === token.symbol));
-  const deprecated = marked(decided.deprecated);
-  const enabled    = taking.filter(each => each.status === 'enabled');
-  const isHidden     = marked(decided.hidden).some(each => each.deploymentKey === entry.deployment_key);
-  const isDeprecated = deprecated.some(each => each.deploymentKey === entry.deployment_key);
-  const isStrategic  = network.chainId === 1 && decided.strategic.includes(token.symbol);
-  const comets       = (markets: typeof taking) => markets.map(each => each.contracts.comet!).sort().map(comet => checksumAddress(comet));
-  return {
-    name:                  token.name,
-    decimals:              token.decimals,
-    is_deprecated:         isDeprecated,
-    is_network_deprecated: enabled.length > 0 && enabled.every(each => deprecated.includes(each)),
-    deprecated_in:         comets(deprecated),
-    is_hidden:             isHidden,
-    hidden_in:             comets(marked(decided.hidden)),
-    is_strategic:          isStrategic,
-    network_roles:         rolesOn(network, address),
-    ...valueOnSummary({ usd, block: marketBlockOf(entry), exceptions }),
-    ...visibilityOnSummary({ isHidden, isDeprecated, isStrategic }, usd),
-  };
-}
-
-/*
- * Each collateral is held to what the test decided and what the node holds:
- * one token of a dollar in every market, which pumpBTC, priced through a
- * price exception of the registry whose expiry is stated with an offset, is
- * worth at the price the registry states. XAUt is strategic, weETH and mETH
+ * Each collateral is held to what the test decided and what the node holds,
+ * every field of it stated apart from the code: one token of a dollar in
+ * every market, which pumpBTC, priced through a price exception of the
+ * registry whose expiry is stated with an offset, is worth at the price the
+ * registry states. XAUt and cbBTC are strategic on mainnet, weETH and mETH
  * are deprecated in USDT's market, and weETH is hidden in USDC's, so every
- * field is held to something.
+ * field is held to something. Three collaterals are stated in full, and every
+ * other by the tables above; each market answers the block it was read at
+ * once, as MARKET_BLOCK_REFS has it.
  */
 t.test('what a collateral says of its token is what holds of it on its chain, and its value its own in its market', async t => {
   const { registry, get } = await workerOf(t, {}, fixedPumpBtc('2999-01-01T00:00:00+01:00'));
   await decide(registry.db, 'usdt', 'XAUt');
+  await decide(registry.db, 'usdc', 'cbBTC');
   await markDeprecated(registry.db, 'usdt', 'weETH');
   await markDeprecated(registry.db, 'usdt', 'mETH');
   await hide(registry.db, 'usdc', 'weETH');
-  const decided = { strategic: [ 'XAUt' ], deprecated: [ [ 'usdt', 'weETH' ], [ 'usdt', 'mETH' ] ] as Array<[ string, string ]>, hidden: [ [ 'usdc', 'weETH' ] ] as Array<[ string, string ]> };
 
   const { provenance, price } = MAINNET.priceExceptions.find(exception => exception.priceFeedAddress === FIXED)! as { provenance: string, price: { value: string } };
   t.equal(price.value, '102447384', 'the price the registry states for pumpBTC\'s feed, at eight decimals');
-  const pumpBtc = [ { kind: 'fixed_price', price_feed_address: checksumAddress(FIXED), provenance, expires_at: '2998-12-31T23:00:00.000Z' } ];
+  const stated = { kind: 'fixed_price', price_feed_address: '0x351a133Fd850ea81ed8a782016e308aCBADDec91', provenance, expires_at: '2998-12-31T23:00:00.000Z' };
 
   const every = await summaryOf(await get(EVERY_NETWORK));
-  for (const read of collateralsOf(every)) {
-    const network = fixture.networks.find(each => each.chainId === read.entry.chain_id)!;
-    const priced  = read.entry.chain_id === 1 && read.collateral.symbol === 'pumpBTC';
-    t.strictSame(without(read.collateral, 'address', 'symbol', 'status', 'message'),
-      expectedOf(network, read.entry, read.collateral, decided, priced ? '1.02447384' : '1', priced ? pumpBtc : []),
-      `${nameOf(read)}: ${priced ? 'at the price the registry states, naming the exception, its expiry an instant' : 'one token at a dollar, at its market\'s block'}`);
+  t.strictSame(collateralOf(entryOf(every, 'usdc'), 'weETH'), {
+    address: '0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee', symbol: 'weETH', status: 'success', name: 'Wrapped eETH', decimals: 18,
+    is_deprecated: false, is_network_deprecated: false, deprecated_in: [ USDT_COMET ], is_hidden: true, hidden_in: [ USDC_COMET ],
+    is_strategic: false, network_roles: [ 'collateral' ],
+    collateral_value_usd: '1.0', collateral_value_status: 'fresh', collateral_value_exception: null,
+    is_visible: false, visibility_reason: 'hidden',
+  }, 'weETH in USDC\'s market: hidden there, deprecated in USDT\'s alone, and one token at a dollar');
+  t.strictSame(collateralOf(entryOf(every, 'usdt'), 'mETH'), {
+    address: '0xd5F7838F5C461fefF7FE49ea5ebaF7728bB0ADfa', symbol: 'mETH', status: 'success', name: 'mETH', decimals: 18,
+    is_deprecated: true, is_network_deprecated: true, deprecated_in: [ USDT_COMET ], is_hidden: false, hidden_in: [],
+    is_strategic: false, network_roles: [ 'collateral' ],
+    collateral_value_usd: '1.0', collateral_value_status: 'fresh', collateral_value_exception: null,
+    is_visible: false, visibility_reason: 'deprecated',
+  }, 'mETH in USDT\'s market, the one that takes it: deprecated there, and so across the chain');
+  t.strictSame(collateralOf(entryOf(every, 'wbtc'), 'pumpBTC'), {
+    address: '0xF469fBD2abcd6B9de8E169d128226C0Fc90a012e', symbol: 'pumpBTC', status: 'success', name: 'pumpBTC', decimals: 8,
+    is_deprecated: false, is_network_deprecated: false, deprecated_in: [], is_hidden: false, hidden_in: [],
+    is_strategic: false, network_roles: [ 'collateral' ],
+    collateral_value_usd: '1.02447384', collateral_value_status: 'exception', collateral_value_exception: stated,
+    is_visible: false, visibility_reason: 'below_threshold',
+  }, 'pumpBTC in WBTC\'s market: one token at the price the registry states, naming the exception, its expiry an instant');
+
+  for (const entry of every) {
+    const market = `${entry.chain_id} ${entry.deployment_key}`;
+    t.strictSame(entry.collateral_value_block, MARKET_BLOCK_REFS[market],
+      `${market}: the block it was read at, which its collaterals' values were read at`);
   }
-  t.strictSame(picked(collateralOf(entryOf(every, 'usdt'), 'XAUt'), 'is_strategic', 'is_visible', 'visibility_reason'),
-    { is_strategic: true, is_visible: true, visibility_reason: 'strategic' }, 'XAUt: strategic, and shown for it');
+  for (const read of collateralsOf(every)) {
+    const market = `${read.entry.chain_id} ${read.entry.deployment_key}`;
+    const priced = market === '1 wbtc' && read.collateral.symbol === 'pumpBTC';
+    const { token } = fixture.networks.find(network => network.chainId === read.entry.chain_id)!.markets
+      .find(entry => entry.deploymentKey === read.entry.deployment_key)!.collateralAssets.find(asset => asset.token.symbol === read.collateral.symbol)!;
+    t.strictSame(without(read.collateral, 'address', 'symbol', 'status', 'message'), {
+      name:                       token.name,
+      decimals:                   token.decimals,
+      ...(DECIDED[`${market} ${read.collateral.symbol}`] ?? { is_deprecated: false, is_network_deprecated: false, deprecated_in: [], is_hidden: false, hidden_in: [] }),
+      is_strategic:               read.entry.chain_id === 1 && STRATEGIC.includes(read.collateral.symbol),
+      network_roles:              (read.entry.chain_id === 1 ? ROLES[read.collateral.symbol] : undefined) ?? [ 'collateral' ],
+      collateral_value_usd:       priced ? '1.02447384' : '1.0',
+      collateral_value_status:    priced ? 'exception' : 'fresh',
+      collateral_value_exception: priced ? stated : null,
+      ...(SAID[`${market} ${read.collateral.symbol}`] ?? { is_visible: false, visibility_reason: 'below_threshold' }),
+    }, `${nameOf(read)}: every field of its token, its value in its market, and whether discovery shows it there`);
+  }
 });
 
 /*
@@ -341,8 +361,8 @@ t.test('an exception that does not expire is answered with a null expiry, not wi
 
   const every = await summaryOf(await get(EVERY_NETWORK));
   const { provenance } = MAINNET.priceExceptions.find(exception => exception.priceFeedAddress === FIXED)!;
-  t.strictSame(collateralOf(entryOf(every, 'wbtc'), 'pumpBTC').collateral_value_exceptions,
-    [ { kind: 'fixed_price', price_feed_address: checksumAddress(FIXED), provenance, expires_at: null } ],
+  t.strictSame(collateralOf(entryOf(every, 'wbtc'), 'pumpBTC').collateral_value_exception,
+    { kind: 'fixed_price', price_feed_address: checksumAddress(FIXED), provenance, expires_at: null },
     'pumpBTC: the exception that priced it, with a null expiry');
 });
 
@@ -368,16 +388,18 @@ t.test('an exception is described as the version that answers describes it, whic
   const second = await activeRegistryDatabase({ snapshot: edited('as the second version describes it', '2999-06-01T00:00:00+02:00', '00000000-0000-4000-8000-0000000000b2') });
   t.teardown(() => second.dispose());
   const { node, get } = await workerOf(t, {}, first);
-  const described = (entries: Entry[]) => (collateralOf(entryOf(entries, 'wbtc'), 'pumpBTC').collateral_value_exceptions as Array<{ provenance: string, expires_at: string }>)
-    .map(({ provenance, expires_at }) => ({ provenance, expires_at }));
+  const described = (entries: Entry[]) => {
+    const { provenance, expires_at } = collateralOf(entryOf(entries, 'wbtc'), 'pumpBTC').collateral_value_exception as { provenance: string, expires_at: string };
+    return { provenance, expires_at };
+  };
 
-  t.same(described(await summaryOf(await get(OF_MAINNET))), [ { provenance: 'as the first version describes it', expires_at: '2999-01-01T00:00:00.000Z' } ]);
+  t.same(described(await summaryOf(await get(OF_MAINNET))), { provenance: 'as the first version describes it', expires_at: '2999-01-01T00:00:00.000Z' });
   const read = node.requests.length;
   const answered = await get(OF_MAINNET, { APP_DB: second.db });
   t.equal(answered.headers.get('x-registry-version'), second.versionId, 'the second version answers');
   const summary = await summaryOf(answered);
   t.equal(node.requests.length - read, 1, 'from the summaries the first one read, asking the node for the latest block alone');
-  t.same(described(summary), [ { provenance: 'as the second version describes it', expires_at: '2999-05-31T22:00:00.000Z' } ],
+  t.same(described(summary), { provenance: 'as the second version describes it', expires_at: '2999-05-31T22:00:00.000Z' },
     'with its own description of the exception, its expiry an instant');
 });
 
@@ -502,8 +524,8 @@ t.test('a market whose status is deprecated answers by its own Comet\'s decision
   t.strictSame(stateOf('usdt', 'mETH'), { is_hidden: true, hidden_in: [ checksumAddress(cometOf('usdt')) ], is_visible: false, visibility_reason: 'hidden' },
     'mETH in USDT\'s market: hidden there, and not shown in it');
   t.strictSame([ 'XAUt', 'sFRAX' ].map(symbol => picked(collateralOf(entryOf(mainnet, 'usdt'), symbol), 'collateral_value_usd', 'is_visible', 'visibility_reason')), [
-    { collateral_value_usd: '300000', is_visible: true,  visibility_reason: 'collateral_threshold' },
-    { collateral_value_usd: '1',      is_visible: false, visibility_reason: 'below_threshold' },
+    { collateral_value_usd: '300000.0', is_visible: true,  visibility_reason: 'collateral_threshold' },
+    { collateral_value_usd: '1.0',      is_visible: false, visibility_reason: 'below_threshold' },
   ], 'and XAUt and sFRAX, which nobody decided about, by what it holds of each');
 });
 
@@ -943,9 +965,6 @@ t.test('a summary leaves the records an outage reads to waitUntil, the record of
  * reads the latest blocks alone.
  */
 t.test('the summary caches the minutely summaries of its markets alone, under their version', async t => {
-  t.equal(market.marketMinutelySummary.version, 10, 'the minutely summary is version 10, with each collateral\'s value and its market\'s block');
-  t.equal(market.marketLatestSummary.version, 6, 'and the latest summary version 6');
-
   const { node, env, get } = await workerOf(t);
   await summaryOf(await get(EVERY_NETWORK));
   const networks = [ ...new Set(fixture.networks.map(network => network.key)) ];
@@ -956,11 +975,11 @@ t.test('the summary caches the minutely summaries of its markets alone, under th
   const keysOf  = async (kv: KVNamespace) => (await kv.list()).keys.map(entry => entry.name);
   const written = await keysOf(env.kv_mainnet);
   const markets = fixture.networks.flatMap(network => network.markets.map(entry => (
-    `marketMinutelySummary-v10:(block:${MARKET_BLOCKS[`${network.chainId} ${entry.deploymentKey}`]};contract:${entry.contracts.comet}@`
+    `marketMinutelySummary-v${market.marketMinutelySummary.version}:(block:${MARKET_BLOCKS[`${network.chainId} ${entry.deploymentKey}`]};contract:${entry.contracts.comet}@`
   )));
   t.equal(written.length, markets.length, 'one record of each market');
   t.ok(markets.every(prefix => written.filter(key => key.startsWith(prefix)).length === 1),
-    'the minutely summary of each, at the block of its minute, under version 10');
+    'the minutely summary of each, at the block of its minute, under its version');
   t.ok((await keysOf(env.kv_registry)).every(key => [ 'active:v1', DEPRECATED_KEY, HIDDEN_KEY, INACTIVE_KEY ].includes(key) || key.startsWith('snapshot:')),
     'and in the registry\'s namespace nothing but what the active reads keep and the record of the inactive markets');
 

@@ -1,11 +1,10 @@
-import type { BlockRefV1, VisibilityReasonV1 } from '../../lib/model/comet-registry.js';
+import type { VisibilityReasonV1 } from '../../lib/model/comet-registry.js';
 
 // what a collateral of /summary answers, in the order it writes it, where every decision was read and every value is known
 const COLLATERAL_KEYS = [
   'address', 'symbol', 'status',
   'name', 'decimals', 'is_deprecated', 'is_network_deprecated', 'deprecated_in', 'is_hidden', 'hidden_in', 'is_strategic', 'network_roles',
-  'collateral_value_usd', 'collateral_value_status',
-  'collateral_value_at', 'collateral_value_block', 'collateral_value_stale_age_seconds', 'collateral_value_exceptions',
+  'collateral_value_usd', 'collateral_value_status', 'collateral_value_exception',
   'is_visible', 'visibility_reason',
 ] as const;
 
@@ -52,30 +51,6 @@ function visibilityOnSummary(
   };
 }
 
-// a price exception as a collateral of /summary names the one that priced it
-type ExceptionOnSummary = { kind: string, price_feed_address: string, provenance: string, expires_at: string | null };
-
-/*
- * The value fields of a collateral of /summary, stated apart from the code:
- * its value in its market, `usd`, every digit, or null where it is not known;
- * the block the market was read at, null where the node did not give its
- * header; and the exceptions that priced it. A value that is known says when
- * it was read, where that is known too, and is never stale; one that is not is
- * `unavailable`, and says neither.
- */
-function valueOnSummary({ usd, block, exceptions = [] }: { usd: string | null, block: BlockRefV1 | null, exceptions?: ExceptionOnSummary[] }) {
-  return {
-    ...(usd === null ? {} : { collateral_value_usd: usd }),
-    collateral_value_status: usd === null ? 'unavailable' : exceptions.length === 0 ? 'fresh' : 'exception',
-    ...(usd === null || block === null ? {} : {
-      collateral_value_at:                new Date(block.timestamp * 1000).toISOString(),
-      collateral_value_block:             block,
-      collateral_value_stale_age_seconds: 0,
-    }),
-    collateral_value_exceptions: exceptions,
-  };
-}
-
 // a decimal string as an exact number of 10^-40ths, so that values of any scale add up exactly
 function scaled(value: string): bigint {
   const [ whole, fraction = '' ] = value.split('.');
@@ -85,5 +60,4 @@ function scaled(value: string): bigint {
   return BigInt(whole!) * 10n ** 40n + BigInt(fraction.padEnd(40, '0'));
 }
 
-export type { ExceptionOnSummary };
-export { COLLATERAL_KEYS, scaled, valueOnSummary, visibilityOnSummary };
+export { COLLATERAL_KEYS, scaled, visibilityOnSummary };
