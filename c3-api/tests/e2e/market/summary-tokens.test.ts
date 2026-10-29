@@ -6,23 +6,28 @@ import * as market from '../../../lib/computations/market.js';
 import { checksumAddress } from '../../../lib/model/comet-registry.js';
 import type { ActiveMarketV1, Address, BlockRefV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
+import { POINTER_KEY } from '../../../src/registry/cache.js';
 import {
   DEPRECATED_COLLATERAL_KIND,
   HIDDEN_COLLATERAL_KIND,
   setCollateral,
 } from '../../../src/registry/collateral-decision-repository.js';
 import { DEPRECATED_KEY, HIDDEN_KEY } from '../../../src/registry/collateral-decisions.js';
+import { applyInactiveMarkets, setInactiveMarket } from '../../../src/registry/inactive-market-repository.js';
+import { INACTIVE_KEY } from '../../../src/registry/inactive-markets.js';
 import { setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
 import { consoleLines } from '../../util/console.js';
+import { executionContext, settledWithin } from '../../util/execution-context.js';
 import { NodeScript, fakeNode, headerReads } from '../../util/fake-node.js';
 import { MemoryKv } from '../../util/kv.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
+import { readSeedInactive } from '../../util/registry-seed.js';
 import { COLLATERAL_KEYS, visibilityOnSummary } from '../../util/summary-token-fields.js';
 import { failingStatements, makeTestEnv } from '../../util/test-env.js';
 
-import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, TOKEN_POLICIES, statementsOf } from '../registry/decision-scenarios.js';
+import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, INACTIVE_MARKETS, TOKEN_POLICIES, statementsOf } from '../registry/decision-scenarios.js';
 
 import '../../../shim/node-self.js';
 
@@ -33,7 +38,8 @@ import '../../../shim/node-self.js';
  * and a node behind the node proxy's service binding. What a collateral says
  * of its token across the chain is held to the decisions the test made, and
  * its value to what the node says its market holds of it, at its market's
- * block.
+ * block. Beside it, whether each market is inactive, by the decisions of
+ * administrators and the record the worker keeps of them.
  */
 const fixture = loadRegistrySnapshotFixture();
 const LATEST  = { number: 23_500_000, timestamp: 1_791_204_930 };
@@ -75,7 +81,7 @@ async function workerOf(t: Test, script: NodeScript = {}, snapshot: RegistrySnap
 }
 
 type Collateral = { address: string, symbol: string, status: string, [field: string]: unknown };
-type Entry      = { chain_id: number, comet: { address: string }, deployment_key: string, collateral_value_block?: BlockRefV1, collaterals?: Collateral[] };
+type Entry      = { chain_id: number, comet: { address: string }, deployment_key: string, is_inactive?: boolean, collateral_value_block?: BlockRefV1, collaterals?: Collateral[] };
 
 async function summaryOf(response: Response): Promise<Entry[]> {
   if (response.status !== 200) {
@@ -115,6 +121,14 @@ const hide = (db: D1Database, key: string, symbol: string) => setCollateral(db, 
   cometAddress: cometOf(key),
   tokenAddress: tokenOf(key, symbol),
   isHidden:     true,
+  actor:        'test',
+  reason:       'decided for a summary test',
+});
+
+const markInactive = (db: D1Database, key: string, isInactive = true) => setInactiveMarket(db, {
+  chainId:      1,
+  cometAddress: cometOf(key),
+  isInactive,
   actor:        'test',
   reason:       'decided for a summary test',
 });
@@ -171,6 +185,25 @@ t.test('every form of the summary answers each collateral with the fields of its
   const alone = await summaryOf(await get(`/market/ethereum-mainnet/${cometOf('usdt')}/summary`));
   t.equal(JSON.stringify(alone), JSON.stringify([ entryOf(every, 'usdt') ]), 'and so does the summary of one market');
   t.equal(headerReads(node).length, new Set(Object.values(MARKET_BLOCKS)).size, 'both from the summaries of the minute, reading no header again');
+});
+
+const afterInstitutional = (entry: Entry) => Object.keys(entry)[Object.keys(entry).indexOf('is_institutional') + 1];
+
+const isUsdt = (entry: Entry) => entry.chain_id === 1 && entry.deployment_key === 'usdt';
+
+/*
+ * Whether an administrator has marked a market inactive is answered on every
+ * market of every form, right after whether it is institutional: a decision
+ * no version holds, read with every request. A market is active unless a
+ * decision says otherwise, and nobody has decided about any market here.
+ */
+t.test('every form of the summary says of every market whether it is inactive, right after whether it is institutional', async t => {
+  const { get } = await workerOf(t);
+  for (const path of [ EVERY_NETWORK, OF_MAINNET, `/market/ethereum-mainnet/${cometOf('usdt')}/summary` ]) {
+    const entries = await summaryOf(await get(path));
+    t.strictSame(entries.map(afterInstitutional), entries.map(() => 'is_inactive'), `${path}: on every market, right after whether it is institutional`);
+    t.strictSame(entries.map(entry => entry.is_inactive), entries.map(() => false), `${path}: and none inactive, as nobody has decided`);
+  }
 });
 
 // the Comets of mainnet the test decides about, checksummed, as the summary names a Comet
@@ -276,6 +309,49 @@ t.test('what a collateral says of its token is what holds of it on its chain, an
       ...(SAID[`${market} ${read.collateral.symbol}`] ?? { is_visible: false, visibility_reason: 'below_threshold' }),
     }, `${nameOf(read)}: every field of its token, its value in its market, and whether discovery shows it there`);
   }
+});
+
+/*
+ * Marking a market inactive changes whether that market is inactive, and
+ * nothing else: its collaterals are decided by the market's own decisions and
+ * values as any market's are, and every other market is as it was. Every
+ * collateral field here depends on something: XAUt is strategic, weETH and
+ * mETH are deprecated in USDT's market, weETH is hidden in USDC's, and USDT's
+ * market holds USD 300,000 of sFRAX, which nobody decided about. A decision
+ * shows on the next request of every form, and so does its reversal.
+ */
+t.test('a market marked inactive says so, and every other byte of every market is as before', async t => {
+  const sFrax = marketOf('usdt').collateralAssets.find(asset => asset.token.symbol === 'sFRAX')!.token;
+  const { registry, get } = await workerOf(t, {
+    answer: ({ comet, name, argument }) => comet === cometOf('usdt') && name === 'totalsCollateral' && argument === sFrax.address
+      ? [ (300_000n * 10n ** BigInt(sFrax.decimals)).toString() ]
+      : undefined,
+  });
+  await decide(registry.db, 'usdt', 'XAUt');
+  await markDeprecated(registry.db, 'usdt', 'weETH');
+  await markDeprecated(registry.db, 'usdt', 'mETH');
+  await hide(registry.db, 'usdc', 'weETH');
+  const paths   = [ EVERY_NETWORK, OF_MAINNET, `/market/ethereum-mainnet/${cometOf('usdt')}/summary` ];
+  const answers = async () => await Promise.all(paths.map(async path => await summaryOf(await get(path))));
+
+  const before = await answers();
+  t.strictSame([ 'XAUt', 'sFRAX', 'mETH' ].map(symbol => picked(collateralOf(entryOf(before[1]!, 'usdt'), symbol), 'is_visible', 'visibility_reason')), [
+    { is_visible: true,  visibility_reason: 'strategic' },
+    { is_visible: true,  visibility_reason: 'collateral_threshold' },
+    { is_visible: false, visibility_reason: 'deprecated' },
+  ], 'USDT\'s market shows XAUt for being strategic and sFRAX for what it holds of it, and not mETH, which it has deprecated');
+
+  await markInactive(registry.db, 'usdt');
+  const marked = await answers();
+  paths.forEach((path, index) => {
+    t.equal(JSON.stringify(marked[index]), JSON.stringify(before[index]!.map(entry => isUsdt(entry) ? { ...entry, is_inactive: true } : entry)),
+      `${path}: the next request says USDT's market is inactive, and answers every other byte as before`);
+  });
+  await markInactive(registry.db, 'usdt', false);
+  const reversed = await answers();
+  paths.forEach((path, index) => {
+    t.equal(JSON.stringify(reversed[index]), JSON.stringify(before[index]), `${path}: and the next request after its reversal answers as before`);
+  });
 });
 
 // that an exception never expires is known, so its expiry is null rather than left out as an unknown value is
@@ -452,6 +528,47 @@ t.test('a market whose status is deprecated answers by its own Comet\'s decision
   ], 'and XAUt and sFRAX, which nobody decided about, by what it holds of each');
 });
 
+/*
+ * The first list of inactive markets names Scroll's USDC market, which the
+ * fixture holds (registry/seed/production.inactive-markets.json): once its
+ * row is applied, that market is inactive in its network's summary and in
+ * every network's, and no other market is, the default one among them.
+ */
+t.test('the Scroll market of the first list is inactive once its row is applied, and no other market is', async t => {
+  const { registry, get } = await workerOf(t);
+  const list = readSeedInactive();
+  await applyInactiveMarkets(registry.db, {
+    reason:    list.reason,
+    decisions: list.inactiveMarkets.filter(row => row.chainId === 534352)
+      .map(({ chainId, cometAddress, deploymentKey, isInactive }) => ({ chainId, cometAddress, deploymentKey: deploymentKey ?? null, isInactive, reason: null })),
+  }, 'test');
+  const scroll = (entries: Entry[]) => entries.filter(entry => entry.chain_id === 534352).map(entry => entry.is_inactive);
+
+  t.same(scroll(await summaryOf(await get('/market/scroll-mainnet/all-contracts/summary'))), [ true ], 'Scroll\'s network: its one market inactive');
+  const every = await summaryOf(await get(EVERY_NETWORK));
+  t.same(scroll(every), [ true ], 'and so in every network\'s');
+  const others = every.filter(entry => entry.chain_id !== 534352);
+  t.strictSame(others.map(entry => entry.is_inactive), others.map(() => false), 'where no other market is, mainnet USDC, the default, among them');
+});
+
+/*
+ * A market's lifecycle status is not whether it is inactive: USDT's,
+ * deprecated here, is not inactive until an administrator marks it so.
+ */
+t.test('a market whose status is deprecated is not inactive until it is marked so', async t => {
+  const snapshot: RegistrySnapshotV1 = {
+    ...fixture,
+    networks: fixture.networks.map(network => network !== MAINNET ? network : {
+      ...network,
+      markets: network.markets.map(entry => entry.deploymentKey === 'usdt' ? { ...entry, status: 'deprecated' as const } : entry),
+    }),
+  };
+  const { registry, get } = await workerOf(t, {}, snapshot);
+  t.equal(entryOf(await summaryOf(await get(OF_MAINNET)), 'usdt').is_inactive, false, 'USDT\'s market, deprecated, is not inactive');
+  await markInactive(registry.db, 'usdt');
+  t.equal(entryOf(await summaryOf(await get(OF_MAINNET)), 'usdt').is_inactive, true, 'until it is marked inactive');
+});
+
 // matches no statement, so that a database fails only while it is down
 const NO_STATEMENT = /^$/;
 
@@ -507,12 +624,13 @@ const saidOf = (collateral: Collateral) => picked(collateral, ...decidedBy.shown
  * The deprecated and the hidden decisions are read as the active reads read
  * them: from D1, or, while D1 cannot be reached, from the record the worker
  * keeps of each kind, and an answer marked with those says that it could not
- * be confirmed. The strategic ones have no record, and what they decide is
- * left out. Every value here is worth less than the threshold, so a
- * collateral its Comet neither hides nor deprecates is told nothing of
- * whether it is shown, as a strategic mark would show it, while one its Comet
- * hides or has deprecated is not shown there whatever they say. Either way
- * the summary is answered: a summary is every market's.
+ * be confirmed. So are the inactive markets, which mark USDT's market here.
+ * The strategic ones have no record, and what they decide is left out. Every
+ * value here is worth less than the threshold, so a collateral its Comet
+ * neither hides nor deprecates is told nothing of whether it is shown, as a
+ * strategic mark would show it, while one its Comet hides or has deprecated
+ * is not shown there whatever they say. Either way the summary is answered: a
+ * summary is every market's.
  */
 t.test('while D1 cannot be reached, the deprecated and the hidden decisions come from their records and are said to be unconfirmed', async t => {
   const { registry, env, get } = await workerOf(t);
@@ -520,6 +638,7 @@ t.test('while D1 cannot be reached, the deprecated and the hidden decisions come
   await decide(registry.db, 'usdt', 'XAUt');
   await markDeprecated(registry.db, 'usdt', 'mETH');
   await hide(registry.db, 'usdc', 'weETH');
+  await markInactive(registry.db, 'usdt');
   let down = false;
   const db = failingStatements(registry.db, NO_STATEMENT, { down: () => down });
 
@@ -531,9 +650,14 @@ t.test('while D1 cannot be reached, the deprecated and the hidden decisions come
     [ { chainId: 1, cometAddress: cometOf('usdt'), tokenAddress: tokenOf('usdt', 'mETH') } ],
     [ { chainId: 1, cometAddress: cometOf('usdc'), tokenAddress: tokenOf('usdc', 'weETH') } ],
   ], 'and records the decisions it read, each kind apart');
+  t.same((await env.kv_registry.get(INACTIVE_KEY, 'json') as { markets: unknown[] }).markets, [ { chainId: 1, cometAddress: cometOf('usdt') } ],
+    'the inactive markets among them');
   const before = await summaryOf(confirmed);
+  t.equal(entryOf(before, 'usdt').is_inactive, true, 'USDT\'s market inactive');
 
-  for (const [ kind, failing ] of [ [ 'deprecated', statementsOf(DEPRECATED_COLLATERALS) ], [ 'hidden', statementsOf(HIDDEN_COLLATERALS) ] ] as const) {
+  for (const [ kind, failing ] of [
+    [ 'deprecated', statementsOf(DEPRECATED_COLLATERALS) ], [ 'hidden', statementsOf(HIDDEN_COLLATERALS) ], [ 'inactive', statementsOf(INACTIVE_MARKETS) ],
+  ] as const) {
     const partly = await get(OF_MAINNET, { APP_DB: failingStatements(registry.db, failing) });
     t.same([ partly.headers.get('x-registry-stale'), partly.headers.get('cache-control') ], [ '0', 'no-store' ],
       `${kind} decisions D1 did not give, the version it did: the decisions last recorded, said to be no older than now, and not to be kept`);
@@ -552,6 +676,7 @@ t.test('while D1 cannot be reached, the deprecated and the hidden decisions come
     { is_hidden: true, is_visible: false, visibility_reason: 'hidden' }, 'of either kind, and a collateral its Comet hides is not shown there');
   t.strictSame(picked(collateralOf(entryOf(during, 'usdt'), 'mETH'), 'is_hidden', 'is_visible', 'visibility_reason'),
     { is_hidden: false, is_visible: false, visibility_reason: 'deprecated' }, 'nor one its Comet has deprecated and does not hide');
+  t.equal(entryOf(during, 'usdt').is_inactive, true, 'and USDT\'s market inactive, by the inactive markets last recorded');
   const strategic = [ ...decidedBy.strategic, ...decidedBy.shown, ...decidedBy.why ];
   const expected  = unreadCollaterals(before, [ 'strategic' ]);
   for (const read of collateralsOf(during)) {
@@ -566,6 +691,8 @@ t.test('while D1 cannot be reached, the deprecated and the hidden decisions come
     t.ok(logs.some(line => line === `warn: ${kind} collateral decisions unreadable; answering with the ones last recorded`),
       `the log says where the ${kind} decisions came from`);
   }
+  t.ok(logs.some(line => line === 'warn: inactive market decisions unreadable; answering with the ones last recorded'),
+    'and where the inactive markets came from');
   t.ok(logs.some(line => line === 'error: the summary could not read the token policies'), 'and which decisions could not be read');
 });
 
@@ -624,6 +751,40 @@ t.test('decisions that cannot be read leave out what they decide, and are logged
 });
 
 /*
+ * A market is active unless a decision in force says otherwise, so inactive
+ * markets that cannot be read, with none recorded, leave every market active
+ * rather than without the flag, USDT's, marked inactive, too. The read is
+ * logged once a minute for each database binding, as the other kinds' are,
+ * and the answer says nothing is unconfirmed: no decision answered it.
+ * Nothing else changes.
+ */
+t.test('inactive markets that cannot be read leave every market active, and are logged under the request', async t => {
+  const { registry, get } = await workerOf(t);
+  const errors = consoleLines(t, [ 'error' ]);
+  await markInactive(registry.db, 'usdt');
+  const before = await summaryOf(await get(OF_MAINNET));
+  t.equal(entryOf(before, 'usdt').is_inactive, true, 'USDT\'s market, marked inactive, says so while the decisions are read');
+
+  const db       = failingStatements(registry.db, statementsOf(INACTIVE_MARKETS));
+  const response = await get(OF_MAINNET, { APP_DB: db, kv_registry: MemoryKv({}) });
+  t.same([ response.status, response.headers.get('x-registry-stale'), response.headers.get('cache-control') ], [ 200, null, null ],
+    'without them, the summary is answered, and says nothing is unconfirmed');
+  const answered = await summaryOf(response);
+  t.strictSame(answered.map(entry => entry.is_inactive), answered.map(() => false), 'every market not inactive, USDT\'s too');
+  t.strictSame(answered.map(afterInstitutional), answered.map(() => 'is_inactive'), 'each saying so where it always does');
+  t.equal(JSON.stringify(answered), JSON.stringify(before.map(entry => isUsdt(entry) ? { ...entry, is_inactive: false } : entry)),
+    'and everything else as when they were read');
+  const at = errors.indexOf('the summary could not read the inactive market decisions');
+  t.ok(at >= 0, 'the log says so');
+  t.match(errors[at + 1], /requestId: '[0-9a-f-]{36}'[\s\S]*Network connection lost/, 'with its cause, under the request\'s id');
+
+  errors.length = 0;
+  const again = await summaryOf(await get(OF_MAINNET, { APP_DB: db, kv_registry: MemoryKv({}) }));
+  t.equal(JSON.stringify(again), JSON.stringify(answered), 'a request right after answers the same');
+  t.notOk(errors.includes('the summary could not read the inactive market decisions'), 'and is not logged again for that database within a minute');
+});
+
+/*
  * A release deployed before migration 0008 finds no table of hidden
  * decisions to read, where the other routes that read them answer 503: the
  * summary is answered without what they decide, as when D1 cannot give them,
@@ -646,6 +807,30 @@ t.test('a database without the hidden collateral migration leaves out what the h
   const logged = 'the summary could not read the hidden collateral decisions';
   t.equal(errors.filter(line => line === logged).length, 1, 'the log says so once');
   t.match(errors[errors.indexOf(logged) + 1], /no such table: hidden_collaterals/, 'with the table D1 does not have');
+});
+
+/*
+ * A release deployed before migration 0009 finds no table of inactive
+ * markets to read, where the routes that read them answer 503: the summary
+ * is answered with every market active, as when D1 cannot give them, and
+ * with every field of every collateral, whose decisions are all there. The
+ * log says why.
+ */
+t.test('a database without the inactive market migration answers every market active', async t => {
+  const { get } = await workerOf(t, {}, fixture, { through: '0008' });
+  const errors = consoleLines(t, [ 'error' ]);
+
+  const response = await get(OF_MAINNET, { kv_registry: MemoryKv({}) });
+  t.same([ response.status, response.headers.get('x-registry-stale'), response.headers.get('cache-control') ], [ 200, null, null ],
+    'the summary is answered, and says nothing is unconfirmed');
+  const answered = await summaryOf(response);
+  t.strictSame(answered.map(entry => entry.is_inactive), answered.map(() => false), 'every market not inactive');
+  for (const read of collateralsOf(answered)) {
+    t.strictSame(Object.keys(read.collateral), COLLATERAL_KEYS, `${nameOf(read)}: with every field of its token`);
+  }
+  const logged = 'the summary could not read the inactive market decisions';
+  t.equal(errors.filter(line => line === logged).length, 1, 'the log says so once');
+  t.match(errors[errors.indexOf(logged) + 1], /no such table: inactive_markets/, 'with the table D1 does not have');
 });
 
 /*
@@ -732,6 +917,45 @@ t.test('while the strategic decisions cannot be read, a collateral its value sho
 });
 
 /*
+ * What a summary keeps for an outage is handed to the request's waitUntil, as
+ * the active reads hand theirs (../registry/kv-outage.test.ts): the pointer
+ * record's write, and the check of each kind's record, the inactive markets'
+ * among them. A namespace slow to take those writes holds no answer.
+ */
+t.test('a summary leaves the records an outage reads to waitUntil, the record of the inactive markets among them', async t => {
+  const { get } = await workerOf(t);
+  const store = MemoryKv({});
+  const records = [ POINTER_KEY, DEPRECATED_KEY, HIDDEN_KEY, INACTIVE_KEY ];
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const held = new Proxy(store, {
+    get(target, property) {
+      const value = Reflect.get(target, property) as unknown;
+      if (property === 'put') {
+        return async (...parameters: unknown[]) => {
+          if (records.includes(parameters[0] as string)) {
+            await released;
+          }
+          return (value as (...parameters: unknown[]) => Promise<void>).apply(target, parameters);
+        };
+      }
+      return typeof(value) === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  }) as KVNamespace;
+
+  const { context, handed } = executionContext();
+  const answer = get(`/market/ethereum-mainnet/${cometOf('usdt')}/summary`, { kv_registry: held }, context);
+  t.ok(await settledWithin(answer, 5000), 'the summary of a known market answers while the namespace holds those writes');
+  t.equal((await answer).status, 200);
+  t.equal(handed.length, 4, 'having handed four to waitUntil: the pointer record, and the check of the record of each kind of decision');
+  t.same(await Promise.all(records.map(key => store.get(key))), [ null, null, null, null ], 'none of which has landed');
+
+  release();
+  await Promise.all(handed.map(entry => entry.work));
+  t.ok((await Promise.all(records.map(key => store.get(key)))).every(value => value !== null), 'and each lands once the namespace takes it');
+});
+
+/*
  * Nothing but the summaries of the markets is cached: the minutely summary
  * under its version, at the block of each market's minute, and in the
  * registry's namespace nothing the active reads do not keep. A minute nobody
@@ -755,8 +979,8 @@ t.test('the summary caches the minutely summaries of its markets alone, under th
   t.equal(written.length, markets.length, 'one record of each market');
   t.ok(markets.every(prefix => written.filter(key => key.startsWith(prefix)).length === 1),
     'the minutely summary of each, at the block of its minute, under its version');
-  t.ok((await keysOf(env.kv_registry)).every(key => [ 'active:v1', DEPRECATED_KEY, HIDDEN_KEY ].includes(key) || key.startsWith('snapshot:')),
-    'and in the registry\'s namespace nothing the active reads do not keep');
+  t.ok((await keysOf(env.kv_registry)).every(key => [ 'active:v1', DEPRECATED_KEY, HIDDEN_KEY, INACTIVE_KEY ].includes(key) || key.startsWith('snapshot:')),
+    'and in the registry\'s namespace nothing but what the active reads keep and the record of the inactive markets');
 
   node.requests.length = 0;
   await summaryOf(await get(EVERY_NETWORK));

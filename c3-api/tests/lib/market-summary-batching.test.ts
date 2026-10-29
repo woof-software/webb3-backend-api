@@ -17,6 +17,9 @@ import * as market  from '../../lib/computations/market.js';
 import * as rewards from '../../lib/computations/rewards.js';
 
 import * as marketHandlers from '../../src/market.js';
+import { decisionSetOf } from '../../src/registry/decision-records.js';
+import { INACTIVE_RECORD } from '../../src/registry/inactive-markets.js';
+import type { SummaryDecisions } from '../../src/registry/summary-tokens.js';
 import {
   AllContracts,
   AllNetworks,
@@ -29,7 +32,7 @@ import { type Call, type FakeNode, type NodeScript, fakeNode, headerReads, serve
 import { fixtureCatalog, loadRegistrySnapshotFixture } from '../util/registry-fixture.js';
 import { REGISTRY_KEYS } from '../util/summary-registry-fields.js';
 import { COLLATERAL_KEYS, scaled } from '../util/summary-token-fields.js';
-import { summaryDecisionsOf } from '../util/summary-decisions.js';
+import { NO_DECISIONS, summaryDecisionsOf } from '../util/summary-decisions.js';
 
 import '../../shim/node-self.js';
 
@@ -377,7 +380,7 @@ const describedOf = (entry: Summary) => Object.fromEntries(Object.entries(entry)
 const VERSION_KEYS = REGISTRY_KEYS.filter(key => key !== 'slug');
 
 const answered = [
-  'chain_id', 'comet', ...VERSION_KEYS, 'status', 'borrow_apr', 'supply_apr',
+  'chain_id', 'comet', ...VERSION_KEYS, 'is_inactive', 'status', 'borrow_apr', 'supply_apr',
   'total_borrow_value', 'total_supply_value', 'total_collateral_value',
   'total_borrow_value_usd', 'total_supply_value_usd', 'total_collateral_value_usd',
   'utilization', 'base_usd_price', 'base_price',
@@ -522,13 +525,54 @@ t.test('a market whose version has no rewards contract, no bulker or no slug lea
   t.strictSame(others.map(entry => Object.keys(entry.comet)), others.map(() => [ 'address', 'rewards', 'bulker' ]), 'and every other market all three');
 
   const usdt = entryOf(summary, USDT);
-  t.strictSame(Object.keys(usdt).slice(2, 9),
-    [ 'deployment_key', 'display_name', 'base_asset_name', 'is_wrapped_native', 'slug', 'is_default', 'is_institutional' ],
+  t.strictSame(Object.keys(usdt).slice(2, 10),
+    [ 'deployment_key', 'display_name', 'base_asset_name', 'is_wrapped_native', 'slug', 'is_default', 'is_institutional', 'is_inactive' ],
     'USDT: its slug after whether its base asset wraps the chain\'s own token');
   t.match(usdt, { slug: 'usdt-institutional', is_institutional: true }, 'as the version has it, in its institutional section');
   const rest = summary.filter(entry => entry !== usdt);
   t.strictSame(rest.map(entry => 'slug' in entry), rest.map(() => false), 'and no other market has a slug');
   t.strictSame(summary.map(entry => entry.status), summary.map(() => 'success'), 'each market a success all the same');
+});
+
+/*
+ * Whether an administrator has marked a market inactive, a decision no
+ * version holds, is answered on every market right after its labels,
+ * whatever its status: a market a decision marks is inactive, an error and a
+ * partial one too, and every other market is not. A decision is about a
+ * Comet on its own chain, so one about mainnet USDT's Comet on Scroll leaves
+ * that market, and Scroll's own, as they are. Where the decisions could not
+ * be read, every market is answered as one nobody marked, and nothing else
+ * changes.
+ */
+t.test('every market says whether it is inactive, right after whether it is institutional, whatever its status', async t => {
+  consoleLines(t, [ 'warn' ]);
+  // WETH's base feed reverts, which makes its market an error, and COMP / USD on USDC's market, which makes it partial
+  const feeds = new Map<string, string>([
+    [ WETH, marketOf(WETH).baseAsset.priceFeed.address ],
+    [ USDC, marketOf(USDC).collateralAssets[0]!.priceFeed.address ],
+  ]);
+  serve(t, nodeOf((comet, fragment, argument) => fragment === 'getPrice' && argument === feeds.get(comet) ? REVERT : undefined));
+  const summaryWith = async (inactive: SummaryDecisions['inactive']) => await (
+    await marketHandlers.latestSummary(everyMarket(), context([], summaryDecisionsOf({ ...NO_DECISIONS, inactive })))
+  ).json() as Summary[];
+  const inactiveOf = (summary: Summary[]) => Object.fromEntries(summary.map(entry => [ `${entry.chain_id} ${entry.deployment_key}`, entry.is_inactive ]));
+
+  const decided = await summaryWith({
+    decisions: decisionSetOf(INACTIVE_RECORD, [ { chainId: 1, cometAddress: USDC }, { chainId: 1, cometAddress: WETH }, { chainId: 1, cometAddress: WBTC }, { chainId: 534352, cometAddress: USDT } ]),
+    recorded:  false,
+  });
+  t.same([ entryOf(decided, USDC).status, entryOf(decided, WETH).status, entryOf(decided, WBTC).status ], [ 'partially', 'error', 'success' ],
+    'USDC\'s market partial, WETH\'s an error, and WBTC\'s a success');
+  t.strictSame(inactiveOf(decided), { '1 usdc': true, '1 weth': true, '1 usdt': false, '1 wbtc': true, '8453 aero': false, '534352 usdc': false },
+    'each market a decision marks is inactive, whatever its status, and every other is not: mainnet USDT\'s Comet, decided on Scroll, is no market there');
+  t.strictSame(decided.map(entry => Object.keys(entry)[Object.keys(entry).indexOf('is_institutional') + 1]), decided.map(() => 'is_inactive'),
+    'every market says so right after whether it is institutional');
+
+  const unread = await summaryWith(null);
+  t.strictSame(unread.map(entry => entry.is_inactive), unread.map(() => false),
+    'where the decisions could not be read, every market, a success, a partial one and an error, is not inactive');
+  t.strictSame(unread.map(entry => without(entry, 'is_inactive')), decided.map(entry => without(entry, 'is_inactive')),
+    'and is answered as when they were read, but for that');
 });
 
 type Collateral = { address: string, symbol: string, status: string, [field: string]: unknown };
@@ -1048,7 +1092,7 @@ t.test('a market whose base feed reverts answers every field it can', async t =>
   t.strictSame(wbtc, { ...without(entryOf(reading, WBTC), ...totals, 'base_price'), status: 'error', message: 'execution reverted' },
     'WBTC: an error, and every field as read but its borrow and supply totals and its base price');
   t.strictSame(Object.keys(wbtc), [
-    'chain_id', 'comet', ...VERSION_KEYS, 'status', 'message', 'borrow_apr', 'supply_apr', 'total_collateral_value', 'total_collateral_value_usd',
+    'chain_id', 'comet', ...VERSION_KEYS, 'is_inactive', 'status', 'message', 'borrow_apr', 'supply_apr', 'total_collateral_value', 'total_collateral_value_usd',
     'utilization', 'base_usd_price', 'collateral_asset_symbols', 'collateral_value_block', 'collaterals',
   ], 'WBTC: its message after its status');
   t.equal(wbtc.base_usd_price, '86106.69', 'WBTC: its USD price, which is the price of BTC');
@@ -1057,7 +1101,7 @@ t.test('a market whose base feed reverts answers every field it can', async t =>
   t.strictSame(usdc, { ...without(entryOf(reading, USDC), ...totals, 'base_usd_price', 'base_price'), status: 'error', message: 'execution reverted' },
     'USDC: an error, and every field as read but its totals and both its prices');
   t.strictSame(Object.keys(usdc), [
-    'chain_id', 'comet', ...VERSION_KEYS, 'status', 'message', 'borrow_apr', 'supply_apr', 'total_collateral_value', 'total_collateral_value_usd',
+    'chain_id', 'comet', ...VERSION_KEYS, 'is_inactive', 'status', 'message', 'borrow_apr', 'supply_apr', 'total_collateral_value', 'total_collateral_value_usd',
     'utilization', 'collateral_asset_symbols', 'collateral_value_block', 'collaterals',
   ], 'USDC: its message after its status');
 

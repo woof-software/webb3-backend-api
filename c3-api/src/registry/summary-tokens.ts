@@ -19,8 +19,12 @@ import type { CollateralStatus, MarketIdentity } from '../../lib/computations/ma
 import type { CacheDeps } from './cache.js';
 import type { Catalog, CatalogMarket, RegistryComet } from './catalog.js';
 import { nowOf } from './clock.js';
-import { DEPRECATED_RECORD, HIDDEN_RECORD, collateralDecisionsOf, markedDecisions } from './collateral-decisions.js';
-import type { CollateralRead } from './collateral-decisions.js';
+import type { CollateralOfComet } from './collateral-decision-repository.js';
+import { DEPRECATED_RECORD, HIDDEN_RECORD } from './collateral-decisions.js';
+import { decisionSetOf, markedDecisions } from './decision-records.js';
+import type { DecisionRead } from './decision-records.js';
+import type { MarketOfChain } from './inactive-market-repository.js';
+import { INACTIVE_RECORD } from './inactive-markets.js';
 import { readStrategicTokensByChain } from './token-policy-repository.js';
 import { visibilityHere } from './token-visibility.js';
 import { staleHeaders } from './version-headers.js';
@@ -51,9 +55,10 @@ type StrategicTokens = ReadonlyMap<number, ReadonlySet<Address>>;
 
 // the decisions of administrators, every chain's, or null where they could not be read
 type SummaryDecisions = {
-  deprecated: CollateralRead | null,
-  hidden:     CollateralRead | null,
+  deprecated: DecisionRead<CollateralOfComet> | null,
+  hidden:     DecisionRead<CollateralOfComet> | null,
   strategic:  StrategicTokens | null,
+  inactive:   DecisionRead<MarketOfChain> | null,
 };
 
 /*
@@ -67,11 +72,15 @@ const unreadDue = throttleBy<D1Database>(60_000);
 /*
  * The decisions, every kind read at once. No read fails the summary: on the
  * legacy router a database fault would be a 500 of every market's summary. A
- * read that failed leaves out the fields it decides on every request, and is
- * logged under the id of the request that found it (unreadDue). The
- * deprecated and the hidden decisions are read as /registry/v1/active reads
- * them, and come from the records the worker keeps while D1 cannot be
- * reached; the strategic ones have no such record.
+ * read that failed leaves out the fields it decides on every request, but for
+ * the inactive markets, without which every market is answered active
+ * (inactiveOf), and is logged under the id of the request that found it
+ * (unreadDue). The deprecated and the hidden decisions are read as
+ * /registry/v1/active reads them, and come from the records the worker keeps
+ * while D1 cannot be reached, as the inactive markets, which only the summary
+ * reads, come from theirs; the strategic ones have no such record. The
+ * inactive markets are read last, so the other kinds' statements go to D1 in
+ * the order they always have.
  */
 async function summaryDecisions(deps: CacheDeps, requestId: string): Promise<SummaryDecisions> {
   const unread = (decisions: string) => (error: unknown) => {
@@ -80,22 +89,38 @@ async function summaryDecisions(deps: CacheDeps, requestId: string): Promise<Sum
     }
     return null;
   };
-  const [ deprecated, hidden, strategic ] = await Promise.all([
+  const [ deprecated, hidden, strategic, inactive ] = await Promise.all([
     markedDecisions(DEPRECATED_RECORD, deps).catch(unread('deprecated collateral decisions')),
     markedDecisions(HIDDEN_RECORD, deps).catch(unread('hidden collateral decisions')),
     readStrategicTokensByChain(deps.db).catch(unread('token policies')),
+    markedDecisions(INACTIVE_RECORD, deps).catch(unread('inactive market decisions')),
   ]);
-  return { deprecated, hidden, strategic };
+  return { deprecated, hidden, strategic, inactive };
 }
 
 /*
  * Collaterals marked by the deprecated or the hidden decisions the worker
  * last recorded, because D1 could not give them, are not confirmed, and the
- * answer says so as /registry/v1/active does; the legacy router sets the
- * version's own age over it where the version came from the cache too.
+ * answer says so as /registry/v1/active does; so are markets answered by the
+ * inactive markets last recorded. The legacy router sets the version's own
+ * age over it where the version came from the cache too. A kind that could
+ * not be read at all marks nothing unconfirmed: what it decides is left out,
+ * or, for the inactive markets, answered as no decision, and neither comes
+ * from an older read.
  */
-function summaryHeaders({ deprecated, hidden }: SummaryDecisions): Record<string, string> {
-  return staleHeaders(deprecated?.recorded || hidden?.recorded ? 0 : null);
+function summaryHeaders({ deprecated, hidden, inactive }: SummaryDecisions): Record<string, string> {
+  return staleHeaders(deprecated?.recorded || hidden?.recorded || inactive?.recorded ? 0 : null);
+}
+
+/*
+ * Whether an administrator has marked a market inactive. A market is active
+ * unless a decision in force says otherwise, so every market is answered one
+ * way or the other, and as active wherever no such decision is known: where
+ * none was made or it was reversed, and where the decisions could not be
+ * read, which is logged (summaryDecisions).
+ */
+function inactiveOf({ inactive }: SummaryDecisions, contract: RegistryComet): boolean {
+  return inactive !== null && inactive.decisions.has({ chainId: contract.registry.chainId, cometAddress: normalizeAddress(contract.address) });
 }
 
 // what /summary says of a token across its chain but its strategic mark, which collateralFields looks up beside what the collateral's own market decides
@@ -118,7 +143,7 @@ type ChainTokens = {
   factsOf:   (token: Address) => ChainFacts,
 };
 
-// a kind of decision as the facts of a chain ask it (collateral-decisions.ts): whether it names a collateral, its addresses lowercase
+// a kind of decision as the facts of a chain ask it (decision-records.ts): whether it names a collateral, its addresses lowercase
 type Decisions = { has: (collateral: { chainId: number, cometAddress: Address, tokenAddress: Address }) => boolean };
 
 /*
@@ -174,8 +199,8 @@ function decisionsOnChain(
 function chainTokens(catalog: Catalog, network: KnownNetwork.Name, chainId: number, decisions: SummaryDecisions): ChainTokens {
   const markets = catalog.marketsOn(network);
   const decided = {
-    deprecated: decisions.deprecated?.decisions ?? collateralDecisionsOf([]),
-    hidden:     decisions.hidden?.decisions ?? collateralDecisionsOf([]),
+    deprecated: decisions.deprecated?.decisions ?? decisionSetOf(DEPRECATED_RECORD, []),
+    hidden:     decisions.hidden?.decisions ?? decisionSetOf(HIDDEN_RECORD, []),
   };
   const found = new Map<Address, ChainFacts>();
   const factsOf = (token: Address): ChainFacts => {
@@ -363,4 +388,4 @@ function withTokenFields<Entry extends ReadMarket>(
 }
 
 export type { SummaryDecisions };
-export { chainTokens, summaryDecisions, summaryHeaders, withTokenFields };
+export { chainTokens, inactiveOf, summaryDecisions, summaryHeaders, withTokenFields };

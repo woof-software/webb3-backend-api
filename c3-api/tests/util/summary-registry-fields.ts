@@ -23,10 +23,12 @@ function registryFields(market: MarketV1) {
 
 /*
  * A summary entry held against the market /registry/v1/active served: the
- * same contracts and fields, in the order the summary writes them.
+ * same contracts and fields, in the order the summary writes them, and after
+ * them whether an administrator has marked the market inactive, which no
+ * version holds.
  */
 function onSummary<Entry extends { chain_id: number, comet: { address: string } }>({ chain_id, comet, ...rest }: Entry, market: MarketV1) {
-  return { chain_id, comet: { ...comet, ...contractsBesideComet(market) }, ...registryFields(market), ...rest };
+  return { chain_id, comet: { ...comet, ...contractsBesideComet(market) }, ...registryFields(market), is_inactive: false, ...rest };
 }
 
 // the keys of a market of the summary that come from the version, and not from what was read

@@ -7,7 +7,8 @@ import type * as Evaluator from '../evaluator.js';
 import { routeAdmin } from './admin-router.js';
 import type { CachedSnapshot } from './cache.js';
 import { activeSnapshot, cacheDepsOf, isUnreachable, versionSnapshot, warmSnapshot } from './cache.js';
-import { readMarks, recordCollaterals } from './collateral-decisions.js';
+import { readMarks } from './collateral-decisions.js';
+import { recordDecisions } from './decision-records.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
@@ -97,13 +98,13 @@ const ERROR_STATUS: Record<RegistryErrorCode, ApiErrorCode> = {
 
 /*
  * A release that reached an environment before its token policy, deprecated
- * collateral or hidden collateral migration finds those tables missing. The
- * remedy is known and is an operator's, so it is said, rather than answered
- * as an internal error only the logs explain. Any other table missing is a
- * fault like the rest, and stays a 500.
+ * collateral, hidden collateral or inactive market migration finds those
+ * tables missing. The remedy is known and is an operator's, so it is said,
+ * rather than answered as an internal error only the logs explain. Any other
+ * table missing is a fault like the rest, and stays a 500.
  */
 function missingSchema(error: unknown): boolean {
-  return /no such table: (token_polic|deprecated_collateral|hidden_collateral)/i.test(String(error));
+  return /no such table: (token_polic|deprecated_collateral|hidden_collateral|inactive_market)/i.test(String(error));
 }
 
 /*
@@ -188,7 +189,7 @@ async function routeRegistry(
       }
     },
     marks:   () => readMarks(deps),
-    record:  kind => recordCollaterals(kind, deps),
+    record:  kind => recordDecisions(kind, deps),
   };
 
   try {

@@ -11,10 +11,18 @@ import type {
 
 import {
   DecisionKind,
+  DecisionList,
+  KindNames,
+  KindTables,
   Planned,
   StateRow,
   activeVersionOf,
+  activeVersionStatement,
   applyDecisions,
+  decisionWrites,
+  historyOf,
+  identityOf,
+  member,
   readDecision,
   refusal,
   reviewDecisions,
@@ -60,10 +68,9 @@ type Decision = TokenOfChain & {
 type PolicyChange = Decision & { reason: string, actor: string };
 
 type ListedDecision = Decision & { symbol: string | null };
-type DecisionList   = { reason: string | null, decisions: ListedDecision[] };
 
 // each token of a JSON parameter (`c` its chain, `t` its address) as the active version and the stored decision describe it
-type TokenState = StateRow & { is_strategic: number | null };
+type TokenState = StateRow & { token_id: string | null, symbol: string | null, is_strategic: number | null };
 
 function statesStatement(db: D1Database, tokens: string): D1PreparedStatement {
   return db.prepare(
@@ -99,60 +106,43 @@ function missingFrom(state: TokenState, token: TokenOfChain): string | null {
   return null;
 }
 
-// the statements of a write, which writeDecisions (decision-store.ts) explains: a token without a row is not strategic
-const WRITE_EVENTS = `
-  INSERT INTO token_policy_events (
-    id, chain_id, token_address, previous_is_strategic, is_strategic, actor, reason, created_at
-  )
-  SELECT json_extract(row.value, '$.i'), json_extract(row.value, '$.c'), json_extract(row.value, '$.t'),
-         policy.is_strategic, json_extract(row.value, '$.s'), ?2, json_extract(row.value, '$.r'), ?3
-  FROM json_each(?1) AS row
-  LEFT JOIN token_policies AS policy
-    ON policy.chain_id = json_extract(row.value, '$.c')
-   AND policy.token_address = json_extract(row.value, '$.t')
-  WHERE json_extract(row.value, '$.r') IS NOT NULL
-    AND COALESCE(policy.is_strategic, 0) <> json_extract(row.value, '$.s')
-  ORDER BY row.key`;
-
-const WRITE_POLICIES = `
-  INSERT INTO token_policies (chain_id, token_address, is_strategic, updated_at, updated_by)
-  SELECT json_extract(row.value, '$.c'), json_extract(row.value, '$.t'), json_extract(row.value, '$.s'), ?3, ?2
-  FROM json_each(?1) AS row
-  LEFT JOIN token_policies AS policy
-    ON policy.chain_id = json_extract(row.value, '$.c')
-   AND policy.token_address = json_extract(row.value, '$.t')
-  WHERE json_extract(row.value, '$.r') IS NOT NULL
-    AND COALESCE(policy.is_strategic, 0) <> json_extract(row.value, '$.s')
-  ORDER BY row.key
-  ON CONFLICT (chain_id, token_address) DO UPDATE
-  SET is_strategic = excluded.is_strategic, updated_at = excluded.updated_at, updated_by = excluded.updated_by`;
-
-const EXPECT_DECISIONS = `
-  INSERT INTO token_policy_expectations (chain_id, token_address, is_strategic)
-  SELECT json_extract(row.value, '$.c'), json_extract(row.value, '$.t'), json_extract(row.value, '$.s')
-  FROM json_each(?1) AS row`;
+// the tables of migrations/0005_token_policies.sql: a token without a row is not strategic
+const TOKEN_POLICY_TABLES: KindTables<TokenOfChain> = {
+  decisions:    'token_policies',
+  events:       'token_policy_events',
+  expectations: 'token_policy_expectations',
+  flag:         'is_strategic',
+  previous:     'previous_is_strategic',
+  keys:         { chainId: [ 'c', 'chain_id' ], tokenAddress: [ 't', 'token_address' ] },
+  alias:        'policy',
+};
 
 /*
- * Token policies, as the store takes them. A policy is a decision about a
- * token the registry serves; one about an address the active version does
- * not describe would be a decision nobody could check.
+ * Token policies, as the store takes them and as their routes name them
+ * (admin-router.ts). A policy is a decision about a token the registry
+ * serves; one about an address the active version does not describe would be
+ * a decision nobody could check.
  */
-const TOKEN_POLICY_KIND: DecisionKind<TokenOfChain, Decision, ListedDecision, TokenState> = {
+const TOKEN_POLICY_KIND: DecisionKind<TokenOfChain, Decision, ListedDecision, TokenState> & KindNames<'isStrategic', 'policies'> = {
   label:       'token policy',
   listOf:      'token policies',
+  flag:        'isStrategic',
+  listKey:     'policies',
+  segment:     'policy',
+  listPath:    'token-policies',
   subject:     'token',
-  identity:    token => ({ c: token.chainId, t: token.tokenAddress }),
+  identity:    identityOf(TOKEN_POLICY_TABLES),
   keyOf:       token => `${token.chainId}:${token.tokenAddress}`,
   flagOf:      decision => decision.isStrategic,
   storedOf:    state => state.is_strategic,
   states:      statesStatement,
-  writes:      { events: WRITE_EVENTS, rows: WRITE_POLICIES, expectations: EXPECT_DECISIONS },
+  writes:      decisionWrites(TOKEN_POLICY_TABLES),
   leftAbort:   'token is not in the active registry',
   missingFrom,
   misnamed:    (decision, state) => decision.symbol !== null && state.symbol !== decision.symbol
     ? `the list names ${decision.tokenAddress} ${decision.symbol}, which the active registry calls ${state.symbol}`
     : null,
-  named:       (state, token) => state.symbol ?? token.tokenAddress,
+  named:       (state, token) => `${token.tokenAddress} (${state.symbol ?? token.tokenAddress})`,
 };
 
 async function setTokenPolicy(db: D1Database, change: PolicyChange): Promise<TokenPolicyResultV1> {
@@ -176,21 +166,15 @@ async function setTokenPolicy(db: D1Database, change: PolicyChange): Promise<Tok
  * market of any status: a token only disabled markets name is held, and its
  * mark shows once a market that names it is served.
  *
- * The changes are listed in the order they were committed, newest first,
- * which is rowid order (migrations/0005_token_policies.sql says why), so the
- * first one is always the change that set the decision in force.
+ * The first of the changes is always the one that set the decision in force
+ * (historyOf; migrations/0005_token_policies.sql says why).
  */
 async function readTokenPolicy(db: D1Database, chainId: number, tokenAddress: Address): Promise<TokenPolicyDetailV1> {
   const { registryVersion, state, events } = await readDecision(
     db,
     TOKEN_POLICY_KIND,
     { chainId, tokenAddress },
-    () => db.prepare(
-      `SELECT * FROM token_policy_events
-       WHERE chain_id = ?1 AND token_address = ?2
-       ORDER BY rowid DESC
-       LIMIT ?3`
-    ).bind(chainId, tokenAddress, MAX_POLICY_EVENTS),
+    () => historyOf(db, TOKEN_POLICY_TABLES, { chainId, tokenAddress }, MAX_POLICY_EVENTS),
   );
   return {
     registryVersion,
@@ -325,12 +309,7 @@ async function readTokenPolicies(db: D1Database, chainId: number): Promise<Token
  */
 async function exportTokenPolicies(db: D1Database): Promise<TokenPolicyListV1 & { registryVersion: VersionRefV1 }> {
   const [ pointer, listed ] = await db.batch([
-    db.prepare(
-      `SELECT state.active_version_id AS version_id, version.snapshot_checksum AS checksum
-       FROM registry_state AS state
-       LEFT JOIN registry_versions AS version ON version.id = state.active_version_id
-       WHERE state.singleton_id = 1`
-    ),
+    activeVersionStatement(db),
     db.prepare(
       `SELECT network.chain_id AS chain_id, token.address AS address, token.symbol AS symbol,
               COALESCE(policy.is_strategic, 0) AS is_strategic
@@ -348,13 +327,16 @@ async function exportTokenPolicies(db: D1Database): Promise<TokenPolicyListV1 & 
   const registryVersion = activeVersionOf(rowsOf<{ version_id: string | null, checksum: string | null }>(pointer)[0]);
   return {
     registryVersion,
-    reason:   null,
-    policies: rowsOf<{ chain_id: number, address: Address, symbol: string, is_strategic: number }>(listed).map(row => ({
-      chainId:      row.chain_id,
-      tokenAddress: row.address,
-      symbol:       row.symbol,
-      isStrategic:  row.is_strategic === 1,
-    })),
+    reason: null,
+    ...member(
+      TOKEN_POLICY_KIND.listKey,
+      rowsOf<{ chain_id: number, address: Address, symbol: string, is_strategic: number }>(listed).map(row => ({
+        chainId:      row.chain_id,
+        tokenAddress: row.address,
+        symbol:       row.symbol,
+        isStrategic:  row.is_strategic === 1,
+      })),
+    ),
   };
 }
 
@@ -374,29 +356,23 @@ function reviewRow(
   };
 }
 
-async function reviewTokenPolicies(db: D1Database, list: DecisionList): Promise<TokenPolicyReviewV1> {
+async function reviewTokenPolicies(db: D1Database, list: DecisionList<ListedDecision>): Promise<TokenPolicyReviewV1> {
   const { registryVersion, summary, planned } = await reviewDecisions(db, TOKEN_POLICY_KIND, list);
-  return { registryVersion, summary, policies: planned.map(reviewRow) };
+  return { registryVersion, summary, ...member(TOKEN_POLICY_KIND.listKey, planned.map(reviewRow)) };
 }
 
-async function applyTokenPolicies(db: D1Database, list: DecisionList, actor: string): Promise<TokenPolicyApplyV1> {
+async function applyTokenPolicies(db: D1Database, list: DecisionList<ListedDecision>, actor: string): Promise<TokenPolicyApplyV1> {
   const { registryVersion, summary, applied } = await applyDecisions(db, TOKEN_POLICY_KIND, list, actor, {
     problemOf: ({ row, decision, problem }) => ({ row, chainId: decision.chainId, tokenAddress: decision.tokenAddress, problem }),
-    conflicts: {
-      left: () => conflict(
-        'TOKEN_LEFT_REGISTRY',
-        `a version that does not hold every token of the list was activated while it was being applied; nothing was written`,
-      ),
-      changed: () => conflict(
-        'DECISION_CHANGED',
-        `a decision of the list was changed by someone else while it was being applied; nothing was written`,
-      ),
-    },
+    left:      () => conflict(
+      'TOKEN_LEFT_REGISTRY',
+      `a version that does not hold every token of the list was activated while it was being applied; nothing was written`,
+    ),
   });
   return {
     registryVersion,
     summary,
-    policies: applied.map(({ row, decision, state }) => ({
+    ...member(TOKEN_POLICY_KIND.listKey, applied.map(({ row, decision, state }) => ({
       row,
       chainId:      decision.chainId,
       tokenAddress: decision.tokenAddress,
@@ -404,12 +380,13 @@ async function applyTokenPolicies(db: D1Database, list: DecisionList, actor: str
       isStrategic:  state.is_strategic === 1,
       changed:      state.written_id !== null,
       updatedAt:    state.updated_at,
-    })),
+    }))),
   };
 }
 
-export type { DecisionList, ListedDecision, PolicyChange };
+export type { ListedDecision, TokenOfChain };
 export {
+  TOKEN_POLICY_KIND,
   applyTokenPolicies,
   exportTokenPolicies,
   readStrategicTokensByChain,

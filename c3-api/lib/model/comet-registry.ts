@@ -78,6 +78,10 @@ function isAddress(value: unknown): value is Address {
   return typeof(value) === 'string' && ADDRESS_PATTERN.test(value);
 }
 
+function isChainId(value: unknown): value is number {
+  return typeof(value) === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
 function normalizeAddress(value: Address | string): Address {
   return value.toLowerCase() as Address;
 }
@@ -624,6 +628,121 @@ type HiddenCollateralListV1     = CollateralDecisionListV1<'isHidden', 'hiddenCo
 type HiddenCollateralReviewV1   = CollateralDecisionReviewV1<'hiddenCollaterals'>;
 type HiddenCollateralApplyV1    = CollateralDecisionApplyV1<'isHidden', 'hiddenCollaterals'>;
 
+/*
+ * The decision an administrator makes about a market: whether it is inactive
+ * (`isInactive`). The app takes no new deposits or loans in an inactive
+ * market and lists it apart, while those who hold positions in it still
+ * withdraw and repay. It is neither the market's lifecycle `status`, which a
+ * version sets, nor a collateral's `isDeprecated`, and only /summary carries
+ * it (`is_inactive`): nothing else the registry serves changes. A decision
+ * names the market by its chain and its Comet, so it outlives every version
+ * as the decisions about collaterals do, and its types are theirs without a
+ * token.
+ *
+ * The decision in force for a market. A market nobody has decided about is
+ * not inactive, and has no time or author to name.
+ */
+type InactiveMarketV1 = {
+  isInactive: boolean,
+  updatedAt:  string | null,
+  updatedBy:  string | null,
+};
+
+type InactiveMarketEventV1 = {
+  id:                 string,
+  // null where the market had no decision yet, which is not inactive
+  previousIsInactive: boolean | null,
+  isInactive:         boolean,
+  actor:              string,
+  reason:             string,
+  createdAt:          string,
+};
+
+/*
+ * One market's decision, and the changes that led to it, newest committed
+ * first. `inActiveVersion` says whether the active version holds the market,
+ * whatever its status; a decision kept while it does not applies again once
+ * a version brings the Comet back.
+ */
+type InactiveMarketDetailV1 = InactiveMarketV1 & {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  cometAddress:    Address,
+  inActiveVersion: boolean,
+  events:          InactiveMarketEventV1[],
+};
+
+// the answer to a decision about one market, as CollateralDecisionResultV1 is for a collateral
+type InactiveMarketResultV1 = {
+  registryVersion: VersionRefV1,
+  chainId:         number,
+  cometAddress:    Address,
+  isInactive:      boolean,
+  changed:         boolean,
+  updatedAt:       string | null,
+};
+
+/*
+ * A row of a list of decisions about markets, which the export answers and
+ * review and apply take, as a list of collateral decisions is. A row that
+ * changes a decision needs a reason: its own, or the list's. `deploymentKey`
+ * is there for the person editing the file; the Comet decides, and a market
+ * the active version calls otherwise is refused as the mistake it usually is.
+ */
+type InactiveMarketDecisionV1 = {
+  chainId:        number,
+  cometAddress:   Address,
+  deploymentKey?: string | null,
+  isInactive:     boolean,
+  reason?:        string | null,
+};
+
+// a decision kept for a market the active version does not hold
+type RetainedInactiveMarketV1 = InactiveMarketV1 & {
+  chainId:      number,
+  cometAddress: Address,
+};
+
+// `registryVersion` and `retained` are not read, as in a list of collateral decisions
+type InactiveMarketListV1 = {
+  registryVersion?: VersionRefV1,
+  reason:           string | null,
+  inactiveMarkets:  InactiveMarketDecisionV1[],
+  retained?:        RetainedInactiveMarketV1[],
+};
+
+// what applying a list would change, row by row, without writing anything
+type InactiveMarketReviewV1 = {
+  registryVersion: VersionRefV1,
+  summary:         { change: number, unchanged: number, problems: number },
+  inactiveMarkets: Array<{
+    row:           number,
+    chainId:       number,
+    cometAddress:  Address,
+    deploymentKey: string | null,
+    current:       boolean,
+    requested:     boolean,
+    action:        'change' | 'unchanged',
+    reason:        string | null,
+    problem:       string | null,
+  }>,
+};
+
+// what applying a list wrote: every row, as the transaction that wrote it left it
+type InactiveMarketApplyV1 = {
+  registryVersion: VersionRefV1,
+  summary:         { changed: number, unchanged: number },
+  inactiveMarkets: Array<{
+    row:           number,
+    chainId:       number,
+    cometAddress:  Address,
+    deploymentKey: string,
+    isInactive:    boolean,
+    changed:       boolean,
+    updatedAt:     string | null,
+  }>,
+};
+
 type CollateralValueStatusV1 = (typeof COLLATERAL_VALUE_STATUSES)[number];
 type VisibilityReasonV1      = (typeof VISIBILITY_REASONS)[number];
 
@@ -719,6 +838,14 @@ export type {
   HiddenCollateralResultV1,
   HiddenCollateralReviewV1,
   HiddenCollateralV1,
+  InactiveMarketApplyV1,
+  InactiveMarketDecisionV1,
+  InactiveMarketDetailV1,
+  InactiveMarketEventV1,
+  InactiveMarketListV1,
+  InactiveMarketResultV1,
+  InactiveMarketReviewV1,
+  InactiveMarketV1,
   ListedCollateralDecisionV1,
   MarketStatus,
   MarketV1,
@@ -735,6 +862,7 @@ export type {
   RetainedCollateralDecisionV1,
   RetainedDeprecatedCollateralV1,
   RetainedHiddenCollateralV1,
+  RetainedInactiveMarketV1,
   RewardAssetV1,
   ServedMarket,
   ServedNetwork,
@@ -765,6 +893,7 @@ export {
   MARKET_STATUSES,
   PRICE_QUOTES,
   isAddress,
+  isChainId,
   isCommitSha,
   MARKET_KEY_SEPARATOR,
   marketKey,

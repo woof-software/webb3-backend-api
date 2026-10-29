@@ -79,7 +79,7 @@ then the headers, then the body. To use them:
 >    how long the window will be.
 > 2. Announce the window beforehand — when it opens and how long it lasts —
 >    to the frontend developer and to whoever answers users.
-> 3. Deploy, and run steps 1 to 7 below straight away, one after another.
+> 3. Deploy, and run steps 1 to 8 below straight away, one after another.
 >
 > Once a version is active, a client that pages transaction history with a
 > cursor it was given before is told to start over, once
@@ -183,7 +183,7 @@ proxy, in `../node-provider-proxy/.dev.vars`, the keys of providers that keep
 archive state, and add `-c wrangler.local-proxy.toml` to both commands.
 
 **Bring it up.** In another terminal, from the root of the checkout, with
-`export API=http://localhost:8787` and your token in `TOKEN`, run steps 1 to 7
+`export API=http://localhost:8787` and your token in `TOKEN`, run steps 1 to 8
 of [the first bring-up](#bringing-an-environment-up-for-the-first-time), and
 time them.
 
@@ -195,7 +195,9 @@ but those; to check the file it asks the node 10 `eth_blockNumber`, 58
 block before — and the decimals of up to 19 feeds. Step 4 answers
 `validated`, step 6 serves every market, none in `error`, and step 7's
 review finds no problem: the version holds every collateral of the initial
-list, which the tests cannot check for the wstETH and USDS markets.
+list, which the tests cannot check for the wstETH and USDS markets. Nor does
+step 8's: the version holds every market of the initial list of inactive
+markets, which the tests can check for Scroll's alone.
 Then compare `GET $API/registry/v1/active` with develop's
 `GET /market/all-networks/all-contracts/summary`: every market develop serves
 but its test markets, under the same display name, base asset name, slug, and
@@ -204,7 +206,7 @@ default and institutional flags.
 **If not.** What step 3 refuses, its table explains. Where the file is at
 fault, it needs a change ([its README](./registry/seed/README.md#changing-it))
 before any environment is brought up with it, and so does the list of step 7
-for a row its review finds a problem in. A `503` there with
+or of step 8 for a row its review finds a problem in. A `503` there with
 `details.code` `CHAIN_REQUEST_FAILED` and
 "the node provider did not serve the code of 0x…", naming a Comet, is a
 provider that did not serve the Comet's code at a past block — most often one
@@ -576,7 +578,10 @@ search the third answer for `"status": "error"`.
 
 **You should see** the number of markets you reviewed, a
 `X-Registry-Version` header equal to `$V`, `200` from both routes over every
-network, and no market in `error`.
+network, and no market in `error`. On an environment whose KV namespaces are
+new, the history has no day cached yet and can answer `503`
+`UPSTREAM_UNAVAILABLE`, "a node provider did not answer", until it is warmed:
+[Warming the history](#warming-the-history), then check again.
 
 **If not.** A market in `error` with the message `creationBlock … is past
 the latest block, …` holds a creation block its chain has not reached. None
@@ -592,6 +597,12 @@ back as in its step 5 with the block its Comet was deployed in as
 the write holds the block against the chain. A market in `error` with
 another message reads a price feed that reverts
 ([A market that stopped answering](#a-market-that-stopped-answering)).
+
+A `503` "a node provider did not answer" from the history alone, while the
+summary over every network answers `200`, is no market's fault on an
+environment whose KV namespaces are new: warm the history
+([Warming the history](#warming-the-history)) and check again, and switch
+nothing back for it.
 
 Any other market those routes cannot read fails them for every market, with
 an answer other than `200`. The worker's log line `route failed` with the
@@ -663,6 +674,73 @@ one of them is the frontend's question, and the file changes by a pull
 request ([its README](./registry/seed/README.md#the-deprecated-collaterals)).
 `503` `REGISTRY_NOT_ACTIVE` means nothing is on yet: step 5 first. Any other
 `error` in place of the summary is in
+[When something goes wrong](#when-something-goes-wrong).
+
+### 8. Mark the initial inactive markets
+
+```sh
+curl -s -X POST "$API/registry/v1/admin/inactive-markets/review" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data-binary @c3-api/registry/seed/production.inactive-markets.json > review.json
+jq 'if .error then .error else .summary, (.inactiveMarkets[] | select(.problem != null)) end' review.json
+```
+
+Postman:
+
+```http
+POST {{API}}/registry/v1/admin/inactive-markets/review
+Authorization: Bearer {{TOKEN}}
+Content-Type: application/json
+
+<the file c3-api/registry/seed/production.inactive-markets.json>
+```
+
+Send the file as it is: **Body → binary**, and select it. Set the
+`Content-Type: application/json` header yourself.
+
+**Why.** Until the registry served them, the app listed apart every market of
+six chains — Unichain, Polygon, Ronin, Mantle, Linea and Scroll — by a list of
+its own: ten markets that take no new deposits or loans, while those who hold
+positions in them still withdraw and repay. The file is those ten markets, in
+the form the review and apply routes take
+([The initial list of inactive markets](#the-initial-list-of-inactive-markets)).
+A market can be marked only while a version that holds it is on, so the list
+goes in once step 5 has switched one on, right after step 7, and until it is
+applied `/summary` answers all ten `"is_inactive": false`. The review writes
+nothing: it holds every row against the version that is on, and says what
+applying the list would change.
+
+**You should see** `"change": 10`, `"unchanged": 0` and `"problems": 0`, and
+nothing after them. Then apply what it changes, right after the review,
+with the command of step 3 of
+[A reviewed list of inactive markets](#a-reviewed-list-of-inactive-markets):
+it reads this `review.json`, and answers `"changed": 10`. In Postman, when
+the review shows `"change": 10`, every row of the file changes, so send the
+file to `…/inactive-markets/apply` as it went to the review; otherwise write
+the body as that step says. `/summary` then counts the ten as inactive, and
+every other market as not:
+
+```sh
+curl -s "$API/market/all-networks/all-contracts/summary" \
+  | jq '[group_by(.is_inactive)[] | {is_inactive: .[0].is_inactive, markets: length}]'
+```
+
+In an environment where the list was applied before, the review shows
+`"change": 0` and `"unchanged": 10`: there is nothing to apply, and the
+command of step 3 says so and sends nothing. Where only part of it was, the
+review counts that part as `unchanged`, and apply writes the rest.
+
+**If not.** A row printed after the summary has a `problem`: the version
+that is on does not hold that chain, or no market of it has that Comet, or it
+calls the market by another key than the row does. Do not apply the file,
+and do not edit it to get past the problem; the command of step 3 sends
+nothing while the review has one. Tell a developer which row it is: the file
+holds the seed's markets on those chains, so a market the source dropped or
+renamed there changes the file by a pull request
+([its README](./registry/seed/README.md#the-inactive-markets)).
+`503` `REGISTRY_NOT_ACTIVE` means nothing is on yet: step 5 first; a `503`
+naming the D1 migrations means migration `0009` is not applied to the
+environment. Any other `error` in place of the summary is in
 [When something goes wrong](#when-something-goes-wrong).
 
 ## When the source changes
@@ -783,9 +861,23 @@ lose, and every field that differs on the others.
   nobody has reviewed, switched off, with none of the old one's decisions.
   While a validated version would drop any, the status raises
   `candidate-drops-markets`.
+- A market under `added` on a chain whose markets are inactive
+  (`GET $API/registry/v1/admin/inactive-markets` lists the decisions), or a
+  key's new Comet there, is not inactive: a decision belongs to one Comet, so
+  once it is on, `/summary` answers it `"is_inactive": false`. If the app
+  should list it apart with the others, mark it
+  ([Marking a market inactive](#marking-a-market-inactive)) right after
+  switching the version on — or before, where the version that is on already
+  holds it, switched off.
 - The registry follows the source. A deployment the source drops stops being
   served once a version without it is on, and nothing keeps it served —
-  `deprecated` is for a market the version still holds. Nothing holds such a
+  `deprecated` is for a market the version still holds. Nor is a status how a
+  market the app lists apart is kept: one that takes no new deposits or loans
+  while its holders withdraw and repay stays `enabled`, and is marked inactive
+  ([Marking a market inactive](#marking-a-market-inactive)), never
+  `deprecated`, which changes how discovery counts the market and whether it
+  can be the default, and never `disabled`, which stops serving it to those
+  who hold positions in it. Nothing holds such a
   draft back either: switching it on is the decision, so confirm every market
   under `unserved` with a developer first. One the source renamed is served
   again once it is described under its new key
@@ -897,7 +989,7 @@ never this one's: replace it as step 4 says, or the write is refused.
 | `slug` | The market's key in the website's links | `null`, unless another market of the network that is not switched off has the same label; then a unique lowercase key such as `usdc-institutional` |
 | `isInstitutional` | Listed in the website's institutional section | Usually `false` |
 | `contractName` | The Comet's name, shown in governance action titles | The Comet contract's `symbol()`, for example `cUSDTv3` |
-| `status` | Whether the market is served | `enabled`; `disabled` keeps it off |
+| `status` | Whether the market is served | `enabled`; `disabled` keeps it off. A market the app should list apart as inactive stays `enabled`: that is a decision of its own ([Marking a market inactive](#marking-a-market-inactive)) |
 | `isDefault` | The market the website opens first | `false` — exactly one market in the whole registry is the default |
 | `creationBlock` | Where the market's history and indexes start | The block the Comet proxy was deployed in (the explorer's "Contract Creation"). Must be above `0` for a market that is served. The write holds it against the chain — the Comet has code at that block and none at the block before it — and refuses one the chain contradicts with `422` `OVERLAY_CREATION_BLOCK_WRONG`, saying whether it is before the deployment, after it, or past the latest block |
 | `collateralValueQuote` | The unit the market's own price feeds answer in | Call `description()` on the base token's price feed from step 2. `X / USD` → `usd`. `Constant price feed` (WETH, wstETH) or `WBTC / BTC` → `base` |
@@ -968,6 +1060,9 @@ curl -s -X PUT "$API/registry/v1/admin/versions/$V/networks/<chainId>/overlay" \
 
 Then steps 4, 5 and 6 of the first bring-up, and step 2 above for what the
 draft changes. The new market is under `added`, now with `"reviewed": true`.
+It is not inactive, whatever its chain: a decision belongs to one Comet, so if
+the app should list it apart, mark it once its version is on
+([Marking a market inactive](#marking-a-market-inactive)).
 
 ## A market that stopped answering
 
@@ -1528,6 +1623,13 @@ because its value there could not be read — see
 `hidden_in` name the markets of the chain that have its token deprecated or
 hidden, by their Comets.
 
+Whether each market is inactive is said beside its collaterals, which
+discovery decides as in any market:
+
+```sh
+curl -s "$API/market/all-networks/all-contracts/summary" | jq '.[] | {chain: .chain_id, market: .deployment_key, is_inactive}'
+```
+
 ## Marking a collateral deprecated
 
 A deprecated collateral is a collateral of a market that the app no longer
@@ -1951,6 +2053,281 @@ the list decides: another environment's version may not hold every
 collateral it names. Review it there and apply what it changes, as steps 2
 and 3 do here.
 
+## Marking a market inactive
+
+An inactive market is one the app takes no new deposits or loans in and lists
+apart, under its network, while those who hold positions in it still
+withdraw and repay. The decision is about one market — its chain and its
+Comet — and of the public reads only `/summary` carries it, as
+`"is_inactive": true` on that market in all three forms. Nothing else the
+API serves changes: no public `/registry/v1` read says it — only the routes
+below answer it, as `"isInactive"` — and the market's collaterals are shown
+or not by discovery as in any market. It is not the market's status: an
+inactive market stays `enabled`, and is neither `deprecated` nor `disabled`
+([See what switching it on would change](#2-see-what-switching-it-on-would-change)).
+
+The API takes one market at a time. It does not hold a chain's markets
+together: the initial list marks every market of six chains because the app
+listed whole chains, and a market the source adds there later is not inactive
+until you mark it. Nor does it refuse the default market, which the app opens
+first: whether the default may be inactive is for you and the frontend
+developer to decide.
+
+Like a strategic mark, the decision stays when a newer version is switched
+on, and comes back if a version drops the market and a later one brings it
+back. You can only decide about a market the version that is on holds, of
+any status — a disabled one too, whose decision applies once it is served —
+and every change needs a reason, which is kept with who made it. The chain is
+part of the market: one Comet can stand at the same address on two chains,
+as `0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf` does as Base's USDbC and
+Arbitrum's USDC, and is two markets, decided apart.
+
+```sh
+curl -s -X PATCH "$API/registry/v1/admin/networks/534352/markets/0xb2f97c1bd3bf02f5e74d13f02e3e26f93d77ce44/inactive" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"isInactive": true, "reason": "No new deposits or loans on Scroll"}' | jq
+```
+
+Postman:
+
+```http
+PATCH {{API}}/registry/v1/admin/networks/534352/markets/0xb2f97c1bd3bf02f5e74d13f02e3e26f93d77ce44/inactive
+Authorization: Bearer {{TOKEN}}
+Content-Type: application/json
+
+{"isInactive": true, "reason": "No new deposits or loans on Scroll"}
+```
+
+**You should see** `"changed": true` and the time in `updatedAt`. Sending the
+same request again answers `"changed": false` and records nothing, so it is
+safe to repeat. To make the market active again, send `"isInactive": false`
+with a reason.
+
+`/summary` says it in its next answer, in every form: `"is_inactive": true`
+on that market, right after `is_institutional`, and every other market as it
+was, those of its chain included. The public `/registry/v1` reads answer as
+before, under the same `ETag`.
+
+```sh
+curl -s "$API/market/scroll-mainnet/all-contracts/summary" | jq '.[] | {market: .deployment_key, is_inactive}'
+```
+
+One market's decision, with its history, newest change first:
+
+```sh
+curl -s "$API/registry/v1/admin/networks/534352/markets/0xb2f97c1bd3bf02f5e74d13f02e3e26f93d77ce44/inactive" \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+A decision stays when a version that drops the market is switched on: the
+export below lists it under `retained`, and its history still answers, with
+`"inActiveVersion": false` — which says whether the version that is on holds
+the market, not whether the market is inactive. It applies again the moment
+a version that holds the market, and serves it, is switched on.
+
+While the database cannot be reached, `/summary` answers with the inactive
+markets the API last recorded, and says it could not confirm them
+(`X-Registry-Stale`, `Cache-Control: no-store`); every command records them
+once it has committed. Where it cannot read them at all, it answers every
+market `"is_inactive": false`, and the log says why
+([When something goes wrong](#when-something-goes-wrong)).
+
+### A reviewed list of inactive markets
+
+A list is applied as a list of hidden collaterals is, in three requests, and
+you never type an address: the first one gives you every market as a file.
+
+**1. Export the markets.** Every market of the version that is on, disabled
+ones included, with its inactive decision, in the form the next two requests
+take:
+
+```sh
+curl -s "$API/registry/v1/admin/inactive-markets" -H "Authorization: Bearer $TOKEN" > inactive-markets.json
+jq 'if .error then .error else (.inactiveMarkets | length) end' inactive-markets.json   # how many markets, or why not
+```
+
+Postman:
+
+```http
+GET {{API}}/registry/v1/admin/inactive-markets
+Authorization: Bearer {{TOKEN}}
+```
+
+(**Save Response → Save to a file**.) Edit the file: set `"isInactive": true`
+on the markets the list marks inactive (or `false` to make one active again)
+and write why in the `"reason"` at the top. A row may carry its own
+`"reason"`, which wins. Leave every other row as it is, or delete it. A row's
+`deploymentKey` is there for you to read, and is checked: a key that is not
+the one the version that is on gives the market is refused. `retained` is not
+read. The rows are under `inactiveMarkets`, and name no token, so a file of
+collateral decisions sent here, or this one sent to their routes, is refused
+with `400` (`unexpected properties`). Step 3 applies only the rows the review
+shows as changes.
+
+**2. See what it would change** — this writes nothing, and keeps the answer
+for step 3:
+
+```sh
+curl -s -X POST "$API/registry/v1/admin/inactive-markets/review" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @inactive-markets.json > review.json
+jq 'if .error then .error else .summary, (.inactiveMarkets[] | select(.action == "change" or .problem != null)) end' review.json
+```
+
+Postman:
+
+```http
+POST {{API}}/registry/v1/admin/inactive-markets/review
+Authorization: Bearer {{TOKEN}}
+Content-Type: application/json
+
+(Body → raw → JSON, and paste the file)
+```
+
+**You should see** `"problems": 0`, and under `change` exactly the markets
+the list decides, each with what it is now (`current`), what the list wants
+(`requested`) and the reason it will be recorded with. A row with a
+`problem` names a chain the version that is on does not hold, a Comet no
+market of that chain has there, a key that is not that market's, or a change
+without a reason; fix the file and review it again.
+
+**3. Apply what it changes** — right after the review:
+
+```sh
+jq 'if .error then error("the review failed: \(.error.message)")
+    elif .summary.problems > 0 then error("the review found problems: fix the file and review it again")
+    elif .summary.change == 0 then error("the review shows no change: there is nothing to apply")
+    else {reason: null, inactiveMarkets: [.inactiveMarkets[] | select(.action == "change") | {chainId, cometAddress, deploymentKey, isInactive: .requested, reason}]}
+    end' review.json > reviewed.json \
+  && curl -s -X POST "$API/registry/v1/admin/inactive-markets/apply" -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' --data @reviewed.json \
+  | jq 'if .error then .error else .summary end'
+```
+
+`jq` writes to `reviewed.json` only the rows the review shows under `change`,
+each with the `reason` the review showed, which is the one the change is
+recorded with, and the `deploymentKey` the version gives the market. A row of
+this list names no token, so the filter writes neither `tokenAddress` nor
+`symbol`, which the filters of the collateral lists write: this list refuses
+either, even as `null`. If the review answered an error, found problems or
+shows no change, `jq` says so, and nothing is sent.
+
+Postman: the same request as step 2, to `…/inactive-markets/apply`, with
+`reviewed.json` as the body. Without `jq`, write the body from the rows the
+review shows under `change`: `{"reason": null, "inactiveMarkets": [ … ]}`,
+each row with its `chainId`, `cometAddress`, `deploymentKey`, `requested` as
+`isInactive`, and `reason`.
+
+**You should see** `"changed"` equal to the number of changes the review
+showed. Apply compares `reviewed.json` with the decisions in force when it
+runs, as it does for a list of hidden collaterals: if the number is lower,
+someone decided one of its markets after your review, and the answer's rows
+show which. Apply does not touch a market `reviewed.json` does not name. The
+list is written in one go: if any row cannot be applied (`422`, naming the
+rows), or a version is switched on or one of its markets decided while it is
+being written (`409`), nothing is written. Applying `reviewed.json` again
+changes nothing.
+
+To use the list in another environment, take the edited file, not
+`reviewed.json`, which holds only what changes here, and keep only the rows
+the list decides: another environment's version may not hold every market it
+names. Review it there and apply what it changes, as steps 2 and 3 do here.
+
+### The initial list of inactive markets
+
+Until the registry served them, the app listed apart every market of six
+chains by a list of its own, `INACTIVE_CHAIN_IDS` (Linear COM-19): Unichain,
+Polygon, Ronin, Mantle, Linea and Scroll. The list is checked in beside the
+seed, as
+[`c3-api/registry/seed/production.inactive-markets.json`](./registry/seed/README.md#the-inactive-markets),
+in the form `GET /registry/v1/admin/inactive-markets` exports and the review
+and apply routes take: every market the seed holds on the six chains, each
+with the address of its Comet and its key, and one reason for every row.
+Step 8 of [the first bring-up](#8-mark-the-initial-inactive-markets) sends it
+once the environment's first version is on. Once it is applied, `/summary`
+answers each of the ten `"is_inactive": true`.
+
+Where the addresses come from: each Comet is the one the seed names for that
+market (`registry/seed/production.comets.json`), and the seed holds no other
+market on the six chains (`registry/seed/production.json`), none of them the
+default market, which is Ethereum's USDC. On 2026-10-27, develop's active
+version (`2b27157d…`) held the same ten, under the same keys and Comets, all
+enabled, and nothing else on those chains:
+
+| Chain | Market | Comet |
+|---|---|---|
+| Unichain (130) | `usdc` | `0x2c7118c4c88b9841fcf839074c26ae8f035f2921` |
+| Unichain (130) | `weth` | `0x6c987dde50db1dcdd32cd4175778c2a291978e2a` |
+| Polygon (137) | `usdc` | `0xf25212e676d1f7f89cd72ffee66158f541246445` |
+| Polygon (137) | `usdt` | `0xaeb318360f27748acb200ce616e389a6c9409a07` |
+| Ronin (2020) | `weth` | `0x4006ed4097ee51c09a04c3b0951d28ccf19e6dfe` |
+| Ronin (2020) | `wron` | `0xc0afdbd1ceb621ef576ba969ce9d4cef78dbc0c0` |
+| Mantle (5000) | `usde` | `0x606174f62cd968d8e684c645080fa694c1d7786e` |
+| Linea (59144) | `usdc` | `0x8d38a3d6b3c3b7d96d6536da7eef94a9d7dbc991` |
+| Linea (59144) | `weth` | `0x60f2058379716a64a7a5d29219397e79bc552194` |
+| Scroll (534352) | `usdc` | `0xb2f97c1bd3bf02f5e74d13f02e3e26f93d77ce44` |
+
+The registry's test fixture holds Scroll's market alone of them, so step 8's
+review checks every row again, against the version that is on where it is
+sent, before anything is written. The list marks whole chains, as the app
+listed them, but each decision is about one market: a market the source adds
+later on one of these chains, or a new Comet it gives one of their keys, is
+not inactive until you mark it
+([See what switching it on would change](#2-see-what-switching-it-on-would-change)).
+On develop the list's events name `registry-admin:woof`, the actor of that
+environment.
+
+## Warming the history
+
+The history of a market — `/market/<network>/<comet>/historical/summary`, and
+the same route over a network or every network — is its last 30 days, each
+read from the chain once and kept in the worker's KV for good. A worker whose
+KV namespaces are new has none of them: a first bring-up, a worker deployed
+with namespaces of its own, such as the test worker of a branch, or a
+release that changes the version of the day summaries, whose cached days sit
+under keys that name it. Its first history over every network then reads
+every market's 30 days in one request, some 1,500 reads for the largest
+market, and the node provider refuses part of such a burst. One read it does
+not serve fails the whole request: `503` `UPSTREAM_UNAVAILABLE`, "a node
+provider did not answer". The days read before it stay cached, so each
+attempt gets further. Warm the history network by network, then over every
+network:
+
+```sh
+for network in $(curl -s "$API/registry/v1/active" | jq -r '.networks[].key'); do
+  for attempt in 1 2 3 4 5 6; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$API/market/$network/all-contracts/historical/summary")
+    echo "$network $attempt $code"
+    [ "$code" = 200 ] && break
+    sleep 10
+  done
+done
+curl -s -o /dev/null -w '%{http_code}\n' "$API/market/all-networks/all-contracts/historical/summary"
+```
+
+Postman: send `GET {{API}}/market/<network>/all-contracts/historical/summary`
+for each network the version holds — the keys under `networks[].key` in
+`GET {{API}}/registry/v1/active` — and send it again, ten seconds later,
+while it answers `503`; then send
+`GET {{API}}/market/all-networks/all-contracts/historical/summary`.
+
+None needs the token. The reads go through the node provider proxy, which
+every worker of the environment shares: run one warm-up at a time, and
+expect another worker to answer a `503` now and then while it runs.
+
+**You should see** each network answer `200` within a few attempts, then
+`200` over every network. From then on a request reads the chain only for
+what it has not cached — each network's latest block, and once a day each
+market's new day — and answers within seconds.
+
+**If not.** A network that still answers `503` after six attempts: warm its
+markets one by one the same way, `/market/<network>/<comet>/historical/summary`
+for each Comet under `networks[].markets[].contracts.comet` in
+`/registry/v1/active`. A market whose history keeps failing while its own
+`…/summary` answers is a node provider that refuses that chain's reads now
+and then: its history answers `200` on one attempt and `503` on the next, and
+the history over every network fails with it. Show the node provider proxy's
+log for that chain to a developer, and switch nothing back or off for it.
+
 ## Keeping an eye on it
 
 One request tells you whether the registry is well:
@@ -2043,9 +2420,9 @@ whose reasons are in the draft it names.
 | `chain-drift` in `/admin/status` | The chain answers a market's feed or collateral otherwise than the version on stores it | [A market that changed on chain](#a-market-that-changed-on-chain) |
 | `422`, `details.code` `OVERLAY_CREATION_BLOCK_WRONG`, writing an overlay, the seed among them | A `creationBlock` the document changes is not the block the market's Comet was deployed in; the message says whether it is before the deployment, after it, or past the latest block. Nothing was written | Send the block the chain's explorer gives as the Comet's "Contract Creation" (step 4 of [Describing a new market](#describing-a-new-market)). From the seed, the file's block is wrong, or the key now names another Comet: see step 3 of [the first bring-up](#3-send-the-seed) |
 | `401` | The token is wrong, or is the hash | Use the admin token itself |
-| `413` | The request body is larger than the route takes | Send less: a directory of overlays, or a list of token policies, of deprecated or of hidden collaterals, in several requests |
+| `413` | The request body is larger than the route takes | Send less: a directory of overlays, or a list of token policies, of deprecated or of hidden collaterals, or of inactive markets, in several requests |
 | `429`, "too many administrative requests from this address" | More than 60 administrative requests in a minute from your address — over IPv6, from your /64 — whatever they were: every request under `/registry/v1/admin/` is counted by address before its token is checked, a wrong token or a path no route takes included, and the right token is refused too once the address has spent its budget | Wait the seconds its `Retry-After` names — a minute at most. A script in a loop, or a monitor sharing your address, is what spends it |
-| `429`, "too many … requests with this token" | More than 30 administrative requests in a minute with your token, counted per family of routes. Reads count too, and every read shares one budget — a monitor polling `/admin/status` with your token spends it with you — while each kind of command has its own. Reviewing a list of token policies, of deprecated or of hidden collaterals writes nothing and counts as a read ("too many read requests"); marking a token or a collateral, hiding a collateral, and applying a list of any of them, share one budget ("too many policy requests") | Wait the seconds its `Retry-After` names. The environment has one token, so a monitor polls the status every few minutes, not in a loop |
+| `429`, "too many … requests with this token" | More than 30 administrative requests in a minute with your token, counted per family of routes. Reads count too, and every read shares one budget — a monitor polling `/admin/status` with your token spends it with you — while each kind of command has its own. Reviewing a list of token policies, of deprecated or of hidden collaterals, or of inactive markets writes nothing and counts as a read ("too many read requests"); marking a token, a collateral or a market, hiding a collateral, and applying a list of any of them, share one budget ("too many policy requests") | Wait the seconds its `Retry-After` names. The environment has one token, so a monitor polls the status every few minutes, not in a loop |
 | `404` marking a token | The version that is on does not hold that chain or that token | Check the chain id and the address against `GET /registry/v1/admin/networks/<chain>/tokens`; a token only a newer draft holds can be marked once that draft is switched on |
 | `409` marking a token, `details.code` `TOKEN_LEFT_REGISTRY` ("left the active registry") | A version without that token was switched on while the change was being written; nothing was written | Check which version is on, and mark the token again if it is still there |
 | `404` "no registry route matches …/token-policies" | The Worker at that address was deployed before token policies | Deploy the release with token policies first |
@@ -2055,9 +2432,12 @@ whose reasons are in the draft it names.
 | `404` hiding a collateral | The version that is on does not hold that chain, no market of it has that Comet, or that market does not take that token as collateral — the message says which. An address the app shows in place of the token the version holds is such a token: the zero address of ETH, POL or RON, or stETH beside wstETH | Take the addresses from the export (`GET /registry/v1/admin/hidden-collaterals`), the market reads (`GET /registry/v1/networks/<chain>/markets`) or the token policies (`GET /registry/v1/admin/networks/<chain>/tokens`) — WETH, WPOL, WRON or wstETH; a collateral only a newer draft holds can be hidden once that draft is switched on ([Hiding a collateral](#hiding-a-collateral)) |
 | `409` hiding a collateral, `details.code` `COLLATERAL_LEFT_REGISTRY` ("left the collateral of") | A version whose market does not take that token was switched on while the change was being written; nothing was written | Check which version is on, and hide the collateral again if its market still takes it |
 | `404` "no registry route matches …/hidden-collaterals", or "…/hidden" hiding a collateral | The Worker at that address was deployed before hidden collaterals | Deploy the release with hidden collaterals first |
+| `404` marking a market inactive | The version that is on does not hold that chain, or no market of it has that Comet there — the message says which. A Comet the version holds on another chain alone is no market of this one | Take the chain and the address from the export (`GET /registry/v1/admin/inactive-markets`); a market only a newer draft holds can be marked once that draft is switched on |
+| `409` marking a market inactive, `details.code` `MARKET_LEFT_REGISTRY` ("left the active registry on chain") | A version without that market was switched on while the change was being written; nothing was written | Check which version is on, and mark the market again if it still holds it |
+| `404` "no registry route matches …/inactive-markets", or "…/inactive" marking a market | The Worker at that address was deployed before inactive markets | Deploy the release with inactive markets first |
 | `422` applying a list | Some rows cannot be applied; `details.problems` names each with why; nothing was written | Fix those rows — review shows them in context — and apply again |
-| `409` applying a list, `details.code` `TOKEN_LEFT_REGISTRY`, `COLLATERAL_LEFT_REGISTRY` or `DECISION_CHANGED` ("while it was being applied") | A version without one of the list's tokens, or collaterals, was switched on — or, for `DECISION_CHANGED`, someone else decided one of its rows — while the list was being written; nothing was written | Review the file again, then apply it |
-| `503` "the database is missing tables this release needs", from a token policy, deprecated or hidden collateral route, `/active` or the market reads | The worker was deployed before its D1 migrations: the token policy tables, `0005`, the deprecated collateral tables, `0007`, or the hidden collateral tables, `0008`, are missing | Apply the migrations to this environment (`npm run d1:migrate:<env>`, or `npx wrangler d1 migrations apply APP_DB --remote -c <config>`) |
+| `409` applying a list, `details.code` `TOKEN_LEFT_REGISTRY`, `COLLATERAL_LEFT_REGISTRY`, `MARKET_LEFT_REGISTRY` or `DECISION_CHANGED` ("while it was being applied") | A version without one of the list's tokens, collaterals or markets was switched on — or, for `DECISION_CHANGED`, someone else decided one of its rows — while the list was being written; nothing was written | Review the file again, then apply it |
+| `503` "the database is missing tables this release needs", from a token policy, deprecated or hidden collateral or inactive market route, `/active` or the market reads | The worker was deployed before its D1 migrations: the token policy tables, `0005`, the deprecated collateral tables, `0007`, the hidden collateral tables, `0008`, or the inactive market tables, `0009`, are missing. Only the inactive market routes need `0009`: `/active` and the market reads answer without it, and `/summary` answers every market `"is_inactive": false` | Apply the migrations to this environment (`npm run d1:migrate:<env>`, or `npx wrangler d1 migrations apply APP_DB --remote -c <config>`) |
 | A collateral of `/summary` is `"collateral_value_status": "unavailable"`, and shown as `data_unavailable` | Its value in its market could not be read: its price reverted, and the collateral is `error`; the Comet holds another asset at its index, which its `message` names; on a market quoted in its base asset, the base USD price reverted, and the market is `error`; or the replacement of a remap stopped answering, and `collateral_value_exception` names the remap while the collateral is `success` | A feed that reverts — the worker logs `price feed reverted: <feed> read by <Comet>` — see [A market that stopped answering](#a-market-that-stopped-answering); for a remap, that line names its replacement, and an exception written for the feed in place of the remap ends it. Another asset at the index: the chain no longer describes the market as the version does — import again and switch the new version on. The base USD feed: change it in the market's overlay |
 | A market of `/summary` answers the values of its collaterals, but no `collateral_value_block` | The node did not give the header of the block the market was read at: a provider that does not have the block yet answers null, or the read failed. The worker logs `block header not read: block <n> on <network>` once a minute per network | Nothing, if it passes: the next minute reads another block. If it persists, the node provider proxy's providers lag behind the chain — check them |
 | A collateral of `/summary` is `below_threshold` while the chain's markets together hold more than USD 250,000 of its token | Discovery decides each market by what that market holds of the collateral, whatever the other markets hold | Nothing, if that is what discovery should show; to show the token in every market that takes it, whatever each holds, mark it strategic ([Marking a token strategic](#marking-a-token-strategic)) |
@@ -2080,9 +2460,13 @@ whose reasons are in the draft it names.
 | `409` cancelling a run, `details.code` `SYNC_RUN_HELD` ("an invocation holds the sync run until …") or `SYNC_RUN_ENDED` ("has already ended") | An invocation holds the run until the time the message names, and may be importing into it; or the run has ended already | Cancel it again once that time has passed. A run that has ended needs no cancel: `GET /registry/v1/admin/sync-runs/<id>` says how it ended |
 | A market reports `"status": "partially"` or `"status": "error"` | A price feed it reads reverts, usually one Chainlink retired | [A market that stopped answering](#a-market-that-stopped-answering) |
 | `/active`, the market reads and `/summary` carry `X-Registry-Stale: 0`, and the log has the warning `deprecated collateral decisions unreadable; answering with the ones last recorded`, or `hidden collateral decisions unreadable; answering with the ones last recorded` | The database answered for the version that is on, but not for the deprecated or the hidden collateral decisions, so the flags are the ones the API last recorded, and the answer may not be kept | Check the database's health; the answers recover by themselves once it answers |
+| `/summary` carries `X-Registry-Stale: 0`, and the log has the warning `inactive market decisions unreadable; answering with the ones last recorded` | The database answered for the version that is on, but not for the inactive markets, so `is_inactive` is as the API last recorded it, and the answer may not be kept | Check the database's health; the answers recover by themselves once it answers |
+| `/summary` answers every market `"is_inactive": false`, though markets were marked inactive, and the log has the error `the summary could not read the inactive market decisions` | The decisions could not be read: the database answered with a fault — `no such table: inactive_markets` where migration `0009` is not applied — or could not be reached with nothing recorded in `kv_registry` to answer with. A market is active unless a decision says otherwise, so every market is answered so; it is logged once a minute per isolate, and no header says it | Apply the migrations if the log names a missing table (`npm run d1:migrate:<env>`); otherwise check the database's health. Nothing is lost: the decisions stay in D1, and the next answer that reads them carries them |
+| `/summary` has no `is_inactive` on any market | The Worker at that address was deployed before inactive markets, or rolled back to such a release; a client reads every market as active | Deploy the release with inactive markets; the decisions made before the rollback are kept, and apply again |
 | `503 UPSTREAM_UNAVAILABLE` from `/active` and the market reads while the database cannot be reached, though other routes answer from the cache | No deprecated, or no hidden, collateral decisions are recorded in the environment's `kv_registry` to answer with: no read of `/active`, the market reads or `/summary`, and no decision of that kind, has recorded them since this release, or the record was removed | Nothing to change: once the database answers, the reads record them again, within five minutes at most |
 | Answers carry `X-Registry-Stale: <seconds>`, and the log has the error `registry database unreachable; answering from the version it last named` | The database could not be reached, so the API is answering from the version it last saw, and saying how old it is. Each isolate logs the error once a minute while this lasts | Check the database's health; the API recovers by itself once D1 answers, and starts returning `503` if the outage outlasts the configured window |
 | `503 UPSTREAM_UNAVAILABLE` from the market and registry routes, or from `/admin/status` | The database could not be reached, and there is no version within the window to answer from. Or, from a route that reads the chain — the market and account routes, transaction history, governance — the node provider proxy did not serve the request: no provider answered it, the worker could not reach the proxy or lost its answer, or the proxy answered a call with an error that is not a revert. Such an answer says `a node provider did not answer`, with the proxy's `Retry-After` when it sent one; the worker's log line `route failed` with the answer's `requestId` has the error — `HTTP 401` in it is the proxy refusing `NODE_PROXY_KEY` — and the proxy's own log has `upstream error` or `json-rpc error` | Check the database's health; nothing in the registry needs changing. For a node provider, fix the proxy, its binding or its key: the routes answer again as soon as it serves them |
+| `503 UPSTREAM_UNAVAILABLE`, "a node provider did not answer", from `…/historical/summary` over a network or every network, while the summary over every network answers `200` | The history reads days it has not cached — a first bring-up, a worker with KV namespaces of its own, or a release that changed the version of the day summaries — and the node provider refused part of that burst of reads; or the node provider refuses one chain's reads now and then. The days read before the failure stay cached | [Warming the history](#warming-the-history). Switch nothing back or off for it |
 | `500 INTERNAL` from the market and registry routes | The database answered with a fault — most often a release deployed before its migrations — or a bug, such as a call the contract reverted where the route needed its value. A node provider that did not answer is a `503`, not this. The worker's log line `route failed` or `registry route failed` with the answer's `requestId` has the error | Apply the migrations if they are missing; otherwise report the log line |
 | A market reports `"status": "error"` with the message `creationBlock … is past the latest block, …`, and the log has the warning `creation block not reached` naming its Comet | The active version holds a creation block the market's chain has not reached — one no overlay write checked, such as one an import inherited. None of the market's values can be read, so the market routes and `/account/{address}/rewards` answer it as `error`, and the other markets as usual. This stops by itself once the chain reaches the block, but the market's history then repeats the day of that block for every day before it | Switch back, or give the market the block its Comet was deployed in, as step 6 of [the first bring-up](#6-check-that-it-is-on) says — after the error has stopped by itself too |
 | The worker's log has the warning `computation cache unreadable` or `computation cache unwritable`, with what KV answered | KV refused a call to the namespace computed values are cached in, `kv_mainnet` or `kv_testnet`: `429` is a value written twice in a second, `503` KV not answering. The request was answered without the cache — a value it could not read was computed again from the chain, and one it could not write was not kept — so it was slower, and asked the node provider more. Each isolate says each once a minute while it lasts | Nothing for a `429` now and then. A `503` that keeps coming back is KV not answering: every request reads the chain while it lasts, and transaction history fails (the next row), so check Cloudflare's status and the node provider proxy |

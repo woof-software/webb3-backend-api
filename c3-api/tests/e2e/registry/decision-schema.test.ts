@@ -10,6 +10,7 @@ import {
   readCollateral,
   setCollateral,
 } from '../../../src/registry/collateral-decision-repository.js';
+import { readInactiveMarket, setInactiveMarket } from '../../../src/registry/inactive-market-repository.js';
 import { readTokenPolicy, setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 import {
   Row,
@@ -33,25 +34,28 @@ import {
   address,
   collateralAssetRow,
   insertCandidate,
+  marketRow,
+  networkRow,
   run,
   validate,
 } from '../../util/registry-rows.js';
 
 /*
- * The decisions of migrations 0005, 0006 and 0008, the second under the names
- * 0007 gave it, in the database itself, run as d1-schema.test.ts runs the
- * rest of the schema: a token policy is decided for a token of the active
- * registry, and a deprecated or a hidden collateral for a collateral of a
- * Comet of it. Whatever code writes them, the schema keeps their audit
- * complete: a decision row is written only beside the event describing that
- * exact change, events are never edited, replaced or deleted, and neither is
- * a decision row.
+ * The decisions of migrations 0005, 0006, 0008 and 0009, the second under the
+ * names 0007 gave it, in the database itself, run as d1-schema.test.ts runs
+ * the rest of the schema: a token policy is decided for a token of the active
+ * registry, a deprecated or a hidden collateral for a collateral of a Comet of
+ * it, and an inactive market for a market of it, by its Comet. Whatever code
+ * writes them, the schema keeps their audit complete: a decision row is
+ * written only beside the event describing that exact change, events are
+ * never edited, replaced or deleted, and neither is a decision row.
  *
- * All three kinds are one store of decisions (src/registry/decision-store.ts)
+ * All four kinds are one store of decisions (src/registry/decision-store.ts)
  * whose triggers are alike, so what they share is tested once, over a
  * description of each kind (DecisionTables), as decision-scenarios.ts tests
- * their routes. Beside it are what only a collateral has, its Comet, and the
- * migrations that brought the collaterals' tables.
+ * their routes. Beside it are what only a collateral has, its Comet; what
+ * only a market has, its Comet on its own chain; and the migrations that
+ * brought the tables of the collaterals and of the markets.
  */
 const { freshEnv } = await registryHarness();
 
@@ -76,6 +80,18 @@ async function insertCollateralCandidate(db: D1Database): Promise<Candidate & { 
 }
 
 /*
+ * A candidate whose market declares its Comet at an address of its own, so
+ * that a version activated after it does not hold the market a decision was
+ * made about.
+ */
+async function insertMarketCandidate(db: D1Database): Promise<Candidate & { comet: string, token: string }> {
+  const candidate = await insertCandidate(db, randomUUID(), 1);
+  const comet     = address(`comet:${candidate.registry_version_id}`);
+  await insertRow(db, 'market_contracts', { market_id: candidate.marketId, role: 'comet', address: comet });
+  return { ...candidate, comet, token: (await addressOf(db, candidate.collateralTokenId))! };
+}
+
+/*
  * A kind of decision as its tables hold it: the tables and the flag a
  * decision sets in them, a candidate holding a subject to decide about, and
  * the kind's own read of a decision. A subject is on mainnet, and is named by
@@ -87,6 +103,8 @@ type DecisionTables = {
   held:         string,
   noun:         string,
   adjective:    string,
+  // the last column a subject is named by, and what the tests call the address it holds: a token, or a Comet
+  named:        { column: string, noun: string },
   // the decisions in force, their audit, and the view a write states what it expects in
   rows:         string,
   events:       string,
@@ -158,8 +176,8 @@ function decisionTableScenarios(kind: DecisionTables): void {
     await activate(db, versionId);
 
     await t.rejects(() => decide({ chainId: 10, value: 1, at: NOW }, null), NOT_ACTIVE, 'a chain the active version does not hold');
-    await t.rejects(() => decide({ subject: { token_address: address('unknown') }, value: 1, at: NOW }, null), NOT_ACTIVE,
-      'a token the active version does not hold');
+    await t.rejects(() => decide({ subject: { [kind.named.column]: address('unknown') }, value: 1, at: NOW }, null), NOT_ACTIVE,
+      `a ${kind.named.noun} the active version does not hold`);
     await t.rejects(() => insertRow(db, kind.rows, row({ value: 1, at: NOW })), UNAUDITED, 'a decision row without its event');
     await t.rejects(() => decide({ value: 1, at: NOW }, 0), UNAUDITED, 'or with an event that misstates the value it replaces');
     await t.rejects(() => insertRow(db, kind.events, event({ value: 0, at: NOW }, null)), CHECK_FAILED,
@@ -172,8 +190,8 @@ function decisionTableScenarios(kind: DecisionTables): void {
     await t.rejects(() => run(db, `UPDATE ${kind.rows} SET ${kind.flag} = 1, updated_at = ?1`, '2026-09-17T00:00:03.000Z'), UNAUDITED,
       'a direct update has no event to stand beside');
     await t.rejects(() => run(db, `UPDATE ${kind.rows} SET updated_by = 'someone-else'`), UNAUDITED, 'and a row is not touched without a change');
-    await t.rejects(() => run(db, `UPDATE ${kind.rows} SET token_address = ?1`, address('moved')), { message: new RegExp(`belongs to one ${kind.noun}`) },
-      'a decision cannot move to another token');
+    await t.rejects(() => run(db, `UPDATE ${kind.rows} SET ${kind.named.column} = ?1`, address('moved')), { message: new RegExp(`belongs to one ${kind.noun}`) },
+      `a decision cannot move to another ${kind.named.noun}`);
     await t.rejects(() => run(db, `DELETE FROM ${kind.rows}`), { message: /changed, not deleted/ }, 'a decision is never deleted');
     await t.rejects(() => run(db, `UPDATE ${kind.events} SET reason = 'edited'`), APPENDED, 'an event is never edited');
     await t.rejects(() => run(db, `DELETE FROM ${kind.events}`), APPENDED, 'nor deleted');
@@ -212,7 +230,7 @@ function decisionTableScenarios(kind: DecisionTables): void {
         `${verb} at rowid ${rowid} is refused: an event takes the next rowid, never one a writer chooses`);
     }
     await t.rejects(
-      () => insertRow(db, kind.rows, { rowid: 1, ...row({ subject: { token_address: address('another') }, value: 1, at: NOW }) }, 'INSERT OR REPLACE'),
+      () => insertRow(db, kind.rows, { rowid: 1, ...row({ subject: { [kind.named.column]: address('another') }, value: 1, at: NOW }) }, 'INSERT OR REPLACE'),
       { message: /rowid/ },
       `a decision row has no rowid through which a replace could reach another ${kind.noun}'s row`,
     );
@@ -235,8 +253,8 @@ function decisionTableScenarios(kind: DecisionTables): void {
     await t.resolves(() => expect(0), 'an expectation that holds passes');
     t.equal(await count(db, kind.expectations), 0, 'and writes nothing');
     await t.rejects(() => expect(1), { message: /changed while they were being written/ }, 'one for another decision aborts');
-    await t.rejects(() => expect(0, { token_address: address('unknown') }), NOT_ACTIVE,
-      'and so does one for a token the active version does not hold');
+    await t.rejects(() => expect(0, { [kind.named.column]: address('unknown') }), NOT_ACTIVE,
+      `and so does one for a ${kind.named.noun} the active version does not hold`);
 
     /*
      * The membership check runs on a plain UPDATE as well as on the upsert:
@@ -290,6 +308,7 @@ const TOKEN_POLICIES: DecisionTables = {
   held:         'an active token',
   noun:         'token',
   adjective:    'strategic',
+  named:        { column: 'token_address', noun: 'token' },
   rows:         'token_policies',
   events:       'token_policy_events',
   expectations: 'token_policy_expectations',
@@ -310,6 +329,7 @@ const DEPRECATED_COLLATERALS: DecisionTables = {
   held:         'a collateral of an active Comet',
   noun:         'collateral',
   adjective:    'deprecated',
+  named:        { column: 'token_address', noun: 'token' },
   rows:         'deprecated_collaterals',
   events:       'deprecated_collateral_events',
   expectations: 'deprecated_collateral_expectations',
@@ -331,6 +351,7 @@ const HIDDEN_COLLATERALS: DecisionTables = {
   held:         'a collateral of an active Comet',
   noun:         'collateral',
   adjective:    'hidden',
+  named:        { column: 'token_address', noun: 'token' },
   rows:         'hidden_collaterals',
   events:       'hidden_collateral_events',
   expectations: 'hidden_collateral_expectations',
@@ -344,9 +365,31 @@ const HIDDEN_COLLATERALS: DecisionTables = {
   },
 };
 
+const INACTIVE_MARKETS: DecisionTables = {
+  name:         'an inactive market',
+  held:         'a market of the active version',
+  noun:         'market',
+  adjective:    'inactive',
+  named:        { column: 'comet_address', noun: 'Comet' },
+  rows:         'inactive_markets',
+  events:       'inactive_market_events',
+  expectations: 'inactive_market_expectations',
+  flag:         'is_inactive',
+  previous:     'previous_is_inactive',
+  candidate:    async db => {
+    const candidate = await insertMarketCandidate(db);
+    return { versionId: candidate.registry_version_id, subject: { comet_address: candidate.comet } };
+  },
+  history:      async (db, subject) => {
+    const decision = await readInactiveMarket(db, { chainId: 1, cometAddress: subject.comet_address as Address });
+    return { decided: decision.isInactive, changes: decision.events.map(event => [ event.previousIsInactive, event.isInactive, event.createdAt ]) };
+  },
+};
+
 decisionTableScenarios(TOKEN_POLICIES);
 decisionTableScenarios(DEPRECATED_COLLATERALS);
 decisionTableScenarios(HIDDEN_COLLATERALS);
+decisionTableScenarios(INACTIVE_MARKETS);
 
 /*
  * What only a collateral has, the Comet it is a collateral of: a decision is
@@ -378,6 +421,104 @@ function cometScenarios(kind: DecisionTables): void {
 
 cometScenarios(DEPRECATED_COLLATERALS);
 cometScenarios(HIDDEN_COLLATERALS);
+
+/*
+ * What only a market has: a decision is made about a market of the active
+ * version by the address that version holds its Comet at, on the decision's
+ * own chain. The registry holds a Comet once on a chain, not once in a
+ * version, and production holds one at the same address on two chains
+ * (registry/seed/production.comets.json), so a Comet the version holds on
+ * another chain alone is no market of this one. A decision stays the market's
+ * it was made about.
+ */
+t.test('an inactive market is decided for a market of the Comet it names on its own chain, and stays with that market', async t => {
+  const { APP_DB: db } = await freshEnv();
+  const candidate = await insertMarketCandidate(db);
+  const { decide, expect } = writerOf(db, INACTIVE_MARKETS, { comet_address: candidate.comet });
+  const NOT_ACTIVE = { message: /market is not in the active registry/ };
+  // another network of the version, whose one market takes a Comet the first one does not hold
+  const scope     = { registry_version_id: candidate.registry_version_id, network_id: randomUUID() };
+  const marketId  = randomUUID();
+  const elsewhere = address('comet of another chain');
+  await db.batch([
+    insertStatement(db, 'registry_networks', networkRow(scope, 8453)),
+    insertStatement(db, 'markets', marketRow(marketId, scope)),
+    insertStatement(db, 'market_contracts', { market_id: marketId, role: 'comet', address: elsewhere }),
+  ]);
+  await validate(db, candidate.registry_version_id);
+  await activate(db, candidate.registry_version_id);
+
+  await t.rejects(() => decide({ subject: { comet_address: address('another comet') }, value: 1, at: NOW }, null), NOT_ACTIVE,
+    'a Comet no market of the active version has');
+  await t.rejects(() => decide({ subject: { comet_address: candidate.token }, value: 1, at: NOW }, null), NOT_ACTIVE,
+    'or a token of the version, which is no Comet');
+  await t.rejects(() => decide({ subject: { comet_address: elsewhere }, value: 1, at: NOW }, null), NOT_ACTIVE,
+    'or a Comet the version holds on another chain alone');
+  await t.rejects(() => expect(0, { comet_address: elsewhere }), NOT_ACTIVE,
+    'and so does an expectation for it');
+  await t.resolves(() => decide({ chainId: 8453, subject: { comet_address: elsewhere }, value: 1, at: NOW }, null),
+    'which is a market of its own chain');
+
+  await decide({ value: 1, at: NOW }, null);
+  await t.rejects(() => run(db, `UPDATE inactive_markets SET comet_address = ?1 WHERE chain_id = 1`, address('moved')), { message: /belongs to one market/ },
+    'a decision cannot move to another Comet');
+  await t.rejects(() => run(db, `UPDATE inactive_markets SET chain_id = 10 WHERE chain_id = 1`), { message: /belongs to one market/ },
+    'nor to another chain');
+});
+
+/*
+ * Where the version holds one Comet on two chains, as production holds
+ * 0x9c4ec768… on Base and Arbitrum, every trigger holds a decision to its own
+ * chain: a decision row stands only beside its own chain's newest event, an
+ * expectation reads its own chain's decision, and a plain UPDATE finds the
+ * market on the decision's chain, not the Comet on the other one.
+ */
+t.test('an inactive market decision is held to its own chain where the version holds its Comet on two', async t => {
+  const { APP_DB: db } = await freshEnv();
+  const candidate = await insertMarketCandidate(db);
+  const { event, decide, expect } = writerOf(db, INACTIVE_MARKETS, { comet_address: candidate.comet });
+  const UNAUDITED  = { message: /changes only with its audit event/ };
+  const NOT_ACTIVE = { message: /market is not in the active registry/ };
+  // another network of the version, whose one market takes the first one's Comet
+  const scope    = { registry_version_id: candidate.registry_version_id, network_id: randomUUID() };
+  const marketId = randomUUID();
+  await db.batch([
+    insertStatement(db, 'registry_networks', networkRow(scope, 8453)),
+    insertStatement(db, 'markets', marketRow(marketId, scope)),
+    insertStatement(db, 'market_contracts', { market_id: marketId, role: 'comet', address: candidate.comet }),
+  ]);
+  await validate(db, candidate.registry_version_id);
+  await activate(db, candidate.registry_version_id);
+
+  await decide({ chainId: 8453, value: 1, at: NOW }, null);
+  await t.rejects(
+    () => insertRow(db, 'inactive_markets', { chain_id: 1, comet_address: candidate.comet, is_inactive: 1, updated_at: NOW, updated_by: 'test-admin' }),
+    UNAUDITED,
+    'a decision row does not stand beside the event of the same Comet on another chain',
+  );
+  await decide({ value: 1, at: NOW }, null);
+  await insertRow(db, 'inactive_market_events', event({ chainId: 8453, value: 0, at: '2026-09-17T00:00:01.000Z' }, 1));
+  await t.rejects(() => run(db, `UPDATE inactive_markets SET is_inactive = 0, updated_at = ?1 WHERE chain_id = 1`, '2026-09-17T00:00:01.000Z'), UNAUDITED,
+    'nor does a change of one beside an event of the other chain that describes it');
+
+  await decide({ value: 0, at: '2026-09-17T00:00:02.000Z' }, 1);
+  await t.resolves(() => expect(1, { chain_id: 8453 }), 'an expectation reads the decision of its own chain');
+  await t.resolves(() => expect(0), 'on mainnet as on Base');
+
+  // a version that holds the Comet on Base alone
+  const next = await insertCandidate(db, randomUUID(), 8453);
+  await insertRow(db, 'market_contracts', { market_id: next.marketId, role: 'comet', address: candidate.comet });
+  await validate(db, next.registry_version_id);
+  await activate(db, next.registry_version_id);
+  await t.rejects(
+    () => db.batch([
+      insertStatement(db, 'inactive_market_events', event({ value: 1, at: '2026-09-17T00:00:03.000Z' }, 0)),
+      db.prepare(`UPDATE inactive_markets SET is_inactive = 1, updated_at = ?1, updated_by = 'test-admin' WHERE chain_id = 1`).bind('2026-09-17T00:00:03.000Z'),
+    ]),
+    NOT_ACTIVE,
+    'and a version that holds the Comet on the other chain alone takes no change of it on this one',
+  );
+});
 
 /*
  * Migration 0006 only adds tables, so it applies over a database a release
@@ -597,6 +738,44 @@ t.test('migration 0008 adds its tables beside a registry in use', async t => {
 });
 
 /*
+ * Migration 0009 only adds tables, as 0008 did, so it applies over a database
+ * a release before it serves from, while that release goes on serving: the
+ * version it activated and the decisions of every kind it made are left as
+ * they were.
+ */
+t.test('migration 0009 adds its tables beside a registry in use', async t => {
+  const { APP_DB: db } = await freshEnv({ through: '0008' });
+
+  const snapshot = loadRegistrySnapshotFixture();
+  const { versionId, counts } = await seedCandidate(db, snapshot);
+  await validate(db, versionId);
+  await activate(db, versionId);
+  const weth = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
+  const usdt = snapshot.networks.find(network => network.chainId === 1)!.markets.find(market => market.deploymentKey === 'usdt')!;
+  const mEth = {
+    chainId:      1,
+    cometAddress: usdt.contracts.comet!,
+    tokenAddress: usdt.collateralAssets.find(asset => asset.token.symbol === 'mETH')!.token.address,
+  };
+  await setTokenPolicy(db, { chainId: 1, tokenAddress: weth, isStrategic: true, actor: 'test-admin', reason: 'decided before 0009' });
+  await setCollateral(db, DEPRECATED_COLLATERAL_KIND, { ...mEth, isDeprecated: true, actor: 'test-admin', reason: 'decided before 0009' });
+  await setCollateral(db, HIDDEN_COLLATERAL_KIND, { ...mEth, isHidden: true, actor: 'test-admin', reason: 'decided before 0009' });
+
+  await applyMigration(db, '0009_inactive_markets.sql');
+
+  t.equal(await activeVersionId(db), versionId, 'the version that was on is on');
+  t.equal(await count(db, 'market_assets'), counts.market_assets, 'with every row of it');
+  t.equal((await readTokenPolicy(db, 1, weth)).isStrategic, true, 'and the token policies decided before it stand');
+  t.equal((await readCollateral(db, DEPRECATED_COLLATERAL_KIND, mEth)).isDeprecated, true, 'as do the deprecated collaterals');
+  t.equal((await readCollateral(db, HIDDEN_COLLATERAL_KIND, mEth)).isHidden, true, 'and the hidden ones');
+  t.same([ await count(db, 'inactive_markets'), await count(db, 'inactive_market_events') ], [ 0, 0 ],
+    'while no market is inactive yet');
+  const inactive = await setInactiveMarket(db, { chainId: 1, cometAddress: usdt.contracts.comet!, isInactive: true, actor: 'test-admin', reason: 'decided after 0009' });
+  t.same([ inactive.changed, inactive.isInactive ], [ true, true ], 'and a market of the version on can be marked inactive at once');
+  t.same(await foreignKeyViolations(db), [], 'no foreign key violations');
+});
+
+/*
  * What 0008 creates for hidden collaterals is what 0007 left for deprecated
  * ones: the same tables, indexes, triggers and view under the hidden names,
  * so the schema holds both kinds of decision to the same rules, each in its
@@ -622,4 +801,34 @@ t.test('migration 0008 creates what 0007 left for deprecated collaterals, under 
     })),
     'each the object deprecated collaterals have, statement for statement',
   );
+});
+
+/*
+ * What 0009 creates for inactive markets is what 0008 created for hidden
+ * collaterals, less the token: two tables, their two indexes, ten triggers on
+ * the tables and two on the view, and the view, under its own names and in
+ * its own words. Every trigger of it is on one of its own objects, so no
+ * write of an earlier table fires one, and every object of 0001 to 0008 is
+ * left as 0008 left it.
+ */
+t.test('migration 0009 creates what 0008 created, under the inactive names, and touches nothing before it', async t => {
+  const schema   = await schemaOf((await freshEnv({ through: '0009' })).APP_DB);
+  const inactive = schema.filter(object => object.tbl_name.startsWith('inactive_market'));
+  t.same(
+    [ 'table', 'index', 'trigger', 'view' ].map(type => inactive.filter(object => object.type === type && object.sql !== null).length),
+    [ 2, 2, 12, 1 ],
+    'two tables, their two indexes, ten triggers on the tables and two on the view, and the view',
+  );
+  t.same([ ...new Set(inactive.filter(object => object.type === 'trigger').map(object => object.tbl_name)) ].sort(),
+    [ 'inactive_market_events', 'inactive_market_expectations', 'inactive_markets' ], 'every trigger on a table or the view of 0009');
+  t.same([ ...new Set(inactive.flatMap(object => [ ...(object.sql ?? '').matchAll(/RAISE\(ABORT, '([^']+)'\)/g) ].map(match => match[1]))) ].sort(), [
+    'an inactive market decision belongs to one market',
+    'an inactive market decision changes only with its audit event',
+    'inactive market decisions are changed, not deleted',
+    'inactive market decisions changed while they were being written',
+    'inactive market events are append-only',
+    'market is not in the active registry',
+  ], 'each refusing in its own words, and in the forms the store and the routes read');
+  t.same(schema.filter(object => !object.tbl_name.startsWith('inactive_market')), await schemaOf((await freshEnv({ through: '0008' })).APP_DB),
+    'and every other object as 0008 left it');
 });

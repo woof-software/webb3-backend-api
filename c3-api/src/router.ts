@@ -51,11 +51,12 @@ interface Context extends Evaluator.Context {
 
 /*
  * What the router hands a market handler: the evaluator it made for the
- * route, and the read of the decisions the summary adds to each collateral
- * (summary-tokens.ts), which a request makes once for all its networks: from
- * D1, and the deprecated and the hidden ones from the records the worker
- * keeps of them while D1 cannot be reached, as the active reads do. Nothing
- * is read until the summary asks.
+ * route, and the read of the decisions the summary adds to each market and
+ * each collateral (summary-tokens.ts), which a request makes once for all its
+ * networks: from D1, and the deprecated and the hidden ones, and the inactive
+ * markets, from the records the worker keeps of them while D1 cannot be
+ * reached, as the active reads do the first two. Nothing is read until the
+ * summary asks.
  */
 interface MarketContext extends Context {
   decisions: () => Promise<SummaryDecisions>;

@@ -159,6 +159,7 @@ function wbtcSummaryError() {
     is_wrapped_native: false,
     is_default:        false,
     is_institutional:  false,
+    is_inactive:       false,
     status:            'error',
     message:           'execution reverted',
   };
@@ -405,7 +406,8 @@ t.test('the rewards of an account answer a market the chain has not reached as a
 /*
  * Only the summary answers what the registry version says of a market in
  * its Comet and beside it: the rewards contract and the bulker beside its
- * Comet, then its keys and labels, of every market, an error too. The
+ * Comet, then its keys and labels, of every market, an error too, and after
+ * them whether an administrator has marked the market inactive. The
  * history, the rewards of every market, the rewards summary of one and the
  * rewards of an account answer as they did: the Comet alone, and none of
  * those fields.
@@ -413,20 +415,21 @@ t.test('the rewards of an account answer a market the chain has not reached as a
 t.test('only the summary answers what the version says of a market in its Comet and beside it', async t => {
   const answer  = answers([ WBTC ]);
   const account: AccountRouteData = { apiHost: '', nodeHost: '', nodeKey: '', account: ACCOUNT, catalog };
-  // what an answer says of a market that its version says: the keys of its Comet, and the fields of the version it has
+  // what an answer says of a market beside what was read: the keys of its Comet, and the fields of the version it has, and whether it is inactive
   const described = (entry: Record<string, any>) => [
     Object.keys(entry.comet ?? {}),
-    Object.keys(entry).filter(key => (REGISTRY_KEYS as readonly string[]).includes(key)),
+    Object.keys(entry).filter(key => ([ ...REGISTRY_KEYS, 'is_inactive' ] as string[]).includes(key)),
   ];
   const ALONE = [ [ 'address' ], [] ];
 
   const summary = await (await marketHandlers.latestSummary(routeData(AllNetworks, AllContracts), uninstantiated(answer))).json() as Entry[];
   const SUMMARY = [
     [ 'address', 'rewards', 'bulker' ],
-    [ 'deployment_key', 'display_name', 'base_asset_name', 'is_wrapped_native', 'is_default', 'is_institutional' ],
+    [ 'deployment_key', 'display_name', 'base_asset_name', 'is_wrapped_native', 'is_default', 'is_institutional', 'is_inactive' ],
   ];
   t.ok(summary.length > 0, 'the summary answers markets');
-  t.strictSame(summary.map(described), summary.map(() => SUMMARY), 'the summary: the Comet, its rewards contract and its bulker, and the keys and labels of the version, of every market');
+  t.strictSame(summary.map(described), summary.map(() => SUMMARY),
+    'the summary: the Comet, its rewards contract and its bulker, the keys and labels of the version, and whether it is inactive, of every market');
   t.equal(statuses(summary)[WBTC], 'error', 'WBTC\'s among them, which is an error');
 
   const days = await (await marketHandlers.historicalSummary(routeData(AllNetworks, AllContracts), uninstantiated(answer))).json() as Entry[];

@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import C3Api, { Env } from '../../../entrypoint.js';
 import { POINTER_KEY } from '../../../src/registry/cache.js';
 import { DEPRECATED_KEY, HIDDEN_KEY } from '../../../src/registry/collateral-decisions.js';
+import { INACTIVE_KEY } from '../../../src/registry/inactive-markets.js';
 import { maintainRegistryCache } from '../../../src/registry/scheduled.js';
 
 import { consoleLines } from '../../util/console.js';
@@ -105,7 +106,7 @@ t.test('a validation, an activation and a rollback answer as committed, though n
 
 /*
  * A decision about a collateral records the decisions of its kind for an
- * outage once it has committed (collateral-decisions.ts), each kind under
+ * outage once it has committed (decision-records.ts), each kind under
  * its own key. A record the namespace does not take must not fail the
  * command either: the next read that finds the record behind writes it.
  */
@@ -124,6 +125,22 @@ t.test('a deprecated or a hidden decision answers as committed, though its recor
     t.match(await decided.json(), { [flag]: true, changed: true }, 'with the decision it committed');
     t.ok(logs.includes(`warn: ${kind} collateral record unwritable`), 'its record, which the namespace did not take, a warning');
   }
+  t.notOk(logs.some(line => line.startsWith('error:')), 'not an error');
+});
+
+// a decision about a market records the inactive markets for /summary the same way, under a key of their own (inactive-markets.ts)
+t.test('an inactive market decision answers as committed, though its record could not be written', async t => {
+  const registry = await activeRegistryDatabase();
+  t.teardown(() => registry.dispose());
+  const logs = captureLogs(t);
+  const env  = await envWith({ APP_DB: registry.db });
+
+  const usdt    = registry.snapshot.networks.find(network => network.chainId === 1)!.markets.find(market => market.deploymentKey === 'usdt')!;
+  const decided = await post(env, `/registry/v1/admin/networks/1/markets/${usdt.contracts.comet}/inactive`,
+    { isInactive: true, reason: 'the namespace does not answer' }, 'PATCH');
+  t.equal(decided.status, 200, 'an inactive market decision answers 200');
+  t.match(await decided.json(), { isInactive: true, changed: true }, 'with the decision it committed');
+  t.ok(logs.includes('warn: inactive market record unwritable'), 'its record, which the namespace did not take, a warning');
   t.notOk(logs.some(line => line.startsWith('error:')), 'not an error');
 });
 
@@ -211,9 +228,9 @@ t.test('a database that cannot be reached, with a namespace that does not answer
 
 /*
  * Bindings of `store` that hold back the writes of the records an outage
- * reads — the pointer record, and the deprecated and the hidden collateral
- * decisions — until `release`. Each binding is an isolate that has written
- * none of them yet.
+ * reads — the pointer record, the deprecated and the hidden collateral
+ * decisions, and the inactive markets — until `release`. Each binding is an
+ * isolate that has written none of them yet.
  */
 function heldRecords(store: KVNamespace): { binding: () => KVNamespace, release: () => void } {
   let release!: () => void;
@@ -223,7 +240,7 @@ function heldRecords(store: KVNamespace): { binding: () => KVNamespace, release:
       const value = Reflect.get(target, property, receiver);
       if (property === 'put' && typeof(value) === 'function') {
         return async (...parameters: unknown[]) => {
-          if (parameters[0] === POINTER_KEY || parameters[0] === DEPRECATED_KEY || parameters[0] === HIDDEN_KEY) {
+          if (parameters[0] === POINTER_KEY || parameters[0] === DEPRECATED_KEY || parameters[0] === HIDDEN_KEY || parameters[0] === INACTIVE_KEY) {
             await released;
           }
           return (value as (...parameters: unknown[]) => unknown).apply(target, parameters);

@@ -1,13 +1,7 @@
 import t from 'tap';
 
-import {
-  DEPRECATED_KEY,
-  DEPRECATED_RECORD,
-  HIDDEN_KEY,
-  HIDDEN_RECORD,
-  markedDecisions,
-  recordCollaterals,
-} from '../../../src/registry/collateral-decisions.js';
+import { DEPRECATED_KEY, DEPRECATED_RECORD, HIDDEN_KEY, HIDDEN_RECORD } from '../../../src/registry/collateral-decisions.js';
+import { markedDecisions, recordDecisions } from '../../../src/registry/decision-records.js';
 
 import { MemoryKv } from '../../util/kv.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
@@ -60,12 +54,12 @@ t.test('the hidden and the deprecated decisions are recorded apart', async t => 
   const mEth = collateral('usdt', 'mETH');
   await decide(HIDDEN_READS, 'usdt', 'mETH', true);
   await decide(DEPRECATED_READS, 'usdc', 'weETH', true);
-  await recordCollaterals(HIDDEN_RECORD, deps);
+  await recordDecisions(HIDDEN_RECORD, deps);
   t.same([ await recorded(kv, HIDDEN_KEY), await recorded(kv, DEPRECATED_KEY) ], [ [ mEth ], [] ],
     'a hidden command records the hidden decisions alone');
-  t.same((await markedDecisions(DEPRECATED_RECORD, deps)).decisions.collaterals, [ collateral('usdc', 'weETH') ],
+  t.same((await markedDecisions(DEPRECATED_RECORD, deps)).decisions.subjects, [ collateral('usdc', 'weETH') ],
     'while the deprecated ones are their own');
-  t.same((await markedDecisions(HIDDEN_RECORD, deps)).decisions.collaterals, [ mEth ], 'as the hidden ones are');
+  t.same((await markedDecisions(HIDDEN_RECORD, deps)).decisions.subjects, [ mEth ], 'as the hidden ones are');
 });
 
 /*

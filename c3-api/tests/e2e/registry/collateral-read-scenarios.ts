@@ -2,8 +2,10 @@ import t, { Test } from 'tap';
 
 import C3Api, { Env } from '../../../entrypoint.js';
 import type { ActiveMarketV1, ActiveSnapshotV1, RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
-import type { RecordedKind } from '../../../src/registry/collateral-decisions.js';
-import { DEPRECATED_RECORD, HIDDEN_RECORD, markedDecisions } from '../../../src/registry/collateral-decisions.js';
+import type { CollateralOfComet } from '../../../src/registry/collateral-decision-repository.js';
+import { DEPRECATED_RECORD, HIDDEN_RECORD } from '../../../src/registry/collateral-decisions.js';
+import type { RecordedKind } from '../../../src/registry/decision-records.js';
+import { markedDecisions } from '../../../src/registry/decision-records.js';
 
 import { consoleLines } from '../../util/console.js';
 import { executionContext, settledWithin } from '../../util/execution-context.js';
@@ -30,7 +32,7 @@ import '../../../shim/node-self.js';
  * cannot be reached answers with the record, saying so.
  *
  * Both kinds are read, recorded and answered with alike
- * (collateral-decisions.ts), so the scenarios are written once, over a
+ * (decision-records.ts), so the scenarios are written once, over a
  * description of each kind (CollateralReadKind), and each kind runs them
  * from its own file, beside the tests only it has:
  * deprecated-collateral-reads.test.ts and hidden-collateral-reads.test.ts.
@@ -52,7 +54,7 @@ type Envelope = { error: { code: string, message: string } };
 const NO_STATEMENT = /^$/;
 
 // a kind of decision as the active reads mark collaterals with it: as the decision scenarios drive it, and its record
-type MarkingKind = { decisions: DecisionKindUnderTest, record: RecordedKind };
+type MarkingKind = { decisions: DecisionKindUnderTest, record: RecordedKind<CollateralOfComet> };
 
 type CollateralReadKind = MarkingKind & { other: MarkingKind };
 
@@ -304,7 +306,7 @@ function decisionReadScenarios(kind: CollateralReadKind): void {
     t.same(flaggedIn((await response.json() as ActiveSnapshotV1).networks, flag), [ 'usdc/weETH' ],
       'and an outage right after it, before any read, answers with its decision');
     const read = await markedDecisions(kind.record, depsOf(db, kv));
-    t.same([ read.recorded, read.decisions.collaterals ], [ true, [ weEth ] ], 'as a read of the decisions themselves does, from the record');
+    t.same([ read.recorded, read.decisions.subjects ], [ true, [ weEth ] ], 'as a read of the decisions themselves does, from the record');
     t.ok(read.decisions.has(weEth), 'which marks the collateral in its Comet');
     t.notOk(read.decisions.has({ ...weEth, cometAddress: collateral('usdt', 'weETH').cometAddress }), 'and not in another');
 
@@ -445,12 +447,12 @@ function decisionReadScenarios(kind: CollateralReadKind): void {
     await decide(kind, 'usdt', 'mETH', true);
 
     const read = await markedDecisions(kind.record, depsOf(registry.db, kv, warnings));
-    t.same([ read.recorded, read.decisions.collaterals ], [ false, [ mEth ] ], 'a read takes the decisions from the database');
+    t.same([ read.recorded, read.decisions.subjects ], [ false, [ mEth ] ], 'a read takes the decisions from the database');
     t.same(await recorded(kv, kind.record.key), [ mEth ], 'and records them');
 
     const unreachable = failingStatements(registry.db, statementsOf(kind.decisions));
     const fallback = await markedDecisions(kind.record, depsOf(unreachable, kv, warnings));
-    t.same([ fallback.recorded, fallback.decisions.collaterals ], [ true, [ mEth ] ],
+    t.same([ fallback.recorded, fallback.decisions.subjects ], [ true, [ mEth ] ],
       'while the database does not give them, a read answers with the record, and says so');
     await markedDecisions(kind.record, depsOf(unreachable, kv, warnings));
     t.same(warnings, [ `${label} decisions unreadable; answering with the ones last recorded` ],
@@ -460,6 +462,24 @@ function decisionReadScenarios(kind: CollateralReadKind): void {
       'with nothing recorded, there is nothing to answer with');
     await t.rejects(markedDecisions(kind.record, depsOf(unreachable, MemoryKv({ seed: { [kind.record.key]: { collaterals: 'not a list' } } }))),
       unavailable, 'nor with a record that is not one');
+    const at = '2026-10-27T09:00:00.000Z';
+    const garbled = [
+      { at, collaterals: 'not a list' },
+      { collaterals: [ mEth ] },
+      { at, collaterals: [ { ...mEth, chainId: 0 } ] },
+      { at, collaterals: [ { ...mEth, cometAddress: 'usdt' } ] },
+      { at, collaterals: [ { ...mEth, tokenAddress: 'mETH' } ] },
+    ];
+    for (const record of garbled) {
+      await t.rejects(markedDecisions(kind.record, depsOf(unreachable, MemoryKv({ seed: { [kind.record.key]: record } }))), unavailable,
+        `nor with a record that is not one: ${JSON.stringify(record)}`);
+    }
+    const otherCase = (address: string) => address.toUpperCase().replace('0X', '0x');
+    const checksummed = MemoryKv({ seed: { [kind.record.key]: {
+      at, collaterals: [ { ...mEth, cometAddress: otherCase(mEth.cometAddress), tokenAddress: otherCase(mEth.tokenAddress) } ],
+    } } });
+    t.same((await markedDecisions(kind.record, depsOf(unreachable, checksummed))).decisions.subjects, [ mEth ],
+      'while a record that names a collateral in another case names the same one');
 
     const windowless = { ...depsOf(registry.db, MemoryKv({})), staleSeconds: 0 };
     await markedDecisions(kind.record, windowless);

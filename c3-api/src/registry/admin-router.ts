@@ -1,6 +1,6 @@
 import type { Env } from '../../entrypoint.js';
 
-import { Address, isAddress, normalizeAddress, parseMarketKey } from '../../lib/model/comet-registry.js';
+import { Address, isAddress, isChainId, normalizeAddress, parseMarketKey } from '../../lib/model/comet-registry.js';
 
 import { authenticateAdmin } from '../http/bearer-auth.js';
 import { clientOf } from '../http/client-address.js';
@@ -19,43 +19,62 @@ import {
   replaceNetworkOverlay,
   replaceOverlays,
 } from './admin.js';
+import type { CollateralDecisionKind, CollateralOfComet, ListedCollateralDecision } from './collateral-decision-repository.js';
 import {
-  getCollateral,
-  getCollateralExport,
-  patchCollateral,
-  postCollateralApply,
-  postCollateralReview,
-} from './collateral-decision-handlers.js';
-import type { CollateralDecisionKind, ListedCollateralDecision } from './collateral-decision-repository.js';
-import { DEPRECATED_COLLATERAL_KIND, HIDDEN_COLLATERAL_KIND, member } from './collateral-decision-repository.js';
-import type { RecordedKind } from './collateral-decisions.js';
+  DEPRECATED_COLLATERAL_KIND,
+  HIDDEN_COLLATERAL_KIND,
+  applyCollaterals,
+  exportCollaterals,
+  readCollateral,
+  reviewCollaterals,
+  setCollateral,
+} from './collateral-decision-repository.js';
 import { DEPRECATED_RECORD, HIDDEN_RECORD } from './collateral-decisions.js';
+import type { DecisionCommands } from './decision-handlers.js';
+import { getDecision, getDecisionExport, patchDecision, postDecisionApply, postDecisionReview } from './decision-handlers.js';
+import type { RecordedKind } from './decision-records.js';
+import type { DecisionList } from './decision-store.js';
+import { member } from './decision-store.js';
 import {
   RegistryContext,
   cancelSyncRun,
   chainIdOf,
+  collateralOf,
   getChanges,
   getMarketOverlay,
   getNetworkOverlay,
   getSyncRun,
   getVersionDetail,
   getVersions,
+  marketOfChain,
   postActivation,
   postValidate,
+  tokenOfChain,
 } from './handlers.js';
 import { isExplicit } from './importer.js';
 import type { InvocationResult } from './importer.js';
+import type { ListedMarketDecision } from './inactive-market-repository.js';
+import {
+  INACTIVE_MARKET_KIND,
+  applyInactiveMarkets,
+  exportInactiveMarkets,
+  readInactiveMarket,
+  reviewInactiveMarkets,
+  setInactiveMarket,
+} from './inactive-market-repository.js';
+import { INACTIVE_RECORD } from './inactive-markets.js';
 import type { SyncOutcome } from './rows.js';
 import { runRegistrySync, transportFor } from './scheduled.js';
-import {
-  getTokenPolicies,
-  getTokenPolicy,
-  getTokenPolicyExport,
-  patchTokenPolicy,
-  postTokenPolicyApply,
-  postTokenPolicyReview,
-} from './token-handlers.js';
+import { getTokenPolicies } from './token-handlers.js';
 import type { ListedDecision } from './token-policy-repository.js';
+import {
+  TOKEN_POLICY_KIND,
+  applyTokenPolicies,
+  exportTokenPolicies,
+  readTokenPolicy,
+  reviewTokenPolicies,
+  setTokenPolicy,
+} from './token-policy-repository.js';
 
 /*
  * Reads the decimals of the feeds an overlay introduces, through the same
@@ -76,40 +95,130 @@ function creationReader(env: Env): CreationReader {
 }
 
 /*
- * The routes of a kind of decision about a collateral: one collateral's
- * decision, read and set, under the kind's own last segment, and the list of
- * every collateral's, exported, reviewed and applied, under the kind's own
- * path, each path's verbs in the order a 405 names them. Each route answers
- * for the kind it was made for (`collateral`), so one case of routeAdmin
- * answers it for either kind, and a command keeps that kind's record
- * (`record`).
+ * A route reads the subject from its path's captures only once it runs
+ * (`subjectOf`), so a command whose body is wrong is refused for its body,
+ * whatever its path says.
  */
-function collateralRoutes<Flag extends string, Column extends string, Rows extends string>(
-  kind: CollateralDecisionKind<Flag, Column, Rows>,
-  record: RecordedKind,
+type RoutedKind<Subject extends object, Flag extends string, Listed extends { chainId: number }> = DecisionCommands<Subject, Flag, Listed> & {
+  one:       RegExp,
+  subjectOf: (...captures: string[]) => Subject,
+  listPath:  string,
+  list:      DecisionListSpec<Listed>,
+};
+
+/*
+ * The routes of a kind of decision: one subject's decision, read and set, and
+ * the list of every subject's, exported, reviewed and applied, under the
+ * kind's own path, each path's verbs in the order a 405 names them. Each
+ * route answers for the kind it was made for (`decision`), so one case of
+ * routeAdmin answers it for every kind.
+ */
+function decisionRoutes<Subject extends object, Flag extends string, Listed extends { chainId: number }>(
+  kind: RoutedKind<Subject, Flag, Listed>,
 ) {
-  const one  = new RegExp(`^/registry/v1/admin/networks/([^/]+)/markets/([^/]+)/collaterals/([^/]+)/${kind.segment}$`);
   const list = `^/registry/v1/admin/${kind.listPath}`;
-  const spec = collateralListSpec(kind);
-  const collateral = {
+  const decision = {
     // the member of a command's body that holds the decision
     flag:   kind.flag,
-    read:   (context: RegistryContext, chainId: string, cometAddress: string, tokenAddress: string) =>
-      getCollateral(context, kind, chainId, cometAddress, tokenAddress),
-    set:    (context: RegistryContext, chainId: string, cometAddress: string, tokenAddress: string, decision: { flag: boolean, reason: string }) =>
-      patchCollateral(context, kind, record, chainId, cometAddress, tokenAddress, decision),
-    export: (context: RegistryContext) => getCollateralExport(context, kind),
-    review: (context: RegistryContext, body: Record<string, unknown>) => postCollateralReview(context, kind, decisionListOf(body, spec)),
-    apply:  (context: RegistryContext, body: Record<string, unknown>) => postCollateralApply(context, kind, record, decisionListOf(body, spec)),
+    read:   (context: RegistryContext, match: RegExpExecArray) => getDecision(context, kind, kind.subjectOf(...match.slice(1))),
+    set:    (context: RegistryContext, match: RegExpExecArray, decided: { flag: boolean, reason: string }) =>
+      patchDecision(context, kind, kind.subjectOf(...match.slice(1)), decided),
+    export: (context: RegistryContext) => getDecisionExport(context, kind),
+    review: (context: RegistryContext, body: Record<string, unknown>) => postDecisionReview(context, kind, decisionListOf(body, kind.list)),
+    apply:  (context: RegistryContext, body: Record<string, unknown>) => postDecisionApply(context, kind, decisionListOf(body, kind.list)),
   };
   return [
-    { pattern: one,                           method: 'GET',   handler: 'collateral',        family: 'read',   collateral },
-    { pattern: one,                           method: 'PATCH', handler: 'setCollateral',     family: 'policy', collateral },
-    { pattern: new RegExp(`${list}$`),        method: 'GET',   handler: 'exportCollaterals', family: 'read',   collateral },
-    { pattern: new RegExp(`${list}/review$`), method: 'POST',  handler: 'reviewCollaterals', family: 'read',   collateral },
-    { pattern: new RegExp(`${list}/apply$`),  method: 'POST',  handler: 'applyCollaterals',  family: 'policy', collateral },
+    { pattern: kind.one,                      method: 'GET',   handler: 'decision',        family: 'read',   decision },
+    { pattern: kind.one,                      method: 'PATCH', handler: 'setDecision',     family: 'policy', decision },
+    { pattern: new RegExp(`${list}$`),        method: 'GET',   handler: 'exportDecisions', family: 'read',   decision },
+    { pattern: new RegExp(`${list}/review$`), method: 'POST',  handler: 'reviewDecisions', family: 'read',   decision },
+    { pattern: new RegExp(`${list}/apply$`),  method: 'POST',  handler: 'applyDecisions',  family: 'policy', decision },
   ] as const;
 }
+
+const TOKEN_POLICY_ROUTES = decisionRoutes({
+  one:       new RegExp(`^/registry/v1/admin/networks/([^/]+)/tokens/([^/]+)/${TOKEN_POLICY_KIND.segment}$`),
+  subjectOf: tokenOfChain,
+  flag:      TOKEN_POLICY_KIND.flag,
+  listPath:  TOKEN_POLICY_KIND.listPath,
+  list:      listSpecOf<ListedDecision>(TOKEN_POLICY_KIND, {
+    retained:    false,
+    names:       [ [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ] ],
+    decisionOf:  (value, reason) => ({
+      chainId:      value.chainId as number,
+      tokenAddress: normalizeAddress(value.tokenAddress as string),
+      symbol:       (value.symbol as string | null | undefined) ?? null,
+      isStrategic:  value.isStrategic as boolean,
+      reason,
+    }),
+    addressesOf: decision => [ decision.tokenAddress ],
+  }),
+  read:      (db, { chainId, tokenAddress }) => readTokenPolicy(db, chainId, tokenAddress),
+  set:       setTokenPolicy,
+  export:    exportTokenPolicies,
+  review:    reviewTokenPolicies,
+  apply:     applyTokenPolicies,
+  // no outage answers with token policies, so they keep no record
+  record:    null,
+});
+
+function collateralRoutes<Flag extends string, Column extends string, Rows extends string>(
+  kind: CollateralDecisionKind<Flag, Column, Rows>,
+  record: RecordedKind<CollateralOfComet>,
+) {
+  return decisionRoutes({
+    one:       new RegExp(`^/registry/v1/admin/networks/([^/]+)/markets/([^/]+)/collaterals/([^/]+)/${kind.segment}$`),
+    subjectOf: collateralOf,
+    flag:      kind.flag,
+    listPath:  kind.listPath,
+    list:      listSpecOf<ListedCollateralDecision<Flag>>(kind, {
+      retained:    true,
+      names:       [ [ 'cometAddress', 'address' ], [ 'deploymentKey', 'name' ], [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ] ],
+      decisionOf:  (value, reason) => ({
+        chainId:       value.chainId as number,
+        cometAddress:  normalizeAddress(value.cometAddress as string),
+        deploymentKey: (value.deploymentKey as string | null | undefined) ?? null,
+        tokenAddress:  normalizeAddress(value.tokenAddress as string),
+        symbol:        (value.symbol as string | null | undefined) ?? null,
+        ...member(kind.flag, value[kind.flag] as boolean),
+        reason,
+      }),
+      addressesOf: decision => [ decision.cometAddress, decision.tokenAddress ],
+    }),
+    read:      (db, collateral) => readCollateral(db, kind, collateral),
+    set:       (db, change) => setCollateral(db, kind, change),
+    export:    db => exportCollaterals(db, kind),
+    review:    (db, list) => reviewCollaterals(db, kind, list),
+    apply:     (db, list, actor) => applyCollaterals(db, kind, list, actor),
+    record,
+  });
+}
+
+const INACTIVE_MARKET_ROUTES = decisionRoutes({
+  one:       new RegExp(`^/registry/v1/admin/networks/([^/]+)/markets/([^/]+)/${INACTIVE_MARKET_KIND.segment}$`),
+  subjectOf: marketOfChain,
+  flag:      INACTIVE_MARKET_KIND.flag,
+  listPath:  INACTIVE_MARKET_KIND.listPath,
+  list:      listSpecOf<ListedMarketDecision>(INACTIVE_MARKET_KIND, {
+    retained:    true,
+    // a row names no token: one that names a token is refused
+    names:       [ [ 'cometAddress', 'address' ], [ 'deploymentKey', 'name' ] ],
+    decisionOf:  (value, reason) => ({
+      chainId:       value.chainId as number,
+      cometAddress:  normalizeAddress(value.cometAddress as string),
+      deploymentKey: (value.deploymentKey as string | null | undefined) ?? null,
+      isInactive:    value.isInactive as boolean,
+      reason,
+    }),
+    addressesOf: decision => [ decision.cometAddress ],
+  }),
+  read:      readInactiveMarket,
+  set:       setInactiveMarket,
+  export:    exportInactiveMarkets,
+  review:    reviewInactiveMarkets,
+  apply:     applyInactiveMarkets,
+  record:    INACTIVE_RECORD,
+});
 
 /*
  * The authenticated administrative routes, behind two rate limiters.
@@ -143,13 +252,10 @@ const ROUTES = [
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/markets\/([^/]+)\/([^/]+)\/overlay$/, method: 'GET',  handler: 'readMarketOverlay', family: 'read' },
   { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/overlays$/,                            method: 'PUT',  handler: 'overlays',       family: 'overlay' },
   { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens$/,                             method: 'GET',  handler: 'tokenPolicies',  family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens\/([^/]+)\/policy$/,            method: 'GET',  handler: 'tokenPolicy',    family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens\/([^/]+)\/policy$/,            method: 'PATCH', handler: 'setTokenPolicy', family: 'policy' },
-  { pattern: /^\/registry\/v1\/admin\/token-policies$/,                                       method: 'GET',  handler: 'exportTokenPolicies', family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/token-policies\/review$/,                               method: 'POST', handler: 'reviewTokenPolicies', family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/token-policies\/apply$/,                                method: 'POST', handler: 'applyTokenPolicies',  family: 'policy' },
+  ...TOKEN_POLICY_ROUTES,
   ...collateralRoutes(DEPRECATED_COLLATERAL_KIND, DEPRECATED_RECORD),
   ...collateralRoutes(HIDDEN_COLLATERAL_KIND, HIDDEN_RECORD),
+  ...INACTIVE_MARKET_ROUTES,
 ] as const;
 
 const MAX_REASON = 1000;
@@ -179,8 +285,7 @@ const MAX_OVERLAYS_PER_REQUEST = 100;
 const MAX_OVERLAYS_BODY_BYTES  = 512 * 1024;
 
 /*
- * A list of decisions in one request, of token policies, of deprecated
- * collaterals or of hidden ones: every token, or every collateral, of every
+ * A list of one kind's decisions in one request: every subject of every
  * network of a registry fits, with a reason on each row. The list is written
  * as a handful of statements whatever its length, so the bound is the body,
  * not D1.
@@ -190,11 +295,9 @@ const MAX_DECISIONS_BODY_BYTES  = 1024 * 1024;
 
 // the bodies larger than an ordinary command, by the handler of the route that takes them
 const BODY_BYTES: Partial<Record<typeof ROUTES[number]['handler'], number>> = {
-  overlays:            MAX_OVERLAYS_BODY_BYTES,
-  reviewTokenPolicies: MAX_DECISIONS_BODY_BYTES,
-  applyTokenPolicies:  MAX_DECISIONS_BODY_BYTES,
-  reviewCollaterals:   MAX_DECISIONS_BODY_BYTES,
-  applyCollaterals:    MAX_DECISIONS_BODY_BYTES,
+  overlays:        MAX_OVERLAYS_BODY_BYTES,
+  reviewDecisions: MAX_DECISIONS_BODY_BYTES,
+  applyDecisions:  MAX_DECISIONS_BODY_BYTES,
 };
 
 /*
@@ -554,7 +657,7 @@ function overlayDocuments(body: Record<string, unknown>, versionId: string, acto
 }
 
 const DECISION_FIELDS = {
-  chainId: { must: 'must be a positive integer', valid: (value: unknown) => typeof(value) === 'number' && Number.isSafeInteger(value) && value > 0 },
+  chainId: { must: 'must be a positive integer', valid: (value: unknown) => isChainId(value) },
   address: { must: 'must be an address',         valid: (value: unknown) => isAddress(value) },
   name:    { must: 'must be null or a string',   valid: (value: unknown) => value === undefined || value === null || typeof(value) === 'string' },
   flag:    { must: 'must be a boolean',          valid: (value: unknown) => typeof(value) === 'boolean' },
@@ -570,67 +673,45 @@ type DecisionListSpec<Listed extends { chainId: number }> = {
   bodyKeys:    string[],
   listKey:     string,
   what:        string,
-  fields:      Array<[ string, keyof typeof DECISION_FIELDS ]>,
+  fields:      Array<[ keyof Listed & string, keyof typeof DECISION_FIELDS ]>,
   decisionOf:  (value: Record<string, unknown>, reason: string | null) => Listed,
   addressesOf: (decision: Listed) => Address[],
 };
 
-const TOKEN_POLICY_LIST: DecisionListSpec<ListedDecision> = {
-  bodyKeys:    [ 'registryVersion', 'reason', 'policies' ],
-  listKey:     'policies',
-  what:        'token policies',
-  fields:      [ [ 'chainId', 'chainId' ], [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ], [ 'isStrategic', 'flag' ] ],
-  decisionOf:  (value, reason) => ({
-    chainId:      value.chainId as number,
-    tokenAddress: normalizeAddress(value.tokenAddress as string),
-    symbol:       (value.symbol as string | null | undefined) ?? null,
-    isStrategic:  value.isStrategic as boolean,
-    reason,
-  }),
-  addressesOf: decision => [ decision.tokenAddress ],
-};
-
 /*
- * A list of a kind of decision about a collateral, its rows under the kind's
- * own member, so neither kind's review takes the other's export. `retained`
- * names the decisions the active version does not hold, and is not read.
+ * A kind's list under the kind's own names, its rows under a member of their
+ * own, so that no kind's review takes another's export. `retained` says
+ * whether the kind's export also lists the decisions the active version does
+ * not hold, which a list sent back carries and nothing reads.
  */
-function collateralListSpec<Flag extends string, Column extends string, Rows extends string>(
-  kind: CollateralDecisionKind<Flag, Column, Rows>,
-): DecisionListSpec<ListedCollateralDecision<Flag>> {
+function listSpecOf<Listed extends { chainId: number }>(
+  kind: { listOf: string, listKey: string, flag: keyof Listed & string },
+  { retained, names, decisionOf, addressesOf }: Pick<DecisionListSpec<Listed>, 'decisionOf' | 'addressesOf'> & {
+    retained: boolean,
+    names:    DecisionListSpec<Listed>['fields'],
+  },
+): DecisionListSpec<Listed> {
   return {
-    bodyKeys:    [ 'registryVersion', 'reason', kind.listKey, 'retained' ],
+    bodyKeys:    [ 'registryVersion', 'reason', kind.listKey, ...(retained ? [ 'retained' ] : []) ],
     listKey:     kind.listKey,
     what:        kind.listOf,
-    fields:      [
-      [ 'chainId', 'chainId' ], [ 'cometAddress', 'address' ], [ 'deploymentKey', 'name' ],
-      [ 'tokenAddress', 'address' ], [ 'symbol', 'name' ], [ kind.flag, 'flag' ],
-    ],
-    decisionOf:  (value, reason) => ({
-      chainId:       value.chainId as number,
-      cometAddress:  normalizeAddress(value.cometAddress as string),
-      deploymentKey: (value.deploymentKey as string | null | undefined) ?? null,
-      tokenAddress:  normalizeAddress(value.tokenAddress as string),
-      symbol:        (value.symbol as string | null | undefined) ?? null,
-      ...member(kind.flag, value[kind.flag] as boolean),
-      reason,
-    }),
-    addressesOf: decision => [ decision.cometAddress, decision.tokenAddress ],
+    fields:      [ [ 'chainId', 'chainId' ], ...names, [ kind.flag, 'flag' ] ],
+    decisionOf,
+    addressesOf,
   };
 }
 
 /*
- * The body of a list's review and apply (`POST /token-policies/review` and
- * `/apply`, `POST /deprecated-collaterals/review` and `/apply`, `POST
- * /hidden-collaterals/review` and `/apply`): a list as the export answers it,
- * edited. `registryVersion` says where it was exported from and is not
- * checked, since a decision belongs to no version. Every problem of every row
- * is reported at once, so a file is fixed in one pass.
+ * The body of a list's review and apply (`POST /<the kind's list>/review`
+ * and `/apply`): a list as the export answers it, edited. `registryVersion`
+ * says where it was exported from and is not checked, since a decision
+ * belongs to no version. Every problem of every row is reported at once, so a
+ * file is fixed in one pass.
  */
 function decisionListOf<Listed extends { chainId: number }>(
   body: Record<string, unknown>,
   spec: DecisionListSpec<Listed>,
-): { reason: string | null, decisions: Listed[] } {
+): DecisionList<Listed> {
   requireExactKeys(body, spec.bodyKeys);
   const problems: string[] = [];
   const reason = optionalReason(body.reason, 'reason', problems);
@@ -787,53 +868,27 @@ async function routeAdmin(
     case 'tokenPolicies':
       // the first capture of a network route is a chain id, not a version id
       return await getTokenPolicies(context, versionId!);
-    case 'tokenPolicy':
-      return await getTokenPolicy(context, versionId!, second!);
-    case 'setTokenPolicy': {
+    case 'decision':
+      return await route.decision.read(context, route.match!);
+    case 'setDecision': {
       /*
-       * A strategic decision changes which tokens the API offers for
-       * discovery, so it carries a reason like every other decision, and the
-       * audit event stores it beside the actor.
+       * A decision changes what the API serves, so it carries a reason, and
+       * the audit event stores it beside the actor.
        */
-      requireExactKeys(body, [ 'isStrategic', 'reason' ]);
-      if (typeof(body.isStrategic) !== 'boolean') {
-        throw new ApiError('BAD_REQUEST', `isStrategic must be a boolean`);
-      }
-      return await patchTokenPolicy(context, versionId!, second!, {
-        isStrategic: body.isStrategic,
-        reason:      requireReason(body),
-      });
-    }
-    case 'exportTokenPolicies':
-      return await getTokenPolicyExport(context);
-    case 'reviewTokenPolicies':
-      return await postTokenPolicyReview(context, decisionListOf(body, TOKEN_POLICY_LIST));
-    case 'applyTokenPolicies':
-      return await postTokenPolicyApply(context, decisionListOf(body, TOKEN_POLICY_LIST));
-    case 'collateral':
-      // a chain id, the Comet and the token, as on the token routes
-      return await route.collateral.read(context, versionId!, second!, third!);
-    case 'setCollateral': {
-      /*
-       * A decision about a collateral changes which tokens discovery shows,
-       * and a deprecated one which collaterals the frontend offers, so it
-       * carries a reason like every other decision, and the audit event
-       * stores it beside the actor.
-       */
-      const { flag } = route.collateral;
+      const { flag } = route.decision;
       requireExactKeys(body, [ flag, 'reason' ]);
       const value = body[flag];
       if (typeof(value) !== 'boolean') {
         throw new ApiError('BAD_REQUEST', `${flag} must be a boolean`);
       }
-      return await route.collateral.set(context, versionId!, second!, third!, { flag: value, reason: requireReason(body) });
+      return await route.decision.set(context, route.match!, { flag: value, reason: requireReason(body) });
     }
-    case 'exportCollaterals':
-      return await route.collateral.export(context);
-    case 'reviewCollaterals':
-      return await route.collateral.review(context, body);
-    case 'applyCollaterals':
-      return await route.collateral.apply(context, body);
+    case 'exportDecisions':
+      return await route.decision.export(context);
+    case 'reviewDecisions':
+      return await route.decision.review(context, body);
+    case 'applyDecisions':
+      return await route.decision.apply(context, body);
   }
 }
 

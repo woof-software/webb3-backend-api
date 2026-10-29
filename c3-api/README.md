@@ -81,7 +81,9 @@ collaterals of which Comets an administrator has marked legacy, with the audit
 of every change, and `0007` renames them deprecated collaterals: tables,
 columns, view, indexes and triggers alike. `0008` stores which collaterals of
 which Comets an administrator has hidden from token discovery, with the audit
-of every change. The Agreements migration takes the next free number.
+of every change, and `0009` which markets an administrator has marked
+inactive, with the audit of every change. The Agreements migration takes the
+next free number.
 
 Apply migrations to the local Miniflare database under `.wrangler/state`:
 ```sh
@@ -98,11 +100,13 @@ npm run d1:migrate:production
 
 CI applies the migrations before it deploys, so a migration has to work with
 the release deployed before it, which serves until the deploy that follows.
+`0009`, like `0008`, only adds objects of its own — tables, their indexes and
+triggers, and a view — and no trigger on a table an earlier one created.
 
 The Comet registry also binds `kv_registry` for its snapshot cache, its
-last check of the chain and the deprecated and the hidden collateral
-decisions it last recorded, two rate limiters for its administrative routes,
-and an hourly Cron trigger for its resumable sync.
+last check of the chain, and the deprecated and the hidden collateral
+decisions and the inactive markets it last recorded, two rate limiters for
+its administrative routes, and an hourly Cron trigger for its resumable sync.
 `REGISTRY_ADMIN_AUTH_RATE_LIMITER` counts every request under
 `/registry/v1/admin/` before its token is checked, 60 a minute for each
 client address (`CF-Connecting-IP`; an IPv6 client by its /64), so wrong
@@ -176,8 +180,9 @@ statements or batches — and about thirty for the run.
 
 `wrangler.toml` sets no `[limits]`, so stage and production have the plan's
 defaults: an import of the whole source, or the summary of every market — four
-calls to the node provider proxy per network, and three D1 statements for the
-decisions it marks collaterals with ([Token Visibility](#token-visibility)) —
+calls to the node provider proxy per network, and four D1 statements for the
+decisions, three it marks collaterals with ([Token Visibility](#token-visibility))
+and one of the inactive markets ([Inactive Markets](#inactive-markets)) —
 stays far inside its subrequests. The history of every market, with none of
 its days cached, stays inside them as well: three calls to the proxy per
 market and one per network, beside four KV operations for each day of each
@@ -333,7 +338,11 @@ are not cached with it. `/active` and the market reads read them beside the
 pointer, in one more statement for each kind, and mark the version's
 collaterals with them in the answer; the answer's `ETag` names the flags it
 carries, so a decision that changes them is never confirmed with a `304` to a
-client holding a copy made before it.
+client holding a copy made before it. The inactive markets
+([Inactive Markets](#inactive-markets)) are no part of a version either. Of
+the public reads, only `/summary` reads them, in one more statement, and no
+public `/registry/v1` read carries them, so no `ETag` names them; under
+`/registry/v1/admin/`, only the inactive market routes answer them.
 
 When D1 cannot be reached at all, a request is answered from the version D1
 last named, for up to `REGISTRY_STALE_FALLBACK_MAX_S` after that. Such a
@@ -347,11 +356,13 @@ answers "no version is active" is an answer, not an outage: it is served as
 `503 REGISTRY_NOT_ACTIVE`, never from the cache; and a D1 that answers with a
 fault, such as a table a migration has not created yet, is a `500`, never
 masked by the cache. The routes that read the token policy, deprecated
-collateral or hidden collateral tables are the one exception, for those
-tables: without migration `0005` the token policy routes, without `0007`
-`/active`, the market reads and the deprecated collateral routes, and without
-`0008` the same reads and the hidden collateral routes, answer
-`503 UPSTREAM_UNAVAILABLE`, naming the migrations to apply.
+collateral, hidden collateral or inactive market tables are the one
+exception, for those tables: without migration `0005` the token policy
+routes, without `0007` `/active`, the market reads and the deprecated
+collateral routes, without `0008` the same reads and the hidden collateral
+routes, and without `0009` the inactive market routes, answer
+`503 UPSTREAM_UNAVAILABLE`, naming the migrations to apply. `/summary`
+answers without `0009` with every market active, and logs why.
 
 During an outage `/active` and the market reads mark deprecated and hidden
 collaterals by the decisions the worker last recorded in `kv_registry`, in a
@@ -366,8 +377,12 @@ it puts back the decisions before it, until the next check puts that right,
 within about five minutes while the reads go on. An answer that could read
 the version but not the decisions, of one kind or both, is marked the same
 way, as `X-Registry-Stale: 0`, and one with either kind not recorded to
-answer with is `503 UPSTREAM_UNAVAILABLE`. With the window at `0` nothing is
-recorded, and nothing is answered from the records.
+answer with is `503 UPSTREAM_UNAVAILABLE`. `/summary` answers whether each
+market is inactive from the record of the inactive markets in the same way,
+which every command that decides about a market keeps, and marks the answer
+the same way; with nothing recorded it answers every market active rather
+than `503`. With the window at `0` nothing is recorded, and nothing is
+answered from the records.
 
 An operator changes what the API serves by importing, reviewing, validating
 and activating a version; see the admin routes in [./API.md](./API.md). The
@@ -692,6 +707,96 @@ committed, apart from the deprecated ones, and `/active`, the market reads and
 ([What a request reads](#what-a-request-reads)). Nothing is hidden when an
 environment is brought up: there is no list to seed.
 
+# Inactive Markets
+
+An administrator can mark a market inactive: one the app takes no new
+deposits or loans in and lists apart, while those who hold positions in it
+still withdraw and repay. This replaces the list of chains the frontend kept
+itself, `INACTIVE_CHAIN_IDS` (Linear COM-19), which listed apart every market
+of six chains. `/summary` says of every market, in all three forms and
+whatever it reads of it, whether it is inactive (`is_inactive`, right after
+`is_institutional`): `true` only for a market with an inactive decision in
+force, and `false` for every other one, as for every market while the
+decisions cannot be read. Nothing else changes: no public `/registry/v1` read
+carries the decision — only the inactive market routes under
+`/registry/v1/admin/` answer it, as `isInactive` — and the market's
+collaterals are decided and valued as any market's
+([Token Visibility](#token-visibility)).
+
+It is not the market's lifecycle status. A status is part of a registry
+version, so changing one takes a new version, and it means something else: a
+`deprecated` market no longer counts toward a token's `is_network_deprecated`
+and cannot be the default, and a `disabled` one is not served at all, which
+would cut off those who hold positions in it. A market the app lists apart
+stays `enabled` and is marked inactive.
+
+A decision belongs to the market as the chain knows it — a chain id and the
+Comet's address — and not to a registry version, as a decision about a
+collateral does, so it survives every activation and comes back with a
+version that brings the market back. The chain is part of it because the
+registry holds a Comet once on a chain, not once in a version: production
+holds `0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf` as both Base's USDbC
+market and Arbitrum's USDC market, and those are two markets, decided apart.
+And a decision is about one Comet: a market the source adds later on a chain
+whose markets are inactive, or a new Comet the source gives a deployment key
+there, is not inactive until an administrator marks it so. It is decided
+only for a market the active version holds, of any status, and a market
+nobody has decided about is not inactive, without a row. Every change is
+written in one D1 transaction with its audit event, and migration `0009`
+enforces that in the database as `0008` does for hidden collaterals, in
+tables of its own. It only adds them, so the release before it runs on
+beside them; a Worker rolled back to that release answers `/summary` without
+`is_inactive`, which a client reads as every market active, while the
+decisions and their record stay for the release that reads them.
+
+The routes are those of the decisions about collaterals, for a market in
+place of a collateral, under the same limiter budgets: marking a market and
+applying a list share the `policy` one, and the reads and the review count
+as reads. One market is marked with
+`PATCH …/networks/{chain_id}/markets/{comet}/inactive`, with exactly
+`{ "isInactive": true, "reason": "…" }`, and a list is exported, reviewed
+without writing anything, and applied in one transaction, with its rows under
+`inactiveMarkets`, each a market by its chain and its Comet, with its
+deployment key for the person editing it:
+
+```sh
+curl -s "$API/registry/v1/admin/inactive-markets" -H "Authorization: Bearer $TOKEN" > inactive-markets.json
+# edit inactive-markets.json: "isInactive": true on the markets to mark inactive, and "reason"
+curl -s -X POST "$API/registry/v1/admin/inactive-markets/review" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data @inactive-markets.json > review.json
+jq 'if .error then .error else .summary end' review.json
+# apply the rows the review shows as changes
+jq 'if .error then error("the review failed: \(.error.message)")
+    elif .summary.problems > 0 then error("the review found problems: fix the file and review it again")
+    elif .summary.change == 0 then error("the review shows no change: there is nothing to apply")
+    else {reason: null, inactiveMarkets: [.inactiveMarkets[] | select(.action == "change") | {chainId, cometAddress, deploymentKey, isInactive: .requested, reason}]}
+    end' review.json > reviewed.json \
+  && curl -s -X POST "$API/registry/v1/admin/inactive-markets/apply" -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' --data @reviewed.json \
+  | jq 'if .error then .error else .summary end'
+```
+
+A row of the list names no token, so the filter keeps only the members a row
+of this list has: one adapted from the filters of the collateral lists would
+write `tokenAddress` and `symbol` as `null`, and the list refuses them. The
+runbook has the steps
+([Marking a market inactive](./REGISTRY_RUNBOOK.md#marking-a-market-inactive)).
+Every command records the inactive markets in force in `kv_registry` once it
+has committed, and `/summary` answers with that record while D1 cannot be
+reached ([What a request reads](#what-a-request-reads)).
+
+The frontend's list of chains is not seeded by a migration, for the reason
+the deprecated collaterals are not. It is checked in beside the registry
+seed, as
+[`registry/seed/production.inactive-markets.json`](./registry/seed/README.md#the-inactive-markets):
+the ten markets of the six chains, Unichain, Polygon, Ronin, Mantle, Linea and
+Scroll, with every Comet address, in a list the review and apply routes take
+as it is. A first bring-up reviews it and applies it once its first version
+is on, right after the deprecated collaterals
+([REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md#8-mark-the-initial-inactive-markets)),
+and the runbook says where each address comes from
+([The initial list of inactive markets](./REGISTRY_RUNBOOK.md#the-initial-list-of-inactive-markets)).
+
 # Token Visibility
 
 `/summary` says of each collateral whether token discovery shows its token in
@@ -704,7 +809,8 @@ when it is strategic ([Token Policies](#token-policies)), when what that
 market holds of it is worth at least USD 250,000, or when that value cannot
 be read, and is not shown otherwise. What the other markets of the chain hold
 of the token, or decide about it, takes no part, and every market the active
-version serves is decided so, whatever its status. The value is computed with
+version serves is decided so, whatever its status, and whether or not it is
+inactive ([Inactive Markets](#inactive-markets)). The value is computed with
 the market, never stored in D1, and compared exactly, in fixed point.
 
 The words of the rule, as these sections, API.md and the code use them:
@@ -729,7 +835,12 @@ The words of the rule, as these sections, API.md and the code use them:
   `/registry/v1/active`, as `is_deprecated` is in `/summary`;
   `is_network_deprecated` says that an enabled market takes the token, and
   that every one that does has it deprecated. `isHidden` is only ever a
-  Comet's decision.
+  Comet's decision;
+- an _inactive_ market is one an administrator marked so, which the app
+  takes no new deposits or loans in: in the words above it is still served,
+  and still takes, offers and leaves to discovery what it did. It is neither
+  a market whose status is `deprecated` nor one the active version does not
+  hold (`inActiveVersion: false` on the administrative reads).
 
 A market's collateral is valued with the rest of its summary, from the same
 reads: what the Comet holds of each collateral and its price, at the market's

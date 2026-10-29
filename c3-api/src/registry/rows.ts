@@ -261,6 +261,30 @@ type DeprecatedCollateralEventRow = CollateralDecisionEventRow<'is_deprecated'>;
 type HiddenCollateralRow          = CollateralDecisionRow<'is_hidden'>;
 type HiddenCollateralEventRow     = CollateralDecisionEventRow<'is_hidden'>;
 
+/*
+ * Inactive markets, from migrations/0009_inactive_markets.sql: the decisions
+ * an administrator makes about a market, kept by chain id and Comet address
+ * rather than on a versioned row, as the decisions about collaterals are.
+ */
+type InactiveMarketRow = {
+  chain_id:      number,
+  comet_address: Address,
+  is_inactive:   number,
+  updated_at:    string,
+  updated_by:    string,
+};
+
+type InactiveMarketEventRow = {
+  id:                   string,
+  chain_id:             number,
+  comet_address:        Address,
+  previous_is_inactive: number | null,
+  is_inactive:          number,
+  actor:                string,
+  reason:               string,
+  created_at:           string,
+};
+
 export type {
   CollateralDecisionEventRow,
   CollateralDecisionRow,
@@ -268,6 +292,8 @@ export type {
   DeprecatedCollateralRow,
   HiddenCollateralEventRow,
   HiddenCollateralRow,
+  InactiveMarketEventRow,
+  InactiveMarketRow,
   MarketAssetRow,
   MarketContractRow,
   MarketRow,
