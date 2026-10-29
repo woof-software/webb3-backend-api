@@ -578,7 +578,10 @@ search the third answer for `"status": "error"`.
 
 **You should see** the number of markets you reviewed, a
 `X-Registry-Version` header equal to `$V`, `200` from both routes over every
-network, and no market in `error`.
+network, and no market in `error`. On an environment whose KV namespaces are
+new, the history has no day cached yet and can answer `503`
+`UPSTREAM_UNAVAILABLE`, "a node provider did not answer", until it is warmed:
+[Warming the history](#warming-the-history), then check again.
 
 **If not.** A market in `error` with the message `creationBlock … is past
 the latest block, …` holds a creation block its chain has not reached. None
@@ -594,6 +597,12 @@ back as in its step 5 with the block its Comet was deployed in as
 the write holds the block against the chain. A market in `error` with
 another message reads a price feed that reverts
 ([A market that stopped answering](#a-market-that-stopped-answering)).
+
+A `503` "a node provider did not answer" from the history alone, while the
+summary over every network answers `200`, is no market's fault on an
+environment whose KV namespaces are new: warm the history
+([Warming the history](#warming-the-history)) and check again, and switch
+nothing back for it.
 
 Any other market those routes cannot read fails them for every market, with
 an answer other than `200`. The worker's log line `route failed` with the
@@ -2267,6 +2276,58 @@ not inactive until you mark it
 On develop the list's events name `registry-admin:woof`, the actor of that
 environment.
 
+## Warming the history
+
+The history of a market — `/market/<network>/<comet>/historical/summary`, and
+the same route over a network or every network — is its last 30 days, each
+read from the chain once and kept in the worker's KV for good. A worker whose
+KV namespaces are new has none of them: a first bring-up, a worker deployed
+with namespaces of its own, such as the test worker of a branch, or a
+release that changes the version of the day summaries, whose cached days sit
+under keys that name it. Its first history over every network then reads
+every market's 30 days in one request, some 1,500 reads for the largest
+market, and the node provider refuses part of such a burst. One read it does
+not serve fails the whole request: `503` `UPSTREAM_UNAVAILABLE`, "a node
+provider did not answer". The days read before it stay cached, so each
+attempt gets further. Warm the history network by network, then over every
+network:
+
+```sh
+for network in $(curl -s "$API/registry/v1/active" | jq -r '.networks[].key'); do
+  for attempt in 1 2 3 4 5 6; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$API/market/$network/all-contracts/historical/summary")
+    echo "$network $attempt $code"
+    [ "$code" = 200 ] && break
+    sleep 10
+  done
+done
+curl -s -o /dev/null -w '%{http_code}\n' "$API/market/all-networks/all-contracts/historical/summary"
+```
+
+Postman: send `GET {{API}}/market/<network>/all-contracts/historical/summary`
+for each network the version holds — the keys under `networks[].key` in
+`GET {{API}}/registry/v1/active` — and send it again, ten seconds later,
+while it answers `503`; then send
+`GET {{API}}/market/all-networks/all-contracts/historical/summary`.
+
+None needs the token. The reads go through the node provider proxy, which
+every worker of the environment shares: run one warm-up at a time, and
+expect another worker to answer a `503` now and then while it runs.
+
+**You should see** each network answer `200` within a few attempts, then
+`200` over every network. From then on a request reads the chain only for
+what it has not cached — each network's latest block, and once a day each
+market's new day — and answers within seconds.
+
+**If not.** A network that still answers `503` after six attempts: warm its
+markets one by one the same way, `/market/<network>/<comet>/historical/summary`
+for each Comet under `networks[].markets[].contracts.comet` in
+`/registry/v1/active`. A market whose history keeps failing while its own
+`…/summary` answers is a node provider that refuses that chain's reads now
+and then: its history answers `200` on one attempt and `503` on the next, and
+the history over every network fails with it. Show the node provider proxy's
+log for that chain to a developer, and switch nothing back or off for it.
+
 ## Keeping an eye on it
 
 One request tells you whether the registry is well:
@@ -2405,6 +2466,7 @@ whose reasons are in the draft it names.
 | `503 UPSTREAM_UNAVAILABLE` from `/active` and the market reads while the database cannot be reached, though other routes answer from the cache | No deprecated, or no hidden, collateral decisions are recorded in the environment's `kv_registry` to answer with: no read of `/active`, the market reads or `/summary`, and no decision of that kind, has recorded them since this release, or the record was removed | Nothing to change: once the database answers, the reads record them again, within five minutes at most |
 | Answers carry `X-Registry-Stale: <seconds>`, and the log has the error `registry database unreachable; answering from the version it last named` | The database could not be reached, so the API is answering from the version it last saw, and saying how old it is. Each isolate logs the error once a minute while this lasts | Check the database's health; the API recovers by itself once D1 answers, and starts returning `503` if the outage outlasts the configured window |
 | `503 UPSTREAM_UNAVAILABLE` from the market and registry routes, or from `/admin/status` | The database could not be reached, and there is no version within the window to answer from. Or, from a route that reads the chain — the market and account routes, transaction history, governance — the node provider proxy did not serve the request: no provider answered it, the worker could not reach the proxy or lost its answer, or the proxy answered a call with an error that is not a revert. Such an answer says `a node provider did not answer`, with the proxy's `Retry-After` when it sent one; the worker's log line `route failed` with the answer's `requestId` has the error — `HTTP 401` in it is the proxy refusing `NODE_PROXY_KEY` — and the proxy's own log has `upstream error` or `json-rpc error` | Check the database's health; nothing in the registry needs changing. For a node provider, fix the proxy, its binding or its key: the routes answer again as soon as it serves them |
+| `503 UPSTREAM_UNAVAILABLE`, "a node provider did not answer", from `…/historical/summary` over a network or every network, while the summary over every network answers `200` | The history reads days it has not cached — a first bring-up, a worker with KV namespaces of its own, or a release that changed the version of the day summaries — and the node provider refused part of that burst of reads; or the node provider refuses one chain's reads now and then. The days read before the failure stay cached | [Warming the history](#warming-the-history). Switch nothing back or off for it |
 | `500 INTERNAL` from the market and registry routes | The database answered with a fault — most often a release deployed before its migrations — or a bug, such as a call the contract reverted where the route needed its value. A node provider that did not answer is a `503`, not this. The worker's log line `route failed` or `registry route failed` with the answer's `requestId` has the error | Apply the migrations if they are missing; otherwise report the log line |
 | A market reports `"status": "error"` with the message `creationBlock … is past the latest block, …`, and the log has the warning `creation block not reached` naming its Comet | The active version holds a creation block the market's chain has not reached — one no overlay write checked, such as one an import inherited. None of the market's values can be read, so the market routes and `/account/{address}/rewards` answer it as `error`, and the other markets as usual. This stops by itself once the chain reaches the block, but the market's history then repeats the day of that block for every day before it | Switch back, or give the market the block its Comet was deployed in, as step 6 of [the first bring-up](#6-check-that-it-is-on) says — after the error has stopped by itself too |
 | The worker's log has the warning `computation cache unreadable` or `computation cache unwritable`, with what KV answered | KV refused a call to the namespace computed values are cached in, `kv_mainnet` or `kv_testnet`: `429` is a value written twice in a second, `503` KV not answering. The request was answered without the cache — a value it could not read was computed again from the chain, and one it could not write was not kept — so it was slower, and asked the node provider more. Each isolate says each once a minute while it lasts | Nothing for a `429` now and then. A `503` that keeps coming back is KV not answering: every request reads the chain while it lasts, and transaction history fails (the next row), so check Cloudflare's status and the node provider proxy |
