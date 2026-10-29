@@ -106,7 +106,7 @@ t.test('a validation, an activation and a rollback answer as committed, though n
 
 /*
  * A decision about a collateral records the decisions of its kind for an
- * outage once it has committed (collateral-decisions.ts), each kind under
+ * outage once it has committed (decision-records.ts), each kind under
  * its own key. A record the namespace does not take must not fail the
  * command either: the next read that finds the record behind writes it.
  */

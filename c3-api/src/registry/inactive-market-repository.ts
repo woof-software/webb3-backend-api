@@ -11,8 +11,19 @@ import type {
 
 import type { ApiError } from '../http/errors.js';
 
-import type { DecisionKind, Planned, StateRow } from './decision-store.js';
-import { activeVersionOf, applyDecisions, readDecision, reviewDecisions, setDecision } from './decision-store.js';
+import type { DecisionKind, DecisionList, KindNames, KindTables, Planned, StateRow } from './decision-store.js';
+import {
+  activeVersionOf,
+  activeVersionStatement,
+  applyDecisions,
+  decisionWrites,
+  historyOf,
+  identityOf,
+  member,
+  readDecision,
+  reviewDecisions,
+  setDecision,
+} from './decision-store.js';
 import { conflict } from './errors.js';
 import type { InactiveMarketEventRow, InactiveMarketRow } from './rows.js';
 import { rowsOf } from './sql-condition.js';
@@ -25,23 +36,22 @@ import { rowsOf } from './sql-condition.js';
  * keeps its lifecycle status, is served as any market is, and has its
  * collaterals decided and valued as any market's.
  *
- * A kind of the decision store (decision-store.ts), as token policies are,
- * with statements of its own: the template of the two kinds about a
- * collateral finds a token among a market's assets, and a market is the
- * subject here. This module describes a market to the store, answers in the
- * kind's own types (lib/model/comet-registry.ts), and reads what only these
- * decisions are read for. A decision is keyed by chain id and Comet address,
- * lowercase, rather than by a versioned market row, so it outlives every
- * activation; migration 0009 creates the tables and enforces the rest in the
- * database. A market of any status may be decided about: a decision about a
- * disabled one applies once it is served. Every read here that answers for
+ * A kind of the decision store (decision-store.ts), as token policies are:
+ * the store builds the statements every kind shares from the kind's tables
+ * (INACTIVE_MARKET_TABLES), and this module describes a market to it, answers
+ * in the kind's own types (lib/model/comet-registry.ts), and reads what only
+ * these decisions are read for. A decision is keyed by chain id and Comet
+ * address, lowercase, rather than by a versioned market row, so it outlives
+ * every activation; migration 0009 creates the tables and enforces the rest in
+ * the database. A market of any status may be decided about: a decision about
+ * a disabled one applies once it is served. Every read here that answers for
  * the active version resolves it in the same statement or batch as the
  * decisions, so an answer never names one version while describing another.
  *
  * Of the public reads, only /summary reads the decisions, on every request
  * (inactive-markets.ts, summary-tokens.ts); no public read of /registry/v1
  * carries them, and only the kind's own routes under /registry/v1/admin/
- * answer them (inactive-market-handlers.ts).
+ * answer them (decision-handlers.ts).
  */
 
 // how many changes one decision read lists, newest first; a market's decision changes rarely
@@ -69,14 +79,20 @@ type MarketDecision = MarketOfChain & {
 type MarketChange = MarketDecision & { reason: string, actor: string };
 
 type ListedMarketDecision = MarketDecision & { deploymentKey: string | null };
-type MarketDecisionList   = { reason: string | null, decisions: ListedMarketDecision[] };
+
+type FoundMarket = {
+  network_id:     string,
+  market_id:      string,
+  deployment_key: string,
+};
+
+type MissingMarket = {
+  market_id:      null,
+  deployment_key: null,
+};
 
 // each market of a JSON parameter (`c` its chain, `m` its Comet) as the active version and the stored decision describe it
-type MarketState = StateRow & {
-  market_id:      string | null,
-  deployment_key: string | null,
-  is_inactive:    number | null,
-};
+type MarketState = StateRow & (FoundMarket | MissingMarket) & { is_inactive: number | null };
 
 /*
  * The market is found by a subquery that names one row, so every market of
@@ -115,72 +131,60 @@ function statesStatement(db: D1Database, markets: string): D1PreparedStatement {
   ).bind(markets);
 }
 
-// why the active version cannot take a decision about the market: a chain it does not hold, or a Comet that is no market of it
-function missingFrom(state: MarketState, market: MarketOfChain): string | null {
+function marketIn(state: MarketState, market: MarketOfChain): { found: StateRow & FoundMarket } | { missing: string } {
   if (state.network_id === null) {
-    return `chain ${market.chainId} is not part of the active registry`;
+    return { missing: `chain ${market.chainId} is not part of the active registry` };
   }
   if (state.market_id === null) {
-    return `${market.cometAddress} is not a market of the active registry on chain ${market.chainId}`;
+    return { missing: `${market.cometAddress} is not a market of the active registry on chain ${market.chainId}` };
   }
-  return null;
+  return { found: state };
 }
 
-// the statements of a write, which writeDecisions (decision-store.ts) explains: a market without a row is not inactive
-const WRITE_EVENTS = `
-  INSERT INTO inactive_market_events (
-    id, chain_id, comet_address, previous_is_inactive, is_inactive, actor, reason, created_at
-  )
-  SELECT json_extract(row.value, '$.i'), json_extract(row.value, '$.c'), json_extract(row.value, '$.m'),
-         decision.is_inactive, json_extract(row.value, '$.s'), ?2, json_extract(row.value, '$.r'), ?3
-  FROM json_each(?1) AS row
-  LEFT JOIN inactive_markets AS decision
-    ON decision.chain_id = json_extract(row.value, '$.c')
-   AND decision.comet_address = json_extract(row.value, '$.m')
-  WHERE json_extract(row.value, '$.r') IS NOT NULL
-    AND COALESCE(decision.is_inactive, 0) <> json_extract(row.value, '$.s')
-  ORDER BY row.key`;
+function missingFrom(state: MarketState, market: MarketOfChain): string | null {
+  const held = marketIn(state, market);
+  return 'missing' in held ? held.missing : null;
+}
 
-const WRITE_DECISIONS = `
-  INSERT INTO inactive_markets (chain_id, comet_address, is_inactive, updated_at, updated_by)
-  SELECT json_extract(row.value, '$.c'), json_extract(row.value, '$.m'), json_extract(row.value, '$.s'), ?3, ?2
-  FROM json_each(?1) AS row
-  LEFT JOIN inactive_markets AS decision
-    ON decision.chain_id = json_extract(row.value, '$.c')
-   AND decision.comet_address = json_extract(row.value, '$.m')
-  WHERE json_extract(row.value, '$.r') IS NOT NULL
-    AND COALESCE(decision.is_inactive, 0) <> json_extract(row.value, '$.s')
-  ORDER BY row.key
-  ON CONFLICT (chain_id, comet_address) DO UPDATE
-  SET is_inactive = excluded.is_inactive, updated_at = excluded.updated_at, updated_by = excluded.updated_by`;
-
-const EXPECT_DECISIONS = `
-  INSERT INTO inactive_market_expectations (chain_id, comet_address, is_inactive)
-  SELECT json_extract(row.value, '$.c'), json_extract(row.value, '$.m'), json_extract(row.value, '$.s')
-  FROM json_each(?1) AS row`;
+// the tables of migrations/0009_inactive_markets.sql: a market without a row is not inactive
+const INACTIVE_MARKET_TABLES: KindTables<MarketOfChain> = {
+  decisions:    'inactive_markets',
+  events:       'inactive_market_events',
+  expectations: 'inactive_market_expectations',
+  flag:         'is_inactive',
+  previous:     'previous_is_inactive',
+  keys:         { chainId: [ 'c', 'chain_id' ], cometAddress: [ 'm', 'comet_address' ] },
+  alias:        'decision',
+};
 
 /*
- * Inactive markets, as the store takes them. A decision is about a market the
- * registry serves, or may serve; one about a Comet the active version does
- * not hold would be a decision nobody could check.
+ * Inactive markets, as the store takes them and as their routes and their
+ * record name them (admin-router.ts, inactive-markets.ts). A decision is about
+ * a market the registry serves, or may serve; one about a Comet the active
+ * version does not hold would be a decision nobody could check.
  */
-const INACTIVE_MARKET_KIND: DecisionKind<MarketOfChain, MarketDecision, ListedMarketDecision, MarketState> = {
+const INACTIVE_MARKET_KIND: DecisionKind<MarketOfChain, MarketDecision, ListedMarketDecision, MarketState>
+  & KindNames<'isInactive', 'inactiveMarkets'> & { recordKey: string } = {
   label:       'inactive market',
   listOf:      'inactive markets',
+  flag:        'isInactive',
+  listKey:     'inactiveMarkets',
+  segment:     'inactive',
+  listPath:    'inactive-markets',
+  recordKey:   'inactive-markets:v1',
   subject:     'market',
-  identity:    market => ({ c: market.chainId, m: market.cometAddress }),
+  identity:    identityOf(INACTIVE_MARKET_TABLES),
   keyOf:       chainCometKey,
   flagOf:      decision => decision.isInactive,
   storedOf:    state => state.is_inactive,
   states:      statesStatement,
-  writes:      { events: WRITE_EVENTS, rows: WRITE_DECISIONS, expectations: EXPECT_DECISIONS },
+  writes:      decisionWrites(INACTIVE_MARKET_TABLES),
   leftAbort:   'market is not in the active registry',
   missingFrom,
   misnamed:    (decision, state) => decision.deploymentKey !== null && state.deployment_key !== decision.deploymentKey
     ? `the list names ${decision.cometAddress} ${decision.deploymentKey}, which the active registry calls ${state.deployment_key}`
     : null,
-  addressOf:   market => market.cometAddress,
-  named:       (state, market) => state.deployment_key ?? market.cometAddress,
+  named:       (state, market) => `${market.cometAddress} (${state.deployment_key ?? market.cometAddress})`,
 };
 
 // the refusal of one market's decision, which a version activated meanwhile without the market aborted
@@ -204,22 +208,16 @@ async function setInactiveMarket(db: D1Database, change: MarketChange): Promise<
 }
 
 /*
- * One market's decision and the changes that led to it (readDecision), newest
- * committed first, which is rowid order (migrations/0009_inactive_markets.sql
- * says why), so the first one is always the change that set the decision in
- * force.
+ * One market's decision and the changes that led to it (readDecision), the
+ * first of which is always the change that set the decision in force
+ * (historyOf; migrations/0009_inactive_markets.sql says why).
  */
 async function readInactiveMarket(db: D1Database, market: MarketOfChain): Promise<InactiveMarketDetailV1> {
   const { registryVersion, state, events } = await readDecision(
     db,
     INACTIVE_MARKET_KIND,
     market,
-    () => db.prepare(
-      `SELECT * FROM inactive_market_events
-       WHERE chain_id = ?1 AND comet_address = ?2
-       ORDER BY rowid DESC
-       LIMIT ?3`
-    ).bind(market.chainId, market.cometAddress, MAX_MARKET_EVENTS),
+    () => historyOf(db, INACTIVE_MARKET_TABLES, market, MAX_MARKET_EVENTS),
   );
   return {
     registryVersion,
@@ -241,22 +239,6 @@ async function readInactiveMarket(db: D1Database, market: MarketOfChain): Promis
 }
 
 /*
- * The markets marked inactive, of every chain, for /summary: one statement,
- * through the kind's partial index. Like the reads that mark collaterals
- * (collateral-decision-repository.ts, readMarkedCollaterals), it does not
- * resolve the active version: the summary answers for the version its catalog
- * names, and a decision belongs to no version.
- */
-async function readInactiveMarkets(db: D1Database): Promise<MarketOfChain[]> {
-  const { results } = await db.prepare(
-    `SELECT chain_id, comet_address FROM inactive_markets
-     WHERE is_inactive = 1
-     ORDER BY chain_id, comet_address`
-  ).all<{ chain_id: number, comet_address: Address }>();
-  return (results ?? []).map(row => ({ chainId: row.chain_id, cometAddress: row.comet_address }));
-}
-
-/*
  * The export, as one batch for one version: the active version; every market
  * of it, disabled ones included, with the decision in force; and the
  * decisions kept for markets it does not hold, each of which applies again if
@@ -264,12 +246,7 @@ async function readInactiveMarkets(db: D1Database): Promise<MarketOfChain[]> {
  */
 function exportStatements(db: D1Database): D1PreparedStatement[] {
   return [
-    db.prepare(
-      `SELECT state.active_version_id AS version_id, version.snapshot_checksum AS checksum
-       FROM registry_state AS state
-       LEFT JOIN registry_versions AS version ON version.id = state.active_version_id
-       WHERE state.singleton_id = 1`
-    ),
+    activeVersionStatement(db),
     db.prepare(
       `SELECT network.chain_id AS chain_id, contract.address AS comet_address, market.deployment_key AS deployment_key,
               COALESCE(decision.is_inactive, 0) AS is_inactive
@@ -318,13 +295,16 @@ async function exportInactiveMarkets(
   const registryVersion = activeVersionOf(rowsOf<{ version_id: string | null, checksum: string | null }>(pointer)[0]);
   return {
     registryVersion,
-    reason:          null,
-    inactiveMarkets: rowsOf<{ chain_id: number, comet_address: Address, deployment_key: string, is_inactive: number }>(listed).map(row => ({
-      chainId:       row.chain_id,
-      cometAddress:  row.comet_address,
-      deploymentKey: row.deployment_key,
-      isInactive:    row.is_inactive === 1,
-    })),
+    reason: null,
+    ...member(
+      INACTIVE_MARKET_KIND.listKey,
+      rowsOf<{ chain_id: number, comet_address: Address, deployment_key: string, is_inactive: number }>(listed).map(row => ({
+        chainId:       row.chain_id,
+        cometAddress:  row.comet_address,
+        deploymentKey: row.deployment_key,
+        isInactive:    row.is_inactive === 1,
+      })),
+    ),
     retained: rowsOf<InactiveMarketRow>(kept).map(row => ({
       chainId:      row.chain_id,
       cometAddress: row.comet_address,
@@ -337,33 +317,26 @@ async function exportInactiveMarkets(
 
 /*
  * How applying a list is refused: a row that cannot be applied, named by its
- * market; a version activated meanwhile without one of the list's markets;
- * and a decision someone made meanwhile on a row the list leaves as it is.
+ * market, and a version activated meanwhile without one of the list's
+ * markets.
  */
 const LIST_REFUSALS = {
   // typed by what it reads, so that applyDecisions takes the type of a row's state from the kind rather than from it
   problemOf: ({ row, decision, problem }: Pick<Planned<MarketOfChain, MarketState>, 'row' | 'decision' | 'problem'>) => (
     { row, chainId: decision.chainId, cometAddress: decision.cometAddress, problem }
   ),
-  conflicts: {
-    left: () => conflict(
-      'MARKET_LEFT_REGISTRY',
-      `a version that does not hold every market of the list was activated while it was being applied; nothing was written`,
-    ),
-    changed: () => conflict(
-      'DECISION_CHANGED',
-      `a decision of the list was changed by someone else while it was being applied; nothing was written`,
-    ),
-  },
+  left:      () => conflict(
+    'MARKET_LEFT_REGISTRY',
+    `a version that does not hold every market of the list was activated while it was being applied; nothing was written`,
+  ),
 };
 
-// each row of a review says what the active version calls its market, and what applying the list would do
-async function reviewInactiveMarkets(db: D1Database, list: MarketDecisionList): Promise<InactiveMarketReviewV1> {
+async function reviewInactiveMarkets(db: D1Database, list: DecisionList<ListedMarketDecision>): Promise<InactiveMarketReviewV1> {
   const { registryVersion, summary, planned } = await reviewDecisions(db, INACTIVE_MARKET_KIND, list);
   return {
     registryVersion,
     summary,
-    inactiveMarkets: planned.map(({ row, decision, state, current, action, problem }) => ({
+    ...member(INACTIVE_MARKET_KIND.listKey, planned.map(({ row, decision, state, current, action, problem }) => ({
       row,
       chainId:       decision.chainId,
       cometAddress:  decision.cometAddress,
@@ -373,7 +346,7 @@ async function reviewInactiveMarkets(db: D1Database, list: MarketDecisionList): 
       action,
       reason:        decision.reason,
       problem,
-    })),
+    }))),
   };
 }
 
@@ -383,37 +356,37 @@ async function reviewInactiveMarkets(db: D1Database, list: MarketDecisionList): 
  * row's market (writeDecisions), so each row's market is found; one that is
  * not is a defect, and must not be answered as written.
  */
-async function applyInactiveMarkets(db: D1Database, list: MarketDecisionList, actor: string): Promise<InactiveMarketApplyV1> {
+async function applyInactiveMarkets(db: D1Database, list: DecisionList<ListedMarketDecision>, actor: string): Promise<InactiveMarketApplyV1> {
   const { registryVersion, summary, applied } = await applyDecisions(db, INACTIVE_MARKET_KIND, list, actor, LIST_REFUSALS);
   return {
     registryVersion,
     summary,
-    inactiveMarkets: applied.map(({ row, decision, state }) => {
-      const missing = missingFrom(state, decision);
-      if (missing !== null) {
-        throw new Error(`a list of ${INACTIVE_MARKET_KIND.listOf} was applied with a row the active registry does not hold: ${missing}`);
+    ...member(INACTIVE_MARKET_KIND.listKey, applied.map(({ row, decision, state }) => {
+      const held = marketIn(state, decision);
+      if ('missing' in held) {
+        throw new Error(`a list of ${INACTIVE_MARKET_KIND.listOf} was applied with a row the active registry does not hold: ${held.missing}`);
       }
       return {
         row,
         chainId:       decision.chainId,
         cometAddress:  decision.cometAddress,
-        deploymentKey: state.deployment_key!,
+        deploymentKey: held.found.deployment_key,
         isInactive:    state.is_inactive === 1,
         changed:       state.written_id !== null,
         updatedAt:     state.updated_at,
       };
-    }),
+    })),
   };
 }
 
-export type { ListedMarketDecision, MarketChange, MarketDecisionList, MarketOfChain };
+export type { ListedMarketDecision, MarketOfChain };
 export {
   INACTIVE_MARKET_KIND,
+  INACTIVE_MARKET_TABLES,
   applyInactiveMarkets,
   chainCometKey,
   exportInactiveMarkets,
   readInactiveMarket,
-  readInactiveMarkets,
   reviewInactiveMarkets,
   setInactiveMarket,
 };

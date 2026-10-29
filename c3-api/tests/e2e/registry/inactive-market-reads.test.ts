@@ -2,14 +2,8 @@ import t from 'tap';
 
 import C3Api, { Env } from '../../../entrypoint.js';
 import type { Address } from '../../../lib/model/comet-registry.js';
-import {
-  DEPRECATED_KEY,
-  DEPRECATED_RECORD,
-  HIDDEN_KEY,
-  HIDDEN_RECORD,
-  markedDecisions,
-  recordCollaterals,
-} from '../../../src/registry/collateral-decisions.js';
+import { DEPRECATED_KEY, DEPRECATED_RECORD, HIDDEN_KEY, HIDDEN_RECORD } from '../../../src/registry/collateral-decisions.js';
+import { markedDecisions, recordDecisions } from '../../../src/registry/decision-records.js';
 import { INACTIVE_KEY, INACTIVE_RECORD } from '../../../src/registry/inactive-markets.js';
 
 import { executionContext, settledWithin } from '../../util/execution-context.js';
@@ -19,7 +13,17 @@ import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
 import { ADMIN_TOKEN, failingStatements } from '../../util/test-env.js';
 
-import { DEPRECATED_READS, HIDDEN_READS, bindingOf, captureLogs, depsOf, envOf, fixture, get } from './collateral-read-scenarios.js';
+import {
+  DEPRECATED_READS,
+  HIDDEN_READS,
+  bindingOf,
+  captureLogs,
+  depsOf,
+  envOf,
+  fixture,
+  get,
+  recorded as recordedCollaterals,
+} from './collateral-read-scenarios.js';
 import { INACTIVE_MARKETS, statementsOf } from './decision-scenarios.js';
 
 import '../../../shim/node-self.js';
@@ -36,7 +40,7 @@ import '../../../shim/node-self.js';
  *
  * How a record is kept in step under load and races is the deprecated kind's
  * to test (deprecated-collateral-reads.test.ts): every kind keeps its record
- * by the same code (collateral-decisions.ts), the inactive markets too; what
+ * by the same code (decision-records.ts), the inactive markets too; what
  * tells one set of inactive markets from another, and so whether a record
  * holds them, is their own (inactive-markets.ts), which the second test
  * holds. And no public read of /registry/v1 carries an inactive market, which
@@ -131,7 +135,7 @@ t.test('a read takes the inactive markets from the database, and from the record
 
   const handed: Array<Promise<unknown>> = [];
   const read = await markedDecisions(INACTIVE_RECORD, { ...depsOf(registry.db, kv, warnings), defer: work => { handed.push(work); } });
-  t.same([ read.recorded, read.decisions.markets ], [ false, [ usdt ] ], 'a read takes the decisions from the database');
+  t.same([ read.recorded, read.decisions.subjects ], [ false, [ usdt ] ], 'a read takes the decisions from the database');
   t.equal(handed.length, 1, 'and hands the check of the record to waitUntil');
   await Promise.all(handed);
   t.same(await recorded(kv), [ usdt ], 'which records them');
@@ -143,7 +147,7 @@ t.test('a read takes the inactive markets from the database, and from the record
 
   const unreachable = failingStatements(registry.db, statementsOf(INACTIVE_MARKETS));
   const fallback = await markedDecisions(INACTIVE_RECORD, depsOf(unreachable, kv, warnings));
-  t.same([ fallback.recorded, fallback.decisions.markets ], [ true, [ usdt ] ],
+  t.same([ fallback.recorded, fallback.decisions.subjects ], [ true, [ usdt ] ],
     'while the database does not give them, a read answers with the record, and says so');
   t.ok(fallback.decisions.has(usdt), 'which marks the market on its own chain');
   t.notOk(fallback.decisions.has({ ...usdt, chainId: 8453 }), 'and not the same Comet on another');
@@ -164,7 +168,7 @@ t.test('a read takes the inactive markets from the database, and from the record
       `nor with a record that is not one: ${JSON.stringify(record)}`);
   }
   const checksummed = MemoryKv({ seed: { [INACTIVE_KEY]: { at: '2026-10-27T09:00:00.000Z', markets: [ { ...usdt, cometAddress: USDT.toUpperCase().replace('0X', '0x') } ] } } });
-  t.same((await markedDecisions(INACTIVE_RECORD, depsOf(unreachable, checksummed))).decisions.markets, [ usdt ],
+  t.same((await markedDecisions(INACTIVE_RECORD, depsOf(unreachable, checksummed))).decisions.subjects, [ usdt ],
     'while a record that names a Comet in another case names the same market');
 
   const windowless = { ...depsOf(registry.db, MemoryKv({})), staleSeconds: 0 };
@@ -190,23 +194,24 @@ t.test('the inactive markets and the decisions about collaterals are recorded ap
   await markedDecisions(INACTIVE_RECORD, deps);
   await markedDecisions(DEPRECATED_RECORD, deps);
   await markedDecisions(HIDDEN_RECORD, deps);
-  t.same(await recorded(kv), [], 'a read of each kind, none decided, writes each record');
+  t.same([ await recorded(kv), await recordedCollaterals(kv, DEPRECATED_KEY), await recordedCollaterals(kv, HIDDEN_KEY) ], [ [], [], [] ],
+    'a read of each kind, none decided, writes each record');
 
   const collaterals = [ await kv.get(DEPRECATED_KEY), await kv.get(HIDDEN_KEY) ];
   await decide(registry.db, USDT, true);
-  await recordCollaterals(INACTIVE_RECORD, deps);
+  await recordDecisions(INACTIVE_RECORD, deps);
   t.same(await recorded(kv), [ { chainId: 1, cometAddress: USDT } ], 'a market command records the inactive markets');
   t.same([ await kv.get(DEPRECATED_KEY), await kv.get(HIDDEN_KEY) ], collaterals,
     'and leaves the records of the decisions about collaterals byte for byte as they were');
 
   const markets = await kv.get(INACTIVE_KEY);
   await decideCollateral(DEPRECATED_READS, 'usdc', 'weETH', true);
-  await recordCollaterals(DEPRECATED_RECORD, deps);
+  await recordDecisions(DEPRECATED_RECORD, deps);
   await decideCollateral(HIDDEN_READS, 'wbtc', 'LBTC', true);
-  await recordCollaterals(HIDDEN_RECORD, deps);
-  t.same((await markedDecisions(DEPRECATED_RECORD, deps)).decisions.collaterals, [ collateral('usdc', 'weETH') ], 'while the collateral commands record their own');
+  await recordDecisions(HIDDEN_RECORD, deps);
+  t.same((await markedDecisions(DEPRECATED_RECORD, deps)).decisions.subjects, [ collateral('usdc', 'weETH') ], 'while the collateral commands record their own');
   t.equal(await kv.get(INACTIVE_KEY), markets, 'and leave the record of the inactive markets byte for byte as it was');
-  t.same((await markedDecisions(INACTIVE_RECORD, deps)).decisions.markets, [ { chainId: 1, cometAddress: USDT } ], 'whose decisions are their own');
+  t.same((await markedDecisions(INACTIVE_RECORD, deps)).decisions.subjects, [ { chainId: 1, cometAddress: USDT } ], 'whose decisions are their own');
 });
 
 /*
@@ -235,9 +240,9 @@ t.test('each kind writes its record in the bytes it always has, the inactive mar
   const kv = MemoryKv({});
   const deps = { db, kv, ttlSeconds: 300, staleSeconds: 3600, debug: quietLog, now: () => new Date('2026-10-27T09:00:00.000Z') };
 
-  await recordCollaterals(DEPRECATED_RECORD, deps);
-  await recordCollaterals(HIDDEN_RECORD, deps);
-  await recordCollaterals(INACTIVE_RECORD, deps);
+  await recordDecisions(DEPRECATED_RECORD, deps);
+  await recordDecisions(HIDDEN_RECORD, deps);
+  await recordDecisions(INACTIVE_RECORD, deps);
   t.equal(await kv.get(DEPRECATED_KEY),
     '{"at":"2026-10-27T09:00:00.000Z","collaterals":[{"chainId":1,"cometAddress":"0x3afdc9bca9213a35503b077a6072f3d0d5ab0840","tokenAddress":"0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa"},{"chainId":1,"cometAddress":"0x3afdc9bca9213a35503b077a6072f3d0d5ab0840","tokenAddress":"0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee"}]}',
     'the deprecated collaterals, as 2164ffd writes them');
@@ -246,6 +251,17 @@ t.test('each kind writes its record in the bytes it always has, the inactive mar
   t.equal(await kv.get(INACTIVE_KEY),
     '{"at":"2026-10-27T09:00:00.000Z","markets":[{"chainId":534352,"cometAddress":"0xb2f97c1bd3bf02f5e74d13f02e3e26f93d77ce44"},{"chainId":137,"cometAddress":"0xf25212e676d1f7f89cd72ffee66158f541246445"}]}',
     'and the inactive markets, each by its chain and its Comet');
+});
+
+/*
+ * A record is read by its key, by the release after the one that wrote it,
+ * and two kinds under one key would write over each other's decisions.
+ */
+t.test('each kind keeps its record under a key of its own, the one it always has', async t => {
+  const keys = [ DEPRECATED_RECORD.key, HIDDEN_RECORD.key, INACTIVE_RECORD.key ];
+  t.same(keys, [ 'deprecated-collaterals:v1', 'hidden-collaterals:v1', 'inactive-markets:v1' ],
+    'the deprecated collaterals, the hidden ones and the inactive markets, each under the key it is read by');
+  t.equal(new Set(keys).size, keys.length, 'no two kinds share one');
 });
 
 /*

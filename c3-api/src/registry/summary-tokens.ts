@@ -19,10 +19,12 @@ import type { CollateralStatus, MarketIdentity } from '../../lib/computations/ma
 import type { CacheDeps } from './cache.js';
 import type { Catalog, CatalogMarket, RegistryComet } from './catalog.js';
 import { nowOf } from './clock.js';
-import { DEPRECATED_RECORD, HIDDEN_RECORD, collateralDecisionsOf, markedDecisions } from './collateral-decisions.js';
-import type { CollateralRead, DecisionRead } from './collateral-decisions.js';
+import type { CollateralOfComet } from './collateral-decision-repository.js';
+import { DEPRECATED_RECORD, HIDDEN_RECORD } from './collateral-decisions.js';
+import { decisionSetOf, markedDecisions } from './decision-records.js';
+import type { DecisionRead } from './decision-records.js';
+import type { MarketOfChain } from './inactive-market-repository.js';
 import { INACTIVE_RECORD } from './inactive-markets.js';
-import type { InactiveMarkets } from './inactive-markets.js';
 import { readStrategicTokensByChain } from './token-policy-repository.js';
 import { visibilityHere } from './token-visibility.js';
 import { staleHeaders } from './version-headers.js';
@@ -53,10 +55,10 @@ type StrategicTokens = ReadonlyMap<number, ReadonlySet<Address>>;
 
 // the decisions of administrators, every chain's, or null where they could not be read
 type SummaryDecisions = {
-  deprecated: CollateralRead | null,
-  hidden:     CollateralRead | null,
+  deprecated: DecisionRead<CollateralOfComet> | null,
+  hidden:     DecisionRead<CollateralOfComet> | null,
   strategic:  StrategicTokens | null,
-  inactive:   DecisionRead<InactiveMarkets> | null,
+  inactive:   DecisionRead<MarketOfChain> | null,
 };
 
 /*
@@ -141,7 +143,7 @@ type ChainTokens = {
   factsOf:   (token: Address) => ChainFacts,
 };
 
-// a kind of decision as the facts of a chain ask it (collateral-decisions.ts): whether it names a collateral, its addresses lowercase
+// a kind of decision as the facts of a chain ask it (decision-records.ts): whether it names a collateral, its addresses lowercase
 type Decisions = { has: (collateral: { chainId: number, cometAddress: Address, tokenAddress: Address }) => boolean };
 
 /*
@@ -197,8 +199,8 @@ function decisionsOnChain(
 function chainTokens(catalog: Catalog, network: KnownNetwork.Name, chainId: number, decisions: SummaryDecisions): ChainTokens {
   const markets = catalog.marketsOn(network);
   const decided = {
-    deprecated: decisions.deprecated?.decisions ?? collateralDecisionsOf([]),
-    hidden:     decisions.hidden?.decisions ?? collateralDecisionsOf([]),
+    deprecated: decisions.deprecated?.decisions ?? decisionSetOf(DEPRECATED_RECORD, []),
+    hidden:     decisions.hidden?.decisions ?? decisionSetOf(HIDDEN_RECORD, []),
   };
   const found = new Map<Address, ChainFacts>();
   const factsOf = (token: Address): ChainFacts => {

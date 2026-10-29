@@ -187,7 +187,6 @@ t.test('every form of the summary answers each collateral with the fields of its
   t.equal(headerReads(node).length, new Set(Object.values(MARKET_BLOCKS)).size, 'both from the summaries of the minute, reading no header again');
 });
 
-// the key a market of the summary answers after whether it is institutional
 const afterInstitutional = (entry: Entry) => Object.keys(entry)[Object.keys(entry).indexOf('is_institutional') + 1];
 
 const isUsdt = (entry: Entry) => entry.chain_id === 1 && entry.deployment_key === 'usdt';

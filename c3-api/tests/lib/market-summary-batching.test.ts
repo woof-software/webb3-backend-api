@@ -17,7 +17,8 @@ import * as market  from '../../lib/computations/market.js';
 import * as rewards from '../../lib/computations/rewards.js';
 
 import * as marketHandlers from '../../src/market.js';
-import { inactiveMarketsOf } from '../../src/registry/inactive-markets.js';
+import { decisionSetOf } from '../../src/registry/decision-records.js';
+import { INACTIVE_RECORD } from '../../src/registry/inactive-markets.js';
 import type { SummaryDecisions } from '../../src/registry/summary-tokens.js';
 import {
   AllContracts,
@@ -557,7 +558,7 @@ t.test('every market says whether it is inactive, right after whether it is inst
   const inactiveOf = (summary: Summary[]) => Object.fromEntries(summary.map(entry => [ `${entry.chain_id} ${entry.deployment_key}`, entry.is_inactive ]));
 
   const decided = await summaryWith({
-    decisions: inactiveMarketsOf([ { chainId: 1, cometAddress: USDC }, { chainId: 1, cometAddress: WETH }, { chainId: 1, cometAddress: WBTC }, { chainId: 534352, cometAddress: USDT } ]),
+    decisions: decisionSetOf(INACTIVE_RECORD, [ { chainId: 1, cometAddress: USDC }, { chainId: 1, cometAddress: WETH }, { chainId: 1, cometAddress: WBTC }, { chainId: 534352, cometAddress: USDT } ]),
     recorded:  false,
   });
   t.same([ entryOf(decided, USDC).status, entryOf(decided, WETH).status, entryOf(decided, WBTC).status ], [ 'partially', 'error', 'success' ],

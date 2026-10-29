@@ -78,6 +78,10 @@ function isAddress(value: unknown): value is Address {
   return typeof(value) === 'string' && ADDRESS_PATTERN.test(value);
 }
 
+function isChainId(value: unknown): value is number {
+  return typeof(value) === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
 function normalizeAddress(value: Address | string): Address {
   return value.toLowerCase() as Address;
 }
@@ -889,6 +893,7 @@ export {
   MARKET_STATUSES,
   PRICE_QUOTES,
   isAddress,
+  isChainId,
   isCommitSha,
   MARKET_KEY_SEPARATOR,
   marketKey,

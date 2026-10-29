@@ -16,9 +16,9 @@ import {
   DEPRECATED_COLLATERAL_KIND,
   HIDDEN_COLLATERAL_KIND,
   applyCollaterals,
-  member,
   setCollateral,
 } from '../../../src/registry/collateral-decision-repository.js';
+import { member } from '../../../src/registry/decision-store.js';
 import { applyInactiveMarkets, setInactiveMarket } from '../../../src/registry/inactive-market-repository.js';
 import { applyTokenPolicies, setTokenPolicy } from '../../../src/registry/token-policy-repository.js';
 
@@ -441,6 +441,18 @@ function decisionRouteScenarios(harness: RegistryHarness, kind: DecisionKindUnde
     const wrongListVerb = await admin.read(kind.list.apply);
     t.equal(wrongListVerb.status, 405, 'a list is applied with POST');
     t.equal(wrongListVerb.header('allow'), 'POST, OPTIONS');
+    // each path of a kind takes its own verbs and no other, and HEAD is not taken for a GET
+    for (const method of [ 'HEAD', 'PUT', 'DELETE' ]) {
+      const refused = await admin.send(method, kind.path(1, kind.subject));
+      t.equal(refused.status, 405, `${method} is refused on a decision`);
+      t.equal(refused.header('allow'), 'GET, PATCH, OPTIONS', 'with the verbs a decision takes');
+    }
+    const lists: Array<[ string, string ]> = [ [ kind.list.export, 'GET, OPTIONS' ], [ kind.list.review, 'POST, OPTIONS' ] ];
+    for (const [ path, allow ] of lists) {
+      const refused = await admin.patch(path, {});
+      t.equal(refused.status, 405, `PATCH is refused on ${path}`);
+      t.equal(refused.header('allow'), allow, 'with the verbs the path takes');
+    }
 
     const preflight = await admin.send('OPTIONS', kind.path(1, kind.subject), undefined, {});
     t.equal(preflight.status, 204);
@@ -482,6 +494,21 @@ function decisionRouteScenarios(harness: RegistryHarness, kind: DecisionKindUnde
       t.equal(response.status, 400, `${name} is refused`);
       t.match(response.body.error.message, message);
     }
+    // a change reads its body, the reason included, before its path, so one wrong in both is refused for its body
+    const lacking: Array<[ string, unknown, string ]> = [
+      [ 'its flag',   {},                    `${kind.flag} must be a boolean` ],
+      [ 'its reason', { [kind.flag]: true }, 'a non-empty reason of at most 1000 characters is required' ],
+    ];
+    for (const [ name, body, message ] of lacking) {
+      const refused = await admin.patch<Refused>(kind.path('01', kind.subject), body);
+      t.equal(refused.status, 400, `a change on a malformed path without ${name} is refused`);
+      t.equal(refused.body.error.message, message, 'for its body');
+    }
+    // a change takes an ordinary command's body, 64 KiB: only a list's review and apply take more
+    const opening  = `${JSON.stringify({ [kind.flag]: true }).slice(0, -1)},"reason":"`;
+    const tooLarge = `${opening}${'r'.repeat(64 * 1024 + 1 - opening.length - 2)}"}`;
+    t.equal(tooLarge.length, 64 * 1024 + 1, 'a change one byte past 64 KiB');
+    t.equal((await admin.patch(kind.path(1, kind.subject), tooLarge)).status, 413, 'is refused for its size');
 
     const chain = await admin.patch<Refused>(kind.path(10, kind.subject), valid);
     t.equal(chain.status, 404, 'a chain the active registry does not hold is not found');
@@ -615,7 +642,6 @@ function withoutCollateral(address: Address): NetworkV1[] {
   }));
 }
 
-// the fixture without the market of one Comet
 function withoutMarket(comet: Address): NetworkV1[] {
   return snapshot.networks.map(network => ({ ...network, markets: network.markets.filter(market => market.contracts.comet !== comet) }));
 }
