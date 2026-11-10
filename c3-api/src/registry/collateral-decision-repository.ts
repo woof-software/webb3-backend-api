@@ -11,8 +11,19 @@ import type {
 
 import type { ApiError } from '../http/errors.js';
 
-import type { DecisionKind, Planned, StateRow } from './decision-store.js';
-import { activeVersionOf, applyDecisions, readDecision, reviewDecisions, setDecision } from './decision-store.js';
+import type { DecisionKind, DecisionList, KindNames, KindTables, Planned, StateRow } from './decision-store.js';
+import {
+  activeVersionOf,
+  activeVersionStatement,
+  applyDecisions,
+  decisionWrites,
+  historyOf,
+  identityOf,
+  member,
+  readDecision,
+  reviewDecisions,
+  setDecision,
+} from './decision-store.js';
 import { conflict } from './errors.js';
 import type { CollateralDecisionEventRow, CollateralDecisionRow } from './rows.js';
 import { rowsOf } from './sql-condition.js';
@@ -38,13 +49,15 @@ import { rowsOf } from './sql-condition.js';
  *
  * The two kinds' tables are one shape under two sets of names (migrations
  * 0006, under the names 0007 gave it, and 0008), so each kind's statements
- * are built here from its tables' names: the same text, naming the kind's own
- * tables and no other's. A read of one kind never reads the other's
- * decisions, so it answers or fails on its own. A release ahead of 0008 fails
- * the hidden reads alone: /summary leaves out what the hidden decisions
- * decide (summary-tokens.ts, collateralFields), and the active reads refuse
- * for want of them. And where D1 does not answer one kind's read, the active
- * reads take that kind from its record (collateral-decisions.ts).
+ * are built from its tables' names: those every kind shares by the store
+ * (decision-store.ts, KindTables), and the others here, the same text for
+ * both kinds, naming the kind's own tables and no other's. A read of one kind
+ * never reads the other's decisions, so it answers or fails on its own. A
+ * release ahead of 0008 fails the hidden reads alone: /summary leaves out
+ * what the hidden decisions decide (summary-tokens.ts, collateralFields), and
+ * the active reads refuse for want of them. And where D1 does not answer one
+ * kind's read, the active reads take that kind from its record
+ * (decision-records.ts).
  */
 
 // how many changes one decision read lists, newest first; a collateral's decision changes rarely
@@ -69,19 +82,6 @@ function collateralKey({ chainId, cometAddress, tokenAddress }: CollateralOfCome
 
 // what a row of a list names beside its collateral, for the person editing the file
 type ListedNames = { deploymentKey: string | null, symbol: string | null };
-
-/*
- * A kind's tables: the decisions in force, their audit, and the view a write
- * states what it expects in; the column of the flag, and an event's column of
- * the flag it replaces.
- */
-type CollateralTables<Column extends string> = {
-  decisions:    string,
-  events:       string,
-  expectations: string,
-  flag:         Column,
-  previous:     `previous_${Column}`,
-};
 
 // a collateral the active version holds: its chain, its market and its token, each found, with their names
 type FoundCollateral = {
@@ -117,36 +117,29 @@ type CollateralDecision<Flag extends string> = CollateralOfComet & Record<Flag, 
 type CollateralChange<Flag extends string> = CollateralDecision<Flag> & { reason: string, actor: string };
 
 type ListedCollateralDecision<Flag extends string> = CollateralDecision<Flag> & ListedNames;
-type CollateralDecisionList<Flag extends string>   = { reason: string | null, decisions: Array<ListedCollateralDecision<Flag>> };
 
 /*
- * What a kind of decision about a collateral is called, and where: `label`
- * names its writes in a defect, and its decisions in a log line and a
- * refusal, and `listOf` a list of them in a defect; its answers name the flag
- * `flag`, an event's flag before the change `previous`, and the member that
- * holds a list's rows `listKey`; its routes end one collateral's path with
- * `segment` and name its list `listPath`; and its record is kept in KV under
- * `recordKey` (collateral-decisions.ts).
+ * What a kind of decision about a collateral is called, and where, beside the
+ * names every kind has (KindNames): `label` names its writes in a defect, and
+ * its decisions in a log line and a refusal, and `listOf` a list of them in a
+ * defect; its answers name an event's flag before the change `previous`; and
+ * its record is kept in KV under `recordKey` (decision-records.ts).
  */
-type CollateralKindNames<Flag extends string, Column extends string, Rows extends string> = {
+type CollateralKindNames<Flag extends string, Column extends string, Rows extends string> = KindNames<Flag, Rows> & {
   label:     string,
   listOf:    string,
-  tables:    CollateralTables<Column>,
-  flag:      Flag,
+  tables:    Omit<KindTables<CollateralOfComet, Column>, 'keys' | 'alias'>,
   previous:  `previous${Capitalize<Flag>}`,
-  listKey:   Rows,
-  segment:   string,
-  listPath:  string,
   recordKey: string,
 };
 
-// a kind as the store takes it, beside what it is called
+// a kind as the store takes it, beside what it is called (collateralKind)
 type CollateralDecisionKind<Flag extends string, Column extends string, Rows extends string> = DecisionKind<
   CollateralOfComet,
   CollateralDecision<Flag>,
   ListedCollateralDecision<Flag>,
   CollateralState & Record<Column, number | null>
-> & CollateralKindNames<Flag, Column, Rows>;
+> & Omit<CollateralKindNames<Flag, Column, Rows>, 'tables'> & { tables: KindTables<CollateralOfComet, Column> };
 
 /*
  * The market and the token are found by subqueries that name one row each, so
@@ -154,7 +147,7 @@ type CollateralDecisionKind<Flag extends string, Column extends string, Rows ext
  * version holds one market per Comet of a network, and lists a token once
  * among a market's collateral.
  */
-function statesStatement(db: D1Database, { decisions, events, flag }: CollateralTables<string>, collaterals: string): D1PreparedStatement {
+function statesStatement(db: D1Database, { decisions, events, flag }: KindTables<CollateralOfComet>, collaterals: string): D1PreparedStatement {
   return db.prepare(
     `SELECT state.active_version_id AS version_id, version.snapshot_checksum AS checksum,
             network.id AS network_id, market.id AS market_id, market.deployment_key AS deployment_key,
@@ -231,70 +224,38 @@ function misnamed(decision: CollateralOfComet & ListedNames, state: CollateralSt
   return null;
 }
 
-// the statements of a write, which writeDecisions (decision-store.ts) explains: a collateral without a row has the flag unset
-function writesOf({ decisions, events, expectations, flag, previous }: CollateralTables<string>): { events: string, rows: string, expectations: string } {
-  return {
-    events: `
-  INSERT INTO ${events} (
-    id, chain_id, comet_address, token_address, ${previous}, ${flag}, actor, reason, created_at
-  )
-  SELECT json_extract(row.value, '$.i'), json_extract(row.value, '$.c'), json_extract(row.value, '$.m'),
-         json_extract(row.value, '$.t'), decision.${flag}, json_extract(row.value, '$.s'), ?2,
-         json_extract(row.value, '$.r'), ?3
-  FROM json_each(?1) AS row
-  LEFT JOIN ${decisions} AS decision
-    ON decision.chain_id = json_extract(row.value, '$.c')
-   AND decision.comet_address = json_extract(row.value, '$.m')
-   AND decision.token_address = json_extract(row.value, '$.t')
-  WHERE json_extract(row.value, '$.r') IS NOT NULL
-    AND COALESCE(decision.${flag}, 0) <> json_extract(row.value, '$.s')
-  ORDER BY row.key`,
-    rows: `
-  INSERT INTO ${decisions} (chain_id, comet_address, token_address, ${flag}, updated_at, updated_by)
-  SELECT json_extract(row.value, '$.c'), json_extract(row.value, '$.m'), json_extract(row.value, '$.t'),
-         json_extract(row.value, '$.s'), ?3, ?2
-  FROM json_each(?1) AS row
-  LEFT JOIN ${decisions} AS decision
-    ON decision.chain_id = json_extract(row.value, '$.c')
-   AND decision.comet_address = json_extract(row.value, '$.m')
-   AND decision.token_address = json_extract(row.value, '$.t')
-  WHERE json_extract(row.value, '$.r') IS NOT NULL
-    AND COALESCE(decision.${flag}, 0) <> json_extract(row.value, '$.s')
-  ORDER BY row.key
-  ON CONFLICT (chain_id, comet_address, token_address) DO UPDATE
-  SET ${flag} = excluded.${flag}, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
-    expectations: `
-  INSERT INTO ${expectations} (chain_id, comet_address, token_address, ${flag})
-  SELECT json_extract(row.value, '$.c'), json_extract(row.value, '$.m'), json_extract(row.value, '$.t'),
-         json_extract(row.value, '$.s')
-  FROM json_each(?1) AS row`,
-  };
-}
-
 /*
  * A kind of decision about a collateral of a Comet, as the store takes it:
  * the kind's names, its flag, and its tables. A decision is about a
  * collateral of a market the registry serves; one about anything else would
  * be a decision nobody could check. Both migrations' triggers abort the same
- * way where the active version does not hold the collateral.
+ * way where the active version does not hold the collateral, and both key a
+ * decision alike.
  */
 function collateralKind<Flag extends string, Column extends string, Rows extends string>(
   names: CollateralKindNames<Flag, Column, Rows>,
 ): CollateralDecisionKind<Flag, Column, Rows> {
-  const { flag, tables } = names;
+  const { flag } = names;
+  const tables: KindTables<CollateralOfComet, Column> = {
+    ...names.tables,
+    keys:  { chainId: [ 'c', 'chain_id' ], cometAddress: [ 'm', 'comet_address' ], tokenAddress: [ 't', 'token_address' ] },
+    alias: 'decision',
+  };
   return {
     ...names,
+    tables,
     subject:     'collateral',
-    identity:    collateral => ({ c: collateral.chainId, m: collateral.cometAddress, t: collateral.tokenAddress }),
+    identity:    identityOf(tables),
     keyOf:       collateralKey,
     flagOf:      decision => decision[flag],
     storedOf:    state => state[tables.flag],
     states:      (db, collaterals) => statesStatement(db, tables, collaterals),
-    writes:      writesOf(tables),
+    writes:      decisionWrites(tables),
     leftAbort:   'collateral is not in the active registry',
     missingFrom,
     misnamed,
-    named:       (state, collateral) => `${state.symbol ?? collateral.tokenAddress} of ${state.deployment_key ?? collateral.cometAddress}`,
+    named:       (state, collateral) =>
+      `${collateral.tokenAddress} (${state.symbol ?? collateral.tokenAddress} of ${state.deployment_key ?? collateral.cometAddress})`,
   };
 }
 
@@ -334,17 +295,6 @@ const HIDDEN_COLLATERAL_KIND = collateralKind<'isHidden', 'is_hidden', 'hiddenCo
   recordKey: 'hidden-collaterals:v1',
 });
 
-/*
- * A member under the name its kind gives it: the flag, an event's flag before
- * the change, or the rows of a list. An object literal types a key it
- * computes from a generic name as any string, so an answer, a decision or a
- * row of a list spreads such a member into its place with this, typed by its
- * name.
- */
-function member<Name extends string, Value>(name: Name, value: Value): Record<Name, Value> {
-  return { [name]: value } as Record<Name, Value>;
-}
-
 async function setCollateral<Flag extends string, Column extends string, Rows extends string>(
   db: D1Database,
   kind: CollateralDecisionKind<Flag, Column, Rows>,
@@ -363,10 +313,9 @@ async function setCollateral<Flag extends string, Column extends string, Rows ex
 }
 
 /*
- * One collateral's decision and the changes that led to it (readDecision).
- * The changes are listed in the order they were committed, newest first,
- * which is rowid order (migrations/0006_legacy_collaterals.sql says why), so
- * the first one is always the change that set the decision in force.
+ * One collateral's decision and the changes that led to it (readDecision),
+ * the first of which is always the change that set the decision in force
+ * (historyOf; migrations/0006_legacy_collaterals.sql says why).
  */
 async function readCollateral<Flag extends string, Column extends string, Rows extends string>(
   db: D1Database,
@@ -377,12 +326,7 @@ async function readCollateral<Flag extends string, Column extends string, Rows e
     db,
     kind,
     collateral,
-    () => db.prepare(
-      `SELECT * FROM ${kind.tables.events}
-       WHERE chain_id = ?1 AND comet_address = ?2 AND token_address = ?3
-       ORDER BY rowid DESC
-       LIMIT ?4`
-    ).bind(collateral.chainId, collateral.cometAddress, collateral.tokenAddress, MAX_COLLATERAL_EVENTS),
+    () => historyOf(db, kind.tables, collateral, MAX_COLLATERAL_EVENTS),
   );
   return {
     registryVersion,
@@ -404,26 +348,6 @@ async function readCollateral<Flag extends string, Column extends string, Rows e
   };
 }
 
-/*
- * The collaterals whose flag is set, of every chain, for the reads that mark
- * collaterals with them: one statement, through the kind's partial index.
- * Unlike the reads of one decision or of a list, it does not resolve the
- * active version: each read that marks collaterals marks the version it has
- * already resolved, and a decision belongs to no version, so one answered
- * from an older version is marked by the decisions D1 gives all the same.
- */
-async function readMarkedCollaterals(
-  db: D1Database,
-  { tables: { decisions, flag } }: { tables: CollateralTables<string> },
-): Promise<CollateralOfComet[]> {
-  const { results } = await db.prepare(
-    `SELECT chain_id, comet_address, token_address FROM ${decisions}
-     WHERE ${flag} = 1
-     ORDER BY chain_id, comet_address, token_address`
-  ).all<{ chain_id: number, comet_address: Address, token_address: Address }>();
-  return (results ?? []).map(row => ({ chainId: row.chain_id, cometAddress: row.comet_address, tokenAddress: row.token_address }));
-}
-
 // a collateral of the export, beside the decision in force, which the kind's column of the flag holds
 type ListedCollateralRow = {
   chain_id:       number,
@@ -441,14 +365,9 @@ type ListedCollateralRow = {
  * A disabled market's collaterals are listed because a decision about one is
  * made while nobody is offered the market, and applies once it is served.
  */
-function exportStatements(db: D1Database, { tables: { decisions, flag } }: { tables: CollateralTables<string> }): D1PreparedStatement[] {
+function exportStatements(db: D1Database, { tables: { decisions, flag } }: { tables: KindTables<CollateralOfComet> }): D1PreparedStatement[] {
   return [
-    db.prepare(
-      `SELECT state.active_version_id AS version_id, version.snapshot_checksum AS checksum
-       FROM registry_state AS state
-       LEFT JOIN registry_versions AS version ON version.id = state.active_version_id
-       WHERE state.singleton_id = 1`
-    ),
+    activeVersionStatement(db),
     db.prepare(
       `SELECT network.chain_id AS chain_id, contract.address AS comet_address, market.deployment_key AS deployment_key,
               token.address AS token_address, token.symbol AS symbol, COALESCE(decision.${flag}, 0) AS ${flag}
@@ -534,32 +453,24 @@ function leftWhileWritten(collateral: CollateralOfComet): ApiError {
 
 /*
  * How applying a list is refused: a row that cannot be applied, named by its
- * collateral; a version activated meanwhile without one of the list's
- * collaterals; and a decision someone made meanwhile on a row the list leaves
- * as it is.
+ * collateral, and a version activated meanwhile without one of the list's
+ * collaterals.
  */
 const LIST_REFUSALS = {
   // typed by what it reads, so that applyDecisions takes the type of a row's state from the kind rather than from it
   problemOf: ({ row, decision, problem }: Pick<Planned<CollateralOfComet, CollateralState>, 'row' | 'decision' | 'problem'>) => (
     { row, chainId: decision.chainId, cometAddress: decision.cometAddress, tokenAddress: decision.tokenAddress, problem }
   ),
-  conflicts: {
-    left: () => conflict(
-      'COLLATERAL_LEFT_REGISTRY',
-      `a version that does not hold every collateral of the list was activated while it was being applied; nothing was written`,
-    ),
-    changed: () => conflict(
-      'DECISION_CHANGED',
-      `a decision of the list was changed by someone else while it was being applied; nothing was written`,
-    ),
-  },
+  left:      () => conflict(
+    'COLLATERAL_LEFT_REGISTRY',
+    `a version that does not hold every collateral of the list was activated while it was being applied; nothing was written`,
+  ),
 };
 
-// each row of a review says what the active version calls its collateral, and what applying the list would do
 async function reviewCollaterals<Flag extends string, Column extends string, Rows extends string>(
   db: D1Database,
   kind: CollateralDecisionKind<Flag, Column, Rows>,
-  list: NoInfer<CollateralDecisionList<Flag>>,
+  list: NoInfer<DecisionList<ListedCollateralDecision<Flag>>>,
 ): Promise<CollateralDecisionReviewV1<Rows>> {
   const { registryVersion, summary, planned } = await reviewDecisions(db, kind, list);
   return {
@@ -590,7 +501,7 @@ async function reviewCollaterals<Flag extends string, Column extends string, Row
 async function applyCollaterals<Flag extends string, Column extends string, Rows extends string>(
   db: D1Database,
   kind: CollateralDecisionKind<Flag, Column, Rows>,
-  list: NoInfer<CollateralDecisionList<Flag>>,
+  list: NoInfer<DecisionList<ListedCollateralDecision<Flag>>>,
   actor: string,
 ): Promise<CollateralDecisionApplyV1<Flag, Rows>> {
   const { registryVersion, summary, applied } = await applyDecisions(db, kind, list, actor, LIST_REFUSALS);
@@ -617,16 +528,14 @@ async function applyCollaterals<Flag extends string, Column extends string, Rows
   };
 }
 
-export type { CollateralDecisionKind, CollateralDecisionList, CollateralOfComet, ListedCollateralDecision };
+export type { CollateralDecisionKind, CollateralOfComet, ListedCollateralDecision };
 export {
   DEPRECATED_COLLATERAL_KIND,
   HIDDEN_COLLATERAL_KIND,
   applyCollaterals,
   collateralKey,
   exportCollaterals,
-  member,
   readCollateral,
-  readMarkedCollaterals,
   reviewCollaterals,
   setCollateral,
 };
