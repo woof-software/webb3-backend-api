@@ -13,8 +13,9 @@ and every route in [API.md](./API.md#registry-v1).
 The registry is the list of markets the API serves — their addresses,
 tokens, prices, names, and which features each one has. A new list is never
 edited in place. It is built as a **draft** (a "candidate version"), checked,
-and only then **switched on** ("activated"). Until the switch, users see no
-change at all, and after it, one command switches back.
+**approved** by one person, and only then **switched on** ("activated") by
+another. Until the switch, users see no change at all, and after it, one
+command switches back.
 
 ## Before you start
 
@@ -26,6 +27,22 @@ change at all, and after it, one command switches back.
   role `admin` — the token itself, not its hash. See
   [The admin tokens](#the-admin-tokens) if the environment has none yet, or
   none for you.
+- A second person with an `admin` token of their own approves what you switch
+  on (step 5 of the bring-up): a version is switched on by two people, and
+  two tokens of one name are one person. So the environment's list names two
+  admins at least before the release with approvals reaches it
+  ([The admin tokens](#the-admin-tokens)); with one, nobody there can switch a
+  version on.
+- The release with approvals is deployed to all of the environment's traffic
+  at once, never beside the release before it in a gradual deployment, and
+  every Worker bound to the environment's database runs it before anyone
+  approves there — a second Worker of another branch on the same database
+  too. Once an approval exists, the database refuses an older release's
+  activations, and its rollbacks but the one step back, which then answer
+  `500`: from then on a bad release is fixed by rolling forward, never by
+  deploying an older one again. Until then, an older release still switches
+  versions on without an approval. Its migration, `0011`, is applied before
+  it, as every migration is.
 - Stage and production have `COMET_GITHUB_TOKEN` set. Without a token GitHub
   allows the import 60 API requests an hour per address, which the Worker
   shares with every other Worker leaving Cloudflare through it, and an import
@@ -72,7 +89,7 @@ then the headers, then the body. To use them:
 > history routes read their markets from the registry and answer `503` while
 > no version is active, and the release that reads from the registry serves
 > users from the moment it is deployed. So the deploy opens a window of
-> `503`s, which step 5 closes. Keep it short and expected:
+> `503`s, which step 6 closes. Keep it short and expected:
 >
 > 1. Run [the preflight](#the-preflight) on the commit being deployed, and
 >    time it. It is the same steps against the real chain, so it finds a
@@ -80,7 +97,8 @@ then the headers, then the body. To use them:
 >    how long the window will be.
 > 2. Announce the window beforehand — when it opens and how long it lasts —
 >    to the frontend's maintainers and to whoever answers users.
-> 3. Deploy, and run steps 1 to 6 below straight away, one after another.
+> 3. Deploy, and run steps 1 to 7 below straight away, one after another,
+>    with the second admin at hand for step 5.
 >
 > Once a version is active, a client that pages transaction history with a
 > cursor it was given before is told to start over, once
@@ -104,11 +122,14 @@ everything the one before it may:
 | `monitor` | `GET /admin/status` | a monitor that polls the status |
 | `reader` | every `GET` under `/admin` | someone who reads drafts and versions |
 | `operator` | besides, imports, cancelling a run, and overlay writes | someone who reviews drafts |
-| `admin` | besides, validate, activate and rollback | someone who decides what is served |
+| `admin` | besides, validate, approve, activate and rollback | someone who decides what is served |
 
 An import not held for review validates its draft by itself once it
 completes, so an `operator` can import a version that validates; switching
-it on is an `admin`'s.
+it on takes two `admin`s of two names, one who approves it and another who
+activates it. So an environment needs two people with the role `admin`, each
+holding a token of their own, and one person never holds two names: the
+names are what the registry tells people apart by.
 
 The worker keeps only the SHA-256 of each token: what is configured cannot
 be used as a token. Tokens go to their holders through the team's password
@@ -144,6 +165,7 @@ printf '%s' "$NEW_TOKEN" | openssl dgst -sha256 -r | cut -d ' ' -f 1
 ```json
 [
   { "name": "alice",          "sha256": "<the hash from step 2>", "role": "admin",    "notAfter": null },
+  { "name": "bob",            "sha256": "<his token's hash>",     "role": "admin",    "notAfter": null },
   { "name": "olga",           "sha256": "<her token's hash>",     "role": "operator", "notAfter": null },
   { "name": "status-monitor", "sha256": "<the monitor's hash>",   "role": "monitor",  "notAfter": null }
 ]
@@ -174,10 +196,11 @@ jq -c . tokens.json | npx wrangler secret put COMET_REGISTRY_ADMIN_TOKENS --env 
 ```
 
 For a worker you run on your own machine, the same line goes into
-`.dev.vars`, which git ignores, in single quotes:
+`.dev.vars`, which git ignores, in single quotes — with two `admin` tokens
+of your own under two names, since a version is switched on by two:
 
 ```
-COMET_REGISTRY_ADMIN_TOKENS='[{"name":"alice","sha256":"<the hash from step 2>","role":"admin","notAfter":null}]'
+COMET_REGISTRY_ADMIN_TOKENS='[{"name":"local-admin","sha256":"<the hash from step 2>","role":"admin","notAfter":null},{"name":"local-approver","sha256":"<the hash of a second token>","role":"admin","notAfter":null}]'
 ```
 
 **5. Check each token** with a request its role may make: an unknown
@@ -231,13 +254,15 @@ on your machine, on a database of its own, against the real chain. Nothing of
 it reaches any environment.
 
 **Set it up.** In `c3-api` of a checkout of the commit being deployed, put
-into `.dev.vars` a `COMET_REGISTRY_ADMIN_TOKENS` that lists an admin token of
-your own (see [The admin tokens](#the-admin-tokens)), a `COMET_GITHUB_TOKEN`,
-and the `NODE_PROXY_HOST` and `NODE_PROXY_KEY` of a deployed node provider
-proxy whose providers keep archive state: the creation blocks are read at
-past blocks. The local source is the one stage and production import,
-`Compound-Foundation/comet` at `main`. Then start the worker on an empty
-database, kept apart from your usual local one:
+into `.dev.vars` a `COMET_REGISTRY_ADMIN_TOKENS` that lists two admin tokens
+of your own under two names (see [The admin tokens](#the-admin-tokens)) —
+step 5 approves the version with one, and step 6 switches it on with the
+other — a `COMET_GITHUB_TOKEN`, and the `NODE_PROXY_HOST` and
+`NODE_PROXY_KEY` of a deployed node provider proxy whose providers keep
+archive state: the creation blocks are read at past blocks. The local source
+is the one stage and production import, `Compound-Foundation/comet` at
+`main`. Then start the worker on an empty database, kept apart from your
+usual local one:
 
 ```sh
 cd c3-api
@@ -253,9 +278,9 @@ proxy, in `../node-provider-proxy/.dev.vars`, the keys of providers that keep
 archive state, and add `-c wrangler.local-proxy.toml` to both commands.
 
 **Bring it up.** In another terminal, from the root of the checkout, with
-`export API=http://localhost:8787` and your token in `TOKEN`, run steps 1 to 6
-of [the first bring-up](#bringing-an-environment-up-for-the-first-time), and
-time them.
+`export API=http://localhost:8787` and your first token in `TOKEN`, run steps
+1 to 7 of [the first bring-up](#bringing-an-environment-up-for-the-first-time),
+step 5 with your second token in `TOKEN`, and time them.
 
 **You should see** each step answer as it says. Step 2 prints its
 `compared:` line alone, or above it only markets the source has added, in
@@ -263,7 +288,7 @@ its second column. Step 3 answers `"changed": true`, with nothing unreviewed
 but those; to check the file it asks the node 10 `eth_blockNumber`, 58
 `eth_getCode` at past blocks — each Comet at its creation block and at the
 block before — and the decimals of up to 19 feeds. Step 4 answers
-`validated`, and step 6 serves every market, none in `error`. Then compare
+`validated`, and step 7 serves every market, none in `error`. Then compare
 `GET $API/registry/v1/active` with the markets the frontend lists today:
 every one is there, under the same display name, base asset name, slug, and
 default and institutional flags.
@@ -576,7 +601,55 @@ wrong is changed, with the overlay routes as in step 5 of
 a newer commit, because the source has moved on since, keeps nothing: send it
 the seed as steps 2 and 3 say.
 
-### 5. Switch it on
+### 5. Have it approved
+
+This step is another admin's, not yours: someone with an `admin` token of
+their own, under another name, who reads what the version would change and
+approves it. They run it with their own token in `TOKEN`:
+
+```sh
+curl -s "$API/registry/v1/admin/versions/$V/changes" -H "Authorization: Bearer $TOKEN" \
+  | jq '{comparedWith, added: [.markets.added[].scope], networks: .networks.added}'
+curl -s -X POST "$API/registry/v1/admin/versions/$V/approve" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"reason":"read the first registry version", "expectedActiveVersionId":null}' | jq '.error // .approval'
+```
+
+Postman, with the approver's token as `TOKEN`:
+
+```http
+POST {{API}}/registry/v1/admin/versions/{{V}}/approve
+Authorization: Bearer {{TOKEN}}
+Content-Type: application/json
+
+{"reason": "read the first registry version", "expectedActiveVersionId": null}
+```
+
+`expectedActiveVersionId` is the version the approver read the changes
+against, which every approval names: `null` here, because nothing is on yet,
+and later the version that is on — `comparedWith` in the answer of
+`…/versions/$V/changes`. In the answer, look at `usable` and `expiresAt`.
+
+**Why.** A version is switched on by two people: one who approves it, and
+another who switches it on. The approval covers exactly this version, which
+can no longer change, against what is on now, and lets one switch through.
+It cannot be taken back: one given by mistake, or with a token that may have
+leaked, stays usable by any other admin until it expires, is used, or another
+version goes on. Tell the other admins, so that nobody uses it.
+
+**You should see** `"usable": true`, and an `expiresAt` a day ahead
+(`COMET_REGISTRY_APPROVAL_TTL_S`): step 6 has until then. Once it has
+expired unused, step 5 is done again.
+
+**If not.** `400`, "expectedActiveVersionId is required": the body does not
+say what the changes were read against; send it as above. `409`, "only a
+validated version can be approved": step 4 first. `409`, "… as this approval
+expected": a version is on that was not when you looked; read the changes
+again against it and approve with its id.
+
+### 6. Switch it on
+
+Back to you, with your own token in `TOKEN` — not the approver's:
 
 ```sh
 curl -s -X POST "$API/registry/v1/admin/versions/$V/activate" \
@@ -603,10 +676,18 @@ while you are deciding, your switch is refused with `409` instead of quietly
 undoing theirs.
 
 **Why.** The API moves to the new list in one step. This is the only step
-users notice. It is recorded with your reason, and can be undone — see
-[Switching back](#switching-back).
+users notice. It is recorded with your reason and the approval it used, and
+can be undone — see [Switching back](#switching-back).
 
-### 6. Check that it is on
+**You should see** `"changed": true` and an `approvalId`.
+
+**If not.** `409` with `details.code` `APPROVAL_REQUIRED`: there is no
+approval you may use. The message says against which version one is needed.
+Step 5 was not done, was done with your own token or another of your name,
+has expired, was used, or was given while another version was on: have it
+done again.
+
+### 7. Check that it is on
 
 ```sh
 curl -s "$API/registry/v1/active" | jq '[.networks[].markets | length] | add'
@@ -688,8 +769,10 @@ export V=<the first versionId listed>
 
 `candidates.validated` lists, newest first, the validated versions newer than
 any ever switched on, and `alerts` has `candidate-awaiting-activation` while
-it is not empty. Take the first; never take a version listed below the one
-that is on, which would switch the registry back to an older commit.
+it is not empty, and `candidate-awaiting-approval` while the first has no
+approval anybody could switch it on with; its `approval` names one once it
+is given. Take the first; never take a version listed below the one that is
+on, which would switch the registry back to an older commit.
 
 When the list is empty, nothing is waiting: the newest version
 (`GET /registry/v1/admin/versions?limit=1`) is either still `importing` — the
@@ -801,9 +884,10 @@ lose, and every field that differs on the others.
 
 ### 3. Switch it on
 
-Steps 5 and 6 above for the version — validated first, if it was a held
-draft — with `"expectedActiveVersionId"` in the body of step 5 naming the
-version that is on: `comparedWith` in the answer of step 2.
+Steps 5, 6 and 7 above for the version — validated first, if it was a held
+draft — with `"expectedActiveVersionId"` in the bodies of steps 5 and 6
+naming the version that is on: `comparedWith` in the answer of step 2, which
+the approver reads before approving.
 
 ## Describing a new market
 
@@ -969,7 +1053,7 @@ curl -s -X PUT "$API/registry/v1/admin/versions/$V/networks/<chainId>/overlay" \
        "expectedDigest": null}' | jq
 ```
 
-Then steps 4, 5 and 6 of the first bring-up, and step 2 above for what the
+Then steps 4 to 7 of the first bring-up, and step 2 above for what the
 draft changes. The new market is under `added`, now with `"reviewed": true`.
 
 ## A market that stopped answering
@@ -1079,7 +1163,7 @@ only an expiry you write or change has to be still to come.
 
 ### 4. Check and switch on
 
-Steps 4, 5 and 6 of the first bring-up. The market reports `success` from
+Steps 4 to 7 of the first bring-up. The market reports `success` from
 the first request after the switch: the exception changes what its summaries
 are cached under. So do the days of its history, a remapped collateral's
 included: a day before its replacement was deployed is read from the feed
@@ -1223,6 +1307,15 @@ somebody has switched another version on since you looked, the rollback is
 refused with `409` naming it, rather than undoing their switch: read the
 status again and decide again.
 
+A rollback needs nobody's approval: undoing a bad version takes one person,
+with any `admin` token. It goes back one step: to the version the one on
+replaced when it was last activated, if that is older. To go further back,
+roll back again from the version you restored. Anything else is refused with
+`409` and `details.code` `ROLLBACK_TARGET_INVALID`, whose message names the
+version a rollback may restore now, or says that none may: a version two
+steps back, one never on, or one newer than the one on is switched on as
+steps 5 to 7 of the first bring-up do, with another admin's approval.
+
 Every import after this starts from the version you went back to, a new
 attempt of the commit you switched off included: what was reviewed for the
 version you left, or for the drafts of its commit before it, is not handed
@@ -1240,13 +1333,26 @@ changes against the version you went back to
 step 3 of [A market that changed on chain](#3-see-what-it-changes-and-switch-it-on)
 says.
 
-The id is the version to go **back to**, which must have been validated. It
-is the `previousVersionId` in the answer of the activation you are undoing.
-The history of the version that is on has it too:
+The id is the version to go **back to**: the one the version on replaced
+when it was last activated. It is the `previousVersionId` in the answer of
+the activation you are undoing. The history of the version that is on has it
+too, under the newest `activate` onto it:
 
 ```sh
-curl -s "$API/registry/v1/admin/versions/<the version that is on>" -H "Authorization: Bearer $TOKEN" \
-  | jq '.version.id as $on | first(.activations[] | select(.targetVersionId == $on)) | .previousVersionId'
+export ON=<the version that is on>
+curl -s "$API/registry/v1/admin/versions/$ON" -H "Authorization: Bearer $TOKEN" \
+  | jq -r '.version.id as $on | first(.activations[] | select(.targetVersionId == $on and .action == "activate")) | .previousVersionId'
+```
+
+If it prints `null`, or nothing, a rollback has nothing to go back to: stop
+there. Otherwise check that the version it printed is older than the version
+on, which prints `true`; an id that names no version stops the check with
+`not a version`:
+
+```sh
+export BACK=<the id it printed>
+for id in "$BACK" "$ON"; do curl -s "$API/registry/v1/admin/versions/$id" -H "Authorization: Bearer $TOKEN"; done \
+  | jq -s 'map(.version // error("not a version") | [ .createdAt, .attempt, .id ]) | .[0] < .[1]'
 ```
 
 Postman:
@@ -1257,10 +1363,19 @@ Authorization: Bearer {{TOKEN}}
 ```
 
 `activations` lists the moves that switched the version on or off, newest
-first. The first one whose `targetVersionId` is the version that is on is the
-move that switched it on, and its `previousVersionId` is the version to go
-back to. `null` there means nothing was on before it: there is nothing to go
-back to.
+first. The first `activate` whose `targetVersionId` is the version that is on
+is the activation that last switched it on, and its `previousVersionId` is
+the version to go back to. Not a `rollback` onto it: that one names the
+newer version it was rolled back from. `null` there — nothing was on before
+it — or no such `activate` means a rollback has nothing to go back to. To
+check the version to go back to, open it as well: it is older when its
+`version.createdAt` is earlier, or the same with a lower `version.attempt` —
+the order `GET /registry/v1/admin/versions` lists them in, newest first. One
+that is newer — `false` above — means the version on was switched on in
+place of a newer one: a rollback restores nothing from it, and only an
+activation, approved by another admin, switches another version on. To go
+further back, roll back again from the version you restored: the newest
+`activate` onto it names the step before.
 
 ## Keeping an eye on it
 
@@ -1278,7 +1393,8 @@ Authorization: Bearer {{TOKEN}}
 ```
 
 **You should see** `"alerts": []`. Everything else in the answer is context:
-which version is on and who switched it on, whether its data is cached, when
+which version is on, who switched it on and who approved that, whether its
+data is cached, when
 the source was last checked, how the last import went, which drafts are
 still open, and when the chain was last read again, and for which version
 (`chainCheck`).
@@ -1287,10 +1403,11 @@ When `alerts` is not empty, each name says what to do:
 
 | Alert | What it means | What to do |
 |---|---|---|
-| `configuration-invalid` | A registry setting of this environment is set to something it does not take; `configuration.invalid` names each. The import refuses to start while one of its own is invalid, and a read takes the default in its place | Correct the value in the environment's `[vars]` in `wrangler.toml` and deploy: the numbers are whole numbers, `COMET_SOURCE_REPOSITORY` is `owner/repository` and `COMET_SOURCE_REF` a branch, a tag or a commit |
+| `configuration-invalid` | A registry setting of this environment is set to something it does not take; `configuration.invalid` names each. The import refuses to start while one of its own is invalid, and a read takes the default in its place — an approval given meanwhile lasts the default day | Correct the value in the environment's `[vars]` in `wrangler.toml` and deploy: the numbers are whole numbers, `COMET_REGISTRY_APPROVAL_TTL_S` one from 1 to 604800 (a week), `COMET_SOURCE_REPOSITORY` is `owner/repository` and `COMET_SOURCE_REF` a branch, a tag or a commit |
 | `no-active-version` | Nothing is switched on, so every market route answers `503` | Bring a version up — [Bringing an environment up for the first time](#bringing-an-environment-up-for-the-first-time) |
 | `candidate-awaiting-review` | A draft is held for review and no import is running | Review it, then validate it (step 4 of [the first bring-up](#bringing-an-environment-up-for-the-first-time)) |
 | `candidate-awaiting-activation` | A new commit was imported and validated, and is waiting to be switched on; `candidates.validated` names it | [When the source changes](#when-the-source-changes). The alert holds until a version at least that new is switched on: one you decide not to switch on keeps it raised until a newer commit's version is |
+| `candidate-awaiting-approval` | The newest version waiting to be switched on has no approval anybody could switch it on with: none was given, or the one given expired, was used, or was given while another version was on | An admin reads what it changes and approves it (step 5 of [the first bring-up](#bringing-an-environment-up-for-the-first-time), with the version's id and the version on as `expectedActiveVersionId`). The alert clears then, and comes back if the approval expires unused or another version goes on first; its `approval` in `candidates.validated` names it while it holds |
 | `candidate-drops-markets` | A version waiting to be switched on would stop serving markets the version on serves; its `unserved` in `candidates.validated` names them, by their keys in the version on. Nothing holds it back | Step 2 of [When the source changes](#when-the-source-changes): `markets.unserved` says where each Comet went. Confirm every one with a developer before switching it on, and describe a renamed one under its new key first. The alert holds until a version at least that new is switched on |
 | `commit-rejected` | The newest commit imported completely but did not validate, and the scheduled job will not import it again by itself; `sync.rejectedCommit` names it | Read why it failed (`GET /registry/v1/admin/versions/<versionId>`). If a decision was wrong, hold a new attempt (step 1 of [Describing a new market](#describing-a-new-market)), correct it there and validate; otherwise the alert clears when the source moves on |
 | `chain-drift` | The version on stores a price feed or a collateral asset its market's Comet no longer answers with: governance changed the market on chain after the import, and the source did not move. `chainCheck.drifts` names each, with what the version stores and what the chain answers. Until a version that agrees is on, the summary at the latest block leaves out a collateral the Comet added ([A market that changed on chain](#a-market-that-changed-on-chain)) | [A market that changed on chain](#a-market-that-changed-on-chain): import the commit again with `forceNewAttempt`, check what it changes and switch it on. The alert clears once the next hourly invocation has checked the version on and found it agrees with the chain, within the hour of the switch |
@@ -1309,24 +1426,25 @@ alert when `alerts` is not empty, or when the request itself fails.
 The registry never deletes a version. Every attempt at importing a commit
 is a version with all its rows — about 1,500 for the source today, some 400
 of them the results of one validation — and a version, its checks, its
-overlay events and the activations are kept by the schema: triggers refuse
-to delete them, and the rows of a version that has been decided cannot
-change. A version is written only when the source has a new commit, or an
-attempt at one is retried or forced, so the database grows with the
-source's commits, which stays far below D1's limits for years. Keeping them
-is what makes a rollback to any earlier version possible, and what keeps the
-audit trail whole. A version names who asked for the import that created it
-(`createdBy`): the operator for one an administrative sync created, whatever
-the request asked for, and `registry-cron:<environment>` for one the hourly
-job created — the same as its run's `requestedBy`.
+overlay events, its approvals and the activations are kept by the schema:
+triggers refuse to delete them, and the rows of a version that has been
+decided cannot change. A version is written only when the source has a new
+commit, or an attempt at one is retried or forced, so the database grows
+with the source's commits, which stays far below D1's limits for years.
+Keeping them is what makes switching back possible — a rollback one step at
+a time, or an approved activation of any earlier version — and what keeps
+the audit trail whole. A version names who asked for the import that
+created it (`createdBy`): the operator for one an administrative sync
+created, whatever the request asked for, and `registry-cron:<environment>`
+for one the hourly job created — the same as its run's `requestedBy`.
 
 The foreign keys from a version's snapshot rows and checks to it say
 `ON DELETE CASCADE`, but no cascade ever runs while those triggers refuse the
-delete; its overlay events and activations say `RESTRICT`. The cascades are
-there for a retention job that does not exist yet: one that removes old
-versions has to replace those triggers in a migration of its own, keep the
-active version and the ones a rollback may still need, and keep the audit
-rows of every version it removes elsewhere.
+delete; its overlay events, approvals and activations say `RESTRICT`. The
+cascades are there for a retention job that does not exist yet: one that
+removes old versions has to replace those triggers in a migration of its
+own, keep the active version and the ones a rollback may still need, and
+keep the audit rows of every version it removes elsewhere.
 
 ## When something goes wrong
 
@@ -1348,7 +1466,7 @@ whose reasons are in the draft it names.
 | `422`, `details.code` `SOURCE_TREE_TRUNCATED`, `SOURCE_CONTENT_TOO_LARGE` or `SOURCE_RESPONSE_INVALID` | GitHub answered, but with something the import cannot use, and would answer the same way again | Report it to a developer with the message; importing again does not help |
 | `422`, "validation failed", from the import, with `details.syncRunId` and `details.registryVersionId` | The import finished and its draft failed a check: the draft is `invalid`, and can no longer change. `/admin/status` raises `last-sync-failed`, and `commit-rejected` as well when every root imported | Read the draft's checks: `GET /registry/v1/admin/versions/<registryVersionId>`, under `validation`. If `all-roots-imported` failed, `GET /registry/v1/admin/sync-runs/<syncRunId>` names the roots the run gave up, and why. Otherwise correct the decisions in a held attempt (step 1 of [Describing a new market](#describing-a-new-market)) and validate it, or wait for a new commit |
 | `400`, `details.code` `OVERLAY_INVALID`, from the import or an overlay route, with a message that begins `version <id> market` or `version <id> network` — or, from `GET …/markets/<chainId>/<deploymentKey>/overlay`, with the market's key, such as `1/weth.displayName` | A decision a version stores that this release no longer takes. From the import, the version is the one on or an earlier attempt of the commit: every import fails on it before it imports a market, and spends nothing; `/admin/status` has it as `sync.lastRun.lastError`, and raises `sync-stalled` once nothing has moved for two hours. From an overlay route, it is the draft's own: every overlay write to the draft — `PUT …/overlay` and `PUT …/overlays` — reads all of its decisions first and is refused, the one that would replace that decision too, and so is the `GET` of the network or market that holds it | Report it to a developer with the message: a release that reads the decision again fixes it. The import then carries on by itself; cancelling the run does not help before that, since a new attempt reads the same decision. A draft the overlay routes refuse cannot be reviewed until then: leave it open, and do not validate it or switch it on — validation does not read the decisions again, and a version on that holds such a decision stops every import |
-| Linea WETH's reward price is about `0.009` (`reward_asset.price` in the rewards routes) | The environment was brought up before 2cf4843, with the COMP / ETH reward feed quoted in USD, and every later version inherited `"quote": "usd"`. The seed quotes it in the base asset | Hold a draft (`{"forceNewAttempt": true, "holdForReview": true, "reason": "quote Linea WETH's reward feed in its base asset"}`), read `…/versions/$V/markets/59144/weth/overlay`, send it back with `rewardPriceFeed.quote` `"base"`, then validate and switch it on (steps 4, 5 and 6 of the first bring-up) |
+| Linea WETH's reward price is about `0.009` (`reward_asset.price` in the rewards routes) | The environment was brought up before 2cf4843, with the COMP / ETH reward feed quoted in USD, and every later version inherited `"quote": "usd"`. The seed quotes it in the base asset | Hold a draft (`{"forceNewAttempt": true, "holdForReview": true, "reason": "quote Linea WETH's reward feed in its base asset"}`), read `…/versions/$V/markets/59144/weth/overlay`, send it back with `rewardPriceFeed.quote` `"base"`, then validate and switch it on (steps 4 to 7 of the first bring-up) |
 | `CHAIN_REQUEST_FAILED` in the import | The worker cannot reach the node provider proxy, or the proxy did not serve the calls, or did not answer them within 30 seconds. The worker's log line `registry root failed` has the status the proxy answered and its URL without the key: `HTTP 503` is no provider answering the proxy, `HTTP 401` the proxy refusing `NODE_PROXY_KEY` | Fix the proxy, its binding or its key; importing again continues where it stopped |
 | A network under `chainCheck.unreadable` in `/admin/status` | The check of the chain could not read that network, for the reason it names — most often `CHAIN_REQUEST_FAILED`, as in the row above. Nothing new is known about its markets: it raises no `chain-drift` of its own and clears none, since a drift found there before stays, with the `seenAt` of the last read that found it. The warning `registry chain not read` in the worker's log has the cause | Fix the proxy for that network. The check reads it again at the next hourly invocation, until it has read every network |
 | `chain-drift` in `/admin/status` | The chain answers a market's feed or collateral otherwise than the version on stores it | [A market that changed on chain](#a-market-that-changed-on-chain) |
@@ -1366,8 +1484,12 @@ whose reasons are in the draft it names.
 | `409` on validate, "the candidate changed while it was being validated" | An overlay was written to the draft while it was being checked, so the checks no longer described it and none was kept | Validate it again |
 | `409` writing an overlay, "is no longer the one this was decided against" or "changed while this overlay was being written" | Somebody changed the draft between your read and your write | Read the overlay again — `GET …/markets/<chainId>/<deploymentKey>/overlay` or `GET …/networks/<chainId>/overlay`, whose answer has its `digest` — redo your change on it, and send it with that digest as `expectedDigest`, or under the document's key in `expectedDigests` of a `PUT …/overlays` |
 | `409` writing an overlay, "already has that slug", "is already the default" or "cannot carry a reward price feed" | The document conflicts with the rest of the draft: another market of the network keeps that slug, another market is the default, or the market's rewards contract names no reward token. The draft is open, and nothing was written | Change the document, not the draft. Choose another slug, or move it with both markets in one `PUT …/overlays`; move the default the same way, both markets in one request. Read both first, and send each one's `digest` under its key in `expectedDigests` (`{"1/usdc": "<digest>", "1/weth": "<digest>"}`), so a change made to either since is not undone. A market without a reward token takes `"rewardPriceFeed": null` and both rewards capabilities `false` |
-| `409` on activate or rollback, "the active version is …" | Somebody switched another version on after you looked | Read the status again and decide again |
-| A version is `invalid` with the failed check `served-network-reviewed` | It serves a market of a network nobody has described — a chain no version had before | An `invalid` version can no longer be changed. Hold a new attempt (step 1 of [Describing a new market](#describing-a-new-market)), which keeps what was reviewed in this one; describe the network there (step 5), then validate it and switch it on (steps 4, 5 and 6 of the first bring-up) |
+| `409` on activate, rollback or approve, "the active version is …" or "the active version changed to … while this … was decided" | Somebody switched another version on after you looked, or while your request was deciding. Nothing of yours was recorded | Read the status again and decide again |
+| `409` on activate, `details.code` `APPROVAL_REQUIRED` | No approval of the version you may switch it on with: none was given, or it was given by you or another token of your name, has expired, was used, or was given while another version was on — the message names the version an approval is needed against. "Was used up while it was decided" is an approval another switch used in the meantime | Have another admin approve it again, against the version on (step 5 of [the first bring-up](#bringing-an-environment-up-for-the-first-time)), then switch it on |
+| `409` on rollback, `details.code` `ROLLBACK_TARGET_INVALID` | A rollback goes back one step only, to the version the one on replaced when it was last activated, if that is older. This one is another — two steps back or more, never on, or newer — or nothing is on, or the version on was switched on in place of a newer one. The message names the version a rollback may restore now, or says that none may; "was switched on again while this rollback was decided" is the version on activated again meanwhile, in place of another | Roll back to the version the message names, one step at a time, as [Switching back](#switching-back) says. To switch on any other version, approve it and activate it (steps 5 to 7 of [the first bring-up](#bringing-an-environment-up-for-the-first-time)) |
+| `400` on approve, "expectedActiveVersionId is required" | The approval does not say which version on its changes were read against | Read the changes, and send the version on as `expectedActiveVersionId` — `comparedWith` in their answer, or `null` when nothing is on (step 5 of [the first bring-up](#bringing-an-environment-up-for-the-first-time)) |
+| `409` on approve, "is on already" | The version is the one on: there is no change to approve | Nothing |
+| A version is `invalid` with the failed check `served-network-reviewed` | It serves a market of a network nobody has described — a chain no version had before | An `invalid` version can no longer be changed. Hold a new attempt (step 1 of [Describing a new market](#describing-a-new-market)), which keeps what was reviewed in this one; describe the network there (step 5), then validate it and switch it on (steps 4 to 7 of the first bring-up) |
 | A root failed with `OVERLAY_INVALID`, "is the default market by the decisions it inherits, but … already is the default" | The draft holds another default than the one its import inherits: the draft's default was moved to a market it holds before the import reached the market that opened by default, or a version that names another default was switched on while the import was running | If the draft's default was moved, the draft is still importing, and the root has attempts left (`attempts` below five in `GET /registry/v1/admin/sync-runs/<id>`): move the default back, import the rest, then move the default with both markets in one `PUT …/overlays`, with their digests under `expectedDigests` as in the row on a slug above. Otherwise continue the import until it ends — each request spends one of the root's five attempts — and hold a new attempt (step 1 of [Describing a new market](#describing-a-new-market)): it inherits the default the draft moved, or the one switched on, and imports both markets |
 | `idle` from import, "attempt … of this commit imported every root and is invalid" | The commit was imported completely and did not validate; another attempt would fail the same way, so the scheduled job does not make one | Read why it failed (`GET /registry/v1/admin/versions/<registryVersionId>`). Correct the decisions in a held attempt (step 1 of [Describing a new market](#describing-a-new-market)) and validate it, or wait for a new commit |
 | `idle` from import, "attempt … did not import every root; it is tried again after …" | Roots of the last attempt did not import — a chain that did not answer, or contracts the source names before they are deployed | Nothing: the scheduled job tries again then. To try now, force a new attempt |
@@ -1379,8 +1501,8 @@ whose reasons are in the draft it names.
 | A market reports `"status": "partially"` or `"status": "error"` | A price feed it reads reverts, usually one Chainlink retired | [A market that stopped answering](#a-market-that-stopped-answering) |
 | Answers carry `X-Registry-Stale: <seconds>`, and the log has the error `registry database unreachable; answering from the version it last named` | The database could not be reached, so the API is answering from the version it last saw, and saying how old it is. Each isolate logs the error once a minute while this lasts | Check the database's health; the API recovers by itself once D1 answers, and starts returning `503` if the outage outlasts the configured window |
 | `503 UPSTREAM_UNAVAILABLE` from the market and registry routes, or from `/admin/status` | The database could not be reached, and there is no version within the window to answer from. Or, from a route that reads the chain — the market and account routes, transaction history, governance — the node provider proxy did not serve the request: no provider answered it, the worker could not reach the proxy or lost its answer, or the proxy answered a call with an error that is not a revert. Such an answer says `a node provider did not answer`, with the proxy's `Retry-After` when it sent one; the worker's log line `route failed` with the answer's `requestId` has the error — `HTTP 401` in it is the proxy refusing `NODE_PROXY_KEY` — and the proxy's own log has `upstream error` or `json-rpc error` | Check the database's health; nothing in the registry needs changing. For a node provider, fix the proxy, its binding or its key: the routes answer again as soon as it serves them |
-| `500 INTERNAL` from the market and registry routes | The database answered with a fault — most often a release deployed before its migrations — or a bug, such as a call the contract reverted where the route needed its value. A node provider that did not answer is a `503`, not this. The worker's log line `route failed` or `registry route failed` with the answer's `requestId` has the error | Apply the migrations if they are missing; otherwise report the log line |
-| A market reports `"status": "error"` with the message `creationBlock … is past the latest block, …`, and the log has the warning `creation block not reached` naming its Comet | The active version holds a creation block the market's chain has not reached — one no overlay write checked, such as one an import inherited. None of the market's values can be read, so the market routes and `/account/{address}/rewards` answer it as `error`, and the other markets as usual. This stops by itself once the chain reaches the block, but the market's history then repeats the day of that block for every day before it | Switch back, or give the market the block its Comet was deployed in, as step 6 of [the first bring-up](#6-check-that-it-is-on) says — after the error has stopped by itself too |
+| `500 INTERNAL` from the market and registry routes | The database answered with a fault — most often a release deployed before its migrations — or a bug, such as a call the contract reverted where the route needed its value. A node provider that did not answer is a `503`, not this. The worker's log line `route failed` or `registry route failed` with the answer's `requestId` has the error. On an activation or a rollback, with "an activation requires an approval", "a rollback restores only the older version …" or "the active registry version moves only with its activation", it is a release from before approvals answering, after the environment's first approval: deployed again, or beside the release with approvals | Apply the migrations if they are missing; deploy the release with approvals, or a later one, to all traffic if an older one answers; otherwise report the log line |
+| A market reports `"status": "error"` with the message `creationBlock … is past the latest block, …`, and the log has the warning `creation block not reached` naming its Comet | The active version holds a creation block the market's chain has not reached — one no overlay write checked, such as one an import inherited. None of the market's values can be read, so the market routes and `/account/{address}/rewards` answer it as `error`, and the other markets as usual. This stops by itself once the chain reaches the block, but the market's history then repeats the day of that block for every day before it | Switch back, or give the market the block its Comet was deployed in, as step 7 of [the first bring-up](#7-check-that-it-is-on) says — after the error has stopped by itself too |
 | The worker's log has the warning `computation cache unreadable` or `computation cache unwritable`, with what KV answered | KV refused a call to the namespace computed values are cached in, `kv_mainnet` or `kv_testnet`: `429` is a value written twice in a second, `503` KV not answering. The request was answered without the cache — a value it could not read was computed again from the chain, and one it could not write was not kept — so it was slower, and asked the node provider more. Each isolate says each once a minute while it lasts | Nothing for a `429` now and then. A `503` that keeps coming back is KV not answering: every request reads the chain while it lasts, and transaction history fails (the next row), so check Cloudflare's status and the node provider proxy |
 | `500 INTERNAL` from transaction history, and the log line `route failed` has `KV GET failed` or `KV PUT failed` | KV refused a history cursor. Cursors are kept in `kv_mainnet` with the computed values, but nothing computes one again: a page whose cursor KV cannot read fails, and so does a page whose cursor it cannot keep, rather than hand out a cursor no later page could read. A first page fails so only after it has been read in full from the chain, since its cursor is written last. While KV does not answer, every page of history fails, though the other routes answer | Check Cloudflare's status; nothing in the registry needs changing. The client may ask again, and history answers as soon as KV does |
 | The worker's log has the warning `history cursor written twice in a second`, with KV's `429` | Two pages asked within a second kept the same cursor — the same page asked twice, or the first pages of two accounts without history at one block: a cursor's id is the digest of what it holds, and names no account. KV takes one write a second to a key, so it refused the second write of a cursor it had just taken, and the page was answered with it | Nothing |
