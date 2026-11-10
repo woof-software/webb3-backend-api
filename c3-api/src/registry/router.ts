@@ -164,7 +164,6 @@ async function routeRegistry(
   let served: CachedSnapshot | null = null;
   const context: RegistryContext = {
     db:      env.APP_DB,
-    actor:   env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`,
     requestId,
     debug,
     active:  async () => (served = await read()),
