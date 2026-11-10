@@ -17,9 +17,11 @@ import type { Log } from '../log.js';
 
 import type { CachedSnapshot, PinnedVersion } from './cache.js';
 import type { CollateralOfComet } from './collateral-decision-repository.js';
-import type { CollateralMarks, RecordedKind } from './collateral-decisions.js';
+import type { CollateralMarks } from './collateral-decisions.js';
 import { markedMarket, markedNetwork, markedRepresentation } from './collateral-decisions.js';
+import type { RecordedKind } from './decision-records.js';
 import { conflict } from './errors.js';
+import type { TokenOfChain } from './token-policy-repository.js';
 import { registryHeaders } from './version-headers.js';
 import type { VersionRef } from './version-headers.js';
 import {
@@ -92,11 +94,11 @@ type RegistryContext = {
    * The decisions of every kind and every chain that the active reads mark
    * the collaterals of the active version with (collateral-decisions.ts):
    * read from D1, or during an outage from the record the Worker keeps of
-   * each kind. `record` keeps a kind's record after a command that may have
-   * changed it, and never fails the command.
+   * each kind (decision-records.ts). `record` keeps a kind's record after a
+   * command that may have changed it, and never fails the command.
    */
   marks:  () => Promise<{ marks: CollateralMarks, recorded: boolean }>,
-  record: (kind: RecordedKind) => Promise<void>,
+  record: <Subject>(kind: RecordedKind<Subject>) => Promise<void>,
 };
 
 const SCHEMA_VERSION = 1;
@@ -273,6 +275,10 @@ function addressOf(value: string): Address {
     throw new ApiError('BAD_REQUEST', `${value} is not an address`);
   }
   return normalizeAddress(value);
+}
+
+function tokenOfChain(chainId: string, tokenAddress: string): TokenOfChain {
+  return { chainId: chainIdOf(chainId), tokenAddress: addressOf(tokenAddress) };
 }
 
 function collateralOf(chainId: string, cometAddress: string, tokenAddress: string): CollateralOfComet {
@@ -689,7 +695,6 @@ async function postActivation(
 export type { RegistryContext };
 
 export {
-  addressOf,
   cancelSyncRun,
   chainIdOf,
   collateralOf,
@@ -706,4 +711,5 @@ export {
   getVersionDetail,
   postActivation,
   postValidate,
+  tokenOfChain,
 };

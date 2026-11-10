@@ -1,13 +1,10 @@
 import t from 'tap';
 
 import { keccak256 } from '../../../lib/hash.js';
-import {
-  DEPRECATED_KEY,
-  DEPRECATED_RECORD,
-  collateralDecisionsOf,
-  markedDecisions,
-  recordCollaterals,
-} from '../../../src/registry/collateral-decisions.js';
+import type { CollateralOfComet } from '../../../src/registry/collateral-decision-repository.js';
+import { DEPRECATED_KEY, DEPRECATED_RECORD, HIDDEN_RECORD } from '../../../src/registry/collateral-decisions.js';
+import type { RecordedKind } from '../../../src/registry/decision-records.js';
+import { decisionSetOf, markedDecisions, recordDecisions } from '../../../src/registry/decision-records.js';
 
 import { settledWithin } from '../../util/execution-context.js';
 import { MemoryKv } from '../../util/kv.js';
@@ -50,7 +47,7 @@ t.test('a tag names each kind\'s flags by a digest of their collaterals, as the 
     `"v1-r5-snapshot+deprecated-${deprecated}+hidden-${hidden}-${registry.versionId}-${registry.snapshot.registryVersion.checksum}"`,
     'the active snapshot names the collaterals it flags deprecated, and those it flags hidden, each by the digest of their keys');
   t.same(
-    [ collateralDecisionsOf([ weEth, mEth ]).digest, collateralDecisionsOf([ lBtc ]).digest ],
+    [ decisionSetOf(DEPRECATED_RECORD, [ weEth, mEth ]).digest, decisionSetOf(HIDDEN_RECORD, [ lBtc ]).digest ],
     [ deprecated, hidden ],
     'and so are the decisions of each kind, in whatever order they were listed');
 });
@@ -147,7 +144,7 @@ t.test('the reads of an isolate check the record once between them, and write it
   const burst = Array.from({ length: 8 }, () => markedDecisions(DEPRECATED_RECORD, deps).then(read => { settled += 1; return read; }));
   await until(() => settled >= 7);
   t.equal(gets, 1, 'eight reads arriving together check the record once, the other seven leaving it to that check');
-  const command = recordCollaterals(DEPRECATED_RECORD, deps);
+  const command = recordDecisions(DEPRECATED_RECORD, deps);
   await until(() => answered() === 9);
   t.equal(answered(), 9, 'the command reads the decisions, as each of the eight reads did, while the check is held');
   release();
@@ -203,10 +200,10 @@ t.test('a record a read put back after a decision is put right by the next check
 
   // isolate B makes a decision meanwhile, and its command records it
   await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
-  await recordCollaterals(DEPRECATED_RECORD, b);
+  await recordDecisions(DEPRECATED_RECORD, b);
   t.equal(await recorded(), 1, 'the command records its decision');
   release();
-  t.equal((await reading).decisions.collaterals.length, 0, 'A read the decisions before it');
+  t.equal((await reading).decisions.subjects.length, 0, 'A read the decisions before it');
   t.equal(await recorded(), 0, 'and its write, landing last, put back the decisions before the decision');
 
   now += 4 * 60_000;
@@ -296,7 +293,7 @@ t.test('a read hands its check of the record to waitUntil, and is answered befor
   t.equal(deferred.length, 1, 'having handed its check over');
   t.equal(await store.get(DEPRECATED_KEY), null, 'which has not written the record yet');
   release();
-  t.equal((await read).decisions.collaterals.length, 1, 'the read answers with the decisions');
+  t.equal((await read).decisions.subjects.length, 1, 'the read answers with the decisions');
   await Promise.all(deferred);
   t.equal((await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] } | null)?.collaterals.length, 1,
     'which the record holds once the namespace takes the write');
@@ -376,7 +373,7 @@ t.test('a command waits for a check of the same decisions under way, and leaves 
 
   t.ok(await settledWithin(markedDecisions(DEPRECATED_RECORD, deps), 5000), 'a read is answered while its check is under way');
   await until(() => puts === 1);
-  const command = recordCollaterals(DEPRECATED_RECORD, deps);
+  const command = recordDecisions(DEPRECATED_RECORD, deps);
   t.notOk(await settledWithin(command, 300), 'a command that read the same decisions waits for that check');
   t.equal(puts, 1, 'and writes nothing of its own meanwhile');
   release();
@@ -398,7 +395,7 @@ t.test('a command waits for a check of the same decisions no longer than the che
   t.ok(await settledWithin(markedDecisions(DEPRECATED_RECORD, deps), 5000), 'a read is answered while its check is under way');
   await until(() => puts() === 1);
   clock.now += 60_000 - 50;
-  t.ok(await settledWithin(recordCollaterals(DEPRECATED_RECORD, deps), 5000), 'a command near the end of that minute waits out the rest of it');
+  t.ok(await settledWithin(recordDecisions(DEPRECATED_RECORD, deps), 5000), 'a command near the end of that minute waits out the rest of it');
   t.equal(puts(), 2, 'then writes the record itself');
   t.equal((await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] } | null)?.collaterals.length, 1, 'with the decisions');
 });
@@ -416,7 +413,54 @@ t.test('a command does not wait for a check of other decisions', async t => {
   t.ok(await settledWithin(markedDecisions(DEPRECATED_RECORD, deps), 5000), 'a read is answered while its check is under way');
   await until(() => puts() === 1);
   await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
-  t.ok(await settledWithin(recordCollaterals(DEPRECATED_RECORD, deps), 5000), 'a command that decided meanwhile does not wait for it');
+  t.ok(await settledWithin(recordDecisions(DEPRECATED_RECORD, deps), 5000), 'a command that decided meanwhile does not wait for it');
   t.equal(puts(), 2, 'and writes the record itself');
   t.equal((await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] } | null)?.collaterals.length, 1, 'with its decision');
+});
+
+/*
+ * What an isolate knows of a record is kept by the record, not by the kind
+ * that describes it: a kind made anew for every read, as a factory called
+ * where the record is read would make one, leaves the record to the check
+ * under way, and so does a command through another. The kind is made member
+ * by member, since a copy spread from the kind would share whatever the kind
+ * held.
+ */
+t.test('reads and a command through a kind made anew each time leave the record to the one check under way', async t => {
+  const { registry, decide } = await fixture(t);
+  await decide(DEPRECATED_READS, 'usdt', 'mETH', true);
+  const store = MemoryKv({});
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  let puts = 0;
+  const deferred: Array<Promise<unknown>> = [];
+  const deps = {
+    db:           registry.db,
+    // the namespace takes the first write it is given, the check's, once released
+    kv:           bindingOf(store, { put: async (_parameters, write) => { puts += 1; await (puts === 1 ? released.then(write) : write()); } }),
+    ttlSeconds:   300,
+    staleSeconds: 3600,
+    debug:        quietLog,
+    defer:        (work: Promise<unknown>) => { deferred.push(work); },
+  };
+  const anew = (): RecordedKind<CollateralOfComet> => ({
+    key:       DEPRECATED_RECORD.key,
+    noun:      DEPRECATED_RECORD.noun,
+    member:    DEPRECATED_RECORD.member,
+    read:      DEPRECATED_RECORD.read,
+    keyOf:     DEPRECATED_RECORD.keyOf,
+    subjectOf: DEPRECATED_RECORD.subjectOf,
+  });
+
+  await Promise.all(Array.from({ length: 8 }, () => markedDecisions(anew(), deps)));
+  await until(() => puts === 1);
+  t.same([ deferred.length, puts ], [ 1, 1 ], 'eight reads arriving together, each through a kind made anew, check the record once');
+  const command = recordDecisions(anew(), deps);
+  t.notOk(await settledWithin(command, 300), 'a command through another waits for that check of the same decisions');
+  t.equal(puts, 1, 'and writes nothing of its own meanwhile');
+  release();
+  t.ok(await settledWithin(command, 5000), 'it is done once the check is');
+  await Promise.all(deferred);
+  t.equal(puts, 1, 'the check having made the one write');
+  t.equal((await store.get(DEPRECATED_KEY, 'json') as { collaterals: unknown[] } | null)?.collaterals.length, 1, 'of the decisions');
 });

@@ -5,7 +5,8 @@ import type { Address } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
 import type { Catalog } from '../../../src/registry/catalog.js';
-import { collateralDecisionsOf } from '../../../src/registry/collateral-decisions.js';
+import { DEPRECATED_RECORD, HIDDEN_RECORD } from '../../../src/registry/collateral-decisions.js';
+import { decisionSetOf } from '../../../src/registry/decision-records.js';
 import { chainTokens, withTokenFields } from '../../../src/registry/summary-tokens.js';
 
 import { loadRegistrySnapshotFixture } from '../../util/registry-fixture.js';
@@ -47,8 +48,8 @@ const chainOf = (
   { deprecated = [], hidden = [] }: { deprecated?: Collateral[], hidden?: Collateral[] } = {},
 ) => chainTokens(within, network, chainId, {
   ...NO_DECISIONS,
-  deprecated: { decisions: collateralDecisionsOf(deprecated), recorded: false },
-  hidden:     { decisions: collateralDecisionsOf(hidden), recorded: false },
+  deprecated: { decisions: decisionSetOf(DEPRECATED_RECORD, deprecated), recorded: false },
+  hidden:     { decisions: decisionSetOf(HIDDEN_RECORD, hidden), recorded: false },
 });
 const mainnet = (decisions: { deprecated?: Collateral[], hidden?: Collateral[] } = {}, within = catalog) => chainOf(within, 'ethereum-mainnet', 1, decisions);
 

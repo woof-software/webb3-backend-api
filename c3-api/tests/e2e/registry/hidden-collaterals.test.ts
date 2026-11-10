@@ -37,7 +37,6 @@ decisionScenarios(harness, HIDDEN_COLLATERALS);
 const snapshot = loadRegistrySnapshotFixture();
 const mainnet  = snapshot.networks.find(network => network.chainId === 1)!;
 
-// a market of the fixture's mainnet by its deployment key, and a collateral of it by symbol
 const comet = (key: string) => mainnet.markets.find(market => market.deploymentKey === key)!.contracts.comet!;
 const collateral = (key: string, symbol: string) => mainnet.markets.find(market => market.deploymentKey === key)!
   .collateralAssets.find(asset => asset.token.symbol === symbol)!.token.address;

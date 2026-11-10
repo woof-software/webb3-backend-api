@@ -7,7 +7,8 @@ import type * as Evaluator from '../evaluator.js';
 import { routeAdmin } from './admin-router.js';
 import type { CachedSnapshot } from './cache.js';
 import { activeSnapshot, cacheDepsOf, isUnreachable, versionSnapshot, warmSnapshot } from './cache.js';
-import { readMarks, recordCollaterals } from './collateral-decisions.js';
+import { readMarks } from './collateral-decisions.js';
+import { recordDecisions } from './decision-records.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
 import { routePublic } from './public-router.js';
@@ -188,7 +189,7 @@ async function routeRegistry(
       }
     },
     marks:   () => readMarks(deps),
-    record:  kind => recordCollaterals(kind, deps),
+    record:  kind => recordDecisions(kind, deps),
   };
 
   try {
