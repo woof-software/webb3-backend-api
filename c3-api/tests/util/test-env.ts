@@ -1,14 +1,34 @@
 import type { Env } from '../../entrypoint.js';
 import { sha256 } from '../../lib/hash.js';
+import type { Role } from '../../src/http/bearer-auth.js';
 
 import { MemoryKv } from './kv.js';
 
 /*
- * The token the administrative routes take in tests. A worker is given only
- * its hash (COMET_REGISTRY_ADMIN_TOKEN_HASH), as production is, and a test
- * presents the token itself.
+ * The tokens the administrative routes take in tests. A worker is given only
+ * their digests, in its list of tokens (COMET_REGISTRY_ADMIN_TOKENS), as
+ * production is, and a test presents the tokens themselves. ADMIN_TOKEN is
+ * test-admin's, which a request sends unless it says otherwise, and
+ * APPROVER_TOKEN test-approver's, an admin of another name, who approves
+ * what test-admin switches on.
  */
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
+const ADMIN_TOKEN    = 'registry-admin-token-for-tests';
+const APPROVER_TOKEN = 'registry-approver-token-for-tests';
+
+// a token of a worker's list as a test holds it: who holds it, the token itself, its role, and its last instant
+type ListedToken = { name: string, token: string, role: Role, notAfter?: string | null };
+
+const ADMIN_TOKENS: ListedToken[] = [
+  { name: 'test-admin',    token: ADMIN_TOKEN,    role: 'admin' },
+  { name: 'test-approver', token: APPROVER_TOKEN, role: 'admin' },
+];
+
+// the list a worker is given for tokens (COMET_REGISTRY_ADMIN_TOKENS): their digests, never the tokens
+async function tokenList(tokens: ListedToken[]): Promise<string> {
+  return JSON.stringify(await Promise.all(tokens.map(async ({ name, token, role, notAfter = null }) => (
+    { name, sha256: await sha256(token), role, notAfter }
+  ))));
+}
 
 /*
  * Stands in for a binding that only exists inside workerd. Any use throws, so
@@ -55,6 +75,7 @@ function defaultTestEnv(): Env {
     COMET_SYNC_LEASE_SECONDS:          '',
     REGISTRY_SNAPSHOT_CACHE_TTL_S:     '',
     REGISTRY_STALE_FALLBACK_MAX_S:     '',
+    COMET_REGISTRY_APPROVAL_TTL_S:     '',
   };
 }
 
@@ -70,13 +91,13 @@ function makeTestEnv(overrides: Partial<Env> = {}, processEnv: NodeJS.ProcessEnv
 
 /*
  * The Env of a Node-side test that sends administrative requests: its routes
- * take ADMIN_TOKEN, and both limiters let every request through, where the
- * default ones throw. What the limiters refuse is tested through workerd, in
- * tests/e2e/registry/security.test.ts.
+ * take ADMIN_TOKEN and APPROVER_TOKEN, and both limiters let every request
+ * through, where the default ones throw. What the limiters refuse is tested
+ * through workerd, in tests/e2e/registry/security.test.ts.
  */
 async function adminTestEnv(overrides: Partial<Env> = {}): Promise<Env> {
   return makeTestEnv({
-    COMET_REGISTRY_ADMIN_TOKEN_HASH:  await sha256(ADMIN_TOKEN),
+    COMET_REGISTRY_ADMIN_TOKENS:      await tokenList(ADMIN_TOKENS),
     REGISTRY_ADMIN_RATE_LIMITER:      { limit: async () => ({ success: true }) },
     REGISTRY_ADMIN_AUTH_RATE_LIMITER: { limit: async () => ({ success: true }) },
     ...overrides,
@@ -116,10 +137,14 @@ function failingStatements(
   });
 }
 
+export type { ListedToken };
 export {
   ADMIN_TOKEN,
+  ADMIN_TOKENS,
+  APPROVER_TOKEN,
   adminTestEnv,
   failingDatabase,
   failingStatements,
   makeTestEnv,
+  tokenList,
 };

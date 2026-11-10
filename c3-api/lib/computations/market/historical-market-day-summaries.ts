@@ -31,9 +31,10 @@ const {
   pull1,
 } = Compute.Functor<HistoricalMarketDaySummaries>({});
 
-const historicalMarketDaySummaries = implement({
-  // 8: where the base feed the version names reverts, a summary prices the base asset through the one the Comet names
-  version: 8,
+const historicalMarketDaySummaries: Compute.Implementation<HistoricalMarketDaySummaries> = implement({
+  // 10: an empty market's APRs come from its Comet's rate model (#23).
+  // 9 is taken by values of another shape in the KV two deployments of develop can share.
+  version: 10,
   index: Index.Everything,
   /*
    * Key computation by materialized date for startBlock's

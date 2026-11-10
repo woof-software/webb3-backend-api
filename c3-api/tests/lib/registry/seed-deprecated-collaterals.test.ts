@@ -7,7 +7,7 @@ import { readSeedComets, readSeedDeprecated, readSeedDeprecatedText } from '../.
 
 /*
  * The first list of deprecated collaterals is the body of
- * `POST …/deprecated-collaterals/review` and `/apply` that step 7 of the
+ * `POST …/deprecated-collaterals/review` and `/apply` that step 8 of the
  * runbook's first bring-up sends once the seed's version is on, and review
  * holds every row against that version. What holds without one is held here:
  * the file's form, and each row against what the repository knows — the

@@ -128,13 +128,13 @@ function priceExceptionRow(scope: Scope, overrides: Row = {}): Row {
 
 type Candidate = Scope & { marketId: string, baseTokenId: string, collateralTokenId: string };
 
-async function insertCandidate(db: D1Database, versionId: string = randomUUID(), chainId: number = 1): Promise<Candidate> {
+async function insertCandidate(db: D1Database, versionId: string = randomUUID(), chainId: number = 1, version: Row = {}): Promise<Candidate> {
   const scope = { registry_version_id: versionId, network_id: randomUUID() };
   const marketId = randomUUID();
   const baseTokenId = randomUUID();
   const collateralTokenId = randomUUID();
   await db.batch([
-    insertStatement(db, 'registry_versions', versionRow(versionId)),
+    insertStatement(db, 'registry_versions', versionRow(versionId, version)),
     insertStatement(db, 'registry_networks', networkRow(scope, chainId)),
     insertStatement(db, 'markets', marketRow(marketId, scope)),
     insertStatement(db, 'tokens', tokenRow(baseTokenId, scope)),
@@ -175,14 +175,23 @@ async function validate(db: D1Database, versionId: string): Promise<void> {
  * The registry's own activation batch: an audit event and the pointer
  * change, each written only when the pointer differs from the target. It is
  * sent as it is, without the checks activateVersion makes before it, because
- * what refuses a version that is not validated has to be the schema.
+ * what refuses a version that is not validated, or a move nobody approved,
+ * has to be the schema. A move is made by test-admin at NOW, with no
+ * approval, unless it says otherwise.
  */
-function activationBatch(db: D1Database, versionId: string, action: 'activate' | 'rollback' = 'activate'): D1PreparedStatement[] {
-  return activationStatements(db, { activationId: randomUUID(), versionId, action, actor: 'test-admin', reason: 'test', at: NOW });
+type Move = { actor?: string, at?: string, approvalId?: string | null };
+
+function activationBatch(
+  db: D1Database,
+  versionId: string,
+  action: 'activate' | 'rollback' = 'activate',
+  { actor = 'test-admin', at = NOW, approvalId = null }: Move = {},
+): D1PreparedStatement[] {
+  return activationStatements(db, { activationId: randomUUID(), versionId, action, actor, reason: 'test', at, approvalId });
 }
 
-async function activate(db: D1Database, versionId: string, action: 'activate' | 'rollback' = 'activate'): Promise<number[]> {
-  const results = await db.batch(activationBatch(db, versionId, action));
+async function activate(db: D1Database, versionId: string, action: 'activate' | 'rollback' = 'activate', move: Move = {}): Promise<number[]> {
+  const results = await db.batch(activationBatch(db, versionId, action, move));
   return results.map(changedRows);
 }
 
@@ -194,7 +203,7 @@ async function run(db: D1Database, sql: string, ...bindings: unknown[]): Promise
   return db.prepare(sql).bind(...bindings).run();
 }
 
-export type { Candidate, Scope };
+export type { Candidate, Move, Scope };
 export {
   NOW,
   activate,

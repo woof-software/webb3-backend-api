@@ -12,7 +12,7 @@ import { executionContext, settledWithin } from '../../util/execution-context.js
 import { MemoryKv, refusingKv } from '../../util/kv.js';
 import { activeRegistryDatabase } from '../../util/registry-database.js';
 import { seedCandidate } from '../../util/registry-fixture.js';
-import { ADMIN_TOKEN, adminTestEnv } from '../../util/test-env.js';
+import { ADMIN_TOKEN, APPROVER_TOKEN, adminTestEnv } from '../../util/test-env.js';
 
 import '../../../shim/node-self.js';
 
@@ -37,10 +37,16 @@ async function get(env: Env, path: string, headers: Record<string, string> = {})
   return C3Api.fetch(new Request(`https://api.test.local${path}`, { headers }), env);
 }
 
-async function post(env: Env, path: string, body: unknown, method: 'POST' | 'PATCH' = 'POST'): Promise<Response> {
+async function post(
+  env: Env,
+  path: string,
+  body: unknown,
+  method: 'POST' | 'PATCH' = 'POST',
+  token: string = ADMIN_TOKEN,
+): Promise<Response> {
   return C3Api.fetch(new Request(`https://api.test.local${path}`, {
     method,
-    headers: { 'Authorization': `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
     body:    JSON.stringify(body),
   }), env);
 }
@@ -86,6 +92,10 @@ t.test('a validation, an activation and a rollback answer as committed, though n
   t.match(await validated.json(), { version: { id: next, status: 'validated' } }, 'with the version it validated');
   t.ok(logs.includes('warn: registry snapshot not warmed'), 'its warm-up, which could not list the namespace, a warning');
 
+  const approved = await post(env, `/registry/v1/admin/versions/${next}/approve`, {
+    reason: 'the namespace does not answer', expectedActiveVersionId: registry.versionId,
+  }, 'POST', APPROVER_TOKEN);
+  t.equal(approved.status, 200, 'an approval answers 200');
   const activated = await post(env, `/registry/v1/admin/versions/${next}/activate`, {
     reason: 'the namespace does not answer', expectedActiveVersionId: registry.versionId,
   });

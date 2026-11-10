@@ -30,7 +30,7 @@ import { TOKEN_POLICIES, decisionScenarios } from './decision-scenarios.js';
  *
  * Refusals of malformed requests are in token-policy-routes.test.ts.
  */
-const harness = await registryHarness({ admin: true, vars: { COMET_REGISTRY_ADMIN_ACTOR: ADMIN_ACTOR } });
+const harness = await registryHarness({ admin: true });
 const admin   = adminClient(harness.server);
 
 decisionScenarios(harness, TOKEN_POLICIES);
@@ -157,11 +157,10 @@ t.test('a list of decisions is exported, reviewed, and applied as one', async t 
   t.equal(applied.header('x-registry-version'), versionId);
   t.same(
     (await db.prepare(
-      `SELECT chain_id, token_address, previous_is_strategic, is_strategic, actor, reason FROM token_policy_events
-       WHERE reason <> 'decided by hand' ORDER BY rowid`
-    ).all()).results?.length,
-    3,
-    'one event per change',
+      `SELECT actor FROM token_policy_events WHERE reason <> 'decided by hand' ORDER BY rowid`
+    ).all<{ actor: string }>()).results?.map(row => row.actor),
+    [ ADMIN_ACTOR, ADMIN_ACTOR, ADMIN_ACTOR ],
+    'one event per change, each under the name of the token that applied the list',
   );
   t.same(
     (await db.prepare(`SELECT chain_id, token_address, is_strategic FROM token_policies ORDER BY chain_id, token_address`).all()).results,

@@ -11,6 +11,7 @@ import { readMarks } from './collateral-decisions.js';
 import { recordDecisions } from './decision-records.js';
 import { RegistryErrorCode, isRegistryError } from './errors.js';
 import { RegistryContext } from './handlers.js';
+import { notifyRegistryEvent } from './notifications.js';
 import { routePublic } from './public-router.js';
 import { registryHeaders } from './version-headers.js';
 
@@ -93,6 +94,8 @@ const ERROR_STATUS: Record<RegistryErrorCode, ApiErrorCode> = {
   OVERLAY_FEED_UNREADABLE:      'UNPROCESSABLE',
   OVERLAY_CREATION_BLOCK_WRONG: 'UNPROCESSABLE',
   CANDIDATE_STATE_CONFLICT:     'CONFLICT',
+  APPROVAL_REQUIRED:            'CONFLICT',
+  ROLLBACK_TARGET_INVALID:      'CONFLICT',
   SYNC_ALREADY_RUNNING:         'CONFLICT',
 };
 
@@ -171,7 +174,6 @@ async function routeRegistry(
   let served: CachedSnapshot | null = null;
   const context: RegistryContext = {
     db:      env.APP_DB,
-    actor:   env.COMET_REGISTRY_ADMIN_ACTOR ?? `registry-admin:${env.ENVIRONMENT}`,
     requestId,
     debug,
     active:  async () => (served = await activeSnapshot(deps)),
@@ -190,6 +192,8 @@ async function routeRegistry(
     },
     marks:   () => readMarks(deps),
     record:  kind => recordDecisions(kind, deps),
+    // a task the runtime sees through after the answer: the command never waits on the webhook
+    notify:  event => waitUntil(notifyRegistryEvent(env, event, { debug, requestId })),
   };
 
   try {

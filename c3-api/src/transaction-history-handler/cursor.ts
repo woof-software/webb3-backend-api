@@ -5,6 +5,7 @@ import { BigNumber   } from '../../lib/bignumber.js';
 import { BigFixnum   } from '../../lib/bigfixnum.js';
 
 import { WorkersKvCache } from '../../lib/symbolic/cache.js';
+import { firstBlockOf   } from '../../lib/symbolic/index/transaction-history-index.js';
 
 import type * as KnownNetwork    from '../../lib/well-known/networks/network.js';
 import type * as governanceModel from '../../lib/model/governance.js';
@@ -29,20 +30,26 @@ type StreamEvent = {
   network: KnownNetwork.Name; // Will change to chain-id later
   marketContractAddresses: Eth.Address[];
   rewardsContractAddress: Eth.Address;
+  /*
+   * The block the stream's ranges of logs are counted from (firstBlockOf): a
+   * block a cursor keeps for the stream ends one of its ranges only as
+   * counted from this one.
+   */
+  firstBlock: Eth.BlockNumber;
 };
 
-function streamKeyOf({ network, rewardsContractAddress }: StreamEvent): string {
+function streamKeyOf({ network, rewardsContractAddress }: Pick<StreamEvent, 'network' | 'rewardsContractAddress'>): string {
   return `${network}|${rewardsContractAddress.toLowerCase()}`;
 }
 
 /*
  * The streams a cursor reads, as one value two lists of streams can be
- * compared by: each stream with every market it reads, in no particular
- * order.
+ * compared by: each stream with the block its ranges are counted from and
+ * every market it reads, in no particular order.
  */
 function streamsOf(streams: StreamEvent[]): string {
   return streams
-    .map(stream => `${streamKeyOf(stream)}:${stream.marketContractAddresses.map(address => address.toLowerCase()).sort().join(',')}`)
+    .map(stream => `${streamKeyOf(stream)}@${stream.firstBlock}:${stream.marketContractAddresses.map(address => address.toLowerCase()).sort().join(',')}`)
     .sort()
     .join(';');
 }
@@ -58,8 +65,8 @@ interface Cursor {
 type CursorPayload = {
   /*
    * The registry version this page was read against. A cursor is meaningful
-   * for as long as the version that answers reads the same streams, which
-   * are what the version's markets define.
+   * for as long as the version that answers reads the same streams from the
+   * same first blocks, which are what the version's markets define.
    */
   registryVersionId: string;
   profilesByAddress: { [key: Eth.Address]: governanceModel.Profile };
@@ -80,9 +87,17 @@ type CursorPayload = {
 /*
  * A cursor as KV holds it. KV keeps cursors without an expiry, and a client
  * may keep one across visits, so a cursor issued before the registry, which
- * carries no version, can still be sent.
+ * carries no version, can still be sent, and so can one kept before its
+ * streams named their first blocks.
  */
-type StoredCursor = Omit<CursorPayload, 'registryVersionId'> & { registryVersionId?: string };
+type StoredCursor = Omit<CursorPayload, 'registryVersionId' | 'streamEvents'> & {
+  registryVersionId?: string;
+  streamEvents: Array<Omit<StreamEvent, 'firstBlock'> & { firstBlock?: Eth.BlockNumber }>;
+};
+
+function namesFirstBlocks(payload: StoredCursor): payload is StoredCursor & { streamEvents: StreamEvent[] } {
+  return payload.streamEvents.every(stream => typeof stream.firstBlock === 'number');
+}
 
 /*
  * What a cursor is named by: the hex SHA-256 of what it holds, the only form
@@ -108,7 +123,7 @@ function isCursorId(value: string): boolean {
  * filter what these streams had already fetched.
  */
 function streamEventsOf(catalog: Catalog): StreamEvent[] {
-  const streams = new Map<string, StreamEvent>();
+  const streams = new Map<string, Omit<StreamEvent, 'firstBlock'>>();
 
   for (const entry of catalog.markets()) {
     const comet   = entry.market.contracts.comet;
@@ -126,7 +141,8 @@ function streamEventsOf(catalog: Catalog): StreamEvent[] {
     }
   }
 
-  return [ ...streams.values() ];
+  // the first block as the reads count it, from the contracts they read
+  return [ ...streams.values() ].map(stream => ({ ...stream, firstBlock: firstBlockOf(contractsOf(catalog, stream)) }));
 }
 
 /*
@@ -134,7 +150,7 @@ function streamEventsOf(catalog: Catalog): StreamEvent[] {
  * address in a stream came from this same catalog, so a market that the
  * version does not describe cannot appear here.
  */
-function contractsOf(catalog: Catalog, stream: StreamEvent): {
+function contractsOf(catalog: Catalog, stream: Omit<StreamEvent, 'firstBlock'>): {
   marketContracts: Eth.Contract[],
   rewardsContract: Eth.Contract,
 } {
@@ -190,58 +206,71 @@ function openCursor(catalog: Catalog, streamEvents: StreamEvent[], filter: Curso
 
 /*
  * Whether a cursor's positions still mean what they meant against the
- * streams a version reads: the version reads the same streams.
+ * streams a version reads: the version reads the same streams, and counts
+ * their ranges from the same blocks.
  */
-function readsSameStreams(payload: StoredCursor, streams: StreamEvent[]): boolean {
+function readsSameStreams(payload: Pick<CursorPayload, 'streamEvents'>, streams: StreamEvent[]): boolean {
   return streamsOf(payload.streamEvents) === streamsOf(streams);
 }
 
 type Resumption =
   | { kind: 'resumed',         payload: CursorPayload }
-  | { kind: 'version-changed', cursorRegistryVersionId: string | null }
-  | { kind: 'filter-changed',  filter: 'markets' | 'actions' | 'initiated by' };
+  | { kind: 'version-changed', cursorRegistryVersionId: string | null };
 
 /*
  * A cursor holds a position in each stream it reads: a block and a
- * transaction in the logs of those contracts. The positions stay true for as
- * long as the version that answers reads the same streams, so a rollback, a
- * re-import of the same markets, or a new label on one leaves pagination
- * going; what each page says about its items is the version that answered
- * that page, which the headers name. A version that reads other streams
- * leaves the positions meaning nothing, and the client is told to start over.
+ * transaction in the logs of those contracts. The block ends one of the
+ * ranges the stream is read in, which are counted from its first block. The
+ * positions stay true for as long as the version that answers reads the same
+ * streams from the same first blocks, so a rollback, a re-import of the same
+ * markets, or a new label on one leaves pagination going; what each page
+ * says about its items is the version that answered that page, which the
+ * headers name. A version that reads other streams, or counts one from
+ * another block, as a corrected creation block can, leaves the positions
+ * meaning nothing: resumed, the cursor would answer again what it has
+ * answered. The client is told to start over.
  *
  * A cursor issued before the registry names no version, and keeps its
  * positions by network rather than by stream. It is ended as one of another
- * version is, whatever it reads, and the client starts over.
+ * version is, whatever it reads, and the client starts over. So is one kept
+ * before its streams named their first blocks, by its own version too, so
+ * that every cursor that goes on names them.
  *
- * A cursor the version reads on goes on only with the filters its first page
- * was asked with: as many values in each, and each of the cursor's among the
- * request's. They are compared in this order, once the version has decided.
+ * A cursor is judged before the request's markets are resolved against the
+ * version: they were resolved against the version that issued it, and a
+ * market whose history this version no longer serves is a change of streams
+ * like any other. The client is told to start over, not that a market it was
+ * paging through is invalid; the page that starts over says that. Its
+ * filters are compared once they are resolved (changedFilter).
  */
-function resumeCursor(
-  stored:       StoredCursor,
-  catalog:      Catalog,
-  streamEvents: StreamEvent[],
-  request:      Pick<CursorPayload['filter'], 'markets' | 'actions' | 'initiatedBy'>,
-): Resumption {
-  const payload: CursorPayload | null = typeof stored.registryVersionId === 'string'
-    && (stored.registryVersionId === catalog.versionId || readsSameStreams(stored, streamEvents))
-    ? { ...stored, registryVersionId: catalog.versionId }
-    : null;
-  if (payload === null) {
+function resumeCursor(stored: StoredCursor, catalog: Catalog, streamEvents: StreamEvent[]): Resumption {
+  if (typeof stored.registryVersionId !== 'string' || !namesFirstBlocks(stored)
+    || (stored.registryVersionId !== catalog.versionId && !readsSameStreams(stored, streamEvents))) {
     return { kind: 'version-changed', cursorRegistryVersionId: stored.registryVersionId ?? null };
   }
+  return { kind: 'resumed', payload: { ...stored, registryVersionId: catalog.versionId } };
+}
 
+/*
+ * A cursor the version reads on goes on only with the filters its first page
+ * was asked with: as many values in each, and each of the cursor's among the
+ * request's. They are compared in this order, and the first that differs is
+ * named; null when none does.
+ */
+function changedFilter(
+  payload: CursorPayload,
+  request: Pick<CursorPayload['filter'], 'markets' | 'actions' | 'initiatedBy'>,
+): 'markets' | 'actions' | 'initiated by' | null {
   for (const [ filter, kept, asked ] of [
     [ 'markets',      payload.filter.markets,     request.markets ],
     [ 'actions',      payload.filter.actions,     request.actions ],
     [ 'initiated by', payload.filter.initiatedBy, request.initiatedBy ],
   ] as const) {
     if (kept.length !== asked.length || !kept.every(value => asked.includes(value))) {
-      return { kind: 'filter-changed', filter };
+      return filter;
     }
   }
-  return { kind: 'resumed', payload };
+  return null;
 }
 
 /*
@@ -286,6 +315,7 @@ export type {
 };
 
 export {
+  changedFilter,
   contractsOf,
   cursorStore,
   isCursorId,

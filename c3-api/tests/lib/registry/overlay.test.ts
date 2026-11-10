@@ -352,8 +352,16 @@ t.test('a price exception is one decision in every shape it is held in', async t
 t.test('a stored exception is read in one place', async t => {
   const sources = sourceFiles();
   t.ok(sources.length > 200, 'every source file is read');
-  // a row's kind, or a column only some kinds fill, read off the row
-  const reading = sources.filter(path => /\brow\.kind\b|\.(?:fixed_price|replacement_price_feed)_\w+/.test(readFileSync(path, 'utf8')));
+  /*
+   * A column only some kinds fill, read off a row, or a row's kind where the
+   * rows are exceptions: other rows have kinds of their own, such as the
+   * audit row of a move or an approval (notifications.ts).
+   */
+  const reading = sources.filter(path => {
+    const text = readFileSync(path, 'utf8');
+    return /\.(?:fixed_price|replacement_price_feed)_\w+/.test(text)
+      || (/\bnetwork_price_exceptions\b|\bNetworkPriceExceptionRow\b/.test(text) && /\brow\.kind\b/.test(text));
+  });
   t.same(reading, [ 'src/registry/repository.ts' ], 'only priceExceptionOfRow reads one');
   t.match(readFileSync('src/registry/overlay-store.ts', 'utf8'), /priceExceptionOfRow\(/, 'which is what the overlay store reads its rows with');
 });

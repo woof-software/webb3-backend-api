@@ -29,7 +29,7 @@ import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, decisionScenarios } from '.
  * what the active reads answer, and the record the commands keep for an
  * outage, in hidden-collateral-reads.test.ts.
  */
-const harness = await registryHarness({ admin: true, vars: { COMET_REGISTRY_ADMIN_ACTOR: ADMIN_ACTOR } });
+const harness = await registryHarness({ admin: true });
 const admin   = adminClient(harness.server);
 
 decisionScenarios(harness, HIDDEN_COLLATERALS);
@@ -118,6 +118,11 @@ t.test('a list of hidden collaterals is exported, reviewed, and applied as one, 
   t.same(applied.body.summary, { changed: 3, unchanged: every.length - 3 }, 'applying writes exactly the reviewed changes');
   t.equal(applied.header('x-registry-version'), versionId);
   t.equal(await count(db, 'hidden_collateral_events', `reason <> 'decided by hand'`), 3, 'one event per change');
+  t.same(
+    (await db.prepare(`SELECT DISTINCT actor FROM hidden_collateral_events WHERE reason <> 'decided by hand'`).all<{ actor: string }>()).results?.map(row => row.actor),
+    [ ADMIN_ACTOR ],
+    'each under the name of the token that applied the list',
+  );
   const after = await admin.read<HiddenCollateralListV1>(HIDDEN_COLLATERALS.list.export);
   t.same(marked(after.body.hiddenCollaterals, row => row.isHidden), [ 'usdc/weETH', 'usdt/weETH' ],
     'and the decisions are what the list says');

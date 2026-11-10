@@ -2,12 +2,13 @@ import type { Env } from '../../entrypoint.js';
 
 import { Address, isAddress, isChainId, normalizeAddress, parseMarketKey } from '../../lib/model/comet-registry.js';
 
-import { authenticateAdmin } from '../http/bearer-auth.js';
+import { allows, authenticateAdmin, refuseRole } from '../http/bearer-auth.js';
 import { clientOf } from '../http/client-address.js';
 import { ApiError, methodNotAllowed } from '../http/errors.js';
 import { MAX_BODY_BYTES, jsonResponse, readJsonObject } from '../http/json.js';
 
 import { cacheDepsOf, isUnreachable } from './cache.js';
+import { registryConfig } from './config.js';
 import { readCreationBlocks, readFeeds } from './enrichment.js';
 import { isRegistryError, isTransportFailure } from './errors.js';
 import { registryStatus } from './status.js';
@@ -36,6 +37,7 @@ import type { RecordedKind } from './decision-records.js';
 import type { DecisionList } from './decision-store.js';
 import { member } from './decision-store.js';
 import {
+  AdminContext,
   RegistryContext,
   cancelSyncRun,
   chainIdOf,
@@ -47,6 +49,7 @@ import {
   getVersionDetail,
   getVersions,
   postActivation,
+  postApproval,
   postValidate,
   tokenOfChain,
 } from './handlers.js';
@@ -101,6 +104,10 @@ type RoutedKind<Subject extends object, Flag extends string, Listed extends { ch
  * kind's own path, each path's verbs in the order a 405 names them. Each
  * route answers for the kind it was made for (`decision`), so one case of
  * routeAdmin answers it for every kind.
+ *
+ * Reading a decision, exporting the list and reviewing an edited one change
+ * nothing, and are a reader's; setting a decision and applying a list change
+ * what the API serves, and are an admin's, who is their actor (AdminContext).
  */
 function decisionRoutes<Subject extends object, Flag extends string, Listed extends { chainId: number }>(
   kind: RoutedKind<Subject, Flag, Listed>,
@@ -110,18 +117,18 @@ function decisionRoutes<Subject extends object, Flag extends string, Listed exte
     // the member of a command's body that holds the decision
     flag:   kind.flag,
     read:   (context: RegistryContext, match: RegExpExecArray) => getDecision(context, kind, kind.subjectOf(...match.slice(1))),
-    set:    (context: RegistryContext, match: RegExpExecArray, decided: { flag: boolean, reason: string }) =>
+    set:    (context: AdminContext, match: RegExpExecArray, decided: { flag: boolean, reason: string }) =>
       patchDecision(context, kind, kind.subjectOf(...match.slice(1)), decided),
     export: (context: RegistryContext) => getDecisionExport(context, kind),
     review: (context: RegistryContext, body: Record<string, unknown>) => postDecisionReview(context, kind, decisionListOf(body, kind.list)),
-    apply:  (context: RegistryContext, body: Record<string, unknown>) => postDecisionApply(context, kind, decisionListOf(body, kind.list)),
+    apply:  (context: AdminContext, body: Record<string, unknown>) => postDecisionApply(context, kind, decisionListOf(body, kind.list)),
   };
   return [
-    { pattern: kind.one,                      method: 'GET',   handler: 'decision',        family: 'read',   decision },
-    { pattern: kind.one,                      method: 'PATCH', handler: 'setDecision',     family: 'policy', decision },
-    { pattern: new RegExp(`${list}$`),        method: 'GET',   handler: 'exportDecisions', family: 'read',   decision },
-    { pattern: new RegExp(`${list}/review$`), method: 'POST',  handler: 'reviewDecisions', family: 'read',   decision },
-    { pattern: new RegExp(`${list}/apply$`),  method: 'POST',  handler: 'applyDecisions',  family: 'policy', decision },
+    { pattern: kind.one,                      method: 'GET',   handler: 'decision',        family: 'read',   role: 'reader', decision },
+    { pattern: kind.one,                      method: 'PATCH', handler: 'setDecision',     family: 'policy', role: 'admin',  decision },
+    { pattern: new RegExp(`${list}$`),        method: 'GET',   handler: 'exportDecisions', family: 'read',   role: 'reader', decision },
+    { pattern: new RegExp(`${list}/review$`), method: 'POST',  handler: 'reviewDecisions', family: 'read',   role: 'reader', decision },
+    { pattern: new RegExp(`${list}/apply$`),  method: 'POST',  handler: 'applyDecisions',  family: 'policy', role: 'admin',  decision },
   ] as const;
 }
 
@@ -193,28 +200,41 @@ function collateralRoutes<Flag extends string, Column extends string, Rows exten
  * protects the registry from a stuck script or a runaway retry loop, while
  * the D1 sync fence remains the real concurrency authority.
  *
- * Callers sharing one token share the second budget. That is a property of
- * the credential, not of the limiter: the environment configures a single
- * token hash, so two operators using it are indistinguishable here and in the
- * audit rows alike. Issuing separate tokens is what would separate them.
+ * Each token has budgets of its own, so a monitor polling the status with a
+ * token of its own spends nothing of an operator's. Callers who share a token
+ * share its budgets, as they share its name in the audit rows: that is a
+ * property of the credential, not of the limiter.
+ *
+ * `role` is the least role a token needs for the route (bearer-auth.ts). The
+ * status is a monitor's, every other read a reader's, and an import and an
+ * overlay write an operator's. Activation and rollback decide what is served,
+ * and are an admin's, and so is an approval, the second person an activation
+ * needs; approving has a budget of its own. So is validation, which ends the
+ * review of a draft a sync held open. That role gates this route alone: a
+ * sync not held for review validates its own draft once the import
+ * completes, and what goes live is decided by an activation all the same. A
+ * decision about a token or a collateral, set or applied, changes what is
+ * served as soon as it is made, and is an admin's too; reading one, and
+ * reviewing a list of them, are a reader's (decisionRoutes).
  */
 const ROUTES = [
-  { pattern: /^\/registry\/v1\/admin\/sync$/,                                                  method: 'POST', handler: 'sync',           family: 'sync' },
-  { pattern: /^\/registry\/v1\/admin\/sync-runs\/([^/]+)$/,                                    method: 'GET',  handler: 'syncRun',        family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/sync-runs\/([^/]+)\/cancel$/,                            method: 'POST', handler: 'cancelSyncRun',  family: 'sync' },
-  { pattern: /^\/registry\/v1\/admin\/status$/,                                                method: 'GET',  handler: 'status',         family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/versions$/,                                              method: 'GET',  handler: 'versions',       family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)$/,                                     method: 'GET',  handler: 'version',        family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/changes$/,                            method: 'GET',  handler: 'changes',        family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/validate$/,                           method: 'POST', handler: 'validate',       family: 'validate' },
-  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/activate$/,                           method: 'POST', handler: 'activate',       family: 'activate' },
-  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/rollback$/,                           method: 'POST', handler: 'rollback',       family: 'activate' },
-  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/networks\/([^/]+)\/overlay$/,         method: 'PUT',  handler: 'networkOverlay', family: 'overlay' },
-  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/networks\/([^/]+)\/overlay$/,         method: 'GET',  handler: 'readNetworkOverlay', family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/markets\/([^/]+)\/([^/]+)\/overlay$/, method: 'PUT',  handler: 'marketOverlay',  family: 'overlay' },
-  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/markets\/([^/]+)\/([^/]+)\/overlay$/, method: 'GET',  handler: 'readMarketOverlay', family: 'read' },
-  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/overlays$/,                            method: 'PUT',  handler: 'overlays',       family: 'overlay' },
-  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens$/,                             method: 'GET',  handler: 'tokenPolicies',  family: 'read' },
+  { pattern: /^\/registry\/v1\/admin\/sync$/,                                                  method: 'POST', handler: 'sync',               family: 'sync',     role: 'operator' },
+  { pattern: /^\/registry\/v1\/admin\/sync-runs\/([^/]+)$/,                                    method: 'GET',  handler: 'syncRun',            family: 'read',     role: 'reader' },
+  { pattern: /^\/registry\/v1\/admin\/sync-runs\/([^/]+)\/cancel$/,                            method: 'POST', handler: 'cancelSyncRun',      family: 'sync',     role: 'operator' },
+  { pattern: /^\/registry\/v1\/admin\/status$/,                                                method: 'GET',  handler: 'status',             family: 'read',     role: 'monitor' },
+  { pattern: /^\/registry\/v1\/admin\/versions$/,                                              method: 'GET',  handler: 'versions',           family: 'read',     role: 'reader' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)$/,                                     method: 'GET',  handler: 'version',            family: 'read',     role: 'reader' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/changes$/,                            method: 'GET',  handler: 'changes',            family: 'read',     role: 'reader' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/validate$/,                           method: 'POST', handler: 'validate',           family: 'validate', role: 'admin' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/approve$/,                            method: 'POST', handler: 'approve',            family: 'approve',  role: 'admin' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/activate$/,                           method: 'POST', handler: 'activate',           family: 'activate', role: 'admin' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/rollback$/,                           method: 'POST', handler: 'rollback',           family: 'activate', role: 'admin' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/networks\/([^/]+)\/overlay$/,         method: 'PUT',  handler: 'networkOverlay',     family: 'overlay',  role: 'operator' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/networks\/([^/]+)\/overlay$/,         method: 'GET',  handler: 'readNetworkOverlay', family: 'read',     role: 'reader' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/markets\/([^/]+)\/([^/]+)\/overlay$/, method: 'PUT',  handler: 'marketOverlay',      family: 'overlay',  role: 'operator' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/markets\/([^/]+)\/([^/]+)\/overlay$/, method: 'GET',  handler: 'readMarketOverlay',  family: 'read',     role: 'reader' },
+  { pattern: /^\/registry\/v1\/admin\/versions\/([^/]+)\/overlays$/,                            method: 'PUT',  handler: 'overlays',           family: 'overlay',  role: 'operator' },
+  { pattern: /^\/registry\/v1\/admin\/networks\/([^/]+)\/tokens$/,                             method: 'GET',  handler: 'tokenPolicies',      family: 'read',     role: 'reader' },
   ...TOKEN_POLICY_ROUTES,
   ...collateralRoutes(DEPRECATED_COLLATERAL_KIND, DEPRECATED_RECORD),
   ...collateralRoutes(HIDDEN_COLLATERAL_KIND, HIDDEN_RECORD),
@@ -346,13 +366,31 @@ function expectedDigestOf(body: Record<string, unknown>): { expectedDigest?: str
 }
 
 /*
- * `expectedActiveVersionId` names the version an activation or a rollback is
- * decided against, so a move made against a version someone else has since
- * replaced is refused instead of silently undoing theirs.
+ * `expectedActiveVersionId` names the version an activation, a rollback or
+ * an approval is decided against, so a move made against a version someone
+ * else has since replaced is refused instead of silently undoing theirs, and
+ * an approval is not given for another change than the one its giver read.
  */
 function expectedActiveVersionOf(body: Record<string, unknown>): { expectedActiveVersionId?: string | null } {
   const { value } = optionalExpectation(body, 'expectedActiveVersionId', /^[0-9A-Za-z-]{1,64}$/, 'a registry version id');
   return value === undefined ? {} : { expectedActiveVersionId: value };
+}
+
+/*
+ * An approval is of one change, from the version on to the one approved, so
+ * it always names the version its giver read the changes against: an
+ * approval recorded against whatever is on by then could cover a change
+ * nobody read.
+ */
+function requireExpectedActiveVersion(body: Record<string, unknown>): string | null {
+  const { expectedActiveVersionId } = expectedActiveVersionOf(body);
+  if (expectedActiveVersionId === undefined) {
+    throw new ApiError(
+      'BAD_REQUEST',
+      `expectedActiveVersionId is required: the id of the version on that the changes were read against, or null when nothing is on`,
+    );
+  }
+  return expectedActiveVersionId;
 }
 
 /*
@@ -458,7 +496,7 @@ function syncAnswer(result: Exclude<InvocationResult, { kind: 'invalid' }>): {
 async function postSync(
   env: Env,
   body: Record<string, unknown>,
-  { actor, requestId }: Pick<RegistryContext, 'actor' | 'requestId'>,
+  { actor, requestId }: Pick<AdminContext, 'actor' | 'requestId'>,
 ): Promise<Response> {
   requireExactKeys(body, [ 'sourceCommitSha', 'forceNewAttempt', 'holdForReview', 'markets', 'reason' ]);
 
@@ -749,7 +787,7 @@ async function routeAdmin(
    * publishes them — so a path that is none of them answers 404 without a
    * token being asked for, as any unknown path does.
    */
-  const credential = await authenticateAdmin(request, env.COMET_REGISTRY_ADMIN_TOKEN_HASH);
+  const credential = await authenticateAdmin(request, env);
 
   const route = matching.find(entry => entry.method === request.method);
   if (route === undefined) {
@@ -757,7 +795,19 @@ async function routeAdmin(
     throw methodNotAllowed(request.method, pathname, [ ...new Set(matching.map(entry => entry.method)), 'OPTIONS' ]);
   }
 
+  /*
+   * The role is checked once the verb is known, since one path takes verbs
+   * of different roles, and before the token's own budget is spent: a route
+   * the token may not call costs it nothing but the address's.
+   */
+  if (!allows(credential.role, route.role)) {
+    throw refuseRole(credential, route.role);
+  }
+
   await limit(env, credential.fingerprint, route.family);
+
+  // a command records the token's name as its actor, wherever the audit keeps one
+  const admin: AdminContext = { ...context, actor: credential.name };
 
   const [ , versionId, second, third ] = route.match!;
   const body = route.method === 'GET'
@@ -773,12 +823,12 @@ async function routeAdmin(
        */
       return jsonResponse(await registryStatus(env, cacheDepsOf(env, context.debug)));
     case 'sync':
-      return await postSync(env, body, context);
+      return await postSync(env, body, admin);
     case 'syncRun':
       return await getSyncRun(context, versionId!);
     case 'cancelSyncRun':
       requireExactKeys(body, [ 'reason' ]);
-      return await cancelSyncRun(context, versionId!, requireReason(body));
+      return await cancelSyncRun(admin, versionId!, requireReason(body));
     case 'versions':
       return await getVersions(context, new URL(request.url).searchParams);
     case 'version':
@@ -792,41 +842,46 @@ async function routeAdmin(
     case 'validate':
       /*
        * Validation decides nothing: it checks the stored candidate and records
-       * every check it ran, exactly as the scheduled import does unattended.
-       * The decision a person makes about a version, with its reason, is the
-       * activation.
+       * every check it ran, and not who asked for it, exactly as the scheduled
+       * import does unattended. The decisions people make about a version,
+       * each with its reason, are the approval and the activation.
        */
       requireExactKeys(body, []);
       return await postValidate(context, versionId!);
+    case 'approve':
+      requireExactKeys(body, [ 'reason', 'expectedActiveVersionId' ]);
+      return await postApproval(
+        admin, versionId!, requireReason(body), registryConfig(env).approvalTtlSeconds, requireExpectedActiveVersion(body),
+      );
     case 'activate':
       requireExactKeys(body, [ 'reason', 'expectedActiveVersionId' ]);
-      return await postActivation(context, versionId!, 'activate', requireReason(body), expectedActiveVersionOf(body));
+      return await postActivation(admin, versionId!, 'activate', requireReason(body), expectedActiveVersionOf(body));
     case 'rollback':
       requireExactKeys(body, [ 'reason', 'expectedActiveVersionId' ]);
-      return await postActivation(context, versionId!, 'rollback', requireReason(body), expectedActiveVersionOf(body));
+      return await postActivation(admin, versionId!, 'rollback', requireReason(body), expectedActiveVersionOf(body));
     case 'networkOverlay':
       requireExactKeys(body, [ 'reason', 'overlay', 'expectedDigest' ]);
-      return jsonResponse(await replaceNetworkOverlay(context.db, {
+      return jsonResponse(await replaceNetworkOverlay(admin.db, {
         versionId: versionId!,
         chainId:   chainIdOf(second!),
         overlay:   body.overlay,
-        actor:     context.actor,
+        actor:     admin.actor,
         reason:    requireReason(body),
         ...expectedDigestOf(body),
       }, feedReader(env)));
     case 'marketOverlay':
       requireExactKeys(body, [ 'reason', 'overlay', 'expectedDigest' ]);
-      return jsonResponse(await replaceMarketOverlay(context.db, {
+      return jsonResponse(await replaceMarketOverlay(admin.db, {
         versionId:     versionId!,
         chainId:       chainIdOf(second!),
         deploymentKey: third!,
         overlay:       body.overlay,
-        actor:         context.actor,
+        actor:         admin.actor,
         reason:        requireReason(body),
         ...expectedDigestOf(body),
       }, feedReader(env), creationReader(env)));
     case 'overlays':
-      return jsonResponse(await replaceOverlays(context.db, overlayDocuments(body, versionId!, context.actor), feedReader(env), creationReader(env)));
+      return jsonResponse(await replaceOverlays(admin.db, overlayDocuments(body, versionId!, admin.actor), feedReader(env), creationReader(env)));
     case 'tokenPolicies':
       // the first capture of a network route is a chain id, not a version id
       return await getTokenPolicies(context, versionId!);
@@ -843,15 +898,15 @@ async function routeAdmin(
       if (typeof(value) !== 'boolean') {
         throw new ApiError('BAD_REQUEST', `${flag} must be a boolean`);
       }
-      return await route.decision.set(context, route.match!, { flag: value, reason: requireReason(body) });
+      return await route.decision.set(admin, route.match!, { flag: value, reason: requireReason(body) });
     }
     case 'exportDecisions':
       return await route.decision.export(context);
     case 'reviewDecisions':
       return await route.decision.review(context, body);
     case 'applyDecisions':
-      return await route.decision.apply(context, body);
+      return await route.decision.apply(admin, body);
   }
 }
 
-export { overlayDocuments, routeAdmin, syncAnswer };
+export { ROUTES, overlayDocuments, routeAdmin, syncAnswer };

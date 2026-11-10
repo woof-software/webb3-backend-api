@@ -47,8 +47,10 @@ With neither, every read of the chain fails.
 
 Every market route answers `503 REGISTRY_NOT_ACTIVE` until a registry
 version is active. Bring one up as an operator brings up an environment: put
-the hash of an admin token of your own into `.dev.vars` before starting the
-worker ([The admin token](./REGISTRY_RUNBOOK.md#the-admin-token)), and follow
+the hashes of two admin tokens of your own into `.dev.vars`, as entries of
+`COMET_REGISTRY_ADMIN_TOKENS` with the role `admin` under two names — one
+approves the version and the other switches it on — before starting the
+worker ([The admin tokens](./REGISTRY_RUNBOOK.md#the-admin-tokens)), and follow
 [Bringing an environment up for the first time](./REGISTRY_RUNBOOK.md#bringing-an-environment-up-for-the-first-time)
 with `API=http://localhost:8787`.
 
@@ -81,7 +83,10 @@ collaterals of which Comets an administrator has marked legacy, with the audit
 of every change, and `0007` renames them deprecated collaterals: tables,
 columns, view, indexes and triggers alike. `0008` stores which collaterals of
 which Comets an administrator has hidden from token discovery, with the audit
-of every change. The Agreements migration takes the next free number.
+of every change. `0011` adds the approvals an activation needs, and an
+environment that applied it first applies `0005` to `0008` after it:
+`wrangler d1 migrations apply` applies every file not applied yet, by name.
+`0009` and `0010` are left to work merged later.
 
 Apply migrations to the local Miniflare database under `.wrangler/state`:
 ```sh
@@ -99,17 +104,17 @@ npm run d1:migrate:production
 CI applies the migrations before it deploys, so a migration has to work with
 the release deployed before it, which serves until the deploy that follows.
 
-The Comet registry also binds `kv_registry` for its snapshot cache, its
-last check of the chain and the deprecated and the hidden collateral
-decisions it last recorded, two rate limiters for its administrative routes,
-and an hourly Cron trigger for its resumable sync.
+The Comet registry also binds `kv_registry` for its snapshot cache, its last
+check of the chain, the deprecated and the hidden collateral decisions it
+last recorded and the last announcement it gave up, two rate limiters for
+its administrative routes, and an hourly Cron trigger for its resumable sync.
 `REGISTRY_ADMIN_AUTH_RATE_LIMITER` counts every request under
 `/registry/v1/admin/` before its token is checked, 60 a minute for each
 client address (`CF-Connecting-IP`; an IPv6 client by its /64), so wrong
 tokens and unknown paths are paid for too; `REGISTRY_ADMIN_RATE_LIMITER`
-counts every authenticated one, reads as well as commands, 30 a minute for
-each admin token and route family. Every environment gives each its own
-namespace id. One invocation imports
+counts every authenticated one on a route its token's role reaches, reads as
+well as commands, 30 a minute for each admin token and route family. Every
+environment gives each its own namespace id. One invocation imports
 `COMET_SYNC_MARKETS_PER_INVOCATION` markets and leaves the rest to the next
 one, resuming from the checkpoints in `APP_DB`; upstream is checked for a new
 commit once per `COMET_UPSTREAM_CHECK_INTERVAL_S`. The chain is read again for
@@ -136,16 +141,20 @@ it, open.
 
 The registry's numbers — `COMET_SYNC_LEASE_SECONDS`,
 `COMET_SYNC_MARKETS_PER_INVOCATION`, `COMET_UPSTREAM_CHECK_INTERVAL_S`,
-`REGISTRY_SNAPSHOT_CACHE_TTL_S` and `REGISTRY_STALE_FALLBACK_MAX_S` — are
-whole numbers, and unset or empty is the default. A value that is not one is
+`REGISTRY_SNAPSHOT_CACHE_TTL_S`, `REGISTRY_STALE_FALLBACK_MAX_S` and
+`COMET_REGISTRY_APPROVAL_TTL_S`, how long an approval lets its version be
+switched on, a day by default and a week at most — are whole numbers, and
+unset or empty is the default. A value that is not one is
 never used: the import refuses to start over one of its own, a read takes
 the default in its place, and `GET /registry/v1/admin/status` names it under
 the alert `configuration-invalid`, as it does a `COMET_SOURCE_REPOSITORY` or
-`COMET_SOURCE_REF` that names no source.
+`COMET_SOURCE_REF` that names no source, and a `COMET_REGISTRY_WEBHOOK_URL`
+that is not an `https` URL, to which nothing is announced. That one is a
+secret, corrected with `npx wrangler secret put` rather than a deploy.
 
 The secrets, and every other value an environment sets outside
 `wrangler.toml` — the registry's among them, such as
-`COMET_REGISTRY_ADMIN_ACTOR` — are listed in
+`COMET_REGISTRY_ADMIN_TOKENS` and `COMET_REGISTRY_WEBHOOK_URL` — are listed in
 [./.dev.vars.example](./.dev.vars.example). Copy it to
 `.dev.vars` for local runs; deployed environments set them with
 `npx wrangler secret put <NAME> --env <environment>`, never in
@@ -182,9 +191,8 @@ stays far inside its subrequests. The history of every market, with none of
 its days cached, stays inside them as well: three calls to the proxy per
 market and one per network, beside four KV operations for each day of each
 market — about 3,600 subrequests for the 29 markets of the source over 30
-days. A `[limits]` section changes them for one Worker, as
-`woof.wrangler.toml` does for the woof deployment: a million subrequests and
-60 seconds of CPU an invocation.
+days. A `[limits]` section changes them for one Worker, for example to a
+million subrequests and 60 seconds of CPU an invocation.
 
 # The Comet Market Registry
 
@@ -216,11 +224,13 @@ What that means for the endpoints:
 - an address the active version does not describe is not a market, and is
   refused with `400`, on any network;
 - transaction history cursors carry the version they were issued against,
-  and the markets it reads. A cursor stays valid across versions that read
-  the same markets; one from a version that read others is refused with
-  `409 REGISTRY_VERSION_CHANGED` and the client restarts pagination. So is a
-  cursor issued before the registry, which carries no version, whatever it
-  reads;
+  the markets it reads, and the block their ranges of logs are counted
+  from. A cursor stays valid across versions that read the same markets
+  from the same blocks; one from a version that read others, or counted
+  from another block, is refused with `409 REGISTRY_VERSION_CHANGED`,
+  whatever mainnet market its `markets[]` names, and the client restarts
+  pagination. So is a cursor issued before the registry, which carries no
+  version, whatever it reads;
 - a market summary, and each day of its history, takes what the market's
   collateral is and the feed that prices its base asset from the version;
   what the Comet holds, the feed it reads for each collateral at the block,
@@ -369,10 +379,42 @@ way, as `X-Registry-Stale: 0`, and one with either kind not recorded to
 answer with is `503 UPSTREAM_UNAVAILABLE`. With the window at `0` nothing is
 recorded, and nothing is answered from the records.
 
-An operator changes what the API serves by importing, reviewing, validating
-and activating a version; see the admin routes in [./API.md](./API.md). The
-step-by-step procedure, with what to expect at each step and what to do when
-something else happens, is [./REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md).
+An operator changes what the API serves by importing, reviewing, validating,
+approving and activating a version; see the admin routes in
+[./API.md](./API.md). Each administrative token has a name and a role, and
+an environment lists its tokens in the secret `COMET_REGISTRY_ADMIN_TOKENS`
+([The admin tokens](./REGISTRY_RUNBOOK.md#the-admin-tokens)); without that
+list, the admin API refuses every request. Every change a token makes is
+recorded under its name, but for a validation, which decides nothing and
+records only its checks; its role — `monitor`, `reader`, `operator` or
+`admin` — bounds the routes it may call. The step-by-step procedure, with
+what to expect at each step and what to do when something else happens, is
+[./REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md).
+
+A version is switched on by two people: an admin approves it, and an admin
+of another name activates it while the approval is in force, a day unless
+`COMET_REGISTRY_APPROVAL_TTL_S` says otherwise. The approval names the
+version on that its giver read the changes against, is of the change from
+that version to the approved one, and lets one activation through. A
+rollback needs nobody's approval, so that undoing a bad version takes one
+person, but it goes back one step only: to the version the one on replaced
+when it was last activated, if that is older. Going further back takes
+another rollback, and each is announced. The code holds these rules for
+every move, and migration `0011` holds them in the database too from an
+environment's first approval on. A decision about a token or a collateral
+([Token Visibility](#token-visibility)) is one admin's: it takes effect as
+soon as it is made, needs nobody's approval, and is not announced.
+
+Every activation and rollback that changes what is served is announced,
+once it has committed, to the webhook `COMET_REGISTRY_WEBHOOK_URL` names — a
+Slack incoming webhook for the team's channel: who switched which version
+on, in place of which, who approved it, which networks and markets that
+added, removed or changed, and last, why ([API.md](./API.md#registry-v1)).
+So is every approval, as it is given. The message is best
+effort, sent once and given up after 5 seconds, and fails no command; the
+audit is the record, and the status raises `notification-failing` when a
+message was given up
+([Announcing changes](./REGISTRY_RUNBOOK.md#announcing-changes)).
 
 ## Bringing a registry up from nothing
 
@@ -418,9 +460,13 @@ curl -X PUT .../registry/v1/admin/versions/$VERSION/overlays \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   --data-binary @registry/seed/production.json
 
-# 4. validate, then activate. The first activation expects nothing to be on;
-#    a later one names the version that is
+# 4. validate; one admin approves, and another activates. The first
+#    approval and activation expect nothing to be on; later ones name the
+#    version that is
 curl -X POST .../registry/v1/admin/versions/$VERSION/validate ...
+curl -X POST .../registry/v1/admin/versions/$VERSION/approve ... \
+  -H "Authorization: Bearer $APPROVER_TOKEN" \
+  -d '{"reason": "read its changes", "expectedActiveVersionId": null}'
 curl -X POST .../registry/v1/admin/versions/$VERSION/activate ... \
   -d '{"reason": "first registry version", "expectedActiveVersionId": null}'
 ```
@@ -613,7 +659,7 @@ collateral of one. It is checked in beside the registry seed, as
 20 collaterals of five Ethereum markets, with every Comet and token address,
 in a list the review and apply routes take as it is. A first bring-up
 reviews it and applies what it changes once its first version is on
-([REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md#7-mark-the-initial-deprecated-collaterals)),
+([REGISTRY_RUNBOOK.md](./REGISTRY_RUNBOOK.md#8-mark-the-initial-deprecated-collaterals)),
 and the runbook says where each address comes from
 ([The initial list of deprecated collaterals](./REGISTRY_RUNBOOK.md#the-initial-list-of-deprecated-collaterals)).
 

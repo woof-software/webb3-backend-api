@@ -26,21 +26,30 @@ type Row = Record<string, SqlValue>;
  *
  * `through` stops after the migration with that number, which is how a test
  * reaches a database a release has been deployed to before its migrations.
+ * `besides` names migrations after it to apply all the same (RELEASED_BEFORE).
  */
 async function applyMigrations(
   db: D1Database,
   directory: string = MIGRATIONS_DIR,
-  { through }: { through?: string } = {},
+  { through, besides = [] }: { through?: string, besides?: string[] } = {},
 ): Promise<string[]> {
   const files = readdirSync(directory)
     .filter(name => name.endsWith('.sql'))
-    .filter(name => through === undefined || name.slice(0, 4) <= through)
+    .filter(name => through === undefined || name.slice(0, 4) <= through || besides.includes(name.slice(0, 4)))
     .sort();
   for (const file of files) {
     await applyMigration(db, file, directory);
   }
   return files;
 }
+
+/*
+ * Migrations a release before the token migrations brought, under numbers
+ * after theirs: 0011, the approvals every activation records. A database a
+ * test stops short of the token migrations has them all the same
+ * (registry-harness.ts, registry-database.ts).
+ */
+const RELEASED_BEFORE = [ '0011' ];
 
 /*
  * Applies one migration file as one batch, for a test that upgrades a
@@ -89,6 +98,7 @@ async function foreignKeyViolations(db: D1Database): Promise<unknown[]> {
 }
 
 export {
+  RELEASED_BEFORE,
   Row,
   SqlValue,
   applyMigration,

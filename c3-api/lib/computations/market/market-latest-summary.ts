@@ -152,8 +152,8 @@ function valueStatusOf({ valueUsd, exception }: CollateralValue): CollateralValu
 
 const { implement, pipe } = Compute.Functor<MarketLatestSummary>({});
 const marketLatestSummary = implement({
-  // 7: a remap that fell back leaves its collateral's value unknown, and is named on it
-  version: 7,
+  // 9: an empty market's APRs come from its Comet's rate model (#23); 8 is that rule over another shape
+  version: 9,
   compute({ apiHost, nodeHost, nodeKey, network, contract, block }) {
     const { chainId } = Fallible.must(
       KnownNetwork.lookup({ name: network })
@@ -164,8 +164,8 @@ const marketLatestSummary = implement({
       {
         basePrice:    read,
         baseUsdPrice: read,
-        borrowApr:    read,
-        supplyApr:    read,
+        borrowApr:    { apiHost, nodeHost, nodeKey, block, contract, network },
+        supplyApr:    { apiHost, nodeHost, nodeKey, block, contract, network },
         totalBorrow:  read,
         totalSupply:  read,
         utilization:  read,

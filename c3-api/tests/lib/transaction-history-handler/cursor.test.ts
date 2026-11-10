@@ -5,6 +5,7 @@ import type { RegistrySnapshotV1 } from '../../../lib/model/comet-registry.js';
 
 import { catalogOf } from '../../../src/registry/catalog.js';
 import {
+  changedFilter,
   cursorStore,
   isCursorId,
   keepCursor,
@@ -13,7 +14,7 @@ import {
   streamEventsOf,
   streamKeyOf,
 } from '../../../src/transaction-history-handler/cursor.js';
-import type { StoredCursor } from '../../../src/transaction-history-handler/cursor.js';
+import type { CursorPayload, StoredCursor } from '../../../src/transaction-history-handler/cursor.js';
 
 import { MemoryKv, refusingKv } from '../../util/kv.js';
 import { quietLog } from '../../util/quiet-log.js';
@@ -70,6 +71,10 @@ function stored(overrides: Partial<StoredCursor> = {}): StoredCursor {
 t.test('a first page starts every stream the version reads, at no position yet', async t => {
   t.same([ ...new Set(streams.map(stream => stream.network)) ].sort(), [ 'base-mainnet', 'ethereum-mainnet' ],
     'the version reads history on two networks');
+  t.same(Object.fromEntries(streams.map(stream => [ stream.network, stream.firstBlock ])), {
+    'ethereum-mainnet': 15_331_586,
+    'base-mainnet':     20_852_405,
+  }, 'each counting its ranges from the earliest creation among its contracts');
 
   // a filter given in another order than the cursor holds it in
   const filter = { networks: [ 'ethereum-mainnet' ], contractAddresses: [ USDC ], ...ASKED };
@@ -95,12 +100,14 @@ t.test('a first page starts every stream the version reads, at no position yet',
 });
 
 /*
- * A cursor's positions are in the logs of the streams it reads. A version
- * that reads the same streams reads it on, whichever version handed it out;
- * one that reads other streams ends it, and the client starts over.
+ * A cursor's positions are in the logs of the streams it reads, in ranges
+ * counted from each stream's first block. A version that reads the same
+ * streams from the same blocks reads it on, whichever version handed it out;
+ * one that reads other streams, or counts one from another block, ends it,
+ * and the client starts over.
  */
 t.test('a version reads on a cursor of the streams it reads, and ends any other', async t => {
-  t.same(resumeCursor(stored(), catalog, streams, ASKED), { kind: 'resumed', payload: stored() },
+  t.same(resumeCursor(stored(), catalog, streams), { kind: 'resumed', payload: stored() },
     'a cursor of the version that answers goes on as it was');
 
   const same = stored({
@@ -111,21 +118,37 @@ t.test('a version reads on a cursor of the streams it reads, and ends any other'
       marketContractAddresses: [ ...stream.marketContractAddresses ].reverse(),
     })).reverse(),
   });
-  t.same(resumeCursor(same, catalog, streams, ASKED), { kind: 'resumed', payload: { ...same, registryVersionId: catalog.versionId } },
+  t.same(resumeCursor(same, catalog, streams), { kind: 'resumed', payload: { ...same, registryVersionId: catalog.versionId } },
     'one of another version that read the same streams goes on, as a cursor of the version that answers');
 
   for (const [ streamEvents, what ] of [
     [ streams.filter(stream => stream.network === 'ethereum-mainnet'), 'a stream fewer' ],
     [ streams.map(stream => ({ ...stream, marketContractAddresses: stream.marketContractAddresses.slice(1) })), 'a market fewer in each' ],
+    // a corrected creation block moves a stream's first block, and with it every range it is read in
+    [ streams.map(stream => ({ ...stream, firstBlock: stream.firstBlock - 1 })), 'its streams from other blocks' ],
   ] as const) {
-    t.same(resumeCursor(stored({ registryVersionId: ANOTHER, streamEvents }), catalog, streams, ASKED),
+    t.same(resumeCursor(stored({ registryVersionId: ANOTHER, streamEvents }), catalog, streams),
       { kind: 'version-changed', cursorRegistryVersionId: ANOTHER }, `one of a version that read ${what} is ended, naming that version`);
   }
 
   const { registryVersionId: _, ...issuedBefore } = stored();
-  t.same(resumeCursor(issuedBefore, catalog, streams, ASKED), { kind: 'version-changed', cursorRegistryVersionId: null },
+  t.same(resumeCursor(issuedBefore, catalog, streams), { kind: 'version-changed', cursorRegistryVersionId: null },
     'and so is one issued before the registry, which names none, though it reads the same streams');
+
+  // a cursor kept before its streams named their first blocks
+  const unnamed = stored({ streamEvents: streams.map(({ firstBlock: _firstBlock, ...stream }) => stream) });
+  t.same(resumeCursor(unnamed, catalog, streams), { kind: 'version-changed', cursorRegistryVersionId: catalog.versionId },
+    'as is one kept before its streams named the blocks they are counted from, by the version that answers too');
 });
+
+// what a cursor holds once the version reads it on
+function resumed(cursor: StoredCursor): CursorPayload {
+  const resumption = resumeCursor(cursor, catalog, streams);
+  if (resumption.kind !== 'resumed') {
+    throw new Error(`the version does not read on a cursor of ${resumption.cursorRegistryVersionId}`);
+  }
+  return resumption.payload;
+}
 
 /*
  * A cursor holds what its first page was filtered by, and goes on only with
@@ -133,8 +156,8 @@ t.test('a version reads on a cursor of the streams it reads, and ends any other'
  * it stopped would leave out what the pages before it did not show.
  */
 t.test('a cursor goes on only with the filters it was handed out with', async t => {
-  const sent = (filters: Partial<typeof ASKED>) => resumeCursor(stored(), catalog, streams, { ...ASKED, ...filters });
-  t.same(sent({ actions: [ 'Supply', 'Borrow' ] }), { kind: 'resumed', payload: stored() }, 'named in any order');
+  const sent = (filters: Partial<typeof ASKED>) => changedFilter(resumed(stored()), { ...ASKED, ...filters });
+  t.equal(sent({ actions: [ 'Supply', 'Borrow' ] }), null, 'named in any order');
 
   const changed: [ Partial<typeof ASKED>, string, string ][] = [
     [ { markets: [] },                                'markets',      'without its market' ],
@@ -149,12 +172,12 @@ t.test('a cursor goes on only with the filters it was handed out with', async t 
     [ { actions: [], initiatedBy: [] },               'actions',      'without its actions and initiator' ],
   ];
   for (const [ filters, filter, what ] of changed) {
-    t.same(sent(filters), { kind: 'filter-changed', filter }, `a cursor sent ${what} is refused for its ${filter} filter`);
+    t.equal(sent(filters), filter, `a cursor sent ${what} is refused for its ${filter} filter`);
   }
 
+  // the version decides first, before a request's markets are resolved against it, let alone compared
   const ended = stored({ registryVersionId: ANOTHER, streamEvents: streams.slice(1) });
-  t.same(resumeCursor(ended, catalog, streams, { markets: [], actions: [], initiatedBy: [] }),
-    { kind: 'version-changed', cursorRegistryVersionId: ANOTHER },
+  t.same(resumeCursor(ended, catalog, streams), { kind: 'version-changed', cursorRegistryVersionId: ANOTHER },
     'while one the version ends is ended, whatever filters it is sent with');
 });
 

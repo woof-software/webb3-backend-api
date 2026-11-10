@@ -150,6 +150,17 @@ type RegistryOverlayEventRow = {
   created_at:          string,
 };
 
+type RegistryApprovalRow = {
+  id:                  string,
+  registry_version_id: string,
+  snapshot_checksum:   string,
+  active_version_id:   string | null,
+  actor:               string,
+  reason:              string,
+  created_at:          string,
+  expires_at:          string,
+};
+
 type SyncRunRow = {
   id:                  string,
   source_commit_sha:   string,
@@ -272,6 +283,7 @@ export type {
   MarketContractRow,
   MarketRow,
   NetworkPriceExceptionRow,
+  RegistryApprovalRow,
   RegistryNetworkRow,
   RegistryOverlayEventRow,
   RegistryTables,

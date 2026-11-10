@@ -48,7 +48,7 @@ async function seededRun(db: D1Database, versionId: string): Promise<string> {
        status, outcome, lease_owner, lease_expires_at, expected_count, completed_count, failed_count,
        last_error, started_at, completed_at
      ) VALUES (
-       ?1, 'a34d9b571c833b5d77f052ab8e2dbdbe10df726d', 'main', ?2, 'manual', 'registry-admin:test',
+       ?1, 'a34d9b571c833b5d77f052ab8e2dbdbe10df726d', 'main', ?2, 'manual', 'test-admin',
        'a release that needs the new markets', 'completed', 'imported', 'secret-lease-owner',
        '2026-09-21T12:15:09.528Z', 7, 4, 2, 'CHAIN_REQUEST_FAILED: a node provider request failed',
        '2026-09-20T22:00:01.117Z', ?3
@@ -89,7 +89,7 @@ t.test('a sync run route answers the run and its roots field by field, in the or
     sourceCommitSha:   'a34d9b571c833b5d77f052ab8e2dbdbe10df726d',
     trackedRef:        'main',
     triggerKind:       'manual',
-    requestedBy:       'registry-admin:test',
+    requestedBy:       'test-admin',
     reason:            'a release that needs the new markets',
     status:            'completed',
     outcome:           'imported',

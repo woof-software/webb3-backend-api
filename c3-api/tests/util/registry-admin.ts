@@ -1,11 +1,12 @@
 import type { TestHarness } from 'wrangler';
 
+import type { Env } from '../../entrypoint.js';
 import type { NetworkV1 } from '../../lib/model/comet-registry.js';
-import { activateVersion } from '../../src/registry/repository.js';
+import { activateVersion, readActiveVersionId } from '../../src/registry/repository.js';
 
-import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from './registry-fixture.js';
+import { approveSeeded, loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from './registry-fixture.js';
 import type { RegistryHarness } from './registry-harness.js';
-import { ADMIN_TOKEN } from './test-env.js';
+import { ADMIN_TOKEN, APPROVER_TOKEN } from './test-env.js';
 
 /*
  * What the registry tests share around the administrative routes: a client
@@ -14,12 +15,11 @@ import { ADMIN_TOKEN } from './test-env.js';
  */
 
 /*
- * The actor a harness gives the worker (COMET_REGISTRY_ADMIN_ACTOR) over
- * wrangler.toml and a developer's .dev.vars, so a test compares who made a
- * decision with this literal rather than with the formula the worker would
- * otherwise build it by.
+ * The name a harness lists ADMIN_TOKEN under (test-env.ts), which the worker
+ * records as the actor of everything a request with it does: a test compares
+ * who made a decision with this literal.
  */
-const ADMIN_ACTOR = 'registry-admin:test';
+const ADMIN_ACTOR = 'test-admin';
 
 const AUTH = { 'Authorization': `Bearer ${ADMIN_TOKEN}` };
 
@@ -38,7 +38,11 @@ type AdminClient = {
   read:     <T>(path: string, headers?: Record<string, string>) => Promise<Answer<T>>,
   post:     <T>(path: string, body: unknown, headers?: Record<string, string>) => Promise<Answer<T>>,
   patch:    <T>(path: string, body: unknown, headers?: Record<string, string>) => Promise<Answer<T>>,
-  // moves the active version through the API, as an administrator does, and fails the test where it cannot
+  /*
+   * Moves the active version through the API, as administrators do, and fails
+   * the test where it cannot: test-approver approves an activation against
+   * the version on, and test-admin makes it; a rollback is test-admin's alone.
+   */
   switchTo: (versionId: string, action?: 'activate' | 'rollback') => Promise<void>,
 };
 
@@ -58,6 +62,16 @@ function adminClient(server: TestHarness): AdminClient {
     post:     (path, body, headers) => send('POST', path, body, headers),
     patch:    (path, body, headers) => send('PATCH', path, body, headers),
     switchTo: async (versionId, action = 'activate') => {
+      if (action === 'activate') {
+        const { APP_DB } = await server.getWorker<Env>().getEnv();
+        const { status } = await send('POST', `/registry/v1/admin/versions/${versionId}/approve`, {
+          reason:                  'approved for a test',
+          expectedActiveVersionId: await readActiveVersionId(APP_DB),
+        }, { 'Authorization': `Bearer ${APPROVER_TOKEN}` });
+        if (status !== 200) {
+          throw new Error(`the approval of ${versionId} answered ${status}`);
+        }
+      }
       const { status } = await send('POST', `/registry/v1/admin/versions/${versionId}/${action}`, { reason: `${action} for a test` });
       if (status !== 200) {
         throw new Error(`${action} of ${versionId} answered ${status}`);
@@ -87,8 +101,9 @@ async function seedValidated(
 
 /*
  * A fresh database with the fixture validated and, with `activate`, active,
- * for a test about something other than activation. `through` stops the
- * migrations at that one.
+ * for a test about something other than activation: approved by
+ * test-approver and switched on by test-seed. `through` stops the migrations
+ * at that one.
  */
 async function freshActive(
   harness: RegistryHarness,
@@ -97,6 +112,7 @@ async function freshActive(
   const db        = await harness.freshDatabase({ through });
   const versionId = await seedValidated(db);
   if (activate) {
+    await approveSeeded(db, versionId);
     await activateVersion(db, { versionId, action: 'activate', actor: 'test-seed', reason: 'seeded for a test' });
   }
   return { db, versionId };

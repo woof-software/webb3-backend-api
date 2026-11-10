@@ -4,8 +4,8 @@ import type { RegistrySnapshotV1 } from '../../lib/model/comet-registry.js';
 
 import { activateVersion } from '../../src/registry/repository.js';
 
-import { applyMigrations } from './d1.js';
-import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from './registry-fixture.js';
+import { RELEASED_BEFORE, applyMigrations } from './d1.js';
+import { approveSeeded, loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from './registry-fixture.js';
 
 /*
  * An APP_DB for tests that call the worker from Node.
@@ -37,7 +37,8 @@ type Options = {
   activate?: boolean,
   /*
    * The last migration to apply, for a test of a release deployed before its
-   * own migrations: every migration by default.
+   * own migrations, with those of the release before (RELEASED_BEFORE):
+   * every migration by default.
    */
   through?: string,
 };
@@ -55,11 +56,12 @@ async function activeRegistryDatabase(options: Options = {}): Promise<RegistryDa
   });
 
   const db = await miniflare.getD1Database('APP_DB') as unknown as D1Database;
-  await applyMigrations(db, undefined, through === undefined ? {} : { through });
+  await applyMigrations(db, undefined, through === undefined ? {} : { through, besides: RELEASED_BEFORE });
 
   const { versionId } = await seedCandidate(db, snapshot);
   await validateSeeded(db, versionId);
   if (activate) {
+    await approveSeeded(db, versionId);
     await activateVersion(db, {
       versionId,
       action: 'activate',

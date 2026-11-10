@@ -5,7 +5,7 @@ import { jsonResponse } from '../http/json.js';
 import type { RecordedKind } from './decision-records.js';
 import type { DecisionList } from './decision-store.js';
 import { member } from './decision-store.js';
-import type { RegistryContext } from './handlers.js';
+import type { AdminContext, RegistryContext } from './handlers.js';
 import { registryHeaders } from './version-headers.js';
 
 /*
@@ -17,9 +17,12 @@ import { registryHeaders } from './version-headers.js';
  * carry one is decided by the active version, so every answer names that
  * version, in headers and in the body, as the other registry routes do.
  *
- * A command of a kind an outage answers with records the kind's decisions in
- * force once it has committed (decision-records.ts); a kind no outage answers
- * with keeps no record (`record` null).
+ * A command takes effect as soon as it has committed: unlike a version's
+ * activation, a decision needs nobody's approval, and nothing announces it
+ * (notifications.ts). Its actor is the name of the token it was sent with
+ * (AdminContext). A command of a kind an outage answers with records the
+ * kind's decisions in force once it has committed (decision-records.ts); a
+ * kind no outage answers with keeps no record (`record` null).
  */
 
 type Answer = { registryVersion: VersionRefV1 };
@@ -52,7 +55,7 @@ async function getDecision<Subject extends object, Flag extends string, Listed>(
  * committed with its audit event before it is answered.
  */
 async function patchDecision<Subject extends object, Flag extends string, Listed>(
-  context: RegistryContext,
+  context: AdminContext,
   kind: DecisionCommands<Subject, Flag, Listed>,
   subject: Subject,
   decision: { flag: boolean, reason: string },
@@ -91,7 +94,7 @@ async function postDecisionReview<Subject extends object, Flag extends string, L
 }
 
 async function postDecisionApply<Subject extends object, Flag extends string, Listed>(
-  context: RegistryContext,
+  context: AdminContext,
   kind: DecisionCommands<Subject, Flag, Listed>,
   list: DecisionList<Listed>,
 ): Promise<Response> {

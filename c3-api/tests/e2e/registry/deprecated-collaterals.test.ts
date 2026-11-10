@@ -29,7 +29,7 @@ import { DEPRECATED_COLLATERALS, decisionScenarios } from './decision-scenarios.
  * Refusals of malformed requests are in deprecated-collateral-routes.test.ts,
  * and what the active reads answer in deprecated-collateral-reads.test.ts.
  */
-const harness = await registryHarness({ admin: true, vars: { COMET_REGISTRY_ADMIN_ACTOR: ADMIN_ACTOR } });
+const harness = await registryHarness({ admin: true });
 const admin   = adminClient(harness.server);
 
 decisionScenarios(harness, DEPRECATED_COLLATERALS);
@@ -57,7 +57,7 @@ const APPLY  = DEPRECATED_COLLATERALS.list.apply;
 
 type Refused = { error: { code: string, message: string, details?: { problems?: unknown[] } } };
 
-// the list step 7 of the runbook's first bring-up sends, and the file as it sends it
+// the list step 8 of the runbook's first bring-up sends, and the file as it sends it
 const list = readSeedDeprecated();
 const text = readSeedDeprecatedText();
 
@@ -150,6 +150,11 @@ t.test('the first list of deprecated collaterals is reviewed and applied as one'
     (await db.prepare(`SELECT DISTINCT reason FROM deprecated_collateral_events`).all<{ reason: string }>()).results?.map(row => row.reason),
     [ seed.reason ],
     'each with the file\'s reason',
+  );
+  t.same(
+    (await db.prepare(`SELECT DISTINCT actor FROM deprecated_collateral_events`).all<{ actor: string }>()).results?.map(row => row.actor),
+    [ ADMIN_ACTOR ],
+    'and under the name of the token that applied it',
   );
   t.same(await flagged(USDT), [ 'wUSDM', 'mETH', 'weETH', 'sdeUSD', 'deUSD', 'USDe' ], 'the USDT market flags its six');
   t.same(await flagged(USDC), [ 'deUSD', 'sdeUSD', 'rsETH', 'USDe' ], 'the USDC market its four, and not its weETH');

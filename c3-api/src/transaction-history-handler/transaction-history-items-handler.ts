@@ -42,6 +42,7 @@ import { Env } from '../../entrypoint.js';
 import type { TransactionHistoryRouteData } from '../router.js';
 
 import {
+  changedFilter,
   contractsOf,
   cursorStore,
   isCursorId,
@@ -626,6 +627,32 @@ async function getTransactionHistory(
    */
   const streamEvents = streamEventsOf(catalog);
 
+  /*
+   * A cursor is judged against this version before the request's markets
+   * are resolved against it (resumeCursor): a filter naming a market whose
+   * history the version no longer serves ends the cursor, as any change of
+   * the streams does, rather than being refused as invalid.
+   */
+  let resumed: CursorPayload | null = null;
+  if (cursor !== null) {
+    const storedPayload = await store.read<StoredCursor>(cursor);
+    if (storedPayload === null) {
+      return new Response('Cursor is invalid', { status: 400 });
+    }
+    const resumption = resumeCursor(storedPayload, catalog, streamEvents);
+    if (resumption.kind === 'version-changed') {
+      throw new ApiError(
+        'REGISTRY_VERSION_CHANGED',
+        'the markets of the registry changed; restart pagination without a cursor',
+        {
+          cursorRegistryVersionId: resumption.cursorRegistryVersionId,
+          registryVersionId:       catalog.versionId,
+        },
+      );
+    }
+    resumed = resumption.payload;
+  }
+
   const contractAddresses: string[] = [];
   const networks: string[] = [];
   if (namedMarkets.length > 0) {
@@ -667,7 +694,7 @@ async function getTransactionHistory(
     });
   }
 
-  if (cursor === null || cursor === undefined) {
+  if (resumed === null) {
     // No cursor provided, use provided filters
     const cursorPayload = openCursor(catalog, streamEvents, {
       markets,
@@ -702,47 +729,32 @@ async function getTransactionHistory(
       )
     ), { status: 200 });
   } else {
-    const storedPayload = await store.read<StoredCursor>(cursor);
-    if (storedPayload === null) {
-      return new Response('Cursor is invalid', { status: 400 });
-    } else {
-      const resumed = resumeCursor(storedPayload, catalog, streamEvents, { markets, actions, initiatedBy });
-      if (resumed.kind === 'version-changed') {
-        throw new ApiError(
-          'REGISTRY_VERSION_CHANGED',
-          'the markets of the registry changed; restart pagination without a cursor',
-          {
-            cursorRegistryVersionId: resumed.cursorRegistryVersionId,
-            registryVersionId:       catalog.versionId,
-          },
-        );
-      }
-      if (resumed.kind === 'filter-changed') {
-        return new Response(`Cursor is having different ${resumed.filter} filter`, { status: 400 });
-      }
-      const cursorPayload = resumed.payload;
-
-      // every stream of a cursor resumes from its own position
-      const [ transactionHistoryResponse, defiSaverProxies ] = await (
-        loadTransactionHistoryItems(
-          catalog,
-          accountAddress,
-          cursorPayload,
-          itemsLimit,
-          {}
-        )
-      );
-      // Manually add DefiSaver to profilesByAddress
-      return new Response(JSON.stringify(
-        formatTransactionHistoryResponse(
-          transactionHistoryResponse,
-          populateDefiSaverProxyProfiles(
-            cursorPayload.profilesByAddress,
-            defiSaverProxies
-          )
-        )
-      ), { status: 200 });
+    // a cursor the version reads on goes on only with the filters it was handed out with
+    const changed = changedFilter(resumed, { markets, actions, initiatedBy });
+    if (changed !== null) {
+      return new Response(`Cursor is having different ${changed} filter`, { status: 400 });
     }
+
+    // every stream of a cursor resumes from its own position
+    const [ transactionHistoryResponse, defiSaverProxies ] = await (
+      loadTransactionHistoryItems(
+        catalog,
+        accountAddress,
+        resumed,
+        itemsLimit,
+        {}
+      )
+    );
+    // Manually add DefiSaver to profilesByAddress
+    return new Response(JSON.stringify(
+      formatTransactionHistoryResponse(
+        transactionHistoryResponse,
+        populateDefiSaverProxyProfiles(
+          resumed.profilesByAddress,
+          defiSaverProxies
+        )
+      )
+    ), { status: 200 });
   }
 }
 

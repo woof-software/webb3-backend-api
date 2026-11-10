@@ -166,12 +166,12 @@ Where a value departs from those rules, or they need saying for one market:
 ## Where it came from
 
 Frozen on 2026-10-20, offline, from the proposal `src/registry/bootstrap.ts`
-made at dev `56d75ffc2ba36d83c5ca0454c24defa8fdcd133a` — what its route
-answered under `bundle` — for a first import of develop's markets: the 31
-that `GET /market/all-networks/all-contracts/summary` listed on develop that
-day, without its two test markets, `1/usdc-test-collateral-revert` and
-`1/usdc-test-base-revert`, which no other source has. The proposal's digest
-was `4897101575bb1d21`, and it left nothing to decide.
+made at commit `56d75ffc2ba36d83c5ca0454c24defa8fdcd133a` — what its route
+answered under `bundle` — for a first import of the markets a development
+deployment served: the 31 that `GET /market/all-networks/all-contracts/summary`
+listed there that day, without its two test markets, which no other source
+has. The proposal's digest was `4897101575bb1d21`, and it left nothing to
+decide.
 
 From that bundle, the file differs in three ways, none of which changes a
 decision: every document is as the overlay parsers return it, which reorders
@@ -191,12 +191,12 @@ proposal after parsing. `bootstrap.ts` and the proposal routes were removed
 after that commit, so the file is now changed by hand
 ([Changing it](#changing-it)).
 
-Develop's summary serves the 29 markets with the same labels: 174 of 174
-values — display name, base asset name, wrapped native, slug, default,
-institutional — are equal. One decision is known to differ from develop's
-overlays: develop quotes `59144/weth`'s reward feed in `usd`, which it
-inherited from before the proposal quoted it in the base asset, and the file
-says `base`, which is right
+That deployment's summary serves the 29 markets with the same labels: 174 of
+174 values — display name, base asset name, wrapped native, slug, default,
+institutional — are equal. One decision is known to differ from its
+overlays: it quotes `59144/weth`'s reward feed in `usd`, which it inherited
+from before the proposal quoted it in the base asset, and the file says
+`base`, which is right
 ([REGISTRY_RUNBOOK.md](../../REGISTRY_RUNBOOK.md#when-something-goes-wrong),
 Linea WETH's reward price).
 
@@ -213,9 +213,9 @@ names its chain, its Comet, the market's key, the token and its symbol, the
 addresses lowercase.
 
 It is not part of the seed, since a collateral can be marked only while a
-version that holds it is on. Step 7 of
-[the first bring-up](../../REGISTRY_RUNBOOK.md#7-mark-the-initial-deprecated-collaterals)
-sends it once step 5 has switched the seed's version on, from the root of a
+version that holds it is on. Step 8 of
+[the first bring-up](../../REGISTRY_RUNBOOK.md#8-mark-the-initial-deprecated-collaterals)
+sends it once step 6 has switched the seed's version on, from the root of a
 checkout: a review of the file as it is, then an apply of what the review
 shows as changes.
 
@@ -249,5 +249,5 @@ USDC, WETH, USDT and WBTC: the review resolves the 12 rows of those markets
 and names the 8 of the wstETH and USDS markets as problems, apply refuses
 the file whole, and the 12 apply as written. Only a version imported from
 the source holds the other two markets, so their rows are checked there: by
-the review of step 7, and before an environment depends on the file, by
+the review of step 8, and before an environment depends on the file, by
 [the preflight](../../REGISTRY_RUNBOOK.md#the-preflight).

@@ -22,7 +22,7 @@ import { activateVersion, snapshotChecksum } from '../../../src/registry/reposit
 import { settledWithin } from '../../util/execution-context.js';
 import { refusingKv } from '../../util/kv.js';
 import { quietLog } from '../../util/quiet-log.js';
-import { loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
+import { approveSeeded, loadRegistrySnapshotFixture, seedCandidate, validateSeeded } from '../../util/registry-fixture.js';
 import { registryHarness } from '../../util/registry-harness.js';
 import { failingDatabase } from '../../util/test-env.js';
 
@@ -57,6 +57,7 @@ async function freshEnvironment(): Promise<{ db: D1Database, kv: KVNamespace }> 
 }
 
 async function activate(db: D1Database, versionId: string): Promise<void> {
+  await approveSeeded(db, versionId);
   await activateVersion(db, { versionId, action: 'activate', actor: 'test-admin', reason: 'test' });
 }
 
