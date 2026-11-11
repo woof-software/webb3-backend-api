@@ -6,8 +6,9 @@ import { throttle, throttleBy } from '../../lib/throttle.js';
  * When a log line that would otherwise repeat on every request is written:
  * the first time for its key, and then once a window, counted from the last
  * time it was written. Every such line in the worker is written by this rule
- * (get-price.ts, market.ts, rewards.ts, the computation cache, the registry
- * cache and its deprecated collateral reads), so it is held here once.
+ * (get-price.ts, market.ts, rewards.ts, eth-get-block-header.ts,
+ * summary-tokens.ts, the computation cache, the registry cache and its
+ * collateral decision reads), so it is held here once.
  */
 const MINUTE = 60_000;
 
