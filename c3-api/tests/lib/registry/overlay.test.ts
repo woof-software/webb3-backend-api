@@ -344,10 +344,9 @@ t.test('a price exception is one decision in every shape it is held in', async t
 
 /*
  * That holds while a stored exception is read in one place, which names every
- * kind. A reader that told the kinds apart itself, as the overlay store did
- * before it read its rows through priceExceptionOfRow, reads the same
- * documents for the kinds there are now, so no answer would show it, and
- * would read a kind added later as another.
+ * kind. A reader that told the kinds apart itself reads the same documents for
+ * the kinds there are now, so no answer would show it, and would read a kind
+ * added later as another.
  */
 t.test('a stored exception is read in one place', async t => {
   const sources = sourceFiles();

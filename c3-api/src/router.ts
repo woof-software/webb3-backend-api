@@ -24,7 +24,7 @@ import { RequestCatalog, catalogHeadersOf, requestCatalog } from './registry/req
 import { summaryDecisions } from './registry/summary-tokens.js';
 import type { SummaryDecisions } from './registry/summary-tokens.js';
 
-import * as Evaluator from './evaluator.js';
+import type * as Evaluator from './evaluator.js';
 
 /*
  * Handlers must declare the sets of computations upon which they depend.
