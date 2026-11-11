@@ -16,9 +16,9 @@ import { reportRevert, type GetPrice, type PriceRead } from './get-price.js';
  * asset, at the scale the import read from it: what the Comet answered
  * baseTokenPriceFeed() with then, which the market rewards report as the
  * market's feed and the chain drift check holds against what the Comet
- * answers now — one feed for all three (R4 of the TOK-0 audit). The rewards
- * keep naming it as the market's feed even where the price was read through
- * the Comet's (market-rewards.ts).
+ * answers now — one feed for all three. The rewards keep naming it as
+ * the market's feed even where the price was read through the Comet's
+ * (market-rewards.ts).
  *
  * Where that feed does not answer at the block — a block before it was
  * deployed, or one after Chainlink retired it while the version still names

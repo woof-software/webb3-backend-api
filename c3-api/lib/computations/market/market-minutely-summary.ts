@@ -15,7 +15,7 @@ type MarketMinutelySummary = Compute.Spec<{
 const { implement, pull1 } = Compute.Functor<MarketMinutelySummary>({});
 const marketMinutelySummary = implement({
   // 13: the latest summary, with an empty market's APRs from its Comet's rate model (#23).
-  // 7 to 12 are taken in the KV two deployments of develop can share: 7 to 9 and 12 by values of other shapes, 10 and 11 by values of the rules 13 changes.
+  // 12 is taken by values of another shape.
   version: 13,
   index: Index.MinutelyBlockIndex,
   key(name, {block, ...context}) {

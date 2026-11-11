@@ -903,7 +903,7 @@ const DEPRECATED_COLLATERALS = collateralKindUnderTest({
   adjective:  'deprecated',
   flag:       'isDeprecated',
   list:       { key: 'collaterals', other: 'policies' },
-  listReason: 'COM-18',
+  listReason: 'no longer offered',
   through:    [ '0005', '0006' ],
 });
 

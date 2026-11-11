@@ -21,7 +21,7 @@ const text   = readSeedDeprecatedText();
 const list   = readSeedDeprecated();
 const comets = readSeedComets();
 
-const REASON = 'Deprecated collateral the app hid by its own list until the registry served it (Linear COM-18)';
+const REASON = 'Deprecated collateral the app hid by its own list until the registry served it';
 
 // a row as the export writes one
 const ROW = [ 'chainId', 'cometAddress', 'deploymentKey', 'tokenAddress', 'symbol', 'isDeprecated' ];
