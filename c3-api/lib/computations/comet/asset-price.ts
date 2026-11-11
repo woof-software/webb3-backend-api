@@ -50,10 +50,10 @@ function exceptionFor(annotation: RegistryAnnotation, priceFeed: Address): Price
 }
 
 /*
- * How the version prices one feed. Decision D1 of the TOK-0 audit: a zero or
- * fixed price stated by the registry replaces the read altogether, since the
- * feed it describes is known not to answer; a remap reads the feed it names
- * instead, and falls back on the feed it replaces, which still answers at a
+ * How the version prices one feed: a zero or fixed price stated by the
+ * registry replaces the read altogether, since the feed it describes
+ * is known not to answer; a remap reads the feed it names instead,
+ * and falls back on the feed it replaces, which still answers at a
  * block before the replacement was deployed. Whether that answer is one to
  * use is the reader's to decide: the totals of the summaries count it as they
  * count the answer of any feed the Comet names, and the value of a

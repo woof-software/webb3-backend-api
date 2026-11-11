@@ -101,8 +101,8 @@ npm run d1:migrate:stage
 npm run d1:migrate:production
 ```
 
-CI applies the migrations before it deploys, so a migration has to work with
-the release deployed before it, which serves until the deploy that follows.
+A migration has to work with the release deployed before it, which serves
+until the deploy that follows.
 
 The Comet registry also binds `kv_registry` for its snapshot cache, its last
 check of the chain, the deprecated and the hidden collateral decisions it
@@ -593,8 +593,8 @@ each environment before it is applied there.
 An administrator can mark a collateral of a market deprecated: one the app
 no longer offers in that market, and keeps showing to a user who still holds
 some of it, so that it can be withdrawn. This replaces the list the frontend
-kept itself, which calls them legacy collateral (Linear COM-18), and which is
-also how it keeps wUSDM out of the USDT market now: that rule is the list's
+kept itself, which calls them legacy collateral, and which is also
+how it keeps wUSDM out of the USDT market now: that rule is the list's
 row for it, and so, once the list is applied, the decision `isDeprecated` on
 wUSDM in cUSDTv3. `/registry/v1/active` and the market reads mark every
 collateral with `isDeprecated`, by the decisions in force when they answer,
@@ -701,9 +701,7 @@ is not hidden, without a row. Every change is written in one D1 transaction
 with its audit event, and migration `0008` enforces that in the database as
 `0007` does for deprecated collaterals, in tables of its own. It only adds
 them, so the release before it runs on beside them; a Worker rolled back to
-that release ignores the decisions, and discovery decides what they hid as
-that release does: by the deprecated decisions, then by its strategic mark
-and its value.
+that release ignores the decisions.
 
 The routes are those of the deprecated collaterals, under the same limiter
 budgets: hiding a collateral and applying a list share the `policy` one, and

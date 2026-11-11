@@ -1,5 +1,5 @@
 {
-  "reason": "Deprecated collateral the app hid by its own list until the registry served it (Linear COM-18)",
+  "reason": "Deprecated collateral the app hid by its own list until the registry served it",
   "collaterals": [
     {
       "chainId": 1,

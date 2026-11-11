@@ -1988,10 +1988,10 @@ Applying `reviewed.json` again changes nothing.
 ### The initial list of deprecated collaterals
 
 Until the registry served them, the app left these collaterals out by a list
-of its own, which calls them legacy collateral (Linear COM-18): 20
-collaterals of five Ethereum markets — the list is also how it keeps wUSDM
-out of the USDT market, which its row `usdt`/`wUSDM` now decides as
-`isDeprecated`. The list is checked in beside the seed, as
+of its own, which calls them legacy collateral: 20 collaterals of five
+Ethereum markets — the list is also how it keeps wUSDM out of the USDT
+market, which its row `usdt`/`wUSDM` now decides as `isDeprecated`. The
+list is checked in beside the seed, as
 [`c3-api/registry/seed/production.deprecated-collaterals.json`](./registry/seed/README.md#the-deprecated-collaterals),
 in the form `GET /registry/v1/admin/deprecated-collaterals` exports and the
 review and apply routes take: every row with the address of its Comet and
@@ -2041,12 +2041,11 @@ WETH, USDT and WBTC — the source fixtures hold the roots of the USDC and
 institutional USDC markets only, and the seed names both Comets
 (`production.comets.json`) but no Comet's collateral. Each token address is
 the one the fixture's Ethereum markets hold under that symbol. That each is
-a collateral of its Comet is what the version that was on said: on
-2026-10-22, the export of develop's active version (`2b27157d…`) listed each
-of the 8 exactly once, as a collateral of its Comet, with the address and
-the symbol the table has. Step 8's review checks every row of the file
-again, against the version that is on where it is sent, before anything is
-written.
+a collateral of its Comet is what a development deployment's active version
+said: on 2026-10-22, its export listed each of the 8 exactly once, as a
+collateral of its Comet, with the address and the symbol the table has.
+Step 8's review checks every row of the file again, against the version
+that is on where it is sent, before anything is written.
 
 ## Hiding a collateral
 

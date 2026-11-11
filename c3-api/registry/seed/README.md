@@ -204,13 +204,12 @@ Linea WETH's reward price).
 
 [`production.deprecated-collaterals.json`](./production.deprecated-collaterals.json)
 holds the collaterals the app left out by a list of its own until the
-registry served them (Linear COM-18): 20 collaterals of the USDT, USDC,
-WBTC, wstETH and USDS markets of Ethereum, each `"isDeprecated": true`,
-under one reason. It is a list as
-`GET /registry/v1/admin/deprecated-collaterals` exports one, which
-`POST …/deprecated-collaterals/review` and `…/apply` take as it is: each row
-names its chain, its Comet, the market's key, the token and its symbol, the
-addresses lowercase.
+registry served them: 20 collaterals of the USDT, USDC, WBTC, wstETH and
+USDS markets of Ethereum, each `"isDeprecated": true`, under one reason.
+It is a list as `GET /registry/v1/admin/deprecated-collaterals` exports one,
+which `POST …/deprecated-collaterals/review` and `…/apply` take as it is:
+each row names its chain, its Comet, the market's key, the token and its
+symbol, the addresses lowercase.
 
 It is not part of the seed, since a collateral can be marked only while a
 version that holds it is on. Step 8 of

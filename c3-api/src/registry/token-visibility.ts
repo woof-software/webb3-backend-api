@@ -14,10 +14,10 @@ import type { VisibilityV1 } from '../../lib/model/comet-registry.js';
  * token, or decide about it, takes no part, and every market the version
  * serves is decided so, whatever its status.
  *
- * A collateral whose value cannot be read is shown (decision D4 of the TOK-0
- * audit): leaving it out would keep from discovery an asset someone may hold,
- * and showing it is the safe answer to not knowing. A collateral the market
- * holds none of is worth nothing, whatever its price says, and so is below
+ * A collateral whose value cannot be read is shown: leaving it out
+ * would keep from discovery an asset someone may hold, and showing
+ * it is the safe answer to not knowing. A collateral the market holds
+ * none of is worth nothing, whatever its price says, and so is below
  * the threshold (market-latest-summary.ts). A strategic token is shown
  * whatever its value says.
  *

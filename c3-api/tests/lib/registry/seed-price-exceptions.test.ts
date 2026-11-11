@@ -28,8 +28,8 @@ const seed = JSON.parse(readFileSync(SEED, 'utf8')) as { networks: Record<string
 const seededOn = (chainId: number) => parseNetworkOverlay(seed.networks[String(chainId)], `networks.${chainId}`).priceExceptions;
 
 /*
- * Parity with the price computation before the registry (asset-price.ts
- * before 3e3c685): every branch it carried, as the network it applied on, the
+ * Parity with the price computation of asset-price.ts before the
+ * registry: every branch it carried, as the network it applied on, the
  * feed it matched as the Comet answered it, and the price it answered. Each
  * is an exception the seed holds for that network, and the registry's price
  * computation answers it with that same price, reading nothing — the proof

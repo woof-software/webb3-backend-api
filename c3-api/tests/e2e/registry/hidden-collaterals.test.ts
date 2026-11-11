@@ -66,7 +66,7 @@ t.test('a list of hidden collaterals is exported, reviewed, and applied as one, 
   const versionId = await seedValidated(db);
   await admin.switchTo(versionId);
   await admin.patch(HIDDEN_COLLATERALS.path(1, { cometAddress: USDT, tokenAddress: METH }), { isHidden: true, reason: 'decided by hand' });
-  await admin.patch(DEPRECATED_COLLATERALS.path(1, { cometAddress: USDC, tokenAddress: WEETH }), { isDeprecated: true, reason: 'Linear COM-18' });
+  await admin.patch(DEPRECATED_COLLATERALS.path(1, { cometAddress: USDC, tokenAddress: WEETH }), { isDeprecated: true, reason: 'no longer offered' });
 
   const exported = await admin.read<HiddenCollateralListV1>(HIDDEN_COLLATERALS.list.export);
   t.equal(exported.status, 200);

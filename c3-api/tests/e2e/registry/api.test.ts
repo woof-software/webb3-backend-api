@@ -297,7 +297,6 @@ t.test('a public read that fails after the version was read names the version', 
   for (const [ path, init, status, what ] of [
     [ `/registry/v1/versions/${randomUUID()}`, {}, 404, 'a version nobody validated' ],
     [ '/registry/v1/unknown', {}, 404, 'an unknown path' ],
-    [ '/registry/v1/networks/1/tokens', {}, 404, 'the path the public token list had' ],
     [ '/registry/v1/active', { method: 'POST' }, 405, 'a method the route does not take' ],
     [ `/registry/v1/admin/versions/${randomUUID()}`, auth, 404, 'an administrative read' ],
   ] as const) {

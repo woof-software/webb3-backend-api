@@ -125,12 +125,12 @@ const SCHEMA_VERSION = 1;
  * The revision of what these routes send for a version. A body is the version
  * as this release presents it, and a release can change that for a version
  * that is already active: the one that stopped listing a network with no
- * served market did, so did the one that marked legacy collaterals, so did
- * the one that renamed that mark `isDeprecated`, and so did the one that
- * marked hidden collaterals beside it. A tag that named the version alone
- * would then confirm, with a 304, a copy an earlier release sent, for as long
- * as that version stays active; so a release that changes what a route sends
- * for a version that already exists moves this on.
+ * served market did. A tag that named the version alone would then confirm,
+ * with a 304, a copy an earlier release sent, for as long as that version
+ * stays active; so a release that changes what a route sends for a version
+ * that already exists moves this on.
+ *
+ * 5: the flags isDeprecated and isHidden.
  */
 const REPRESENTATION_REVISION = 5;
 

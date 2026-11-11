@@ -31,7 +31,7 @@ const { implement, pipe1 } = Compute.Functor<MarketDaySummary>({});
  */
 const marketDaySummary = implement({
   // 10: an empty market's APRs come from its Comet's rate model (#23).
-  // 9 is taken by values of another shape in the KV two deployments of develop can share.
+  // 9 is taken by values of another shape.
   version: 10,
   index: Index.DailyBlockIndex,
   /*

@@ -25,8 +25,8 @@ import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, TOKEN_POLICIES } from './de
  * condition a write is made on, what it expects of every row once it is
  * done, the order a history is read in. However the statements come to be
  * built, or shared between kinds, each keeps every byte, and a call sends
- * them in the order it always has: the texts here are those ad89bd5
- * prepares, and one that differs fails with the difference.
+ * them in the order it always has: the texts here are those each kind has
+ * always prepared, and one that differs fails with the difference.
  *
  * Each call is made as a request makes it, against a real D1 in Node, so a
  * text held here is one D1 runs.
@@ -424,7 +424,7 @@ const KINDS: Array<[ kind: DecisionKindUnderTest, statements: Record<string, str
 ];
 
 for (const [ kind, statements, reads ] of KINDS) {
-  t.test(`the statements of ${kind.list.what} are the texts ad89bd5 prepares, each call's in its order`, async t => {
+  t.test(`the statements of ${kind.list.what} keep their texts, each call's in its order`, async t => {
     const registry = await activeRegistryDatabase();
     t.teardown(() => registry.dispose());
     const { db, prepared } = recording(registry.db);

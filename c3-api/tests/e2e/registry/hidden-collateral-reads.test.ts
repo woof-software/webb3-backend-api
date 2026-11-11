@@ -68,7 +68,7 @@ t.test('the hidden and the deprecated decisions are recorded apart', async t => 
  * The bytes each record is written as, for the decisions a database gives,
  * in the order it gives them, at a fixed time: a record outlives the release
  * that wrote it, and the one after reads it. Both are held to the strings
- * 2164ffd writes for the same decisions.
+ * they have always been written as, for the same decisions.
  */
 t.test('each kind writes its record in the bytes it always has', async t => {
   const comet = '0x3afdc9bca9213a35503b077a6072f3d0d5ab0840';
@@ -84,9 +84,9 @@ t.test('each kind writes its record in the bytes it always has', async t => {
   await recordDecisions(HIDDEN_RECORD, deps);
   t.equal(await kv.get(DEPRECATED_KEY),
     '{"at":"2026-10-27T09:00:00.000Z","collaterals":[{"chainId":1,"cometAddress":"0x3afdc9bca9213a35503b077a6072f3d0d5ab0840","tokenAddress":"0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa"},{"chainId":1,"cometAddress":"0x3afdc9bca9213a35503b077a6072f3d0d5ab0840","tokenAddress":"0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee"}]}',
-    'the deprecated collaterals, as 2164ffd writes them');
+    'the deprecated collaterals');
   t.equal(await kv.get(HIDDEN_KEY), '{"at":"2026-10-27T09:00:00.000Z","collaterals":[]}',
-    'the hidden ones, none, as 2164ffd writes them');
+    'the hidden ones, none');
 });
 
 /*

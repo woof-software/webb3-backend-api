@@ -1314,7 +1314,7 @@ would send; `/active` and the market reads are cacheable by the deprecated
 and the hidden flags they carry as well, which their tag names. A tag
 also names the revision of what this API sends for a version, which a
 release moves on when it changes that for a version already active,
-as the one that added `isHidden` did: a copy an earlier release sent
+as the one that added those flags did: a copy an earlier release sent
 is then sent again, not confirmed. The tags are compared weakly, as
 RFC 9110 has it: `W/"…"`, which is what a browser sends back for a response
 Cloudflare compressed, names the same as the tag itself; `*` names any; and a
@@ -1593,7 +1593,7 @@ them changes the tag, and a client holding a copy made before it is sent the
 new one rather than a `304`. A browser may still keep a copy for its
 `max-age`. A tag is compared whole, and reads
 `"v1-r5-snapshot+deprecated-<digest>+hidden-<digest>-<version id>-<checksum>"`:
-the revision of what is sent — `5` since the release that added `isHidden` —
+the revision of what is sent — `5` since the release that added the flags —
 and for each flag a digest of the collaterals it is set on; the market reads
 tag their own part of the version the same way.
 
@@ -3031,7 +3031,7 @@ A malformed body answers `400` with every problem of every row in
       "current": false,
       "requested": true,
       "action": "change",
-      "reason": "Deprecated collateral the app hid by its own list until the registry served it (Linear COM-18)",
+      "reason": "Deprecated collateral the app hid by its own list until the registry served it",
       "problem": null
     }
   ]
