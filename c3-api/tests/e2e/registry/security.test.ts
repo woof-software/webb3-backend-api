@@ -2,15 +2,18 @@ import t from 'tap';
 
 import { randomUUID } from 'node:crypto';
 
-import { createTestHarness } from 'wrangler';
-
-import type { Env } from '../../../entrypoint.js';
-import { ROLES, sha256Hex } from '../../../src/http/bearer-auth.js';
+import { sha256 } from '../../../lib/hash.js';
+import { ROLES } from '../../../src/http/bearer-auth.js';
 import type { Role } from '../../../src/http/bearer-auth.js';
 import { ROUTES } from '../../../src/registry/admin-router.js';
 
-import { applyMigrations } from '../../util/d1.js';
+import { adminClient, count, seedValidated } from '../../util/registry-admin.js';
+import { registryHarness } from '../../util/registry-harness.js';
 import { registryWorker } from '../../util/registry-worker.js';
+import { ADMIN_TOKEN } from '../../util/test-env.js';
+
+import type { DecisionKindUnderTest } from './decision-scenarios.js';
+import { DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS, TOKEN_POLICIES } from './decision-scenarios.js';
 
 /*
  * What protects the administrative API, exercised through the worker: the
@@ -22,9 +25,6 @@ import { registryWorker } from '../../util/registry-worker.js';
  * an answer that is refused cheaply, refused before it says anything about
  * the registry, and refused the same way whatever the caller guessed.
  */
-// the token most cases send: alice's, an admin's
-const ADMIN_TOKEN = 'registry-admin-token-for-tests';
-
 // a token of the list for each role, held by somebody of that role's name
 const ROLE_TOKENS: Record<Role, string> = {
   monitor:  'registry-monitor-token-for-tests',
@@ -37,37 +37,22 @@ const ROLE_TOKENS: Record<Role, string> = {
 const ROTATED_OUT = 'registry-rotated-out-token-for-tests';
 const ROTATED_IN  = 'registry-rotated-in-token-for-tests';
 
+// an entry of a list a test gives the worker in place of the harness's, which holds the token's digest
 const listed = async (name: string, token: string, role: Role, notAfter: string | null = null) =>
-  ({ name, sha256: await sha256Hex(token), role, notAfter });
+  ({ name, sha256: await sha256(token), role, notAfter });
 
 /*
- * The worker stores only the hashes of the tokens it lists, so the harness is
- * given the hashes and the tests present the tokens themselves.
+ * The worker lists test-admin's token, which most cases send, and
+ * test-approver's (registryHarness), and beside them a token for each role,
+ * under the role's name, and the two tokens of a holder rotating one.
  */
-const SECRETS = {
-  COMET_REGISTRY_ADMIN_TOKENS: JSON.stringify([
-    await listed('alice', ADMIN_TOKEN, 'admin'),
-    ...await Promise.all(ROLES.map(role => listed(role, ROLE_TOKENS[role], role))),
-    await listed('rotating', ROTATED_OUT, 'operator', '2026-01-01T00:00:00Z'),
-    await listed('rotating', ROTATED_IN, 'operator'),
-  ]),
-};
-
-const server = createTestHarness({ workers: [ registryWorker(SECRETS) ] });
-
-t.before(async () => {
-  await server.listen();
-});
-t.teardown(() => server.close());
+const { server, freshDatabase } = await registryHarness({ admin: true, tokens: [
+  ...ROLES.map(role => ({ name: role, token: ROLE_TOKENS[role], role })),
+  { name: 'rotating', token: ROTATED_OUT, role: 'operator', notAfter: '2026-01-01T00:00:00Z' },
+  { name: 'rotating', token: ROTATED_IN,  role: 'operator' },
+] });
 
 const auth = { 'Authorization': `Bearer ${ADMIN_TOKEN}` };
-
-async function freshDatabase(): Promise<D1Database> {
-  await server.reset();
-  const { APP_DB } = await server.getWorker<Env>().getEnv();
-  await applyMigrations(APP_DB);
-  return APP_DB;
-}
 
 t.test('the token is what the routes are behind, and nothing else', async t => {
   await freshDatabase();
@@ -76,7 +61,7 @@ t.test('the token is what the routes are behind, and nothing else', async t => {
     [ 'no header',        undefined ],
     [ 'another scheme',   { 'Authorization': `Basic ${ADMIN_TOKEN}` } ],
     [ 'an empty token',   { 'Authorization': 'Bearer ' } ],
-    [ 'the token hash',   { 'Authorization': `Bearer ${await sha256Hex(ADMIN_TOKEN)}` } ],
+    [ 'the token hash',   { 'Authorization': `Bearer ${await sha256(ADMIN_TOKEN)}` } ],
     [ 'a prefix of it',   { 'Authorization': `Bearer ${ADMIN_TOKEN.slice(0, -1)}` } ],
     [ 'more after it',    { 'Authorization': `Bearer ${ADMIN_TOKEN} garbage` } ],
   ];
@@ -286,7 +271,26 @@ const UNKNOWN = '00000000-0000-4000-8000-000000000000';
 // unlike a move, an approval always names the version on it was read against
 const APPROVAL = { reason: 'not this one', expectedActiveVersionId: null };
 
-const ROUTE_TABLE: Array<{ method: string, path: string, body?: unknown, role: Role }> = [
+type RouteRow = { method: string, path: string, body?: unknown, role: Role };
+
+/*
+ * The routes of a kind of decision: reading a decision, exporting the list
+ * and reviewing an edit of it change nothing, and are a reader's; setting a
+ * decision and applying a list change what is served, and are an admin's.
+ * With nothing on, a read answers that nothing is, and a command is refused
+ * for its empty body.
+ */
+const DECISION_KINDS = [ TOKEN_POLICIES, DEPRECATED_COLLATERALS, HIDDEN_COLLATERALS ];
+
+const decisionRows = (kind: DecisionKindUnderTest): RouteRow[] => [
+  { method: 'GET',   path: kind.path(1, kind.subject),           role: 'reader' },
+  { method: 'PATCH', path: kind.path(1, kind.subject), body: {}, role: 'admin' },
+  { method: 'GET',   path: kind.list.export,                     role: 'reader' },
+  { method: 'POST',  path: kind.list.review,           body: {}, role: 'reader' },
+  { method: 'POST',  path: kind.list.apply,            body: {}, role: 'admin' },
+];
+
+const ROUTE_TABLE: RouteRow[] = [
   { method: 'POST', path: '/registry/v1/admin/sync',                                         body: { markets: 0 },                  role: 'operator' },
   { method: 'GET',  path: `/registry/v1/admin/sync-runs/${UNKNOWN}`,                                                                role: 'reader' },
   { method: 'POST', path: `/registry/v1/admin/sync-runs/${UNKNOWN}/cancel`,                  body: { reason: 'not this one' },      role: 'operator' },
@@ -303,6 +307,8 @@ const ROUTE_TABLE: Array<{ method: string, path: string, body?: unknown, role: R
   { method: 'PUT',  path: `/registry/v1/admin/versions/${UNKNOWN}/markets/1/usdc/overlay`,   body: { reason: 'x', overlay: {} },    role: 'operator' },
   { method: 'GET',  path: `/registry/v1/admin/versions/${UNKNOWN}/markets/1/usdc/overlay`,                                          role: 'reader' },
   { method: 'PUT',  path: `/registry/v1/admin/versions/${UNKNOWN}/overlays`,                 body: { reason: 'x' },                 role: 'operator' },
+  { method: 'GET',  path: '/registry/v1/admin/networks/1/tokens',                                                                   role: 'reader' },
+  ...DECISION_KINDS.flatMap(decisionRows),
 ];
 
 // a route the router takes and the table leaves out would go untested, so the table is held to the router
@@ -349,6 +355,53 @@ t.test('a token reaches the routes of its role and of every role before it, and 
 });
 
 /*
+ * A decision about a token or a collateral changes what the API serves as
+ * soon as it is made, and needs nobody's approval, so only an admin makes
+ * one, and its audit names the token it was made with. A reader and an
+ * operator read the decisions, export a kind's list and review it, and are
+ * refused setting a decision or applying a list, whatever the request holds.
+ */
+t.test('a reader or an operator reads the decisions, and only an admin makes one, under its token\'s name', async t => {
+  const db = await freshDatabase();
+  await adminClient(server).switchTo(await seedValidated(db));
+  // from an address of its own, so the address's budget is not what answers
+  const send = (token: string, method: string, path: string, body?: unknown) => server.fetch(path, {
+    method,
+    headers: {
+      'Authorization':    `Bearer ${token}`,
+      'CF-Connecting-IP': '198.51.100.40',
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+
+  for (const kind of DECISION_KINDS) {
+    const decision = kind.path(1, kind.subject);
+    const change   = { [kind.flag]: true, reason: 'decided by whoever may' };
+    for (const role of [ 'reader', 'operator' ] as const) {
+      t.equal((await send(ROLE_TOKENS[role], 'GET', decision)).status, 200, `a ${role} reads a ${kind.label} decision`);
+      const exported = await send(ROLE_TOKENS[role], 'GET', kind.list.export);
+      t.equal(exported.status, 200, 'exports the list');
+      const list = await exported.json();
+      t.equal((await send(ROLE_TOKENS[role], 'POST', kind.list.review, list)).status, 200, 'and reviews it');
+
+      for (const [ method, path, body ] of [ [ 'PATCH', decision, change ], [ 'POST', kind.list.apply, list ] ] as const) {
+        const refused = await send(ROLE_TOKENS[role], method, path, body);
+        t.equal(refused.status, 403, `but is refused ${method} ${path}`);
+        t.equal(refused.headers.get('www-authenticate'), 'Bearer error="insufficient_scope"', 'as a token without the scope');
+        const { error } = await refused.json() as { error: { details: unknown } };
+        t.same(error.details, { role, requiredRole: 'admin' }, 'which needs an admin');
+      }
+    }
+    t.equal(await count(db, kind.tables.events), 0, 'nothing is decided');
+
+    t.equal((await send(ADMIN_TOKEN, 'PATCH', decision, change)).status, 200, `while an admin makes the ${kind.label} decision`);
+    t.equal(await db.prepare(`SELECT actor FROM ${kind.tables.events}`).first<string>('actor'), 'test-admin',
+      'which its audit records under the name of the token it was made with');
+  }
+});
+
+/*
  * A refusal for the token is logged under the answer's request id, with whose
  * token it was — an expired one still in use may have leaked — and never the
  * token, its digest, or the fingerprint its budget is kept under.
@@ -369,7 +422,7 @@ t.test('a refused token is logged by its name, and never by itself', async t => 
   t.match(logged, /requiredRole: 'reader'/, 'and the role the route needs');
   t.match(logged, /name: 'rotating'/, 'and the name of the token that has expired');
   for (const token of [ ROLE_TOKENS.monitor, ROTATED_OUT ]) {
-    const digest = await sha256Hex(token);
+    const digest = await sha256(token);
     t.notOk(logged.includes(token) || logged.includes(digest.slice(0, 16)), 'never the token, nor any of its digest');
   }
 });
@@ -418,7 +471,7 @@ t.test('a list the worker cannot read closes the administrative API to every tok
   await freshDatabase();
   await server.update({ workers: [ registryWorker({
     COMET_REGISTRY_ADMIN_TOKENS: JSON.stringify([
-      await listed('alice', ADMIN_TOKEN, 'admin'),
+      await listed('test-admin', ADMIN_TOKEN, 'admin'),
       await listed('monitor', ROLE_TOKENS.monitor, 'monitor'),
       { ...await listed('somebody', ROLE_TOKENS.admin, 'admin'), name: 'Somebody' },
     ]),
