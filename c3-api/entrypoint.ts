@@ -219,7 +219,11 @@ export default {
     const response = await route(
       request,
       { ...context, requestId },
-      Evaluator.preInstantiate(quota, context, computations),
+      Evaluator.preInstantiate(quota, {
+        ...context,
+        // the computation cache's writes to KV, which would otherwise end with the answer
+        defer: task => execution?.waitUntil(task),
+      }, computations),
     );
     return secured(response, corsHeaders('legacy'));
   },
