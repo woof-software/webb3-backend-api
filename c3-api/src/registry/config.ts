@@ -175,4 +175,4 @@ function assertImportable(config: RegistryConfig): void {
 }
 
 export type { RegistryConfig };
-export { assertImportable, registryConfig, webhookUrlOf };
+export { assertImportable, numberOf, registryConfig, webhookUrlOf };
