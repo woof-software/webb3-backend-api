@@ -17,7 +17,7 @@ import { registryWorker } from '../../util/registry-worker.js';
  * tokens and their roles, the two limiters, and the size of what a caller may
  * send.
  *
- * The registry's admin routes can rebuild and switch what the registry
+ * The registry's admin routes can rebuild and switch what every market route
  * serves, so the interesting cases are the ones where something is refused:
  * an answer that is refused cheaply, refused before it says anything about
  * the registry, and refused the same way whatever the caller guessed.
