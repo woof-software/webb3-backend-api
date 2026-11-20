@@ -36,26 +36,27 @@ async function getAccounts(
   // Parse and use any query selectors for the resulting data.
   const pageSize = parseInt(queryParams.get('page_size') ?? '20');
   const pageNumber = parseInt(queryParams.get('page_number') ?? '1');
+  // a list may have a space after a comma, as in `0xA, 0xB` or the query string's `0xA,+0xB`
   const addressesRaw = (
     queryParams
       .get('addresses')
       ?.split(',')
-      .map(address => address.toLowerCase())
+      .map(address => address.trim().toLowerCase())
   ) ?? [];
 
   // verify deprecation of pagination parameters
   if (pageSize > 20) {
-    return new Response(`Error: page_size ${pageSize} is not valid. Use 20.`);
+    return new Response(`Error: page_size ${pageSize} is not valid. Use 20.`, { status: 400 });
   }
   if (pageNumber != 1) {
-    return new Response(`Error: page_number is not supported. Must use '1' or omit.`);
+    return new Response(`Error: page_number is not supported. Must use '1' or omit.`, { status: 400 });
   }
 
   // parse addresses from the addresses query parameter
   const addresses: Eth.Address[] = [];
   for (let rawAddress of addressesRaw) {
     if (!Eth.parseAddress(rawAddress)) {
-      return new Response(`Error: address ${rawAddress} is not a valid address`);
+      return new Response(`Error: address ${rawAddress} is not a valid address`, { status: 400 });
     }
     addresses.push(rawAddress);
   }
@@ -75,19 +76,21 @@ async function getAccounts(
   const governorBravo = Eth.wellKnownContractsByNetwork[network]['GovernorBravo']['default'];
   const bravoId: TallyApi.CAIP10 = `eip155:${chainId}:${governorBravo.address}`;
 
+  /*
+   * The accounts come from the Tally API. When it fails, the request fails
+   * the way any request does: a 500 that tells the client the request id and
+   * nothing else, while the log has what Tally answered under that id.
+   * Tally's answer, which can be any body at all, is never echoed back.
+   */
+
   // for a specific set of addresses, use a filtered query instead of
   // enumerating all accounts
   if (addresses.length > 0) {
     const accountIds = addresses.map(address => `eip155:1:${address}` as TallyApi.CAIP10);
-    let results: TallyApi.Result<TallyApi.AccountProfiles.Data>; try {
-      results = await TallyApi.AccountProfiles.query(
-        context.env.TALLY_API_KEY,
-        { accountIds, governanceIds: [ bravoId ] }
-      );
-    } catch (error) {
-      console.error(`Tally API Error`, error);
-      return new Response(`Tally API Error: ${(error as Error).message}`, { status: 500 });
-    }
+    const results = await TallyApi.AccountProfiles.query(
+      context.env.TALLY_API_KEY,
+      { accountIds, governanceIds: [ bravoId ] }
+    );
 
     if ('errors' in results) {
       throw new Error(results.errors[0]?.message);
@@ -99,18 +102,13 @@ async function getAccounts(
   }
 
   // if no specific addresses were requested, we enumerate all accounts
-  let results: TallyApi.Result<TallyApi.Delegates.Data>; try {
-    results = await TallyApi.Delegates.query(
-      context.env.TALLY_API_KEY,
-      {
-        governanceId: bravoId,
-        // cursor: ...
-      }
-    );
-  } catch (error) {
-    console.error(`Tally API Error`, error);
-    return new Response(`Tally API Error: ${(error as Error).message}`, { status: 500 });
-  }
+  const results = await TallyApi.Delegates.query(
+    context.env.TALLY_API_KEY,
+    {
+      governanceId: bravoId,
+      // cursor: ...
+    }
+  );
 
   if ('errors' in results) {
     throw new Error(results.errors[0]?.message);
