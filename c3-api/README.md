@@ -714,6 +714,11 @@ overall accuracy of estimated timestamps for that network. Grossly
 inaccurate estimates can result in the API computing answers affected by
 time skew, which can present as user-facing bugs in some circumstances.
 
+The historical market summary does not rely on them: it finds the first
+block of each UTC day from the blocks' own timestamps
+(`lib/computations/market/day-opening-block.ts`), and takes the estimate only
+as its first guess.
+
 The accuracy of `Eth.estimateBlockTimestampRelative(..)` should not error
 more than 1hr (3,600s) for a new network when performing estimates
 relative to the 'latest' block
