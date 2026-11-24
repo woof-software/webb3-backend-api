@@ -10,6 +10,7 @@ import * as governanceModel from '../../lib/model/governance.js';
 
 import * as KnownNetwork from '../../lib/well-known/networks/network.js';
 
+import { jsonResponse } from '../http/json.js';
 import { AllContracts, GovernanceRouteData } from '../router.js';
 
 import { Context } from './handlers.js';
@@ -98,7 +99,7 @@ async function getAccounts(
 
     // format response
     const accounts: governanceModel.Account[] = results.data.accounts.map(account => parseDelegate({ account }));
-    return new Response(JSON.stringify({ accounts }));
+    return jsonResponse({ accounts });
   }
 
   // if no specific addresses were requested, we enumerate all accounts
@@ -119,7 +120,7 @@ async function getAccounts(
     const parsed = parseDelegate(delegate);
     return { ...parsed, rank: index + 1 };
   });
-  return new Response(JSON.stringify({ accounts }));
+  return jsonResponse({ accounts });
 }
 
 function parseDelegate(delegate: { account: TallyApi.Account }): governanceModel.Account {
