@@ -15,8 +15,7 @@
 #   computations, and the historical market day summaries;
 # - tests that read a live chain through a node provider: the all-networks
 #   and mainnet market summaries, account rewards, and the market day,
-#   minutely, rewards and rewards summary computations;
-# - the legacy gas price, which reads blocknative.
+#   minutely, rewards and rewards summary computations.
 #
 # Arguments are passed on to tap.
 set -eu
@@ -44,5 +43,4 @@ exec npx tap --disable-coverage --timeout=600 \
   --exclude='dist/tests/lib/computations/market/market-minutely-summary.test.js' \
   --exclude='dist/tests/lib/computations/market/market-rewards.test.js' \
   --exclude='dist/tests/lib/computations/market/rewards-summary.test.js' \
-  --exclude='dist/tests/e2e/legacy/gas-price.test.js' \
   "$@"

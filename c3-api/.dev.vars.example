@@ -19,9 +19,6 @@
 # Public host of this API
 # V3_API_HOST=
 
-# Optional Blocknative API key for /legacy/mainnet/gas-price
-# BLOCK_NATIVE_API_KEY=
-
 # Comet registry admin API: its tokens, as a JSON list on one line, in single
 # quotes. Each entry names who holds the token, the SHA-256 of the token as
 # 64 hex digits (never the token itself), its role — monitor, reader,
