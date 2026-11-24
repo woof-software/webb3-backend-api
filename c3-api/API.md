@@ -931,6 +931,14 @@ restarts pagination without a cursor, as above:
 A value of any other form is not a cursor, and is a `400` with the text
 `Cursor is invalid`.
 
+`limit` is a number of items of 1 or more, in decimal digits alone, and is 15
+when it is left out. A larger value is read as 15, so `limit=30`, as in the
+example below, answers pages of up to 15 items. Any other value — `0`, a
+negative number, a fraction such as `1.5`, a sign, a space, an exponent,
+hexadecimal or other text, or an empty `limit=` — is a `400` with the text
+`Invalid limit …` and the value as sent, in plain text, answered before
+anything is read.
+
 A page reads a bounded number of ranges of blocks and enriches a bounded
 number of items, so it can hold fewer items than `limit`, or none, while
 `done` is `false`: ask again with its `cursor` until `done` is `true`. Only
