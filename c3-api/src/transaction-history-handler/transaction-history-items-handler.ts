@@ -8,6 +8,7 @@ import { BigFixnum } from '../../lib/bigfixnum.js';
 
 import * as KnownNetwork  from '../../lib/well-known/networks/network.js';
 
+import { jsonResponse } from '../http/json.js';
 import { ApiError } from '../http/errors.js';
 import { numberOf } from '../registry/config.js';
 import { refuseTestnet } from '../testnets.js';
@@ -921,7 +922,7 @@ async function getTransactionHistory(
         latestBlocks
       )
     );
-    return new Response(JSON.stringify(
+    return jsonResponse(
       formatTransactionHistoryResponse(
         transactionHistoryResponse,
         populateDefiSaverProxyProfiles(
@@ -929,7 +930,7 @@ async function getTransactionHistory(
           defiSaverProxies
         )
       )
-    ), { status: 200 });
+    );
   } else {
     // Validate cursor and match if the provided filters are the same
     if (resumed.filter.markets.length !== markets.length) {
@@ -972,7 +973,7 @@ async function getTransactionHistory(
       )
     );
     // Manually add DefiSaver to profilesByAddress
-    return new Response(JSON.stringify(
+    return jsonResponse(
       formatTransactionHistoryResponse(
         transactionHistoryResponse,
         populateDefiSaverProxyProfiles(
@@ -980,7 +981,7 @@ async function getTransactionHistory(
           defiSaverProxies
         )
       )
-    ), { status: 200 });
+    );
   }
 }
 
