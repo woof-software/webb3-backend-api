@@ -33,6 +33,17 @@ import { HexAddress } from './evm/address.js';
 // already accepts this object as.
 import type { WellKnownContractsByNetworkAddress } from './well-known/contracts/utils.js';
 
+/*
+ * These are the contracts this API is built against: governors, COMP, the V2
+ * protocol, the bridges, the migrators.
+ *
+ * No market of a mainnet is among them. Markets, their tokens, and their
+ * feeds are resolved from the activated registry version through the request
+ * catalog, and governance names markets from it too; what remains here names
+ * the rest of a governance action. The testnet files keep their Comets until
+ * the files themselves go, and nothing resolves a market through them.
+ */
+
 const wellKnownContractsByNetwork: WellKnownContractsByNetworkAddress = {
   ...sepoliaContracts,
   ...mainnetContracts,
@@ -88,7 +99,6 @@ function nodeEndpoint(nodeHost:string, nodeKey:string, network: KnownNetwork.Nam
   return `https://${nodeHost}/${network}/${nodeKey}`;
 }
 
-const mainnetGasPriceEndpoint = `https://api.blocknative.com/gasprices/blockprices`;
 const governanceTallyQueryEndpoint = `https://api.tally.xyz/query`;
 
 /*
@@ -453,7 +463,6 @@ export {
   //
   nodeEndpoint,
   parseTransaction,
-  mainnetGasPriceEndpoint,
   wellKnownContractsByNetwork,
   //
   DefiSaverBotAddresses,

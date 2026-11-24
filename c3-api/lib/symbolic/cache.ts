@@ -2,6 +2,7 @@ import * as Debug    from '../debug-log.js';
 import * as Json     from '../json-types.js';
 import * as Quota    from '../quota.js';
 import * as Fallible from '../fallible/fallible.js';
+import { keccak256 } from '../hash.js';
 
 interface Cache {
   debug: Debug.Logger;
@@ -56,21 +57,115 @@ class MemoryCache implements Cache {
 }
 
 /*
+ * The key an entry is stored under in KV.
+ *
+ * KV refuses a key longer than 512 bytes of UTF-8 ("KV GET failed: 414 UTF-8
+ * encoded length of 513 exceeds key length limit of 512."), and a key grows
+ * with what its computation is keyed by: the markets of a history stream and
+ * an account's proxies, the markets of a rewards group. Such a key is stored
+ * under its computation's name and its digest. Every key KV takes is stored as
+ * it is, so nothing already cached is lost; a computation's own key has ':'
+ * after its name where a digest has '#', so the two never meet.
+ */
+const KV_MAX_KEY_BYTES = 512;
+
+const encoder = new TextEncoder();
+
+function kvKeyOf(key: string): string {
+  if (encoder.encode(key).byteLength <= KV_MAX_KEY_BYTES) {
+    return key;
+  }
+  const name = /^[\w.-]{1,64}(?=:)/.exec(key)?.[0] ?? 'key';
+  return `${name}#keccak256:${keccak256(key)}`;
+}
+
+/*
+ * When this isolate last logged a call KV refused, by namespace and kind.
+ *
+ * A refusal is a warning: the request is answered without the cache. It is
+ * logged once a minute rather than once a call, since a KV that does not
+ * answer refuses every read and write of every request, and a line for each
+ * would bury everything else in the log.
+ */
+type Refusal = 'unreadable' | 'unwritable';
+
+const reportedRefusals = new WeakMap<KVNamespace, { [_ in Refusal]?: number }>();
+
+const REPORT_REFUSAL_EVERY_MS = 60_000;
+
+/*
  * Workers KV Cache
  * Common cache interface wrapper for Workers KV `KVNamespace' instances.
  * Exposes non-standard methods for `list`, `delete` on entries.
+ *
+ * A call KV refuses, such as a 429 or a 503, costs a computation only its
+ * cache: `get` answers a miss, so the value is computed, and `put` leaves the
+ * value computed but not kept. Failing the request instead would answer 500
+ * for what could only have made it slower. State that nothing computes again,
+ * such as a history cursor, is read and written with `read` and `write`,
+ * which throw what KV refused.
  */
 class WorkersKvCache implements Cache {
+  // the logger as given, before it is scoped: a refusal is logged whatever scopes DEBUG names
+  private readonly log: Debug.Logger;
+
   constructor(
     public store: KVNamespace,
     public revivers: Json.Reviver<unknown>[] = [],
     public debug: Debug.Logger = Debug.MakeLogger([]),
   ) {
+    this.log   = debug;
     this.debug = debug.scope('cache');
   }
 
   async get<T>(key: string): Promise<T | null> {
-    const cached = await this.store.get(key);
+    let cached: string | null;
+    try {
+      cached = await this.store.get(kvKeyOf(key));
+    } catch (error) {
+      this.refused('unreadable', key, error);
+      return null;
+    }
+    return this.parsed<T>(key, cached);
+  }
+
+  async put(
+    key:     string,
+    value:   Json.Representable,
+    options: KVNamespacePutOptions = {},
+  ): Promise<void> {
+    try {
+      await this.write(key, value, options);
+    } catch (error) {
+      this.refused('unwritable', key, error);
+    }
+  }
+
+  async read<T>(key: string): Promise<T | null> {
+    return this.parsed<T>(key, await this.store.get(kvKeyOf(key)));
+  }
+
+  async write(
+    key:     string,
+    value:   unknown,
+    options: KVNamespacePutOptions = {},
+  ): Promise<void> {
+    this.debug.log(`WorkersKvCache: put: ${key} with ${JSON.stringify(options)}`);
+    await this.store.put(kvKeyOf(key), JSON.stringify(value), options);
+  }
+
+  delete(key: string): Promise<void> {
+    this.debug.log(`WorkersKvCache: delete: ${key}`);
+    return this.store.delete(kvKeyOf(key));
+  }
+
+  // a key too long for KV is listed as its computation's name, '#' and its digest
+  list<Metadata>(prefix: string): Promise<KVNamespaceListResult<Metadata>> {
+    this.debug.log(`WorkersKvCache: list: { prefix: ${prefix} }`);
+    return this.store.list({ prefix });
+  }
+
+  private parsed<T>(key: string, cached: string | null): T | null {
     if (cached === null || cached === '') {
       this.debug.log(`WorkersKvCache: get: miss: ${key}`);
       return null;
@@ -79,25 +174,24 @@ class WorkersKvCache implements Cache {
     return Json.parse(cached, this.revivers) as T;
   }
 
-  put(
-    key:     string,
-    value:   Json.Representable,
-    options: KVNamespacePutOptions = {},
-  ): Promise<void> {
-    this.debug.log(`WorkersKvCache: put: ${key} with ${JSON.stringify(options)}`);
-    return this.store.put(key, JSON.stringify(value), options);
-  }
-
-  delete(key: string): Promise<void> {
-    this.debug.log(`WorkersKvCache: delete: ${key}`);
-    return this.store.delete(key);
-  }
-
-  list<Metadata>(prefix: string): Promise<KVNamespaceListResult<Metadata>> {
-    this.debug.log(`WorkersKvCache: list: { prefix: ${prefix} }`);
-    return this.store.list({ prefix });
+  private refused(kind: Refusal, key: string, error: unknown): void {
+    const at       = Date.now();
+    const reported = reportedRefusals.get(this.store) ?? {};
+    const last     = reported[kind];
+    if (last !== undefined && at - last < REPORT_REFUSAL_EVERY_MS) {
+      return;
+    }
+    reportedRefusals.set(this.store, { ...reported, [kind]: at });
+    const message = error instanceof Error ? error.message : String(error);
+    this.log.warn(`computation cache ${kind}: ${message}: ${key}`);
   }
 }
+
+/*
+ * What a write leaves to finish after the invocation has answered: the
+ * entrypoint gives ExecutionContext.waitUntil.
+ */
+type Defer = (task: Promise<unknown>) => void;
 
 /*
  * Layers Cache Wrapper
@@ -108,12 +202,13 @@ class LayersCache implements Cache {
   private constructor(
     public layers: Cache[],
     public debug: Debug.Logger = Debug.MakeLogger([]),
+    private readonly defer?: Defer,
   ) {
     this.debug = this.debug.scope('cache');
   }
-  // Cache.Layers.of([ memorycache, kvcache ])
-  static of(orderedLayers: Cache[], debug?: Debug.Logger) {
-    return new LayersCache(orderedLayers, debug);
+  // Cache.Layers.of([ memorycache, kvcache ], debug, defer)
+  static of(orderedLayers: Cache[], debug?: Debug.Logger, defer?: Defer) {
+    return new LayersCache(orderedLayers, debug, defer);
   }
 
   async get<T>(key: string)
@@ -149,11 +244,19 @@ class LayersCache implements Cache {
   )
     : Promise<Fallible.Outcome.OrJust<void>>
   {
-    /* NOTE(jordan): only wait for the fastest layer to persist. The
-     * others can finish (or fail to persist) on their own time.
+    /*
+     * Only the fastest layer is waited for, so a computation goes on as soon
+     * as its value is in memory, and the slower ones, KV, finish on their own
+     * time. But the runtime ends what an invocation still has pending once it
+     * has answered, a failure included, unless it was handed to waitUntil: a
+     * value computed late in a request, or in one that failed, never reached
+     * KV, and every isolate without it in memory computed it again. So every
+     * write is handed to `defer`, to finish after the answer.
      */
     this.debug.debug(`LayersCache: put: initiate race`);
-    return Promise.race(this.layers.map(l => l.put(key, value, options)));
+    const writes = this.layers.map(l => l.put(key, value, options));
+    this.defer?.(Promise.allSettled(writes));
+    return Promise.race(writes);
   }
 }
 
@@ -258,6 +361,9 @@ export {
   WorkersKvCache,
   // Failure type tags
   Failures,
+  // the key KV stores an entry under
+  kvKeyOf,
+  KV_MAX_KEY_BYTES,
 };
 
 /*
